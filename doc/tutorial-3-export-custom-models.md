@@ -195,7 +195,7 @@ No LoRA nodes needed — load and go!
 ## FAQ
 
 **Q: Can I add new LoRAs on top of an exported model?**
-A: Yes. The exported model is a regular quantized model — you can still stack new LoRAs on top.
+A: For SVDQ-exported models, yes — you can stack new LoRAs (with the LoRA Config node). However, **Lighting-exported models do not currently support adding new LoRAs** — if you need a different LoRA combination, re-export from the original FP16 model.
 
 **Q: How long does export take?**
 A: Depends on model size and backend. Lighting from FP16 requires quantization time (a few minutes). SVDQ export is faster.
