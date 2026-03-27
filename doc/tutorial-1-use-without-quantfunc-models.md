@@ -47,6 +47,7 @@ In the **QuantFunc Model Loader** node:
 | `device` | GPU index (usually `0`) |
 | `precision_config` | Per-layer precision config file path (see below) |
 | `fused_mod` | Recommended `True` for Qwen series models (see below) |
+| `prequant_weights` | Pre-quantized modulation weights path, recommended for low-VRAM GPUs (see below) |
 
 ![Configure Model Loader node](../assets/t1-step2-model-loader.png)
 
@@ -86,6 +87,27 @@ When enabled, `fused_mod` fuses the modulation layer's SiLU, GEMV, bias, and spl
 > **Recommendation: When using Qwen series models (e.g., Qwen-Image-Edit-2511), set `fused_mod` to `True`.** The Qwen Transformer architecture benefits significantly from this optimization, yielding noticeable performance gains.
 
 For other model architectures, whether this option helps depends on their modulation layer implementation. If unsure, keep the default (off).
+
+#### Modulation Optimization: fused_mod vs prequant_weights (QwenImage Only)
+
+QwenImage models offer two **mutually exclusive** modulation optimization options — choose based on your VRAM:
+
+| Your VRAM | Recommended | How to Set |
+|-----------|-------------|------------|
+| **24 GB+** (RTX 4090, etc.) | `fused_mod = True` | Better image quality, model ~14 GB |
+| **8–12 GB** (RTX 3060, etc.) | `prequant_weights = path` | Model ~11 GB, inference ~9s (vs 20s+ without) |
+
+> **Note:** These two options are mutually exclusive — setting `prequant_weights` overrides `fused_mod`.
+
+**Using prequant_weights:**
+
+1. Download the `mod_weights.safetensors` file for your model from [QuantFunc ModelScope](https://www.modelscope.cn/models/QuantFunc) or HuggingFace
+2. Set in Model Loader:
+```
+prequant_weights = /path/to/mod_weights.safetensors
+```
+
+> The option chosen during export is saved in model metadata and auto-enabled on load.
 
 ### Step 3: Configure Generation Parameters
 

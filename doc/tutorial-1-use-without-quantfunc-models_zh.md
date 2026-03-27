@@ -47,6 +47,7 @@ git clone https://huggingface.co/Qwen/Qwen-Image-Edit-2511 /path/to/Qwen-Image-E
 | `device` | GPU 编号（通常为 `0`） |
 | `precision_config` | 逐层精度配置文件路径（见下方说明） |
 | `fused_mod` | Qwen 系列模型建议开启 `True`（见下方说明） |
+| `prequant_weights` | 预量化调制权重路径，低显存 GPU 推荐（见下方说明） |
 
 ![配置 Model Loader 节点](../assets/t1-step2-model-loader.png)
 
@@ -86,6 +87,27 @@ precision_config = /path/to/configs/precision-config/your-model-config.json
 > **建议：使用 Qwen 系列模型（如 Qwen-Image-Edit-2511）时，将 `fused_mod` 设为 `True`。** Qwen 系列的 Transformer 结构非常适合此优化，开启后可获得明显的性能提升。
 
 其他模型架构是否受益于此选项取决于其 modulation 层的实现方式，如不确定可先保持默认关闭。
+
+#### 调制层优化：fused_mod vs prequant_weights（仅 QwenImage 系列）
+
+QwenImage 系列提供两种**互斥**的调制层优化方案，根据你的显存情况选择其一：
+
+| 你的显存 | 推荐方案 | 设置方式 |
+|----------|----------|----------|
+| **24 GB+**（RTX 4090 等） | `fused_mod = True` | 画质更好，模型约 14 GB |
+| **8–12 GB**（RTX 3060 等） | `prequant_weights = 路径` | 模型约 11 GB，推理约 9 秒（无此优化需 20 秒+） |
+
+> **注意：** 两个选项互斥 —— 设置了 `prequant_weights` 后，`fused_mod` 不生效。
+
+**使用 prequant_weights：**
+
+1. 从 [QuantFunc ModelScope](https://www.modelscope.cn/models/QuantFunc) 或 HuggingFace 下载对应模型的 `mod_weights.safetensors` 文件
+2. 在 Model Loader 中设置：
+```
+prequant_weights = /path/to/mod_weights.safetensors
+```
+
+> 导出时选择的方案会保存到模型元数据中，加载导出模型时自动启用。
 
 ### 第三步：配置生成参数
 
