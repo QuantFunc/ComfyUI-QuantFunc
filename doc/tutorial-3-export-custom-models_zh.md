@@ -45,7 +45,10 @@ Lighting 后端的 Model Loader 配置与[教程 1](tutorial-1-use-without-quant
 | `model_backend` | `lighting` |
 | `device` | GPU 编号（通常为 `0`） |
 | `precision_config` | 逐层精度配置文件路径（详见[教程 1](tutorial-1-use-without-quantfunc-models_zh.md)） |
-| `fused_mod` | Qwen 系列模型建议开启 `True` |
+| `fused_mod` | Qwen 系列模型建议开启 `True`（与 `prequant_weights` 互斥） |
+| `prequant_weights` | 预量化调制权重路径，低显存 GPU 推荐（与 `fused_mod` 互斥） |
+
+> **调制层优化选择：** 24 GB+ 显存用 `fused_mod = True`（画质更好）；8-12 GB 显存用 `prequant_weights`（模型从 ~14 GB 降到 ~11 GB）。导出时的选择会保存到模型元数据中，加载时自动启用。详见[教程 1 的调制层优化说明](tutorial-1-use-without-quantfunc-models_zh.md)。
 
 ![Lighting 后端 Model Loader 配置](../assets/t1-step2-model-loader.png)
 
