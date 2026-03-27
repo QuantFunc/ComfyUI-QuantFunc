@@ -45,7 +45,10 @@ The Lighting backend Model Loader config is the same as [Tutorial 1](tutorial-1-
 | `model_backend` | `lighting` |
 | `device` | GPU index (usually `0`) |
 | `precision_config` | Per-layer precision config file path (see [Tutorial 1](tutorial-1-use-without-quantfunc-models.md)) |
-| `fused_mod` | Recommended `True` for Qwen series models |
+| `fused_mod` | Recommended `True` for Qwen series models (mutually exclusive with `prequant_weights`) |
+| `prequant_weights` | Pre-quantized modulation weights path, recommended for low-VRAM GPUs (mutually exclusive with `fused_mod`) |
+
+> **Modulation optimization:** 24 GB+ VRAM → use `fused_mod = True` (better quality); 8–12 GB VRAM → use `prequant_weights` (model ~11 GB vs ~14 GB). The choice is saved in exported model metadata and auto-enabled on load. See [Tutorial 1's modulation optimization section](tutorial-1-use-without-quantfunc-models.md) for details.
 
 ![Lighting backend Model Loader config](../assets/t1-step2-model-loader.png)
 
