@@ -116,7 +116,7 @@ If the library was not found:
 
 ## 3. Usage
 
-See [workflow_sample/README.md](workflow_sample/README.md) for detailed node reference and quick start guides.
+See [doc/](doc/) for detailed tutorials and [workflow_sample/README.md](workflow_sample/README.md) for node reference.
 
 ### 3.1 Basic Flow
 
@@ -129,7 +129,25 @@ ModelLoader → (LoRA) → (LoRA Config) → Generate → PreviewImage
 3. **QuantFunc LoRA Config** (optional, required for SVDQ + LoRA) — merge strategy
 4. **QuantFunc Generate** — enter prompt, dimensions, steps → outputs IMAGE
 
-### 3.2 Example Workflows
+### 3.2 Use Any Diffusers Model (No Pre-quantized Download)
+
+You don't need to download QuantFunc pre-quantized models. With the **Lighting backend**, any diffusers-format model (e.g., [Qwen/Qwen-Image-Edit-2511](https://huggingface.co/Qwen/Qwen-Image-Edit-2511)) works out of the box — set `model_backend` to `lighting`, leave `transformer_path` empty, and the engine quantizes FP16 weights on the fly.
+
+> **[Tutorial 1: Use Without QuantFunc Models →](doc/tutorial-1-use-without-quantfunc-models.md)**
+
+### 3.3 Download Pre-quantized Models for Maximum Speed
+
+For the best performance (2x–11x speedup), download QuantFunc **SVDQ pre-quantized models** from [ModelScope](https://www.modelscope.cn/models/QuantFunc) or [HuggingFace](https://huggingface.co/QuantFunc). SVDQ models are quantized offline with advanced SVD algorithms — they load instantly and run faster than real-time quantization.
+
+> **[Tutorial 2: Download & Use QuantFunc Models →](doc/tutorial-2-download-and-use-quantfunc-models.md)**
+
+### 3.4 Export Custom Models with LoRA Baked In
+
+Once you've dialed in your perfect LoRA stack, export the whole pipeline as a standalone pre-quantized model. Exported models load with LoRA already fused — no LoRA nodes needed, no re-quantization on startup.
+
+> **[Tutorial 3: Export Custom Models →](doc/tutorial-3-export-custom-models.md)**
+
+### 3.5 Example Workflows
 
 Import from `workflow_sample/`:
 
