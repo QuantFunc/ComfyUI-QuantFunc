@@ -1,0 +1,15 @@
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Dynamic libraries (all platforms)
+*.dll
+*.so
+*.dylib
+
+# Static libraries (all platforms)
+*.lib
+*.a
+
+# Keep bin directory structure but ignore libraries
+# config.json and other non-binary files are still tracked
