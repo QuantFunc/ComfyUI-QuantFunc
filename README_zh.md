@@ -116,7 +116,7 @@ pip install modelscope
 
 ## 3. 使用方法
 
-详细节点说明和快速上手指南见 [workflow_sample/README_zh.md](workflow_sample/README_zh.md)。
+详细教程见 [doc/](doc/)，节点说明见 [workflow_sample/README_zh.md](workflow_sample/README_zh.md)。
 
 ### 3.1 基本连接
 
@@ -129,7 +129,25 @@ ModelLoader → (LoRA) → (LoRA Config) → Generate → PreviewImage
 3. **QuantFunc LoRA Config**（可选，SVDQ + LoRA 时必须）—— 合并策略
 4. **QuantFunc Generate** —— 输入提示词、尺寸、步数 → 输出 IMAGE
 
-### 3.2 示例工作流
+### 3.2 使用任意 Diffusers 模型（无需下载预量化模型）
+
+你不需要下载 QuantFunc 预量化模型也能使用。通过 **Lighting 后端**，任何 diffusers 格式的模型（如 [Qwen/Qwen-Image-Edit-2511](https://huggingface.co/Qwen/Qwen-Image-Edit-2511)）都可以直接使用 —— 将 `model_backend` 设为 `lighting`，`transformer_path` 留空，引擎会实时将 FP16 权重量化加速。
+
+> **[教程 1：不下载预量化模型直接使用 →](doc/tutorial-1-use-without-quantfunc-models_zh.md)**
+
+### 3.3 下载预量化模型获得极致加速
+
+想要最佳性能（2x-11x 加速），可以从 [ModelScope](https://www.modelscope.cn/models/QuantFunc) 或 [HuggingFace](https://huggingface.co/QuantFunc) 下载 QuantFunc 的 **SVDQ 预量化模型**。SVDQ 模型通过离线 SVD 算法量化，加载即用，推理速度优于实时量化。
+
+> **[教程 2：下载并使用 QuantFunc 模型 →](doc/tutorial-2-download-and-use-quantfunc-models_zh.md)**
+
+### 3.4 导出自定义模型（烘焙 LoRA）
+
+当你调试好了完美的 LoRA 组合，可以将整个管线导出为独立的预量化模型。导出后 LoRA 已融合 —— 无需 LoRA 节点，无需重新量化，加载即用。
+
+> **[教程 3：导出自定义模型 →](doc/tutorial-3-export-custom-models_zh.md)**
+
+### 3.5 示例工作流
 
 从 `workflow_sample/` 导入：
 
