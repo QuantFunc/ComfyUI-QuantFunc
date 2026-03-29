@@ -1,12 +1,16 @@
-# Tutorial 1: Use Workflows Without Downloading QuantFunc Models
+# Tutorial 1: Runtime Quantization — Quantize BF16/FP16 Models to 4bit
 
 [中文版本](tutorial-1-use-without-quantfunc-models_zh.md)
 
 ## Overview
 
-You **don't need** to download QuantFunc pre-quantized models to use this plugin. As long as you have a **diffusers-format** base model (e.g., [Qwen/Qwen-Image-Edit-2511](https://huggingface.co/Qwen/Qwen-Image-Edit-2511)), you can use the **Lighting backend** for real-time quantization and accelerated inference.
+You **don't need** to download QuantFunc pre-quantized models to use this plugin. The **Lighting backend** provides **runtime quantization** — it quantizes any **diffusers-format** FP16 model (e.g., [Qwen/Qwen-Image-Edit-2511](https://huggingface.co/Qwen/Qwen-Image-Edit-2511)) at load time and accelerates inference, with no pre-conversion needed.
 
-The Lighting backend quantizes FP16 weights to low precision at load time — no pre-conversion needed.
+![Workflow overview](../assets/t1t3-workflow-overview.png)
+
+> **Workflow files (use the Lighting group on the right side):**
+> - Text-to-image: [`workflow_sample/QuantFunc-Text-to-Image-Workflow.json`](../workflow_sample/QuantFunc-Text-to-Image-Workflow.json)
+> - Image editing: [`workflow_sample/QuantFunc-Image-to-Image-Workflow.json`](../workflow_sample/QuantFunc-Image-to-Image-Workflow.json)
 
 ## Prerequisites
 
@@ -183,10 +187,10 @@ If you run into VRAM issues or want to fine-tune, add a **QuantFunc Pipeline Con
 ## FAQ
 
 **Q: First load is slow?**
-A: Normal. Lighting quantizes model weights on the first run. Subsequent runs are much faster. Use [Tutorial 3](tutorial-3-export-custom-models.md) to export quantized models and skip this step.
+A: Normal. Lighting performs runtime quantization on the first run. Subsequent runs use the cached quantized model. You can also use [Tutorial 2](tutorial-2-export-quantized-models.md) to export all runtime-quantized models to disk, skipping re-quantization entirely on future loads.
 
 **Q: Which models work?**
 A: Any diffusers-format model. Check [QuantFunc official docs](https://www.modelscope.cn/models/QuantFunc) for supported architectures.
 
 **Q: How does this compare to pre-quantized models?**
-A: Pre-quantized models (SVDQ) load faster and run faster because quantization is done offline with more advanced SVD algorithms. Lighting from FP16 is more flexible but slightly slower. See [Tutorial 2](tutorial-2-download-and-use-quantfunc-models.md) for details.
+A: Pre-exported quantized models (including SVDQ) load faster because they skip the runtime quantization step. In terms of inference speed, SVDQ and Lighting are roughly the same — on sub-RTX 50 GPUs, Lighting is actually ~20% faster than SVDQ. Lighting has no SVDQ low-rank computation overhead, which is why it's faster on sub-RTX 50 GPUs. See [Tutorial 3](tutorial-3-download-quantfunc-models.md) for details.

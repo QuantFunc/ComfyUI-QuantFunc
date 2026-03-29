@@ -1,14 +1,22 @@
-# Tutorial 2: Download and Use QuantFunc Pre-quantized Models for Maximum Speed
+# Tutorial 3: Download and Use Pre-exported Quantized Models
 
-[中文版本](tutorial-2-download-and-use-quantfunc-models_zh.md)
+[中文版本](tutorial-3-download-quantfunc-models_zh.md)
 
 ## Overview
 
-QuantFunc provides **pre-quantized models** (SVDQ format) that use offline SVD quantization to compress model weights to INT4/INT8 precision. Compared to Lighting real-time quantization, SVDQ models:
+QuantFunc has pre-exported commonly used models that were runtime-quantized using the Lighting engine. You can download these **pre-exported quantized models** directly and use them immediately — no need to perform runtime quantization yourself.
 
-- **Load faster**: No on-the-fly quantization — loads pre-processed weights directly
-- **Run faster**: Uses more aggressive quantization strategies for 2x-11x speedup
-- **Better quality**: Offline quantization has more time to optimize, reducing quantization error
+These models offer:
+
+- **Instant loading**: No runtime quantization needed — loads pre-exported weights directly
+- **Fast inference**: 2x-11x speedup
+- **Ready to use**: Download, set path, and go
+
+![Workflow overview](../assets/t1t3-workflow-overview.png)
+
+> **Workflow files (use the SVDQ group on the left side):**
+> - Text-to-image: [`workflow_sample/QuantFunc-Text-to-Image-Workflow.json`](../workflow_sample/QuantFunc-Text-to-Image-Workflow.json)
+> - Image editing: [`workflow_sample/QuantFunc-Image-to-Image-Workflow.json`](../workflow_sample/QuantFunc-Image-to-Image-Workflow.json)
 
 ## Step 1: Determine Your GPU Variant
 
@@ -86,7 +94,7 @@ In the **QuantFunc Generate** node:
 
 ## Step 5: Run
 
-Click **Queue Prompt**. SVDQ models load quickly with no real-time quantization overhead.
+Click **Queue Prompt**. SVDQ models load quickly with no runtime quantization overhead.
 
 ![SVDQ run result](../assets/t1-step4-run-result.png)
 
@@ -112,7 +120,7 @@ Model Loader (svdq)
 | | `concat` — Direct concatenation (nunchaku's approach) |
 | `max_rank` | Max merged LoRA rank (1-1024, use default or `-1` for auto) |
 
-> This is needed because SVDQ models have pre-quantized low-rank structures baked in, and new LoRAs must be merged with the existing structure.
+> This is needed because SVDQ models have pre-quantized low-rank structures fused in, and new LoRAs must be merged with the existing structure.
 
 ![SVDQ + LoRA + LoRA Config connection](../assets/t2-svdq-lora-config.png)
 
@@ -128,14 +136,15 @@ Same as [Tutorial 1](tutorial-1-use-without-quantfunc-models.md):
 
 ## SVDQ vs Lighting Comparison
 
-| Dimension | SVDQ (Pre-quantized) | Lighting (Real-time) |
+| Dimension | SVDQ (Offline Quantization) | Lighting (Runtime Quantization) |
 |-----------|-----------------------|----------------------|
 | Model source | Must download QuantFunc models | Any diffusers FP16 model |
-| First load | Fast (direct load) | Slow (real-time quantization) |
-| Inference speed | Fastest (2x-11x) | Fast (slightly slower than SVDQ) |
-| Quantization quality | Best (offline optimized) | Good |
+| First load | Fast (direct load) | Slow (runtime quantization on first load) |
+| Inference speed | 2x-11x | 2x-11x (on sub-RTX 50 GPUs, ~20% faster than SVDQ) |
+| Quantization quality | Good (offline optimized) | Good |
 | LoRA usage | Requires LoRA Config node | Direct stacking, zero cost |
 | Flexibility | Limited to pre-quantized models | Any model works |
+| Export | Re-export with LoRA fused in | Export all runtime-quantized models to skip re-quantization |
 
 ## FAQ
 

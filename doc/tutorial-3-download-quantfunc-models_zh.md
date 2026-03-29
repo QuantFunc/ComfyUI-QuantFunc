@@ -1,14 +1,22 @@
-# 教程 2：下载并使用 QuantFunc 预量化模型获得极致加速
+# 教程 3：下载并使用已导出的量化模型
 
-[English Version](tutorial-2-download-and-use-quantfunc-models.md)
+[English Version](tutorial-3-download-quantfunc-models.md)
 
 ## 概述
 
-QuantFunc 提供**预量化模型**（SVDQ 格式），通过离线 SVD 量化算法将模型压缩为 INT4/INT8 精度。相比 Lighting 实时量化，SVDQ 预量化模型：
+QuantFunc 已将常用模型提前通过 Lighting 引擎进行运行时量化并导出，你可以直接下载这些**已导出的量化模型**，加载即用，无需自行进行运行时量化。
 
-- **加载更快**：无需实时量化，直接加载预处理好的权重
-- **推理更快**：使用更激进的量化策略，达到 2x-11x 加速
-- **质量更好**：离线量化有更多时间优化，减少量化误差
+这些模型的优势：
+
+- **即时加载**：无需运行时量化，直接加载已导出的权重
+- **推理加速**：2x-11x 加速
+- **开箱即用**：下载、设置路径、直接使用
+
+![工作流全貌](../assets/t1t3-workflow-overview.png)
+
+> **工作流文件（使用左侧 SVDQ 组）：**
+> - 文生图：[`workflow_sample/QuantFunc-Text-to-Image-Workflow.json`](../workflow_sample/QuantFunc-Text-to-Image-Workflow.json)
+> - 图像编辑：[`workflow_sample/QuantFunc-Image-to-Image-Workflow.json`](../workflow_sample/QuantFunc-Image-to-Image-Workflow.json)
 
 ## 第一步：确定你的 GPU 变体
 
@@ -86,7 +94,7 @@ huggingface-cli download QuantFunc/YourModel-SVDQ --local-dir /path/to/QuantFunc
 
 ## 第五步：运行
 
-点击 **Queue Prompt**。SVDQ 模型加载速度快，首次推理也不需要实时量化。
+点击 **Queue Prompt**。SVDQ 模型加载速度快，首次推理也不需要运行时量化。
 
 ![SVDQ 运行结果](../assets/t1-step4-run-result.png)
 
@@ -128,14 +136,15 @@ Model Loader (svdq)
 
 ## SVDQ vs Lighting 对比
 
-| 维度 | SVDQ（预量化） | Lighting（实时量化） |
+| 维度 | SVDQ（离线量化） | Lighting（运行时量化） |
 |------|----------------|---------------------|
 | 模型来源 | 必须下载 QuantFunc 预量化模型 | 任意 diffusers FP16 模型 |
-| 首次加载 | 快（直接加载） | 慢（需要实时量化） |
-| 推理速度 | 最快（2x-11x） | 快（稍慢于 SVDQ） |
-| 量化质量 | 最优（离线优化） | 良好 |
+| 首次加载 | 快（直接加载） | 慢（首次加载需运行时量化） |
+| 推理速度 | 2x-11x | 2x-11x（RTX 50 以下机器比 SVDQ 快约 20%） |
+| 量化质量 | 良好（离线优化） | 良好 |
 | LoRA 使用 | 需要 LoRA Config 节点 | 直接叠加，零成本 |
 | 灵活性 | 受限于预量化模型 | 任意模型均可 |
+| 导出 | 支持融合 LoRA 后重新导出 | 导出所有运行时量化模型，跳过重新量化 |
 
 ## 常见问题
 

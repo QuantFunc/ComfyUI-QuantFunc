@@ -10,9 +10,9 @@
 |--------|------|
 | `QuantFunc-Text-to-Image-Workflow.json` | 文生图（SVDQ + Lighting） |
 | `QuantFunc-Image-to-Image-Workflow.json` | 参考图像编辑（QwenImage-Edit） |
-| `QuantFunc-Model-Export.json` | 导出预量化模型（可烘焙 LoRA） |
+| `QuantFunc-Model-Export.json` | 导出运行时量化模型（支持融合 LoRA） |
 
-每个工作流包含**两组节点** —— 左侧 **SVDQ**（预量化权重），右侧 **Lighting**（实时量化）。根据你的模型选择对应的组。
+每个工作流包含**两组节点** —— 左侧 **SVDQ**（预量化权重），右侧 **Lighting**（运行时量化）。根据你的模型选择对应的组。
 
 ## 2. 节点说明
 
@@ -23,8 +23,8 @@
 | 参数 | 必填 | 说明 |
 |------|------|------|
 | `model_dir` | 是 | 基础模型目录路径（diffusers 格式，含 `model_index.json`） |
-| `transformer_path` | 是* | 量化 Transformer 权重路径（`.safetensors`）。*Lighting 从 FP16 量化时留空 |
-| `model_backend` | 是 | `svdq`（预量化）或 `lighting`（实时量化） |
+| `transformer_path` | 是* | 量化 Transformer 权重路径（`.safetensors`）。*Lighting 运行时量化从 FP16 时留空 |
+| `model_backend` | 是 | `svdq`（预量化）或 `lighting`（运行时量化） |
 | `device` | 是 | GPU 编号（0, 1, ...） |
 | `precision_config` | 仅 Lighting | 逐层精度 JSON 配置文件路径 |
 | `prequant_weights` | 仅 Lighting | 预量化 modulation 权重路径 |
@@ -93,7 +93,7 @@
 
 ### 2.7 QuantFunc Export（模型导出）
 
-导出预量化模型（可烘焙 LoRA），后续加载即时启动。
+将所有运行时量化的模型导出到磁盘（支持融合 LoRA），后续加载无需重新量化。
 
 | 参数 | 说明 |
 |------|------|
@@ -132,8 +132,8 @@
 1. 导入 `QuantFunc-Model-Export.json`
 2. 配置 Model Loader（Lighting 后端 + LoRA）
 3. 在 Export 节点设置 `export_path`
-4. 点击 **Queue Prompt** —— 模型量化并保存
-5. 后续使用：在 `transformer_path` 填入导出的权重路径，即时加载
+4. 点击 **Queue Prompt** —— 模型运行时量化并将所有量化权重保存
+5. 后续使用：在 `transformer_path` 填入导出的权重路径，即时加载（无需重新量化）
 
 ## 4. 模型下载
 

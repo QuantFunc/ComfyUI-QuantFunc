@@ -12,10 +12,10 @@
 
 **核心特性：**
 - 通过 `libquantfunc.so` / `quantfunc.dll` 原生 C++/CUDA 加速
-- SVDQ + Lighting 双引擎支持
+- SVDQ（离线量化）+ Lighting（运行时量化）双引擎
 - 零成本 LoRA 叠加
 - 参考图像编辑
-- 模型导出（可烘焙 LoRA）
+- 导出运行时量化模型（支持融合 LoRA）
 - 从 ModelScope 自动更新
 
 ## 2. 安装
@@ -118,36 +118,25 @@ pip install modelscope
 
 详细教程见 [doc/](doc/)，节点说明见 [workflow_sample/README_zh.md](workflow_sample/README_zh.md)。
 
-### 3.1 基本连接
+### 3.1 运行时量化：将 BF16/FP16 原模型量化为 4bit 加速推理
 
-```
-ModelLoader → (LoRA) → (LoRA Config) → Generate → PreviewImage
-```
+**Lighting 后端**提供**运行时量化**能力 —— 基于 Lighting 引擎，在加载时将任意 diffusers 格式的 BF16/FP16 原模型（如 [Qwen/Qwen-Image-Edit-2511](https://huggingface.co/Qwen/Qwen-Image-Edit-2511)）量化为 4bit 并加速推理。将 `model_backend` 设为 `lighting`，`transformer_path` 留空即可，无需下载预量化模型。
 
-1. **QuantFunc Model Loader** —— 设置模型路径、后端、设备
-2. **QuantFunc LoRA**（可选）—— 链式添加一个或多个 LoRA
-3. **QuantFunc LoRA Config**（可选，SVDQ + LoRA 时必须）—— 合并策略
-4. **QuantFunc Generate** —— 输入提示词、尺寸、步数 → 输出 IMAGE
+> **[教程 1：运行时量化直接使用 →](doc/tutorial-1-use-without-quantfunc-models_zh.md)**
 
-### 3.2 使用任意 Diffusers 模型（无需下载预量化模型）
+### 3.2 导出运行时量化模型（支持融合 LoRA）
 
-你不需要下载 QuantFunc 预量化模型也能使用。通过 **Lighting 后端**，任何 diffusers 格式的模型（如 [Qwen/Qwen-Image-Edit-2511](https://huggingface.co/Qwen/Qwen-Image-Edit-2511)）都可以直接使用 —— 将 `model_backend` 设为 `lighting`，`transformer_path` 留空，引擎会实时将 FP16 权重量化加速。
+Lighting 导出功能将运行时量化产生的所有量化模型持久化到磁盘，避免每次启动都重新量化。如果叠加了 LoRA，LoRA 也会被永久融入导出的权重 —— 无需 LoRA 节点，无需重新量化，加载即用。
 
-> **[教程 1：不下载预量化模型直接使用 →](doc/tutorial-1-use-without-quantfunc-models_zh.md)**
+> **[教程 2：导出运行时量化模型 →](doc/tutorial-2-export-quantized-models_zh.md)**
 
-### 3.3 下载预量化模型获得极致加速
+### 3.3 下载并使用已导出的量化模型
 
-想要最佳性能（2x-11x 加速），可以从 [ModelScope](https://www.modelscope.cn/models/QuantFunc) 或 [HuggingFace](https://huggingface.co/QuantFunc) 下载 QuantFunc 的 **SVDQ 预量化模型**。SVDQ 模型通过离线 SVD 算法量化，加载即用，推理速度优于实时量化。
+QuantFunc 已将常用模型提前进行运行时量化并导出，你可以直接从 [ModelScope](https://www.modelscope.cn/models/QuantFunc) 或 [HuggingFace](https://huggingface.co/QuantFunc) 下载这些**已导出的量化模型**，加载即用，无需自行量化。与运行时量化一样，这些模型同样能达到 2x-11x 推理加速，且跳过了量化步骤，加载更快。
 
-> **[教程 2：下载并使用 QuantFunc 模型 →](doc/tutorial-2-download-and-use-quantfunc-models_zh.md)**
+> **[教程 3：下载并使用已导出的量化模型 →](doc/tutorial-3-download-quantfunc-models_zh.md)**
 
-### 3.4 导出自定义模型（烘焙 LoRA）
-
-当你调试好了完美的 LoRA 组合，可以将整个管线导出为独立的预量化模型。导出后 LoRA 已融合 —— 无需 LoRA 节点，无需重新量化，加载即用。
-
-> **[教程 3：导出自定义模型 →](doc/tutorial-3-export-custom-models_zh.md)**
-
-### 3.5 示例工作流
+### 3.4 示例工作流
 
 从 `workflow_sample/` 导入：
 
@@ -155,7 +144,7 @@ ModelLoader → (LoRA) → (LoRA Config) → Generate → PreviewImage
 |------|------|
 | `QuantFunc-Text-to-Image-Workflow.json` | 文生图（SVDQ + Lighting 并排对比） |
 | `QuantFunc-Image-to-Image-Workflow.json` | 参考图像编辑 |
-| `QuantFunc-Model-Export.json` | 导出量化模型（含 LoRA） |
+| `QuantFunc-Model-Export.json` | 导出运行时量化模型（支持融合 LoRA） |
 
 ## 4. 常见问题
 
