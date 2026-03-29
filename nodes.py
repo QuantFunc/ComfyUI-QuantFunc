@@ -98,6 +98,11 @@ def _make_cache_key(cfg):
 # Worker Manager — manages worker subprocess
 # ============================================================================
 
+_dep_download_lock = threading.Lock()
+_dep_downloading = False  # True while download is in progress
+_dep_downloaded = False   # True after dep download attempted (success or fail)
+
+
 class WorkerManager:
     """Manages a QuantFunc worker subprocess with isolated CUDA libraries."""
 
@@ -112,91 +117,151 @@ class WorkerManager:
 
     # ── Worker lifecycle ──
 
-    def _ensure_worker(self):
-        """Start worker process if not running."""
-        if self._process is not None and self._process.poll() is None:
-            return
-
-        if self._process is not None:
-            logging.warning("[QuantFunc] Worker process died, restarting...")
-            self._current_key = None
-
-        dll_path = _LIB_PATH
-        dll_dir = os.path.dirname(os.path.abspath(dll_path))
-
+    def _build_worker_env(self, dll_dir):
+        """Build environment dict for the worker subprocess."""
         env = os.environ.copy()
         if _IS_WINDOWS:
-            # Prepend quantfunc DLL dir and CUDA toolkit to PATH.
-            # This ensures the worker finds our CUDA libs before PyTorch's.
             extra = [dll_dir]
             cuda_path = env.get("CUDA_PATH", "")
             if cuda_path:
                 cuda_bin = os.path.join(cuda_path, "bin")
                 if os.path.isdir(cuda_bin):
                     extra.insert(0, cuda_bin)
-            # Also scan for any cuDNN directories alongside the DLL
-            for f in os.listdir(dll_dir) if os.path.isdir(dll_dir) else []:
-                if f.startswith("cudnn") and f.endswith(".dll"):
-                    break  # cuDNN is in dll_dir, already added
             env["PATH"] = os.pathsep.join(extra) + os.pathsep + env.get("PATH", "")
         else:
-            # Linux: prepend CUDA lib path
             cuda_path = env.get("CUDA_PATH", "/usr/local/cuda")
             lib64 = os.path.join(cuda_path, "lib64")
             if os.path.isdir(lib64):
                 env["LD_LIBRARY_PATH"] = lib64 + ":" + env.get("LD_LIBRARY_PATH", "")
+        return env
 
-        # Use a Python interpreter that does NOT have PyTorch's CUDA libs.
-        # ComfyUI's embedded Python bundles CUDA 12.x — we need isolation.
-        # Worker needs: Python 3.8+ with ctypes and numpy. It does NOT import
-        # torch, so using the same Python as ComfyUI is fine for dependencies.
-        # The CUDA isolation comes from PATH/LD_LIBRARY_PATH, not the Python exe.
+    def _start_worker(self, dll_path, env):
+        """Start worker subprocess and wait for ready signal.
+        Returns (success, error_message).
+        """
         python_exe = os.environ.get("QUANTFUNC_PYTHON", "") or sys.executable
-
         cmd = [python_exe, _WORKER_PY, "--dll-path", dll_path]
 
         creation_flags = 0
         if _IS_WINDOWS:
             creation_flags = subprocess.CREATE_NO_WINDOW
 
-        logging.info("[QuantFunc] Starting worker: %s (python=%s)", " ".join(cmd[:4]), python_exe)
+        logging.info("[QuantFunc] Starting worker: %s (python=%s)",
+                     " ".join(cmd[:4]), python_exe)
 
         try:
             self._process = subprocess.Popen(
                 cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE, env=env, creationflags=creation_flags)
         except Exception as e:
-            raise RuntimeError(f"Failed to start worker process: {e}\n"
-                               f"Python: {python_exe}\n"
-                               f"Set QUANTFUNC_PYTHON env var to a working Python 3.8+ path.")
+            return False, (f"Failed to start worker process: {e}\n"
+                           f"Python: {python_exe}\n"
+                           f"Set QUANTFUNC_PYTHON env var to a working Python 3.8+ path.")
 
         self._stdin = self._process.stdin
         self._stdout = self._process.stdout
 
-        # Forward worker stderr to logging
         self._stderr_thread = threading.Thread(
             target=self._stderr_reader, daemon=True)
         self._stderr_thread.start()
 
-        # Wait for ready signal (worker loads DLL which can take a few seconds)
         ready = self._read_response(timeout=60)
         if ready is None or ready.get("type") != "ready":
-            # Try to get stderr output for diagnostics
             try:
                 self._process.kill()
                 _, stderr_out = self._process.communicate(timeout=5)
                 stderr_msg = stderr_out.decode(errors="replace")[-500:] if stderr_out else ""
             except Exception:
                 stderr_msg = ""
-            raise RuntimeError(
-                f"Worker failed to start (timeout or crash).\n"
-                f"Python: {python_exe}\n"
-                f"DLL: {dll_path}\n"
-                f"Worker stderr: {stderr_msg}\n"
-                f"Hint: Set QUANTFUNC_PYTHON env var to a Python with ctypes + numpy.")
+            self._process = None
+            return False, (f"Worker failed to start (timeout or crash).\n"
+                           f"Python: {python_exe}\n"
+                           f"DLL: {dll_path}\n"
+                           f"Worker stderr: {stderr_msg}\n"
+                           f"Hint: Set QUANTFUNC_PYTHON env var to a Python with ctypes + numpy.")
 
         logging.info("[QuantFunc] Worker ready (version %s, pid %d)",
                      ready.get("version", "?"), self._process.pid)
+        return True, ""
+
+    @staticmethod
+    def _try_download_deps(dll_path):
+        """Download dependency DLLs if not already attempted. Thread-safe.
+        Returns True if deps were newly downloaded.
+        Raises RuntimeError if another thread is currently downloading.
+        """
+        global _dep_downloading, _dep_downloaded
+        if _dep_downloaded:
+            return False
+        acquired = _dep_download_lock.acquire(blocking=False)
+        if not acquired:
+            # Another thread is downloading right now
+            raise RuntimeError(
+                "[QuantFunc] 依赖库正在下载中，请稍后再试。\n"
+                "Dependency libraries are being downloaded. Please try again shortly.")
+        try:
+            if _dep_downloaded:
+                return False
+            _dep_downloading = True
+            try:
+                from .lib_setup import detect_cuda_major, _download_dep_zip
+                cuda_major = detect_cuda_major()
+                bin_dir = os.path.dirname(os.path.abspath(dll_path))
+                logging.warning("[QuantFunc] Worker failed to load DLL, "
+                                "downloading dependency libraries...")
+                result = _download_dep_zip(cuda_major, bin_dir)
+                _dep_downloaded = True
+                return result
+            except Exception as e:
+                logging.error("[QuantFunc] Dependency download failed: %s", e)
+                _dep_downloaded = True
+                return False
+            finally:
+                _dep_downloading = False
+        finally:
+            _dep_download_lock.release()
+
+    def _ensure_worker(self):
+        """Start worker process if not running.
+        On first DLL load failure (Windows), downloads deps and retries once.
+        """
+        if self._process is not None and self._process.poll() is None:
+            return
+
+        # If deps are being downloaded by another thread, fail fast
+        if _dep_downloading:
+            raise RuntimeError(
+                "[QuantFunc] 依赖库正在下载中，请稍后再试。\n"
+                "Dependency libraries are being downloaded. Please try again shortly.")
+
+        if self._process is not None:
+            logging.warning("[QuantFunc] Worker process died, restarting...")
+            self._current_key = None
+
+        dll_path = _LIB_PATH
+        if not os.path.exists(dll_path):
+            raise RuntimeError(
+                f"QuantFunc library not found: {dll_path}\n"
+                f"The auto-download may still be in progress or may have failed.\n"
+                f"Check the ComfyUI console for download status messages.")
+        dll_dir = os.path.dirname(os.path.abspath(dll_path))
+        env = self._build_worker_env(dll_dir)
+
+        # First attempt
+        ok, err = self._start_worker(dll_path, env)
+        if ok:
+            return
+
+        # On Windows, first failure may be missing dep DLLs — download and retry
+        if _IS_WINDOWS and self._try_download_deps(dll_path):
+            logging.info("[QuantFunc] Dependencies installed, retrying worker...")
+            env = self._build_worker_env(dll_dir)  # rebuild (deps now in dll_dir)
+            ok2, err2 = self._start_worker(dll_path, env)
+            if ok2:
+                return
+            raise RuntimeError(err2)
+
+        raise RuntimeError(err)
 
     def _stderr_reader(self):
         """Forward worker's stderr to logging."""

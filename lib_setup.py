@@ -112,33 +112,115 @@ def get_dep_zip_name(cuda_major: int) -> str:
         return "cu13-dep-win32.zip"
 
 
+def _collect_dll_dirs(dll_path: str) -> list:
+    """Collect directories that may contain DLL dependencies.
+
+    Mirrors the same scanning logic as worker.py _load_dll() so that
+    the test result accurately predicts whether the worker can load.
+    """
+    dll_dir = os.path.dirname(os.path.abspath(dll_path))
+    extra_dirs = [dll_dir]
+
+    if not _IS_WINDOWS:
+        return extra_dirs
+
+    # CUDA toolkit bin
+    cuda_path = os.environ.get("CUDA_PATH", "")
+    if not cuda_path:
+        base = r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA"
+        if os.path.isdir(base):
+            versions = sorted(os.listdir(base), reverse=True)
+            for v in versions:
+                if os.path.isdir(os.path.join(base, v, "bin")):
+                    cuda_path = os.path.join(base, v)
+                    break
+    if cuda_path:
+        for sub in [os.path.join("bin", "x64"), "bin"]:
+            d = os.path.join(cuda_path, sub)
+            if os.path.isdir(d):
+                extra_dirs.append(d)
+
+    # cuDNN: add ALL cuda-version subdirs
+    cudnn_base = os.path.join(
+        os.environ.get("ProgramFiles", r"C:\Program Files"), "NVIDIA", "CUDNN")
+    if os.path.isdir(cudnn_base):
+        for ver in sorted(os.listdir(cudnn_base), reverse=True):
+            ver_dir = os.path.join(cudnn_base, ver, "bin")
+            if os.path.isdir(ver_dir):
+                for sub in sorted(os.listdir(ver_dir), reverse=True):
+                    x64 = os.path.join(ver_dir, sub, "x64")
+                    if os.path.isdir(x64):
+                        extra_dirs.append(x64)
+                break  # highest cuDNN version only
+
+    # PATH dirs containing CUDA/cuDNN/OpenCV DLLs
+    for p in os.environ.get("PATH", "").split(os.pathsep):
+        if not p or not os.path.isdir(p):
+            continue
+        try:
+            files = os.listdir(p)
+        except OSError:
+            continue
+        if any(f.startswith(("cublas", "cudart", "cudnn", "cusolver",
+                             "curand", "opencv")) and f.endswith(".dll")
+               for f in files):
+            extra_dirs.append(p)
+
+    return extra_dirs
+
+
 def _test_load_dll(dll_path: str) -> tuple:
-    """Try to load the DLL. Returns (success, error_message)."""
+    """Try to load the DLL in a subprocess. Returns (success, error_message).
+
+    Uses a subprocess to avoid false positives: the parent process (ComfyUI)
+    has PyTorch's CUDA/cuDNN DLLs already loaded in memory, so an in-process
+    test would succeed even when dependency DLLs are missing on disk.  The
+    subprocess replicates the same path scanning as the worker for accuracy.
+    """
     if not os.path.exists(dll_path):
         return False, f"File not found: {dll_path}"
 
-    dll_dir = os.path.dirname(os.path.abspath(dll_path))
+    # Collect the same dirs the worker would use
+    extra_dirs = _collect_dll_dirs(dll_path)
+    dirs_json = json.dumps(extra_dirs)
 
-    if _IS_WINDOWS and hasattr(os, "add_dll_directory"):
-        try:
-            os.add_dll_directory(dll_dir)
-        except OSError:
-            pass
-
-    old_path = os.environ.get("PATH", "")
-    os.environ["PATH"] = dll_dir + os.pathsep + old_path
-
+    script = (
+        "import ctypes, json, os, sys, platform\n"
+        "dll_path = sys.argv[1]\n"
+        "dirs = json.loads(sys.argv[2])\n"
+        "if platform.system() == 'Windows' and hasattr(os, 'add_dll_directory'):\n"
+        "    for d in dirs:\n"
+        "        try:\n"
+        "            os.add_dll_directory(d)\n"
+        "        except OSError:\n"
+        "            pass\n"
+        "os.environ['PATH'] = os.pathsep.join(dirs) + os.pathsep + os.environ.get('PATH', '')\n"
+        "try:\n"
+        "    lib = ctypes.CDLL(dll_path)\n"
+        "    lib.quantfunc_version.restype = ctypes.c_char_p\n"
+        "    v = lib.quantfunc_version()\n"
+        "    print(v.decode('utf-8') if v else '')\n"
+        "except Exception as e:\n"
+        "    print('ERROR:' + str(e), file=sys.stderr)\n"
+        "    sys.exit(1)\n"
+    )
     try:
-        lib = ctypes.CDLL(dll_path)
-        lib.quantfunc_version.restype = ctypes.c_char_p
-        version = lib.quantfunc_version().decode()
-        # Unload by deleting reference (Windows may keep it loaded)
-        del lib
-        return True, version
-    except OSError as e:
-        return False, str(e)
-    finally:
-        os.environ["PATH"] = old_path
+        result = subprocess.run(
+            [sys.executable, "-c", script, dll_path, dirs_json],
+            capture_output=True, text=True, timeout=15,
+        )
+        if result.returncode == 0:
+            ver = result.stdout.strip()
+            return True, ver if ver else "unknown"
+        else:
+            err = result.stderr.strip()
+            if err.startswith("ERROR:"):
+                err = err[6:]
+            return False, err or "subprocess exited with code {}".format(result.returncode)
+    except subprocess.TimeoutExpired:
+        return False, "DLL test load timed out"
+    except Exception as e:
+        return False, f"subprocess test failed: {e}"
 
 
 _MODELSCOPE_RAW_URL = "https://www.modelscope.cn/models/QuantFunc/Plugin/resolve/master"
@@ -280,38 +362,14 @@ def resolve_library() -> str:
         logger.warning("No DLL found at %s", dll_path)
         return dll_path  # auto_update.py will download it
 
-    # Test-load to check dependencies
+    # Quick test-load to log status (dep download is handled by WorkerManager)
     success, msg = _test_load_dll(dll_path)
     if success:
         logger.info("DLL loaded OK: %s (v%s, CUDA %d)", dll_name, msg, cuda_major)
-        return dll_path
-
-    # Load failed — likely missing CUDA/cuDNN shared libraries
-    if not _IS_WINDOWS:
-        cuda_pkg = "cuda-toolkit-13-1" if cuda_major >= 13 else "cuda-toolkit-12-6"
-        print(f"[QuantFunc] Cannot load {dll_name}: {msg}")
-        print(f"[QuantFunc] Install CUDA and cuDNN dependencies:")
-        print(f"[QuantFunc]   # CUDA Toolkit")
-        print(f"[QuantFunc]   sudo apt install {cuda_pkg}  # or: conda install cuda-toolkit")
-        print(f"[QuantFunc]   # cuDNN 9.x")
-        print(f"[QuantFunc]   sudo apt install libcudnn9-cuda-{'13' if cuda_major >= 13 else '12'}")
-        print(f"[QuantFunc]   # Or download from: https://developer.nvidia.com/cudnn")
-        return dll_path
-
-    logger.warning("DLL load failed (%s), attempting dependency download...", msg)
-
-    # Download dep zip and extract to bin dir
-    if _download_dep_zip(cuda_major, bin_dir):
-        # Retry load
-        success2, msg2 = _test_load_dll(dll_path)
-        if success2:
-            print(f"[QuantFunc] DLL loaded successfully after dep install (v{msg2})")
-        else:
-            print(f"[QuantFunc] DLL still cannot load after dep install: {msg2}")
-            print(f"[QuantFunc] Please install CUDA Toolkit and cuDNN manually.")
     else:
-        print(f"[QuantFunc] Could not download dependencies. Please install manually:")
-        print(f"[QuantFunc]   - CUDA Toolkit {'13.x' if cuda_major >= 13 else '12.x'}")
-        print(f"[QuantFunc]   - cuDNN 9.x")
+        # Log but don't fail — WorkerManager._ensure_worker will download deps
+        # and retry when the worker actually fails to load.
+        logger.info("DLL pre-check: %s may have missing deps (%s), "
+                    "will resolve on first use", dll_name, msg)
 
     return dll_path

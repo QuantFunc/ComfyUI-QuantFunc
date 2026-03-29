@@ -405,6 +405,18 @@ def _check_and_update():
 
 
 def check_for_updates():
-    """Launch background update check. Non-blocking, safe to call on startup."""
+    """Launch update check. Blocks on first-time download, background for updates.
+
+    When the library doesn't exist yet (first install), the download runs
+    synchronously so the DLL is ready before the user can trigger a node.
+    For subsequent update checks the thread runs in the background.
+    """
+    lib_path = os.path.join(_get_bin_dir(), _LIB_NAME)
+    lib_missing = not os.path.exists(lib_path)
+
     t = threading.Thread(target=_check_and_update, daemon=True, name="QuantFunc-UpdateCheck")
     t.start()
+
+    if lib_missing:
+        # Block until download finishes so the worker doesn't race against it
+        t.join(timeout=120)

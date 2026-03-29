@@ -166,6 +166,7 @@ def _load_dll(dll_path):
                     extra_dirs.append(d)
 
         # cuDNN: installed separately, scan common locations
+        # Add ALL cuda-version subdirs so both CUDA 12 and 13 DLLs are found
         cudnn_base = os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"),
                                   "NVIDIA", "CUDNN")
         if os.path.isdir(cudnn_base):
@@ -173,11 +174,10 @@ def _load_dll(dll_path):
                 # cuDNN 9.x puts DLLs in bin/<cuda_ver>/x64/
                 ver_dir = os.path.join(cudnn_base, ver, "bin")
                 if os.path.isdir(ver_dir):
-                    for sub in os.listdir(ver_dir):
+                    for sub in sorted(os.listdir(ver_dir), reverse=True):
                         x64 = os.path.join(ver_dir, sub, "x64")
                         if os.path.isdir(x64):
                             extra_dirs.append(x64)
-                            break  # use first (highest) cuda version subdir
                     break  # use first (highest) cuDNN version
 
         # Scan PATH for directories with CUDA/cuDNN/OpenCV DLLs
