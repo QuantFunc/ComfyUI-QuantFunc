@@ -30,25 +30,27 @@ import time
 # ============================================================================
 
 _IS_WINDOWS = platform.system() == "Windows"
-_LIB_NAME = "quantfunc.dll" if _IS_WINDOWS else "libquantfunc.so"
 _BIN_SUBDIR = "windows" if _IS_WINDOWS else "linux"
 
 def _resolve_lib_path():
-    """Find the quantfunc shared library."""
-    pkg_dir = os.path.dirname(__file__)
-    candidates = [
-        os.path.join(pkg_dir, "bin", _BIN_SUBDIR, _LIB_NAME),
-    ]
+    """Find the quantfunc shared library.
+    Uses lib_setup to detect CUDA version and select the correct DLL.
+    """
+    # Environment override takes priority
     env_path = os.environ.get("QUANTFUNC_LIB", "")
-    if env_path:
-        candidates.insert(0, env_path)
-    if _IS_WINDOWS:
-        candidates.append(os.path.join(pkg_dir, "..", "..", "QuantFunc",
-                                       "build_win", _LIB_NAME))
-    for path in candidates:
-        if os.path.exists(path):
-            return os.path.abspath(path)
-    return os.path.abspath(candidates[0])
+    if env_path and os.path.exists(env_path):
+        return os.path.abspath(env_path)
+
+    try:
+        from .lib_setup import resolve_library
+        return resolve_library()
+    except Exception as e:
+        logging.getLogger("QuantFunc").warning("lib_setup failed: %s, using default", e)
+
+    # Fallback: default name
+    pkg_dir = os.path.dirname(__file__)
+    lib_name = "quantfunc.dll" if _IS_WINDOWS else "libquantfunc.so"
+    return os.path.join(pkg_dir, "bin", _BIN_SUBDIR, lib_name)
 
 _LIB_PATH = _resolve_lib_path()
 _WORKER_PY = os.path.join(os.path.dirname(__file__), "worker.py")
