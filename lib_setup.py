@@ -141,27 +141,73 @@ def _test_load_dll(dll_path: str) -> tuple:
         os.environ["PATH"] = old_path
 
 
+_MODELSCOPE_RAW_URL = "https://www.modelscope.cn/models/QuantFunc/Plugin/resolve/master"
+
+
+def _ensure_modelscope():
+    """Install modelscope SDK if not available."""
+    try:
+        import modelscope  # noqa: F401
+        return True
+    except ImportError:
+        print("[QuantFunc] Installing modelscope SDK...")
+        try:
+            subprocess.check_call(
+                [sys.executable, "-m", "pip", "install", "modelscope", "-q"],
+                stdout=subprocess.DEVNULL,
+            )
+            print("[QuantFunc] modelscope installed successfully")
+            return True
+        except Exception as e:
+            print(f"[QuantFunc] Failed to install modelscope: {e}")
+            return False
+
+
+def _download_from_modelscope(file_path: str):
+    """Download a file from ModelScope. Tries SDK then direct HTTP.
+    Returns local file path or None.
+    """
+    # Method 1: modelscope SDK (auto-install if needed)
+    if _ensure_modelscope():
+        try:
+            from modelscope.hub.file_download import model_file_download
+            return model_file_download(model_id=_MODELSCOPE_REPO, file_path=file_path)
+        except Exception as e:
+            print(f"[QuantFunc] modelscope download failed: {e}")
+
+    # Method 2: direct HTTP fallback
+    url = f"{_MODELSCOPE_RAW_URL}/{file_path}"
+    try:
+        import urllib.request
+        print(f"[QuantFunc] Trying direct download: {url}")
+        tmp_path = os.path.join(tempfile.gettempdir(), os.path.basename(file_path))
+        urllib.request.urlretrieve(url, tmp_path)
+        return tmp_path
+    except Exception as e:
+        print(f"[QuantFunc] Direct download also failed: {e}")
+        print(f"[QuantFunc] Please download manually: {url}")
+        return None
+
+
 def _download_dep_zip(cuda_major: int, dest_dir: str) -> bool:
     """Download and extract CUDA dependency zip from ModelScope."""
     zip_name = get_dep_zip_name(cuda_major)
-    print(f"[QuantFunc] Downloading {zip_name} from ModelScope...")
+    print(f"[QuantFunc] Downloading dependencies ({zip_name})...")
+
+    local_path = _download_from_modelscope(zip_name)
+    if not local_path or not os.path.exists(local_path):
+        print(f"[QuantFunc] Extract to: {dest_dir}")
+        return False
 
     try:
-        from modelscope.hub.file_download import model_file_download
-        local_path = model_file_download(
-            model_id=_MODELSCOPE_REPO,
-            file_path=zip_name,
-        )
-
-        print(f"[QuantFunc] Extracting {zip_name} to {dest_dir}...")
+        print(f"[QuantFunc] Extracting to {dest_dir}...")
         os.makedirs(dest_dir, exist_ok=True)
         with zipfile.ZipFile(local_path, "r") as zf:
             zf.extractall(dest_dir)
-
-        print(f"[QuantFunc] Dependencies installed to {dest_dir}")
+        print(f"[QuantFunc] Dependencies installed")
         return True
     except Exception as e:
-        print(f"[QuantFunc] Failed to download dependencies: {e}")
+        print(f"[QuantFunc] Extract failed: {e}")
         return False
 
 

@@ -132,23 +132,62 @@ def _ver_cmp(a: str, b: str) -> int:
     return 0
 
 
+_MODELSCOPE_RAW_URL = "https://www.modelscope.cn/models/QuantFunc/Plugin/resolve/master"
+
+
+def _ensure_modelscope():
+    """Install modelscope SDK if not available."""
+    try:
+        import modelscope  # noqa: F401
+        return True
+    except ImportError:
+        print("[QuantFunc] Installing modelscope SDK...")
+        try:
+            import subprocess
+            subprocess.check_call(
+                [sys.executable, "-m", "pip", "install", "modelscope", "-q"],
+                stdout=subprocess.DEVNULL,
+            )
+            print("[QuantFunc] modelscope installed successfully")
+            return True
+        except Exception as e:
+            print("[QuantFunc] Failed to install modelscope: {}".format(e))
+            return False
+
+
 def _fetch_remote_versions() -> Optional[Dict]:
     """Fetch version.json from ModelScope.
+    Auto-installs modelscope SDK if needed, falls back to direct HTTP.
     Returns the platform dict or None.
     """
-    try:
-        from modelscope.hub.file_download import model_file_download
-        local_path = model_file_download(
-            model_id=_MODELSCOPE_REPO,
-            file_path="version.json",
-        )
-        with open(local_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception as e:
-        logger.debug("Failed to fetch remote version.json: %s", e)
-        return None
+    data = None
 
-    return data.get(_PLATFORM)
+    # Method 1: modelscope SDK (auto-install)
+    if _ensure_modelscope():
+        try:
+            from modelscope.hub.file_download import model_file_download
+            local_path = model_file_download(
+                model_id=_MODELSCOPE_REPO,
+                file_path="version.json",
+            )
+            with open(local_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            print("[QuantFunc] modelscope download failed: {}".format(e))
+
+    # Method 2: direct HTTP fallback
+    if data is None:
+        try:
+            import urllib.request
+            url = "{}/version.json".format(_MODELSCOPE_RAW_URL)
+            with urllib.request.urlopen(url, timeout=15) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+        except Exception as e:
+            print("[QuantFunc] Direct download also failed: {}".format(e))
+            print("[QuantFunc] Manual download: {}".format(_MODELSCOPE_RAW_URL))
+            return None
+
+    return data.get(_PLATFORM) if data else None
 
 
 def _get_cuda_suffix() -> str:
@@ -216,14 +255,39 @@ def _download_lib(version_key: str, info: Dict) -> bool:
     remote_subdir = "windows" if _IS_WINDOWS else "linux"
     remote_path = "{}/{}/{}".format(version_key, remote_subdir, _LIB_NAME)
 
-    print("[QuantFunc] Downloading {} v{} from ModelScope...".format(_LIB_NAME, lib_version))
+    download_url = "{}/{}".format(_MODELSCOPE_RAW_URL, remote_path)
+    print("[QuantFunc] Downloading {} v{} ...".format(_LIB_NAME, lib_version))
+
+    local_path = None
+
+    # Method 1: modelscope SDK (auto-installed)
+    if _ensure_modelscope():
+        try:
+            from modelscope.hub.file_download import model_file_download
+            local_path = model_file_download(
+                model_id=_MODELSCOPE_REPO,
+                file_path=remote_path,
+            )
+        except Exception as e:
+            print("[QuantFunc] modelscope download failed: {}".format(e))
+
+    # Method 2: direct HTTP fallback
+    if local_path is None or not os.path.exists(str(local_path)):
+        try:
+            import urllib.request
+            print("[QuantFunc] Trying direct download: {}".format(download_url))
+            tmp_fd, tmp_dl = tempfile.mkstemp(suffix=".download")
+            os.close(tmp_fd)
+            urllib.request.urlretrieve(download_url, tmp_dl)
+            local_path = tmp_dl
+        except Exception as e:
+            print("[QuantFunc] Download failed: {}".format(e))
+            print("[QuantFunc] Please download manually:")
+            print("[QuantFunc]   {}".format(download_url))
+            print("[QuantFunc] Place in: {}".format(bin_dir))
+            return False
 
     try:
-        from modelscope.hub.file_download import model_file_download
-        local_path = model_file_download(
-            model_id=_MODELSCOPE_REPO,
-            file_path=remote_path,
-        )
 
         # Ensure bin dir exists
         os.makedirs(bin_dir, exist_ok=True)
