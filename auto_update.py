@@ -38,7 +38,18 @@ logger = logging.getLogger("QuantFunc.AutoUpdate")
 _MODELSCOPE_REPO = "QuantFunc/Plugin"
 _IS_WINDOWS = platform.system() == "Windows"
 _PLATFORM = "win32" if _IS_WINDOWS else "linux"
-_LIB_NAME = "quantfunc.dll" if _IS_WINDOWS else "libquantfunc.so"
+
+def _get_lib_name() -> str:
+    """Get the correct library filename based on CUDA version."""
+    try:
+        from .lib_setup import detect_cuda_major, get_lib_names
+        cuda_major = detect_cuda_major()
+        lib_name, _ = get_lib_names(cuda_major)
+        return lib_name
+    except Exception:
+        return "quantfunc.dll" if _IS_WINDOWS else "libquantfunc.so"
+
+_LIB_NAME = _get_lib_name()
 
 
 def _get_bin_dir() -> str:
@@ -140,10 +151,25 @@ def _fetch_remote_versions() -> Optional[Dict]:
     return data.get(_PLATFORM)
 
 
+def _get_cuda_suffix() -> str:
+    """Return version.json key suffix based on CUDA version: '' for CUDA 13, '-12' for CUDA 12."""
+    try:
+        from .lib_setup import detect_cuda_major
+        cuda_major = detect_cuda_major()
+        return "-12" if cuda_major <= 12 else ""
+    except Exception:
+        return ""
+
+_CUDA_SUFFIX = _get_cuda_suffix()
+
+
 def _find_best_compatible_version(
     remote_versions: Dict, comfy_version: str, local_lib: Optional[str]
 ) -> Optional[Tuple[str, Dict]]:
     """Find the highest lib version compatible with the current plugin.
+
+    Uses CUDA-specific version keys: "lib" + "comfy" for CUDA 13,
+    "lib-12" + "comfy-12" for CUDA 12.
 
     Eligible if:
       1. "comfy" requirement <= comfy_version
@@ -151,13 +177,16 @@ def _find_best_compatible_version(
 
     Returns (version_key, info_dict) or None.
     """
+    lib_key = "lib" + _CUDA_SUFFIX        # "lib" or "lib-12"
+    comfy_key = "comfy" + _CUDA_SUFFIX    # "comfy" or "comfy-12"
+
     best_key = None
     best_lib = None
     best_info = None
 
     for version_key, info in remote_versions.items():
-        required_comfy = info.get("comfy", "0.0.00")
-        lib_version = info.get("lib", version_key)
+        required_comfy = info.get(comfy_key, info.get("comfy", "0.0.00"))
+        lib_version = info.get(lib_key, info.get("lib", version_key))
 
         # Plugin must be new enough
         if _ver_cmp(required_comfy, comfy_version) > 0:
@@ -183,8 +212,9 @@ def _download_lib(version_key: str, info: Dict) -> bool:
     bin_dir = _get_bin_dir()
     lib_version = info.get("lib", version_key)
 
-    # Remote path uses "win32" or "linux" as subdirectory, matching _PLATFORM
-    remote_path = "{}/{}/{}".format(version_key, _PLATFORM, _LIB_NAME)
+    # Remote path uses "windows" or "linux" as subdirectory on ModelScope
+    remote_subdir = "windows" if _IS_WINDOWS else "linux"
+    remote_path = "{}/{}/{}".format(version_key, remote_subdir, _LIB_NAME)
 
     print("[QuantFunc] Downloading {} v{} from ModelScope...".format(_LIB_NAME, lib_version))
 
