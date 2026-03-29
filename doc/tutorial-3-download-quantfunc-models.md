@@ -36,10 +36,17 @@ Download pre-quantized models from:
 - **ModelScope**: https://www.modelscope.cn/models/QuantFunc
 - **HuggingFace**: https://huggingface.co/QuantFunc
 
+QuantFunc provides two types of pre-exported models — **SVDQ** and **Lighting**. Both are ready to use, but use different backends:
+
+| Model Type | Backend | Transformer Weights | Notes |
+|------------|---------|-------------------|-------|
+| SVDQ | `svdq` | SVDQ transformer | Offline SVD quantization |
+| Lighting | `lighting` | Lighting transformer | Exported from runtime quantization, no low-rank overhead |
+
 Each model repo typically contains:
 
 ```
-QuantFunc/SomeModel-SVDQ/
+QuantFunc/SomeModel/
 ├── model_index.json          # diffusers model index
 ├── transformer/              # pre-quantized transformer weights
 │   └── *.safetensors
@@ -64,8 +71,11 @@ huggingface-cli download QuantFunc/YourModel-SVDQ --local-dir /path/to/QuantFunc
 
 ## Step 3: Import Workflow and Configure
 
-1. Import `workflow_sample/QuantFunc-Text-to-Image-Workflow.json` into ComfyUI
-2. Use the **left-side SVDQ group**
+Import `workflow_sample/QuantFunc-Text-to-Image-Workflow.json` into ComfyUI. Choose the configuration that matches the model type you downloaded:
+
+### Option A: Load SVDQ Model
+
+Use the **left-side SVDQ group** in the workflow.
 
 ![Import workflow and select SVDQ group](../assets/t2-step3-import-workflow.png)
 
@@ -74,9 +84,24 @@ Configure the **QuantFunc Model Loader** node:
 | Parameter | Value |
 |-----------|-------|
 | `model_dir` | QuantFunc model directory, e.g., `/path/to/QuantFunc-Model` |
-| `transformer_path` | Transformer weight path, e.g., `/path/to/QuantFunc-Model/transformer/model.safetensors` (also compatible with legacy nunchaku quantized weights) |
+| `transformer_path` | SVDQ transformer weight path, e.g., `/path/to/QuantFunc-Model/transformer/model.safetensors` (also compatible with legacy nunchaku quantized weights) |
 | `model_backend` | Select `svdq` |
 | `device` | GPU index (usually `0`) |
+
+### Option B: Load Lighting Pre-exported Model
+
+Use the **right-side Lighting group** in the workflow. The usage is the same as SVDQ — the only difference is that you select the Lighting transformer weights and set the backend to `lighting`.
+
+Configure the **QuantFunc Model Loader** node:
+
+| Parameter | Value |
+|-----------|-------|
+| `model_dir` | QuantFunc model directory, e.g., `/path/to/QuantFunc-Model` |
+| `transformer_path` | Lighting transformer weight path, e.g., `/path/to/QuantFunc-Model/transformer/model.safetensors` |
+| `model_backend` | Select `lighting` |
+| `device` | GPU index (usually `0`) |
+
+> **Note:** When loading a pre-exported Lighting model, `transformer_path` must point to the Lighting transformer weights. Since the model is already quantized, no runtime quantization occurs — it loads just as fast as SVDQ.
 
 ## Step 4: Configure Generation Parameters
 
@@ -152,7 +177,7 @@ Same as [Tutorial 1](tutorial-1-use-without-quantfunc-models.md):
 A: `model_dir` points to the full diffusers model directory (includes VAE, tokenizer, etc.), while `transformer_path` points to the specific quantized transformer weight file (.safetensors).
 
 **Q: Output is all noise?**
-A: Ensure `model_backend` is set to `svdq` and the transformer weights are actually in SVDQ format. Using Lighting weights with SVDQ backend (or vice versa) produces noisy output.
+A: Ensure `model_backend` matches the transformer weights — use `svdq` for SVDQ weights and `lighting` for Lighting weights. Mismatching backend and weights produces noisy output.
 
 **Q: Can I mix 50x-below and 50x-above?**
 A: No. You must use the variant matching your GPU, otherwise you may get errors or degraded performance.

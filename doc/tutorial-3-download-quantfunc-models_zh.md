@@ -36,10 +36,17 @@ QuantFunc 根据 GPU 架构提供不同版本的量化模型：
 - **ModelScope**: https://www.modelscope.cn/models/QuantFunc
 - **HuggingFace**: https://huggingface.co/QuantFunc
 
+QuantFunc 提供两种类型的预导出模型 —— **SVDQ** 和 **Lighting**，均可直接使用，但使用不同的后端：
+
+| 模型类型 | 后端 | Transformer 权重 | 说明 |
+|----------|------|-----------------|------|
+| SVDQ | `svdq` | SVDQ transformer | 离线 SVD 量化 |
+| Lighting | `lighting` | Lighting transformer | 由运行时量化导出，无 low-rank 计算开销 |
+
 每个模型仓库通常包含：
 
 ```
-QuantFunc/SomeModel-SVDQ/
+QuantFunc/SomeModel/
 ├── model_index.json          # diffusers 模型索引
 ├── transformer/              # 预量化的 Transformer 权重
 │   └── *.safetensors
@@ -64,8 +71,11 @@ huggingface-cli download QuantFunc/YourModel-SVDQ --local-dir /path/to/QuantFunc
 
 ## 第三步：导入 Workflow 并配置
 
-1. 在 ComfyUI 中导入 `workflow_sample/QuantFunc-Text-to-Image-Workflow.json`
-2. 使用**左侧 SVDQ 组**
+在 ComfyUI 中导入 `workflow_sample/QuantFunc-Text-to-Image-Workflow.json`，根据你下载的模型类型选择对应的配置方式：
+
+### 方式 A：加载 SVDQ 模型
+
+使用工作流中**左侧 SVDQ 组**。
 
 ![导入 Workflow 并选择 SVDQ 组](../assets/t2-step3-import-workflow.png)
 
@@ -74,9 +84,24 @@ huggingface-cli download QuantFunc/YourModel-SVDQ --local-dir /path/to/QuantFunc
 | 参数 | 设置 |
 |------|------|
 | `model_dir` | QuantFunc 模型目录路径，例如 `/path/to/QuantFunc-Model` |
-| `transformer_path` | Transformer 权重路径，例如 `/path/to/QuantFunc-Model/transformer/model.safetensors`（也兼容旧版 nunchaku 的量化权重） |
+| `transformer_path` | SVDQ Transformer 权重路径，例如 `/path/to/QuantFunc-Model/transformer/model.safetensors`（也兼容旧版 nunchaku 的量化权重） |
 | `model_backend` | 选择 `svdq` |
 | `device` | GPU 编号（通常为 `0`） |
+
+### 方式 B：加载 Lighting 预导出模型
+
+使用工作流中**右侧 Lighting 组**。用法与 SVDQ 相同，区别仅在于选择 Lighting 的 Transformer 权重并将后端设为 `lighting`。
+
+在 **QuantFunc Model Loader** 节点中配置：
+
+| 参数 | 设置 |
+|------|------|
+| `model_dir` | QuantFunc 模型目录路径，例如 `/path/to/QuantFunc-Model` |
+| `transformer_path` | Lighting Transformer 权重路径，例如 `/path/to/QuantFunc-Model/transformer/model.safetensors` |
+| `model_backend` | 选择 `lighting` |
+| `device` | GPU 编号（通常为 `0`） |
+
+> **注意：** 加载 Lighting 预导出模型时，`transformer_path` 必须指向 Lighting 的 Transformer 权重。由于模型已经是量化好的，不会发生运行时量化，加载速度与 SVDQ 一样快。
 
 ## 第四步：配置生成参数
 
@@ -152,7 +177,7 @@ Model Loader (svdq)
 A: `model_dir` 指向完整的 diffusers 模型目录（包含 VAE、tokenizer 等），`transformer_path` 指向具体的量化 Transformer 权重文件（.safetensors）。
 
 **Q: 输出全是噪点？**
-A: 请确认 `model_backend` 设为 `svdq`，且 Transformer 权重确实是 SVDQ 格式。使用 Lighting 格式的权重搭配 SVDQ 后端（或反之）会产生噪声输出。
+A: 请确认 `model_backend` 与 Transformer 权重匹配 —— SVDQ 权重用 `svdq`，Lighting 权重用 `lighting`。后端与权重不匹配会产生噪声输出。
 
 **Q: 50x-below 和 50x-above 能混用吗？**
 A: 不能。必须使用与你 GPU 匹配的变体，否则可能出错或性能下降。
