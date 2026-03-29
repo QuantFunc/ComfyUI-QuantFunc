@@ -10,9 +10,9 @@ This directory contains example workflows for the QuantFunc ComfyUI plugin. Impo
 |----------|-------------|
 | `QuantFunc-Text-to-Image-Workflow.json` | Text-to-image generation (SVDQ + Lighting) |
 | `QuantFunc-Image-to-Image-Workflow.json` | Reference-based image editing (QwenImage-Edit) |
-| `QuantFunc-Model-Export.json` | Export pre-quantized models with LoRA baked in |
+| `QuantFunc-Model-Export.json` | Export runtime-quantized models with LoRA fusion support |
 
-Each workflow file contains **two groups** side by side — one for **SVDQ** (pre-quantized weights) and one for **Lighting** (on-the-fly quantization). Use the one that matches your model.
+Each workflow file contains **two groups** side by side — one for **SVDQ** (pre-quantized weights) and one for **Lighting** (runtime quantization). Use the one that matches your model.
 
 ## 2. Node Reference
 
@@ -23,8 +23,8 @@ The entry point. Configures which model to load and how.
 | Parameter | Required | Description |
 |-----------|----------|-------------|
 | `model_dir` | Yes | Path to base model directory (diffusers format, contains `model_index.json`) |
-| `transformer_path` | Yes* | Path to quantized transformer weights (`.safetensors`). *Leave empty for Lighting from-FP16 mode |
-| `model_backend` | Yes | `svdq` (pre-quantized) or `lighting` (on-the-fly quantization) |
+| `transformer_path` | Yes* | Path to quantized transformer weights (`.safetensors`). *Leave empty for Lighting runtime quantization from FP16 |
+| `model_backend` | Yes | `svdq` (pre-quantized) or `lighting` (runtime quantization) |
 | `device` | Yes | GPU index (0, 1, ...) |
 | `precision_config` | Lighting only | Path to per-layer precision JSON config |
 | `prequant_weights` | Lighting only | Path to pre-quantized modulation weights |
@@ -93,7 +93,7 @@ Advanced configuration (optional). Overrides `auto_optimize` defaults when conne
 
 ### 2.7 QuantFunc Export
 
-Exports a pre-quantized model (with LoRA baked in) for instant future loading.
+Exports all runtime-quantized models to disk (with LoRA fusion support) for instant future loading.
 
 | Parameter | Description |
 |-----------|-------------|
@@ -132,8 +132,8 @@ Exports a pre-quantized model (with LoRA baked in) for instant future loading.
 1. Open `QuantFunc-Model-Export.json`
 2. Configure Model Loader with Lighting backend + LoRAs
 3. Set `export_path` in the Export node
-4. Click **Queue Prompt** — model is quantized and saved
-5. Future runs: load exported model with `transformer_path` for instant startup
+4. Click **Queue Prompt** — model is runtime-quantized and all quantized weights are saved
+5. Future runs: load exported model with `transformer_path` for instant startup (no re-quantization)
 
 ## 4. Model Download
 

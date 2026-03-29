@@ -1,21 +1,25 @@
-# 教程 3：将自定义模型与 LoRA 导出为 Lighting/SVDQ 模型
+# 教程 2：导出运行时量化模型（支持融合 LoRA）
 
-[English Version](tutorial-3-export-custom-models.md)
+[English Version](tutorial-2-export-quantized-models.md)
 
 ## 概述
 
-如果你精心调试了模型参数、叠加了多个 LoRA，你可以将当前配置**一键导出**为预量化模型。导出后的模型：
+Lighting 后端每次加载模型时都会进行**运行时量化**。**导出功能**将所有运行时量化产生的模型持久化到磁盘，后续加载时完全跳过重新量化。如果叠加了 LoRA，LoRA 也会被永久融入导出的权重。导出后的模型：
 
-- **LoRA 已烘焙**：无需每次运行时重新加载 LoRA
-- **量化权重已保存**：跳过实时量化步骤，加载即用
+- **所有运行时量化模型已保存**：跳过运行时量化步骤，加载即用
+- **LoRA 已融合**（可选）：导出时可将 LoRA 永久融合进模型，无需每次运行时重新加载
 - **可分享**：导出的模型可以分享给他人直接使用
+
+![教程 2 工作流全貌](../assets/t2-workflow-overview.png)
+
+> **工作流文件：** [`workflow_sample/QuantFunc-Model-Export.json`](../workflow_sample/QuantFunc-Model-Export.json)
 
 ## 使用场景
 
 | 场景 | 说明 |
 |------|------|
-| LoRA 烘焙 | 将你调试好的 LoRA（含强度配置）永久融入模型 |
-| 加速加载 | Lighting 实时量化后导出，下次直接加载量化权重 |
+| 跳过运行时量化 | 导出 Lighting 运行时量化的模型，避免每次启动都重新量化 |
+| LoRA 融合 | 将你调试好的 LoRA（含强度配置）永久融合进模型 |
 | 模型分发 | 将配置好的模型打包分享给团队成员 |
 | 多 LoRA 合并 | 将多个 LoRA 合并为单一模型，简化工作流 |
 
@@ -27,7 +31,9 @@
 
 根据你的模型选择后端：
 
-### 方案 A：从 FP16 模型导出（Lighting 后端）
+### 方案 A：导出运行时量化模型（Lighting 后端，从 FP16）
+
+当你使用 Lighting 运行时量化后觉得效果不错，可以将量化后的模型导出到磁盘。下次加载时直接读取已导出的量化权重，跳过运行时量化步骤，**加载速度通常提升两倍以上**。
 
 ```
 QuantFunc Model Loader (lighting)
@@ -41,7 +47,7 @@ Lighting 后端的 Model Loader 配置与[教程 1](tutorial-1-use-without-quant
 | 参数 | 设置 |
 |------|------|
 | `model_dir` | 你的 FP16 基础模型路径，例如 `/path/to/Qwen-Image-Edit-2511` |
-| `transformer_path` | **留空** —— Lighting 会从 FP16 实时量化 |
+| `transformer_path` | **留空** —— Lighting 会从 FP16 运行时量化 |
 | `model_backend` | `lighting` |
 | `device` | GPU 编号（通常为 `0`） |
 | `precision_config` | 逐层精度配置文件路径（详见[教程 1](tutorial-1-use-without-quantfunc-models_zh.md)） |
@@ -54,6 +60,8 @@ Lighting 后端的 Model Loader 配置与[教程 1](tutorial-1-use-without-quant
 
 ### 方案 B：从 SVDQ 模型导出（SVDQ 后端）
 
+当你已有现成的 SVDQ 模型，并希望将指定的 LoRA 永久融合到模型中导出时，可以使用 SVDQ 后端导出。
+
 ```
 QuantFunc Model Loader (svdq)
     → QuantFunc LoRA (LoRA 1)
@@ -61,7 +69,7 @@ QuantFunc Model Loader (svdq)
             → QuantFunc Export
 ```
 
-SVDQ 后端的 Model Loader 配置与[教程 2](tutorial-2-download-and-use-quantfunc-models_zh.md) 相同：
+SVDQ 后端的 Model Loader 配置与[教程 3](tutorial-3-download-quantfunc-models_zh.md) 相同：
 
 | 参数 | 设置 |
 |------|------|
@@ -70,7 +78,7 @@ SVDQ 后端的 Model Loader 配置与[教程 2](tutorial-2-download-and-use-quan
 | `model_backend` | `svdq` |
 | `device` | GPU 编号（通常为 `0`） |
 
-> SVDQ 后端导出时，如果叠加了 LoRA，必须添加 LoRA Config 节点。详见[教程 2 的 LoRA 配置说明](tutorial-2-download-and-use-quantfunc-models_zh.md)。
+> SVDQ 后端导出时，如果叠加了 LoRA，必须添加 LoRA Config 节点。详见[教程 3 的 LoRA 配置说明](tutorial-3-download-quantfunc-models_zh.md)。
 
 ![SVDQ 后端 Model Loader 配置](../assets/t2-step3-import-workflow.png)
 
@@ -86,7 +94,7 @@ Model Loader → LoRA (scale=0.8) → LoRA (scale=1.2) → Export
 - `lora_path`：LoRA 文件路径
 - `scale`：LoRA 强度（0.0-2.0）
 
-> 你在这里设置的 LoRA 强度会被永久烘焙到导出的模型中。
+> 你在这里设置的 LoRA 强度会被永久融合到导出的模型中。
 
 ![添加多个 LoRA 节点](../assets/t1-optional-add-lora.png)
 
@@ -104,7 +112,7 @@ Model Loader → LoRA (scale=0.8) → LoRA (scale=1.2) → Export
 
 | 参数 | 说明 |
 |------|------|
-| `export_transformer` | 导出 Transformer（量化权重 + 烘焙的 LoRA） |
+| `export_transformer` | 导出 Transformer（量化权重 + 融合的 LoRA） |
 | `export_text_encoder` | 导出文本编码器 |
 | `export_vision_encoder` | 导出视觉编码器 |
 
@@ -118,8 +126,8 @@ Model Loader → LoRA (scale=0.8) → LoRA (scale=1.2) → Export
 
 1. 加载基础模型
 2. 应用所有 LoRA（按配置的强度和合并策略）
-3. 执行量化（如果是 Lighting 从 FP16 量化）
-4. 将量化后的权重保存到指定目录
+3. 执行运行时量化（如果是 Lighting 从 FP16 量化）
+4. 将所有运行时量化的模型权重保存到指定目录
 
 导出完成后，目录结构类似：
 
@@ -127,7 +135,7 @@ Model Loader → LoRA (scale=0.8) → LoRA (scale=1.2) → Export
 my-exported-model/
 ├── model_index.json
 ├── transformer/
-│   └── *.safetensors    ← 量化权重（含烘焙的 LoRA）
+│   └── *.safetensors    ← 量化权重（含融合的 LoRA）
 ├── vae/
 ├── tokenizer/
 ├── text_encoder/
@@ -146,7 +154,7 @@ my-exported-model/
 |------|------|
 | `model_dir` | `/path/to/my-exported-model` |
 | `transformer_path` | 留空或指向导出的 Transformer 权重 |
-| `model_backend` | `lighting`（导出的量化权重作为预量化加载） |
+| `model_backend` | `lighting`（导出的运行时量化权重直接加载，无需重新量化） |
 
 ### 方式 B：仅替换 Transformer 权重
 
@@ -156,7 +164,7 @@ my-exported-model/
 | `transformer_path` | `/path/to/my-exported-model/transformer/model.safetensors` |
 | `model_backend` | 与导出时相同 |
 
-> 使用导出模型时**不需要**再添加之前的 LoRA 节点——LoRA 已经烘焙进去了。
+> 使用导出模型时**不需要**再添加之前的 LoRA 节点——LoRA 已经融合进去了。
 
 ![使用导出的模型](../assets/t1-step2-model-loader.png)
 
@@ -201,7 +209,7 @@ Model Loader                    Generate
 A: SVDQ 后端导出的模型可以继续叠加新 LoRA（需要 LoRA Config 节点）。但 **Lighting 后端导出的模型目前不支持再叠加新 LoRA**——如果需要更换 LoRA 组合，请从原始 FP16 模型重新导出。
 
 **Q: 导出需要多长时间？**
-A: 取决于模型大小和后端。Lighting 从 FP16 导出需要量化时间（几分钟），SVDQ 导出相对快一些。
+A: 取决于模型大小和后端。Lighting 导出包含运行时量化的时间（几分钟），SVDQ 导出更快因为权重已经是量化的。
 
 **Q: 导出的模型体积有多大？**
 A: INT4 量化后的 Transformer 权重通常只有 FP16 的 1/4 左右。完整模型（含 VAE、tokenizer）的总大小取决于各组件。

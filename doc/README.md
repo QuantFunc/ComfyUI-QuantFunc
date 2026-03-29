@@ -12,9 +12,9 @@
 
 | Tutorial | Description |
 |----------|-------------|
-| [Tutorial 1: Use Without QuantFunc Models](tutorial-1-use-without-quantfunc-models.md) | Use any diffusers-format model (e.g., Qwen-Image-Edit-2511) with the Lighting backend — no pre-quantized models needed |
-| [Tutorial 2: Download & Use QuantFunc Models](tutorial-2-download-and-use-quantfunc-models.md) | Download pre-quantized SVDQ models for maximum acceleration (2x-11x speedup) |
-| [Tutorial 3: Export Custom Models](tutorial-3-export-custom-models.md) | Export your fine-tuned models with LoRA baked in as Lighting/SVDQ models |
+| [Tutorial 1: Runtime Quantization](tutorial-1-use-without-quantfunc-models.md) | Quantize any BF16/FP16 model to 4bit at load time with Lighting — no pre-quantized models needed |
+| [Tutorial 2: Export Runtime-Quantized Models](tutorial-2-export-quantized-models.md) | Export all runtime-quantized models from Lighting to disk (with LoRA fusion support) |
+| [Tutorial 3: Download & Use Pre-exported Models](tutorial-3-download-quantfunc-models.md) | Download QuantFunc pre-exported quantized models for instant loading (2x-11x speedup) |
 
 ### Reference
 
@@ -36,9 +36,9 @@ See the main [README.md](../README.md) for installation instructions.
 
 | 教程 | 说明 |
 |------|------|
-| [教程 1：不下载 QuantFunc 模型直接使用](tutorial-1-use-without-quantfunc-models_zh.md) | 使用任意 diffusers 格式模型（如 Qwen-Image-Edit-2511），通过 Lighting 后端实时量化加速 |
-| [教程 2：下载并使用 QuantFunc 模型](tutorial-2-download-and-use-quantfunc-models_zh.md) | 下载 SVDQ 预量化模型，获得极致加速（2x-11x） |
-| [教程 3：导出自定义模型](tutorial-3-export-custom-models_zh.md) | 将精心配置的模型与 LoRA 导出为预量化模型 |
+| [教程 1：运行时量化](tutorial-1-use-without-quantfunc-models_zh.md) | 基于 Lighting 将任意 BF16/FP16 模型量化为 4bit 加速推理，无需下载预量化模型 |
+| [教程 2：导出运行时量化模型](tutorial-2-export-quantized-models_zh.md) | 将 Lighting 运行时量化的所有模型导出到磁盘（支持融合 LoRA） |
+| [教程 3：下载并使用已导出的量化模型](tutorial-3-download-quantfunc-models_zh.md) | 下载 QuantFunc 提前导出的量化模型，加载即用（2x-11x 加速） |
 
 ### 参考文档
 

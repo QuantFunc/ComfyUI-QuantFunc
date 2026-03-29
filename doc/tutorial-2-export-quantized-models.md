@@ -1,21 +1,25 @@
-# Tutorial 3: Export Custom Models with LoRA as Lighting/SVDQ Models
+# Tutorial 2: Export Runtime-Quantized Models (with LoRA Fusion Support)
 
-[中文版本](tutorial-3-export-custom-models_zh.md)
+[中文版本](tutorial-2-export-quantized-models_zh.md)
 
 ## Overview
 
-If you've carefully tuned your model with specific LoRA combinations, you can **export the entire configuration** as a pre-quantized model in one click. Exported models:
+The Lighting backend performs **runtime quantization** every time a model is loaded. The **export** function saves all runtime-quantized models to disk, so subsequent loads skip re-quantization entirely. If you've also stacked LoRAs, they are permanently fused into the exported weights. Exported models:
 
-- **LoRA baked in**: No need to reload LoRAs each run
-- **Quantized weights saved**: Skips real-time quantization, loads instantly
+- **All runtime-quantized models saved**: Skips runtime quantization on future loads — instant startup
+- **LoRA fused in** (optional): Export can permanently fuse LoRAs into the model — no need to reload them each run
 - **Shareable**: Exported models can be shared with others
+
+![Tutorial 2 workflow overview](../assets/t2-workflow-overview.png)
+
+> **Workflow file:** [`workflow_sample/QuantFunc-Model-Export.json`](../workflow_sample/QuantFunc-Model-Export.json)
 
 ## Use Cases
 
 | Scenario | Description |
 |----------|-------------|
+| Skip runtime quantization | Export after Lighting runtime quantization to avoid re-quantizing every startup |
 | LoRA baking | Permanently fuse your tuned LoRAs (with strength settings) into the model |
-| Faster loading | Export after Lighting quantization to skip it next time |
 | Model distribution | Package configured models for team members |
 | Multi-LoRA merge | Merge multiple LoRAs into a single model, simplifying workflows |
 
@@ -27,7 +31,9 @@ Import `workflow_sample/QuantFunc-Model-Export.json` into ComfyUI.
 
 Choose your backend based on your model:
 
-### Option A: Export from FP16 Model (Lighting Backend)
+### Option A: Export Runtime-Quantized Models from FP16 (Lighting Backend)
+
+If you're happy with the Lighting runtime quantization results, you can export the quantized model to disk. Next time you load it, the exported weights are read directly — skipping the runtime quantization step and **typically loading 2x faster or more**.
 
 ```
 QuantFunc Model Loader (lighting)
@@ -54,6 +60,8 @@ The Lighting backend Model Loader config is the same as [Tutorial 1](tutorial-1-
 
 ### Option B: Export from SVDQ Model (SVDQ Backend)
 
+If you already have an SVDQ model and want to permanently fuse specific LoRAs into it for export, use the SVDQ backend.
+
 ```
 QuantFunc Model Loader (svdq)
     → QuantFunc LoRA (LoRA 1)
@@ -61,7 +69,7 @@ QuantFunc Model Loader (svdq)
             → QuantFunc Export
 ```
 
-The SVDQ backend Model Loader config is the same as [Tutorial 2](tutorial-2-download-and-use-quantfunc-models.md):
+The SVDQ backend Model Loader config is the same as [Tutorial 3](tutorial-3-download-quantfunc-models.md):
 
 | Parameter | Value |
 |-----------|-------|
@@ -70,7 +78,7 @@ The SVDQ backend Model Loader config is the same as [Tutorial 2](tutorial-2-down
 | `model_backend` | `svdq` |
 | `device` | GPU index (usually `0`) |
 
-> When exporting from SVDQ with LoRAs, you must include the LoRA Config node. See [Tutorial 2's LoRA config section](tutorial-2-download-and-use-quantfunc-models.md) for details.
+> When exporting from SVDQ with LoRAs, you must include the LoRA Config node. See [Tutorial 3's LoRA config section](tutorial-3-download-quantfunc-models.md) for details.
 
 ![SVDQ backend Model Loader config](../assets/t2-step3-import-workflow.png)
 
@@ -86,7 +94,7 @@ Each LoRA node:
 - `lora_path`: Path to LoRA file
 - `scale`: LoRA strength (0.0-2.0)
 
-> The LoRA strengths you set here are permanently baked into the exported model.
+> The LoRA strengths you set here are permanently fused into the exported model.
 
 ![Add multiple LoRA nodes](../assets/t1-optional-add-lora.png)
 
@@ -104,7 +112,7 @@ With `custom` mode, you can control:
 
 | Parameter | Description |
 |-----------|-------------|
-| `export_transformer` | Export transformer (quantized weights + baked LoRA) |
+| `export_transformer` | Export transformer (quantized weights + fused LoRA) |
 | `export_text_encoder` | Export text encoder |
 | `export_vision_encoder` | Export vision encoder |
 
@@ -118,8 +126,8 @@ Click **Queue Prompt**. The export process will:
 
 1. Load the base model
 2. Apply all LoRAs (with configured strengths and merge strategy)
-3. Perform quantization (if Lighting from FP16)
-4. Save quantized weights to the specified directory
+3. Perform runtime quantization (if Lighting from FP16)
+4. Save all runtime-quantized model weights to the specified directory
 
 After export, directory structure looks like:
 
@@ -127,7 +135,7 @@ After export, directory structure looks like:
 my-exported-model/
 ├── model_index.json
 ├── transformer/
-│   └── *.safetensors    ← quantized weights (with baked LoRA)
+│   └── *.safetensors    ← quantized weights (with fused LoRA)
 ├── vae/
 ├── tokenizer/
 ├── text_encoder/
@@ -146,7 +154,7 @@ Load exported models in two ways:
 |-----------|-------|
 | `model_dir` | `/path/to/my-exported-model` |
 | `transformer_path` | Leave empty or point to exported transformer weights |
-| `model_backend` | `lighting` (exported quantized weights load as pre-quantized) |
+| `model_backend` | `lighting` (exported runtime-quantized weights load directly, no re-quantization) |
 
 ### Option B: Replace Only Transformer Weights
 
@@ -156,7 +164,7 @@ Load exported models in two ways:
 | `transformer_path` | `/path/to/my-exported-model/transformer/model.safetensors` |
 | `model_backend` | Same as when exported |
 
-> You do **not** need to add the previous LoRA nodes — they're already baked in.
+> You do **not** need to add the previous LoRA nodes — they're already fused in.
 
 ![Use exported model](../assets/t1-step2-model-loader.png)
 
@@ -201,7 +209,7 @@ No LoRA nodes needed — load and go!
 A: For SVDQ-exported models, yes — you can stack new LoRAs (with the LoRA Config node). However, **Lighting-exported models do not currently support adding new LoRAs** — if you need a different LoRA combination, re-export from the original FP16 model.
 
 **Q: How long does export take?**
-A: Depends on model size and backend. Lighting from FP16 requires quantization time (a few minutes). SVDQ export is faster.
+A: Depends on model size and backend. Lighting export includes runtime quantization time (a few minutes). SVDQ export is faster since weights are already quantized.
 
 **Q: How large are exported models?**
 A: INT4 quantized transformer weights are typically ~1/4 the size of FP16. Total size depends on components included (VAE, tokenizer, etc.).

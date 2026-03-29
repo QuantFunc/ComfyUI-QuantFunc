@@ -12,10 +12,10 @@ ComfyUI plugin for **QuantFunc** — the fastest diffusion model inference engin
 
 **Key features:**
 - Native C++/CUDA acceleration via `libquantfunc.so` / `quantfunc.dll`
-- SVDQ + Lighting dual engine support
+- SVDQ (offline quantization) + Lighting (runtime quantization) dual engine
 - Zero-cost LoRA stacking
 - Image editing with reference images
-- Model export with LoRA baked in
+- Export runtime-quantized models with LoRA fusion support
 - Auto-update from ModelScope
 
 ## 2. Installation
@@ -118,36 +118,25 @@ If the library was not found:
 
 See [doc/](doc/) for detailed tutorials and [workflow_sample/README.md](workflow_sample/README.md) for node reference.
 
-### 3.1 Basic Flow
+### 3.1 Runtime Quantization: Quantize BF16/FP16 Models to 4bit for Accelerated Inference
 
-```
-ModelLoader → (LoRA) → (LoRA Config) → Generate → PreviewImage
-```
+The **Lighting backend** provides **runtime quantization** — it uses the Lighting engine to quantize any diffusers-format BF16/FP16 model (e.g., [Qwen/Qwen-Image-Edit-2511](https://huggingface.co/Qwen/Qwen-Image-Edit-2511)) to 4bit at load time for accelerated inference. Just set `model_backend` to `lighting` and leave `transformer_path` empty — no pre-quantized model download needed.
 
-1. **QuantFunc Model Loader** — set model path, backend, device
-2. **QuantFunc LoRA** (optional) — chain one or more LoRA adapters
-3. **QuantFunc LoRA Config** (optional, required for SVDQ + LoRA) — merge strategy
-4. **QuantFunc Generate** — enter prompt, dimensions, steps → outputs IMAGE
+> **[Tutorial 1: Runtime Quantization →](doc/tutorial-1-use-without-quantfunc-models.md)**
 
-### 3.2 Use Any Diffusers Model (No Pre-quantized Download)
+### 3.2 Export Runtime-Quantized Models (with LoRA Fusion Support)
 
-You don't need to download QuantFunc pre-quantized models. With the **Lighting backend**, any diffusers-format model (e.g., [Qwen/Qwen-Image-Edit-2511](https://huggingface.co/Qwen/Qwen-Image-Edit-2511)) works out of the box — set `model_backend` to `lighting`, leave `transformer_path` empty, and the engine quantizes FP16 weights on the fly.
+The Lighting export saves all runtime-quantized models to disk, so you don't need to re-quantize on every startup. If you've also stacked LoRAs, they are permanently fused into the exported weights — no LoRA nodes needed, no re-quantization, load and go.
 
-> **[Tutorial 1: Use Without QuantFunc Models →](doc/tutorial-1-use-without-quantfunc-models.md)**
+> **[Tutorial 2: Export Runtime-Quantized Models →](doc/tutorial-2-export-quantized-models.md)**
 
-### 3.3 Download Pre-quantized Models for Maximum Speed
+### 3.3 Download and Use Pre-exported Quantized Models
 
-For the best performance (2x–11x speedup), download QuantFunc **SVDQ pre-quantized models** from [ModelScope](https://www.modelscope.cn/models/QuantFunc) or [HuggingFace](https://huggingface.co/QuantFunc). SVDQ models are quantized offline with advanced SVD algorithms — they load instantly and run faster than real-time quantization.
+QuantFunc has pre-exported commonly used models (runtime-quantized and ready to use). Download them directly from [ModelScope](https://www.modelscope.cn/models/QuantFunc) or [HuggingFace](https://huggingface.co/QuantFunc) — same 2x–11x inference speedup as runtime quantization, but with faster loading since the quantization step is skipped.
 
-> **[Tutorial 2: Download & Use QuantFunc Models →](doc/tutorial-2-download-and-use-quantfunc-models.md)**
+> **[Tutorial 3: Download & Use Pre-exported Models →](doc/tutorial-3-download-quantfunc-models.md)**
 
-### 3.4 Export Custom Models with LoRA Baked In
-
-Once you've dialed in your perfect LoRA stack, export the whole pipeline as a standalone pre-quantized model. Exported models load with LoRA already fused — no LoRA nodes needed, no re-quantization on startup.
-
-> **[Tutorial 3: Export Custom Models →](doc/tutorial-3-export-custom-models.md)**
-
-### 3.5 Example Workflows
+### 3.4 Example Workflows
 
 Import from `workflow_sample/`:
 
@@ -155,7 +144,7 @@ Import from `workflow_sample/`:
 |------|----------|
 | `QuantFunc-Text-to-Image-Workflow.json` | Text-to-image (SVDQ + Lighting side by side) |
 | `QuantFunc-Image-to-Image-Workflow.json` | Image editing with reference images |
-| `QuantFunc-Model-Export.json` | Export quantized model with LoRA |
+| `QuantFunc-Model-Export.json` | Export runtime-quantized models (supports LoRA fusion) |
 
 ## 4. Troubleshooting
 
