@@ -165,13 +165,58 @@ def _download_dep_zip(cuda_major: int, dest_dir: str) -> bool:
         return False
 
 
+def _detect_gpu_sm() -> int:
+    """Detect GPU compute capability (SM version). Returns e.g. 120, 89, 86, or 0."""
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
+            timeout=5, stderr=subprocess.DEVNULL
+        ).decode().strip()
+        # Parse "12.0" → 120, "8.9" → 89
+        for line in out.split("\n"):
+            line = line.strip()
+            if "." in line:
+                major, minor = line.split(".")[:2]
+                return int(major) * 10 + int(minor)
+    except Exception:
+        pass
+
+    # Fallback: try torch
+    try:
+        import torch
+        if torch.cuda.is_available():
+            cap = torch.cuda.get_device_capability(0)
+            return cap[0] * 10 + cap[1]
+    except Exception:
+        pass
+
+    return 0
+
+
 def resolve_library() -> str:
     """Main entry point: detect CUDA, select DLL, ensure deps, return DLL path.
 
     Returns the absolute path to the quantfunc DLL ready for loading.
+    Raises RuntimeError if SM120+ GPU detected with CUDA 12 (unsupported).
     """
     bin_dir = _get_bin_dir()
     cuda_major = detect_cuda_major()
+    gpu_sm = _detect_gpu_sm()
+
+    # SM120+ (RTX 50 series) requires CUDA 13. CUDA 12 cannot compile PTX for SM120.
+    if gpu_sm >= 120 and cuda_major <= 12 and cuda_major > 0:
+        msg = (
+            f"[QuantFunc] FATAL: RTX 50-series GPU detected (SM{gpu_sm}) but only "
+            f"CUDA {cuda_major} is available.\n"
+            f"[QuantFunc] SM120+ requires CUDA 13.x. Please upgrade:\n"
+            f"[QuantFunc]   https://developer.nvidia.com/cuda-downloads\n"
+            f"[QuantFunc] After installing CUDA 13, restart ComfyUI."
+        )
+        print(msg)
+        raise RuntimeError(
+            f"SM{gpu_sm} GPU requires CUDA 13+ (found CUDA {cuda_major}). "
+            f"Install CUDA 13.x from https://developer.nvidia.com/cuda-downloads"
+        )
     dll_name, _ = get_lib_names(cuda_major)
     dll_path = os.path.join(bin_dir, dll_name)
 
