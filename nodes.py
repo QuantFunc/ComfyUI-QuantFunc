@@ -627,11 +627,11 @@ try:
 
     _original_free_memory = _mm.free_memory
 
-    def _hooked_free_memory(memory_required, device, keep_loaded=[]):
+    def _hooked_free_memory(memory_required, device, keep_loaded=[], **kwargs):
         if _manager._current_key is not None:
             logging.info("[QuantFunc] Auto-unloading pipelines to free VRAM for other models")
             _manager.destroy_all()
-        return _original_free_memory(memory_required, device, keep_loaded=keep_loaded)
+        return _original_free_memory(memory_required, device, keep_loaded=keep_loaded, **kwargs)
 
     _mm.free_memory = _hooked_free_memory
 except Exception:
