@@ -56,6 +56,37 @@ _LIB_PATH = _resolve_lib_path()
 _WORKER_PY = os.path.join(os.path.dirname(__file__), "worker.py")
 
 
+def _get_available_devices():
+    """Detect available CUDA GPU devices. Returns list of string device IDs."""
+    devices = []
+    try:
+        import torch
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                name = torch.cuda.get_device_name(i)
+                devices.append("{}: {}".format(i, name))
+    except Exception:
+        pass
+    if not devices:
+        # Fallback: try nvidia-smi
+        try:
+            import subprocess
+            out = subprocess.check_output(
+                ["nvidia-smi", "--query-gpu=index,name", "--format=csv,noheader"],
+                timeout=5, stderr=subprocess.DEVNULL,
+            ).decode().strip()
+            for line in out.split("\n"):
+                line = line.strip()
+                if line:
+                    devices.append(line.replace(", ", ": "))
+        except Exception:
+            pass
+    return devices if devices else ["0: GPU"]
+
+
+_AVAILABLE_DEVICES = _get_available_devices()
+
+
 def _load_lib_config():
     """Load config.json from the same directory as the quantfunc library binary.
     Returns dict with server_url and api_key (empty strings if not found).
@@ -686,7 +717,7 @@ class QuantFuncModelLoader:
                 "model_dir": ("STRING", {"default": "", "tooltip": "Base model directory (contains model_index.json)"}),
                 "transformer_path": ("STRING", {"default": "", "tooltip": "Transformer weights path (safetensors file or directory)"}),
                 "model_backend": (["svdq", "lighting"], {"default": "svdq"}),
-                "device": ("INT", {"default": 0, "min": 0, "max": 7}),
+                "device": (_AVAILABLE_DEVICES,),
             },
             "optional": {
                 "config": ("QUANTFUNC_CONFIG", {"tooltip": "Advanced pipeline config (from PipelineConfig node). If not connected, uses auto_optimize defaults."}),
@@ -753,7 +784,147 @@ class QuantFuncModelLoader:
             "backend": model_backend,
             "precision": text_precision,
             "scheduler": scheduler_config,
-            "device": device,
+            "device": int(device.split(":")[0]) if isinstance(device, str) else device,
+            "options": options,
+            "unload": manual_unload_model,
+        }
+        return (cfg,)
+
+
+# ============================================================================
+# Node: QuantFunc Model Auto Loader
+# ============================================================================
+
+def _get_auto_loader_dropdowns():
+    """Get dropdown options from resource cache (loaded at import time)."""
+    try:
+        from .model_auto_loader import (
+            get_transformer_options, get_prequant_options,
+            get_precision_config_options,
+        )
+        return (get_transformer_options(),
+                get_prequant_options(),
+                get_precision_config_options())
+    except Exception:
+        return ["None"], ["None"], ["None"]
+
+
+class QuantFuncModelAutoLoader:
+    """Auto-download and load QuantFunc models.
+
+    Selects the correct GPU variant (50x-below/50x-above) automatically.
+    Downloads base model, transformer, prequant weights, and precision config
+    from HuggingFace or ModelScope on first use.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        from .model_auto_loader import MODEL_SERIES_LIST, _DATA_SOURCES
+        transformer_opts, prequant_opts, precision_opts = _get_auto_loader_dropdowns()
+        return {
+            "required": {
+                "model_series": (MODEL_SERIES_LIST, {"tooltip": "Model series to download and load"}),
+                "model_backend": (["svdq", "lighting"], {"default": "svdq"}),
+                "device": (_AVAILABLE_DEVICES,),
+                "data_source": (_DATA_SOURCES, {"default": "modelscope", "tooltip": "Download source: modelscope (China) or huggingface"}),
+            },
+            "optional": {
+                "transformer": (transformer_opts, {"default": "None", "tooltip": "Transformer model variant. Format: Series/name. Select None to use base model's default transformer."}),
+                "prequant_weights": (prequant_opts, {"default": "None", "tooltip": "Pre-quantized modulation weights (Lighting only). Z-Image has no prequant — use None."}),
+                "precision_config": (precision_opts, {"default": "None", "tooltip": "Per-layer precision config (Lighting only). Format: Series/name."}),
+                "config": ("QUANTFUNC_CONFIG", {"tooltip": "Advanced pipeline config (from PipelineConfig node)"}),
+                "api_key": ("STRING", {"default": "", "tooltip": "QuantFunc API key for model authentication"}),
+                "scheduler_config": ("STRING", {"default": "", "tooltip": "Scheduler JSON config path (for Lightning models)"}),
+                "fused_mod": ("BOOLEAN", {"default": False, "tooltip": "Fused INT8 SiLU+GEMV+bias+split6 for W8A8 modulation layers (Lighting backend only)"}),
+                "manual_unload_model": ("BOOLEAN", {"default": False, "tooltip": "Activate to manually unload the model and free GPU memory."}),
+            }
+        }
+
+    RETURN_TYPES = ("QUANTFUNC_PIPELINE",)
+    RETURN_NAMES = ("pipeline",)
+    FUNCTION = "load_model"
+    CATEGORY = "QuantFunc"
+
+    def load_model(self, model_series, model_backend, device, data_source,
+                   config=None, manual_unload_model=False,
+                   transformer="None", prequant_weights="None",
+                   precision_config="None", api_key="", scheduler_config="",
+                   **kwargs):
+        from .model_auto_loader import (
+            detect_gpu_variant, download_base_model,
+            download_transformer, download_prequant, download_precision_config,
+            resolve_transformer_selection, resolve_prequant_selection,
+            resolve_precision_config_selection,
+        )
+
+        # ── GPU variant & base model ──
+        gpu_variant = detect_gpu_variant()
+        model_dir = download_base_model(model_series, gpu_variant, data_source)
+
+        # ── Transformer (download if selected, otherwise use base model's) ──
+        transformer_path = ""
+        if transformer and transformer != "None":
+            t_series, t_name = resolve_transformer_selection(transformer, model_series)
+            if t_series and t_name:
+                transformer_path = download_transformer(t_series, t_name, data_source)
+
+        # ── Prequant weights ──
+        prequant_path = ""
+        if prequant_weights and prequant_weights != "None":
+            p_series, p_name = resolve_prequant_selection(prequant_weights, model_series)
+            if p_series and p_name:
+                prequant_path = download_prequant(p_series, p_name, data_source)
+
+        # ── Precision config ──
+        precision_config_path = ""
+        if precision_config and precision_config != "None":
+            pc_series, pc_name = resolve_precision_config_selection(
+                precision_config, model_series)
+            if pc_series and pc_name:
+                precision_config_path = download_precision_config(
+                    pc_series, pc_name, data_source)
+
+        # ── Build pipeline config (same structure as ModelLoader) ──
+        scheduler_config = scheduler_config.strip() if isinstance(scheduler_config, str) else ""
+        if scheduler_config and not os.path.exists(scheduler_config):
+            logging.warning("[QuantFunc] scheduler_config path does not exist: %r, ignoring",
+                            scheduler_config)
+            scheduler_config = ""
+
+        fused_mod = kwargs.get("fused_mod", False)
+        api_key = api_key.strip() if isinstance(api_key, str) else ""
+
+        lib_config = _load_lib_config()
+        if not api_key:
+            api_key = lib_config.get("api_key", "")
+        server_url = lib_config.get("server_url", "")
+
+        options = {"auto_optimize": True}
+        if precision_config_path:
+            options["precision_config"] = precision_config_path
+        if prequant_path:
+            options["mod_weights"] = prequant_path
+        if fused_mod:
+            options["fused_mod"] = True
+        if api_key:
+            options["api_key"] = api_key
+        if server_url:
+            options["server_url"] = server_url
+        if model_backend == "lighting":
+            options.setdefault("rotation_block_size", 256)
+
+        text_precision = "int4"
+        if config and isinstance(config, dict):
+            text_precision = config.pop("text_precision", text_precision)
+            options.update(config)
+
+        cfg = {
+            "model_dir": model_dir,
+            "transformer": transformer_path,
+            "backend": model_backend,
+            "precision": text_precision,
+            "scheduler": scheduler_config,
+            "device": int(device.split(":")[0]) if isinstance(device, str) else device,
             "options": options,
             "unload": manual_unload_model,
         }
@@ -1041,6 +1212,7 @@ class QuantFuncExport:
 NODE_CLASS_MAPPINGS = {
     "QuantFuncPipelineConfig": QuantFuncPipelineConfig,
     "QuantFuncModelLoader": QuantFuncModelLoader,
+    "QuantFuncModelAutoLoader": QuantFuncModelAutoLoader,
     "QuantFuncLoRALoader": QuantFuncLoRALoader,
     "QuantFuncLoRAConfig": QuantFuncLoRAConfig,
     "QuantFuncGenerate": QuantFuncGenerate,
@@ -1051,6 +1223,7 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "QuantFuncPipelineConfig": "QuantFunc Pipeline Config",
     "QuantFuncModelLoader": "QuantFunc Model Loader",
+    "QuantFuncModelAutoLoader": "QuantFunc Model Auto Loader",
     "QuantFuncLoRALoader": "QuantFunc LoRA",
     "QuantFuncLoRAConfig": "QuantFunc LoRA Config",
     "QuantFuncGenerate": "QuantFunc Generate",

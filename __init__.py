@@ -14,3 +14,10 @@ try:
     check_for_updates()
 except Exception as e:
     logging.getLogger("QuantFunc").debug("Auto-update check skipped: %s", e)
+
+# Refresh resource cache for ModelAutoLoader dropdowns (background)
+try:
+    from .model_auto_loader import refresh_cache_background
+    refresh_cache_background()
+except Exception as e:
+    logging.getLogger("QuantFunc").debug("Resource cache refresh skipped: %s", e)
