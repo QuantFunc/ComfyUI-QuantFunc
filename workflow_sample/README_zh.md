@@ -8,6 +8,7 @@
 
 | 工作流 | 说明 |
 |--------|------|
+| `QuantFunc-Easy-Gen.json` | 新手入门 3 节点工作流，自动下载模型，无需手动配置 |
 | `QuantFunc-Text-to-Image-Workflow.json` | 文生图（SVDQ + Lighting） |
 | `QuantFunc-Image-to-Image-Workflow.json` | 参考图像编辑（QwenImage-Edit） |
 | `QuantFunc-Model-Export.json` | 导出运行时量化模型（支持融合 LoRA） |

@@ -8,6 +8,7 @@ This directory contains example workflows for the QuantFunc ComfyUI plugin. Impo
 
 | Workflow | Description |
 |----------|-------------|
+| `QuantFunc-Easy-Gen.json` | Beginner-friendly 3-node workflow with auto-download (no manual setup) |
 | `QuantFunc-Text-to-Image-Workflow.json` | Text-to-image generation (SVDQ + Lighting) |
 | `QuantFunc-Image-to-Image-Workflow.json` | Reference-based image editing (QwenImage-Edit) |
 | `QuantFunc-Model-Export.json` | Export runtime-quantized models with LoRA fusion support |

@@ -118,6 +118,12 @@ If the library was not found:
 
 See [doc/](doc/) for detailed tutorials and [workflow_sample/README.md](workflow_sample/README.md) for node reference.
 
+### Must-Read for Beginners: Generate Your First Image in 3 Nodes
+
+The easiest way to get started — import the Easy Gen workflow, pick a model from the dropdown, and the plugin auto-downloads everything. No manual model downloads or path configuration needed.
+
+> **[Beginners: Easy Gen →](doc/tutorial-0-easy-gen.md)**
+
 ### 3.1 Runtime Quantization: Quantize BF16/FP16 Models to 4bit for Accelerated Inference
 
 The **Lighting backend** provides **runtime quantization** — it uses the Lighting engine to quantize any diffusers-format BF16/FP16 model (e.g., [Qwen/Qwen-Image-Edit-2511](https://huggingface.co/Qwen/Qwen-Image-Edit-2511)) to 4bit at load time for accelerated inference. Just set `model_backend` to `lighting` and leave `transformer_path` empty — no pre-quantized model download needed.
@@ -142,6 +148,7 @@ Import from `workflow_sample/`:
 
 | File | Use Case |
 |------|----------|
+| `QuantFunc-Easy-Gen.json` | **Beginners** — 3-node auto-download workflow |
 | `QuantFunc-Text-to-Image-Workflow.json` | Text-to-image (SVDQ + Lighting side by side) |
 | `QuantFunc-Image-to-Image-Workflow.json` | Image editing with reference images |
 | `QuantFunc-Model-Export.json` | Export runtime-quantized models (supports LoRA fusion) |
