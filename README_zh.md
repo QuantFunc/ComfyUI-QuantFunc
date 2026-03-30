@@ -71,6 +71,16 @@ ComfyUI/
 #### Linux
 
 ```bash
+# CUDA 12 运行时库
+sudo apt install cuda-libraries-12-8
+# 或单独安装：
+sudo apt install libcublas-12-8 libcurand-12-8 libcusolver-12-8 libcusparse-12-8 libnvjitlink-12-8
+
+# cuDNN 9
+sudo apt install libcudnn9-cuda-12
+
+# --- 或者 ---
+
 # CUDA 13 运行时库
 sudo apt install cuda-libraries-13-0
 # 或单独安装：
