@@ -731,9 +731,6 @@ class QuantFuncModelLoader:
                 "config": ("QUANTFUNC_CONFIG", {"tooltip": "Advanced pipeline config (from PipelineConfig node). If not connected, uses auto_optimize defaults."}),
                 "api_key": ("STRING", {"default": "", "tooltip": "QuantFunc API key for model authentication (e.g. qf_xxx). Server URL is read from config.json next to the library."}),
                 "scheduler_config": ("STRING", {"default": "", "tooltip": "Scheduler JSON config path (for Lightning models)"}),
-                "precision_config (optional)": ("STRING", {"default": " ", "tooltip": "Per-layer precision config JSON path (Lighting backend only)"}),
-                "prequant_weights (optional)": ("STRING", {"default": " ", "tooltip": "Pre-quantized modulation weights safetensors path (Lighting backend only)"}),
-                "fused_mod": ("BOOLEAN", {"default": False, "tooltip": "Fused INT8 SiLU+GEMV+bias+split6 for W8A8 modulation layers (Lighting backend only)"}),
                 "manual_unload_model": ("BOOLEAN", {"default": False, "tooltip": "Activate to manually unload the model and free GPU memory. No image will be generated."}),
             }
         }
@@ -751,13 +748,7 @@ class QuantFuncModelLoader:
         if scheduler_config and not os.path.exists(scheduler_config):
             logging.warning(f"[QuantFunc] scheduler_config path does not exist: {scheduler_config!r}, ignoring")
             scheduler_config = ""
-        precision_config = kwargs.get("precision_config (optional)", "")
-        precision_config = precision_config.strip() if isinstance(precision_config, str) else ""
-        prequant_weights = kwargs.get("prequant_weights (optional)", "")
-        prequant_weights = prequant_weights.strip() if isinstance(prequant_weights, str) else ""
         transformer_path = transformer_path if isinstance(transformer_path, str) and transformer_path else ""
-
-        fused_mod = kwargs.get("fused_mod", False)
 
         api_key = api_key.strip() if isinstance(api_key, str) else ""
 
@@ -768,12 +759,6 @@ class QuantFuncModelLoader:
         server_url = lib_config.get("server_url", "")
 
         options = {"auto_optimize": True}
-        if precision_config:
-            options["precision_config"] = precision_config
-        if prequant_weights:
-            options["mod_weights"] = prequant_weights
-        if fused_mod:
-            options["fused_mod"] = True
         if api_key:
             options["api_key"] = api_key
         if server_url:
@@ -806,15 +791,10 @@ class QuantFuncModelLoader:
 def _get_auto_loader_dropdowns():
     """Get dropdown options from resource cache (loaded at import time)."""
     try:
-        from .model_auto_loader import (
-            get_transformer_options, get_prequant_options,
-            get_precision_config_options,
-        )
-        return (get_transformer_options(),
-                get_prequant_options(),
-                get_precision_config_options())
+        from .model_auto_loader import get_transformer_options
+        return get_transformer_options()
     except Exception:
-        return ["None"], ["None"], ["None"]
+        return ["None"]
 
 
 class QuantFuncModelAutoLoader:
@@ -828,7 +808,7 @@ class QuantFuncModelAutoLoader:
     @classmethod
     def INPUT_TYPES(cls):
         from .model_auto_loader import MODEL_SERIES_LIST, _DATA_SOURCES
-        transformer_opts, prequant_opts, precision_opts = _get_auto_loader_dropdowns()
+        transformer_opts = _get_auto_loader_dropdowns()
         return {
             "required": {
                 "model_series": (MODEL_SERIES_LIST, {"tooltip": "Model series to download and load"}),
@@ -838,12 +818,9 @@ class QuantFuncModelAutoLoader:
             },
             "optional": {
                 "transformer": (transformer_opts, {"default": "None", "tooltip": "Transformer model variant. Format: Series/name. Select None to use base model's default transformer."}),
-                "prequant_weights": (prequant_opts, {"default": "None", "tooltip": "Pre-quantized modulation weights (Lighting only). Z-Image has no prequant — use None."}),
-                "precision_config": (precision_opts, {"default": "None", "tooltip": "Per-layer precision config (Lighting only). Format: Series/name."}),
                 "config": ("QUANTFUNC_CONFIG", {"tooltip": "Advanced pipeline config (from PipelineConfig node)"}),
                 "api_key": ("STRING", {"default": "", "tooltip": "QuantFunc API key for model authentication"}),
                 "scheduler_config": ("STRING", {"default": "", "tooltip": "Scheduler JSON config path (for Lightning models)"}),
-                "fused_mod": ("BOOLEAN", {"default": False, "tooltip": "Fused INT8 SiLU+GEMV+bias+split6 for W8A8 modulation layers (Lighting backend only)"}),
                 "manual_unload_model": ("BOOLEAN", {"default": False, "tooltip": "Activate to manually unload the model and free GPU memory."}),
             }
         }
@@ -855,14 +832,11 @@ class QuantFuncModelAutoLoader:
 
     def load_model(self, model_series, model_backend, device, data_source,
                    config=None, manual_unload_model=False,
-                   transformer="None", prequant_weights="None",
-                   precision_config="None", api_key="", scheduler_config="",
+                   transformer="None", api_key="", scheduler_config="",
                    **kwargs):
         from .model_auto_loader import (
             detect_gpu_variant, download_base_model,
-            download_transformer, download_prequant, download_precision_config,
-            resolve_transformer_selection, resolve_prequant_selection,
-            resolve_precision_config_selection,
+            download_transformer, resolve_transformer_selection,
         )
 
         # ── GPU variant & base model ──
@@ -876,22 +850,6 @@ class QuantFuncModelAutoLoader:
             if t_series and t_name:
                 transformer_path = download_transformer(t_series, t_name, data_source)
 
-        # ── Prequant weights ──
-        prequant_path = ""
-        if prequant_weights and prequant_weights != "None":
-            p_series, p_name = resolve_prequant_selection(prequant_weights, model_series)
-            if p_series and p_name:
-                prequant_path = download_prequant(p_series, p_name, data_source)
-
-        # ── Precision config ──
-        precision_config_path = ""
-        if precision_config and precision_config != "None":
-            pc_series, pc_name = resolve_precision_config_selection(
-                precision_config, model_series)
-            if pc_series and pc_name:
-                precision_config_path = download_precision_config(
-                    pc_series, pc_name, data_source)
-
         # ── Build pipeline config (same structure as ModelLoader) ──
         scheduler_config = scheduler_config.strip() if isinstance(scheduler_config, str) else ""
         if scheduler_config and not os.path.exists(scheduler_config):
@@ -899,7 +857,6 @@ class QuantFuncModelAutoLoader:
                             scheduler_config)
             scheduler_config = ""
 
-        fused_mod = kwargs.get("fused_mod", False)
         api_key = api_key.strip() if isinstance(api_key, str) else ""
 
         lib_config = _load_lib_config()
@@ -908,12 +865,6 @@ class QuantFuncModelAutoLoader:
         server_url = lib_config.get("server_url", "")
 
         options = {"auto_optimize": True}
-        if precision_config_path:
-            options["precision_config"] = precision_config_path
-        if prequant_path:
-            options["mod_weights"] = prequant_path
-        if fused_mod:
-            options["fused_mod"] = True
         if api_key:
             options["api_key"] = api_key
         if server_url:
