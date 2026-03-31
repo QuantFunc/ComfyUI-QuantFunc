@@ -628,9 +628,17 @@ try:
     _original_free_memory = _mm.free_memory
 
     def _hooked_free_memory(memory_required, device, keep_loaded=[], **kwargs):
-        if _manager._current_key is not None:
-            logging.info("[QuantFunc] Auto-unloading pipelines to free VRAM for other models")
-            _manager.destroy_all()
+        if _manager._current_key is not None and memory_required > 0:
+            # Only unload if there isn't enough free VRAM to satisfy the request
+            try:
+                import torch
+                free_vram, _ = torch.cuda.mem_get_info(device)
+            except Exception:
+                free_vram = 0
+            if free_vram < memory_required:
+                logging.info("[QuantFunc] Auto-unloading pipelines to free VRAM for other models "
+                             f"(need {memory_required // 1024**2} MB, free {free_vram // 1024**2} MB)")
+                _manager.destroy_all()
         return _original_free_memory(memory_required, device, keep_loaded=keep_loaded, **kwargs)
 
     _mm.free_memory = _hooked_free_memory
