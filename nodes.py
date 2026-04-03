@@ -1084,11 +1084,12 @@ class QuantFuncGenerate:
                 if neg and true_cfg_scale > 1.0:
                     t2i_opts["negative_prompt"] = neg
                     t2i_opts["true_cfg_scale"] = true_cfg_scale
-                if sampler_name != "euler":
-                    t2i_opts["sampler"] = sampler_name
+                t2i_opts["sampler"] = sampler_name
                 if sampler_eta > 0.0:
                     t2i_opts["eta"] = sampler_eta
                 opts_json = json.dumps(t2i_opts) if t2i_opts else None
+                logging.info("[QuantFunc] t2i sampler_name=%s, sampler_eta=%s, opts_json=%s",
+                             sampler_name, sampler_eta, opts_json)
 
                 arr = _manager.text_to_image(
                     prompt=prompt, height=height, width=width,
