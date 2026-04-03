@@ -295,12 +295,18 @@ class WorkerManager:
         raise RuntimeError(err)
 
     def _stderr_reader(self):
-        """Forward worker's stderr to logging."""
+        """Forward worker's stderr to logging and cache recent error lines."""
+        self._recent_stderr = []
         try:
             for line in self._process.stderr:
                 text = line.decode("utf-8", errors="replace").rstrip()
                 if text:
                     logging.info("[QuantFunc-worker] %s", text)
+                    # Cache recent lines with error/warning keywords for crash diagnostics
+                    if any(k in text.lower() for k in ("error", "fatal", "exception", "oom", "abort", "segfault")):
+                        self._recent_stderr.append(text)
+                        if len(self._recent_stderr) > 10:
+                            self._recent_stderr.pop(0)
         except Exception:
             pass
 
@@ -345,22 +351,26 @@ class WorkerManager:
         self._stdin.write(data)
         self._stdin.flush()
 
+    _SENTINEL_TIMEOUT = "__timeout__"
+    _SENTINEL_WORKER_DIED = "__worker_died__"
+
     def _read_response(self, timeout=600):
         """Read one JSON line from worker stdout."""
         # Simple blocking read with timeout via thread
-        result = [None]
+        result = [self._SENTINEL_TIMEOUT]  # default = timeout
         def reader():
             try:
                 line = self._stdout.readline()
                 if line:
                     result[0] = json.loads(line.decode("utf-8").strip())
+                else:
+                    # Empty line = worker process exited (stdout closed)
+                    result[0] = self._SENTINEL_WORKER_DIED
             except Exception as e:
                 result[0] = {"type": "error", "error_message": str(e)}
         t = threading.Thread(target=reader, daemon=True)
         t.start()
         t.join(timeout=timeout)
-        if t.is_alive():
-            return None  # timeout
         return result[0]
 
     def _read_binary(self, n_bytes):
@@ -373,15 +383,35 @@ class WorkerManager:
             data += chunk
         return data
 
-    def _call(self, cmd, progress_cb=None, timeout=600):
+    def _call(self, cmd, progress_cb=None, timeout=1800):
         """Send command and collect response, relaying progress."""
         self._send_command(cmd)
 
         while True:
             resp = self._read_response(timeout=timeout)
-            if resp is None:
+            if resp is self._SENTINEL_TIMEOUT:
                 self._kill_worker()
-                raise RuntimeError("Worker timeout")
+                raise RuntimeError(f"Worker timeout after {timeout}s — the operation took too long. "
+                                   "Try a smaller resolution or fewer steps.")
+            if resp is self._SENTINEL_WORKER_DIED:
+                # Worker crashed — read cached stderr error lines
+                import time
+                time.sleep(0.5)  # let stderr reader finish flushing
+                stderr_lines = getattr(self, "_recent_stderr", [])
+                error_detail = stderr_lines[-1] if stderr_lines else ""
+                # Also check exit code
+                exit_code = None
+                try:
+                    exit_code = self._process.poll()
+                except Exception:
+                    pass
+                self._kill_worker()
+                if not error_detail:
+                    error_detail = f"Worker process crashed (exit code: {exit_code}, no error details captured)"
+                else:
+                    error_detail = f"Worker crashed (exit code: {exit_code}): {error_detail}"
+                logging.error(f"[QuantFunc] {error_detail}")
+                raise RuntimeError(error_detail)
 
             msg_type = resp.get("type", "")
 
