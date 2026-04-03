@@ -464,7 +464,7 @@ class WorkerManager:
                          f"device={create_cmd['device_idx']!r}, "
                          f"config_json={create_cmd['config_json']!r}")
 
-            self._call(create_cmd, timeout=600)
+            self._call(create_cmd, timeout=1800)
             self._current_key = key
             self._current_api_key = new_api_key
             logging.info("[QuantFunc] Pipeline ready.")
