@@ -733,6 +733,9 @@ class QuantFuncModelLoader:
                 "config": ("QUANTFUNC_CONFIG", {"tooltip": "Advanced pipeline config (from PipelineConfig node). If not connected, uses auto_optimize defaults."}),
                 "api_key": ("STRING", {"default": "", "tooltip": "QuantFunc API key for model authentication (e.g. qf_xxx). Server URL is read from config.json next to the library."}),
                 "scheduler_config": ("STRING", {"default": "", "tooltip": "Scheduler JSON config path (for Lightning models)"}),
+                "precision_config": ("STRING", {"default": "", "tooltip": "Per-layer precision config JSON path (Lighting backend only)"}),
+                "prequant_weights": ("STRING", {"default": "", "tooltip": "Pre-quantized modulation weights safetensors path (Lighting backend only)"}),
+                "fused_mod": ("BOOLEAN", {"default": False, "tooltip": "Fused INT8 SiLU+GEMV+bias+split6 for W8A8 modulation layers (Lighting backend only)"}),
                 "manual_unload_model": ("BOOLEAN", {"default": False, "tooltip": "Activate to manually unload the model and free GPU memory. No image will be generated."}),
             }
         }
@@ -744,12 +747,16 @@ class QuantFuncModelLoader:
 
     def load_model(self, model_dir, transformer_path, model_backend,
                    device, config=None, manual_unload_model=False,
-                   api_key="", scheduler_config="", **kwargs):
+                   api_key="", scheduler_config="",
+                   precision_config="", prequant_weights="",
+                   fused_mod=False, **kwargs):
         scheduler_config = scheduler_config.strip() if isinstance(scheduler_config, str) else ""
         # Validate: scheduler_config must be a file path (not a bare number or random text)
         if scheduler_config and not os.path.exists(scheduler_config):
             logging.warning(f"[QuantFunc] scheduler_config path does not exist: {scheduler_config!r}, ignoring")
             scheduler_config = ""
+        precision_config = precision_config.strip() if isinstance(precision_config, str) else ""
+        prequant_weights = prequant_weights.strip() if isinstance(prequant_weights, str) else ""
         transformer_path = transformer_path if isinstance(transformer_path, str) and transformer_path else ""
 
         api_key = api_key.strip() if isinstance(api_key, str) else ""
@@ -761,6 +768,12 @@ class QuantFuncModelLoader:
         server_url = lib_config.get("server_url", "")
 
         options = {"auto_optimize": True}
+        if precision_config:
+            options["precision_config"] = precision_config
+        if prequant_weights:
+            options["mod_weights"] = prequant_weights
+        if fused_mod:
+            options["fused_mod"] = True
         if api_key:
             options["api_key"] = api_key
         if server_url:
