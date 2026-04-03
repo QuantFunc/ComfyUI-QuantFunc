@@ -160,10 +160,15 @@ class WorkerManager:
                     extra.insert(0, cuda_bin)
             env["PATH"] = os.pathsep.join(extra) + os.pathsep + env.get("PATH", "")
         else:
+            ld_parts = [dll_dir]
             cuda_path = env.get("CUDA_PATH", "/usr/local/cuda")
             lib64 = os.path.join(cuda_path, "lib64")
             if os.path.isdir(lib64):
-                env["LD_LIBRARY_PATH"] = lib64 + ":" + env.get("LD_LIBRARY_PATH", "")
+                ld_parts.append(lib64)
+            existing = env.get("LD_LIBRARY_PATH", "")
+            if existing:
+                ld_parts.append(existing)
+            env["LD_LIBRARY_PATH"] = os.pathsep.join(ld_parts)
         return env
 
     def _start_worker(self, dll_path, env):
@@ -254,7 +259,7 @@ class WorkerManager:
 
     def _ensure_worker(self):
         """Start worker process if not running.
-        On first DLL load failure (Windows), downloads deps and retries once.
+        On first load failure, downloads deps and retries once.
         """
         if self._process is not None and self._process.poll() is None:
             return
@@ -283,8 +288,8 @@ class WorkerManager:
         if ok:
             return
 
-        # On Windows, first failure may be missing dep DLLs — download and retry
-        if _IS_WINDOWS and self._try_download_deps(dll_path):
+        # First failure may be missing dependency libs — download and retry
+        if self._try_download_deps(dll_path):
             logging.info("[QuantFunc] Dependencies installed, retrying worker...")
             env = self._build_worker_env(dll_dir)  # rebuild (deps now in dll_dir)
             ok2, err2 = self._start_worker(dll_path, env)

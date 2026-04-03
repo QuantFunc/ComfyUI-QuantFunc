@@ -204,12 +204,21 @@ def _load_dll(dll_path):
                     log(f"  add_dll_directory FAILED: {d} ({e})")
         os.environ["PATH"] = os.pathsep.join(extra_dirs) + os.pathsep + os.environ.get("PATH", "")
 
+    if platform.system() != "Windows":
+        # Ensure dll_dir is in LD_LIBRARY_PATH so extracted dep .so files are found
+        dll_dir_abs = os.path.abspath(dll_dir)
+        ld_path = os.environ.get("LD_LIBRARY_PATH", "")
+        if dll_dir_abs not in ld_path.split(os.pathsep):
+            os.environ["LD_LIBRARY_PATH"] = dll_dir_abs + os.pathsep + ld_path
+            log(f"  Added {dll_dir_abs} to LD_LIBRARY_PATH")
+
     log(f"Loading DLL: {dll_path}")
     try:
         _lib = ctypes.CDLL(dll_path)
     except OSError as e:
         log(f"CDLL failed: {e}")
-        log(f"Extra dirs searched: {extra_dirs if platform.system() == 'Windows' else 'N/A'}")
+        ld_info = os.environ.get("LD_LIBRARY_PATH", "N/A") if platform.system() != "Windows" else "N/A"
+        log(f"Extra dirs searched: {extra_dirs if platform.system() == 'Windows' else ld_info}")
         raise
 
     # Function signatures

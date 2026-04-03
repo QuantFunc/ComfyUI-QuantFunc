@@ -105,11 +105,12 @@ def get_lib_names(cuda_major: int):
 
 
 def get_dep_zip_name(cuda_major: int) -> str:
-    """Return dependency zip filename for the given CUDA version."""
+    """Return dependency zip filename for the given CUDA version and platform."""
+    plat = "win32" if _IS_WINDOWS else "linux"
     if cuda_major <= 12:
-        return "cu12-dep-win32.zip"
+        return f"cu12-dep-{plat}.zip"
     else:
-        return "cu13-dep-win32.zip"
+        return f"cu13-dep-{plat}.zip"
 
 
 def _collect_dll_dirs(dll_path: str) -> list:
@@ -122,6 +123,28 @@ def _collect_dll_dirs(dll_path: str) -> list:
     extra_dirs = [dll_dir]
 
     if not _IS_WINDOWS:
+        # Linux: collect CUDA lib directories
+        cuda_path = os.environ.get("CUDA_PATH", "")
+        if not cuda_path:
+            # Auto-detect highest CUDA toolkit
+            for ver in [13, 12]:
+                candidate = f"/usr/local/cuda-{ver}"
+                if os.path.isdir(candidate):
+                    cuda_path = candidate
+                    break
+            if not cuda_path and os.path.isdir("/usr/local/cuda"):
+                cuda_path = "/usr/local/cuda"
+        if cuda_path:
+            for sub in ["lib64", "lib"]:
+                d = os.path.join(cuda_path, sub)
+                if os.path.isdir(d):
+                    extra_dirs.append(d)
+
+        # LD_LIBRARY_PATH dirs containing CUDA .so files
+        for p in os.environ.get("LD_LIBRARY_PATH", "").split(os.pathsep):
+            if p and os.path.isdir(p) and p not in extra_dirs:
+                extra_dirs.append(p)
+
         return extra_dirs
 
     # CUDA toolkit bin
@@ -195,6 +218,8 @@ def _test_load_dll(dll_path: str) -> tuple:
         "        except OSError:\n"
         "            pass\n"
         "os.environ['PATH'] = os.pathsep.join(dirs) + os.pathsep + os.environ.get('PATH', '')\n"
+        "if platform.system() != 'Windows':\n"
+        "    os.environ['LD_LIBRARY_PATH'] = os.pathsep.join(dirs) + os.pathsep + os.environ.get('LD_LIBRARY_PATH', '')\n"
         "try:\n"
         "    lib = ctypes.CDLL(dll_path)\n"
         "    lib.quantfunc_version.restype = ctypes.c_char_p\n"
