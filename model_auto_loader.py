@@ -459,6 +459,22 @@ def _resolve_selection(selection, model_series, resource_label):
         resource_label, short_name))
 
 
+def resolve_selection_no_series(selection, resource_label):
+    """Parse a 'SeriesShort/name' dropdown value without model_series validation.
+    Returns (series_full_name, name) or (None, None) if 'None'.
+    """
+    if not selection or selection == "None":
+        return None, None
+    if "/" not in selection:
+        return None, None
+    short_name, name = selection.split("/", 1)
+    for s in MODEL_SERIES_LIST:
+        if s.endswith("/" + short_name):
+            return s, name
+    raise ValueError("Unknown series in {} selection: {}".format(
+        resource_label, short_name))
+
+
 def resolve_transformer_selection(selection, model_series):
     return _resolve_selection(selection, model_series, "Transformer")
 

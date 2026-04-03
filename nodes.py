@@ -847,6 +847,24 @@ def _get_auto_loader_dropdowns():
         return ["None"]
 
 
+def _get_prequant_dropdowns():
+    """Get prequant weight dropdown options from resource cache."""
+    try:
+        from .model_auto_loader import get_prequant_options
+        return get_prequant_options()
+    except Exception:
+        return ["None"]
+
+
+def _get_precision_config_dropdowns():
+    """Get precision config dropdown options from resource cache."""
+    try:
+        from .model_auto_loader import get_precision_config_options
+        return get_precision_config_options()
+    except Exception:
+        return ["None"]
+
+
 class QuantFuncModelAutoLoader:
     """Auto-download and load QuantFunc models.
 
@@ -870,7 +888,6 @@ class QuantFuncModelAutoLoader:
                 "transformer": (transformer_opts, {"default": "None", "tooltip": "Transformer model variant. Format: Series/name. Select None to use base model's default transformer."}),
                 "config": ("QUANTFUNC_CONFIG", {"tooltip": "Advanced pipeline config (from PipelineConfig node)"}),
                 "api_key": ("STRING", {"default": "", "tooltip": "QuantFunc API key for model authentication"}),
-                "scheduler_config": ("STRING", {"default": "", "tooltip": "Scheduler JSON config path (for Lightning models)"}),
                 "manual_unload_model": ("BOOLEAN", {"default": False, "tooltip": "Activate to manually unload the model and free GPU memory."}),
             }
         }
@@ -882,7 +899,7 @@ class QuantFuncModelAutoLoader:
 
     def load_model(self, model_series, model_backend, device, data_source,
                    config=None, manual_unload_model=False,
-                   transformer="None", api_key="", scheduler_config="",
+                   transformer="None", api_key="",
                    **kwargs):
         from .model_auto_loader import (
             detect_gpu_variant, download_base_model,
@@ -901,12 +918,6 @@ class QuantFuncModelAutoLoader:
                 transformer_path = download_transformer(t_series, t_name, data_source)
 
         # ── Build pipeline config (same structure as ModelLoader) ──
-        scheduler_config = scheduler_config.strip() if isinstance(scheduler_config, str) else ""
-        if scheduler_config and not os.path.exists(scheduler_config):
-            logging.warning("[QuantFunc] scheduler_config path does not exist: %r, ignoring",
-                            scheduler_config)
-            scheduler_config = ""
-
         api_key = api_key.strip() if isinstance(api_key, str) else ""
 
         lib_config = _load_lib_config()
@@ -932,12 +943,95 @@ class QuantFuncModelAutoLoader:
             "transformer": transformer_path,
             "backend": model_backend,
             "precision": text_precision,
-            "scheduler": scheduler_config,
             "device": int(device.split(":")[0]) if isinstance(device, str) else device,
             "options": options,
             "unload": manual_unload_model,
         }
         return (cfg,)
+
+
+# ============================================================================
+# Node: QuantFunc Prequant Auto Loader
+# ============================================================================
+
+class QuantFuncPrequantAutoLoader:
+    """Auto-download prequant weights from HuggingFace or ModelScope.
+
+    Outputs a file path string that can be connected to ModelLoader's
+    prequant_weights input. When not connected, ModelLoader falls back
+    to its own text input field.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        from .model_auto_loader import _DATA_SOURCES
+        prequant_opts = _get_prequant_dropdowns()
+        return {
+            "required": {
+                "prequant": (prequant_opts, {"default": "None", "tooltip": "Pre-quantized modulation weights. Format: Series/name. Select None to skip."}),
+                "data_source": (_DATA_SOURCES, {"default": "modelscope", "tooltip": "Download source: modelscope (China) or huggingface"}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("prequant_weights",)
+    FUNCTION = "load_prequant"
+    CATEGORY = "QuantFunc"
+
+    def load_prequant(self, prequant, data_source):
+        if not prequant or prequant == "None":
+            return ("",)
+
+        from .model_auto_loader import resolve_selection_no_series, download_prequant
+
+        pq_series, pq_name = resolve_selection_no_series(prequant, "Prequant")
+        if not pq_series or not pq_name:
+            return ("",)
+
+        path = download_prequant(pq_series, pq_name, data_source)
+        return (path,)
+
+
+# ============================================================================
+# Node: QuantFunc Precision Config Auto Loader
+# ============================================================================
+
+class QuantFuncPrecisionConfigAutoLoader:
+    """Auto-download precision config from HuggingFace or ModelScope.
+
+    Outputs a file path string that can be connected to ModelLoader's
+    precision_config input. When not connected, ModelLoader falls back
+    to its own text input field.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        from .model_auto_loader import _DATA_SOURCES
+        pc_opts = _get_precision_config_dropdowns()
+        return {
+            "required": {
+                "precision_config": (pc_opts, {"default": "None", "tooltip": "Per-layer precision config JSON. Format: Series/name. Select None to skip."}),
+                "data_source": (_DATA_SOURCES, {"default": "modelscope", "tooltip": "Download source: modelscope (China) or huggingface"}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("precision_config",)
+    FUNCTION = "load_precision_config"
+    CATEGORY = "QuantFunc"
+
+    def load_precision_config(self, precision_config, data_source):
+        if not precision_config or precision_config == "None":
+            return ("",)
+
+        from .model_auto_loader import resolve_selection_no_series, download_precision_config
+
+        pc_series, pc_name = resolve_selection_no_series(precision_config, "Precision config")
+        if not pc_series or not pc_name:
+            return ("",)
+
+        path = download_precision_config(pc_series, pc_name, data_source)
+        return (path,)
 
 
 # ============================================================================
@@ -1250,6 +1344,8 @@ NODE_CLASS_MAPPINGS = {
     "QuantFuncPipelineConfig": QuantFuncPipelineConfig,
     "QuantFuncModelLoader": QuantFuncModelLoader,
     "QuantFuncModelAutoLoader": QuantFuncModelAutoLoader,
+    "QuantFuncPrequantAutoLoader": QuantFuncPrequantAutoLoader,
+    "QuantFuncPrecisionConfigAutoLoader": QuantFuncPrecisionConfigAutoLoader,
     "QuantFuncLoRALoader": QuantFuncLoRALoader,
     "QuantFuncLoRAConfig": QuantFuncLoRAConfig,
     "QuantFuncGenerate": QuantFuncGenerate,
@@ -1261,6 +1357,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "QuantFuncPipelineConfig": "QuantFunc Pipeline Config",
     "QuantFuncModelLoader": "QuantFunc Model Loader",
     "QuantFuncModelAutoLoader": "QuantFunc Model Auto Loader",
+    "QuantFuncPrequantAutoLoader": "QuantFunc Prequant Auto Loader",
+    "QuantFuncPrecisionConfigAutoLoader": "QuantFunc Precision Config Auto Loader",
     "QuantFuncLoRALoader": "QuantFunc LoRA",
     "QuantFuncLoRAConfig": "QuantFunc LoRA Config",
     "QuantFuncGenerate": "QuantFunc Generate",
