@@ -506,7 +506,8 @@ class WorkerManager:
             return self._read_image(resp)
 
     def image_to_image(self, prompt, ref_paths, height, width, steps, seed,
-                       true_cfg_scale=4.0, negative_prompt="", pbar=None):
+                       true_cfg_scale=4.0, negative_prompt="",
+                       options_json=None, pbar=None):
         """Generate image-to-image. Returns [H, W, 3] float32 numpy array."""
         with self._lock:
             self._ensure_worker()
@@ -526,6 +527,7 @@ class WorkerManager:
                 "true_cfg_scale": true_cfg_scale,
                 "negative_prompt": negative_prompt,
                 "seed": seed,
+                "options_json": options_json,
             }
 
             resp = self._call(cmd, progress_cb=on_progress, timeout=600)
@@ -992,6 +994,22 @@ class QuantFuncGenerate:
                 "ref_images": ("QUANTFUNC_IMAGE_LIST", {"tooltip": "Reference images for edit mode (from ImageList node)"}),
                 "negative_prompt": ("STRING", {"default": "", "multiline": True}),
                 "true_cfg_scale": ("FLOAT", {"default": 4.0, "min": 1.0, "max": 30.0, "step": 0.1}),
+                "sampler_name": (["euler", "heun", "dpm++2m", "dpm++2m_sde", "euler_a", "ddim"], {
+                    "default": "euler",
+                    "tooltip": "Sampling algorithm:\n"
+                               "• euler — 1st order, fast, deterministic\n"
+                               "• heun — 2nd order, higher quality, 2x slower\n"
+                               "• dpm++2m — 2nd order multistep, deterministic\n"
+                               "• dpm++2m_sde — dpm++2m + noise (use sampler_eta)\n"
+                               "• euler_a — euler + noise (use sampler_eta)\n"
+                               "• ddim — classic DDIM, deterministic (eta=0) or stochastic (eta>0)",
+                }),
+                "sampler_eta": ("FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "Noise scale for stochastic samplers (dpm++2m_sde, euler_a, ddim).\n"
+                               "0 = deterministic (no effect). Only used by stochastic samplers.\n"
+                               "Recommended 0.2~0.5 for ≤20 steps. Higher eta needs more steps.",
+                }),
             }
         }
 
@@ -1003,7 +1021,8 @@ class QuantFuncGenerate:
 
     def generate(self, pipeline, prompt, width, height, steps, seed,
                  guidance_scale, ref_images=None,
-                 negative_prompt="", true_cfg_scale=4.0):
+                 negative_prompt="", true_cfg_scale=4.0,
+                 sampler_name="euler", sampler_eta=0.0):
         import torch
 
         # Handle unload request
@@ -1048,17 +1067,27 @@ class QuantFuncGenerate:
                         tmp_paths.append(tmp_path)
 
                 neg = negative_prompt if isinstance(negative_prompt, str) and negative_prompt else ""
+                i2i_opts = {}
+                if sampler_name != "euler":
+                    i2i_opts["sampler"] = sampler_name
+                if sampler_eta > 0.0:
+                    i2i_opts["eta"] = sampler_eta
+                i2i_opts_json = json.dumps(i2i_opts) if i2i_opts else None
                 arr = _manager.image_to_image(
                     prompt=prompt, ref_paths=tmp_paths,
                     height=height, width=width, steps=steps, seed=seed,
                     true_cfg_scale=true_cfg_scale, negative_prompt=neg,
-                    pbar=pbar)
+                    options_json=i2i_opts_json, pbar=pbar)
             else:
                 t2i_opts = {}
                 neg = negative_prompt if isinstance(negative_prompt, str) and negative_prompt else ""
                 if neg and true_cfg_scale > 1.0:
                     t2i_opts["negative_prompt"] = neg
                     t2i_opts["true_cfg_scale"] = true_cfg_scale
+                if sampler_name != "euler":
+                    t2i_opts["sampler"] = sampler_name
+                if sampler_eta > 0.0:
+                    t2i_opts["eta"] = sampler_eta
                 opts_json = json.dumps(t2i_opts) if t2i_opts else None
 
                 arr = _manager.text_to_image(
