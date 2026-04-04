@@ -1442,6 +1442,11 @@ class QuantFuncGenerate:
         # Auto-detect edit mode from ref_images
         cfg = dict(pipeline)
         cfg["options"] = dict(cfg.get("options", {}))
+        # Unpack ImageList dict format
+        keep_ref_img_size = False
+        if ref_images is not None and isinstance(ref_images, dict):
+            keep_ref_img_size = ref_images.get("keep_ref_img_size", False)
+            ref_images = ref_images["images"]
         if ref_images is not None:
             cfg["options"]["edit_mode"] = True
 
@@ -1474,6 +1479,8 @@ class QuantFuncGenerate:
                     i2i_opts["sampler"] = sampler_name
                 if sampler_eta > 0.0:
                     i2i_opts["eta"] = sampler_eta
+                if keep_ref_img_size:
+                    i2i_opts["keep_ref_img_size"] = True
                 i2i_opts_json = json.dumps(i2i_opts) if i2i_opts else None
                 arr = _manager.image_to_image(
                     prompt=prompt, ref_paths=tmp_paths,
@@ -1516,6 +1523,10 @@ class QuantFuncImageList:
     @classmethod
     def INPUT_TYPES(cls):
         optional = {f"image{i}": ("IMAGE",) for i in range(2, 11)}
+        optional["keep_ref_img_size"] = ("BOOLEAN", {
+            "default": False,
+            "tooltip": "Keep reference image original size for better quality (slower speed)",
+        })
         return {
             "required": {
                 "image1": ("IMAGE",),
@@ -1528,13 +1539,13 @@ class QuantFuncImageList:
     FUNCTION = "combine"
     CATEGORY = "QuantFunc"
 
-    def combine(self, image1, **kwargs):
+    def combine(self, image1, keep_ref_img_size=False, **kwargs):
         images = [image1]
         for i in range(2, 11):
             img = kwargs.get(f"image{i}")
             if img is not None:
                 images.append(img)
-        return (images,)
+        return ({"images": images, "keep_ref_img_size": keep_ref_img_size},)
 
 
 # ============================================================================
