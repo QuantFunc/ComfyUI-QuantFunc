@@ -1035,6 +1035,53 @@ class QuantFuncPrecisionConfigAutoLoader:
 
 
 # ============================================================================
+# Node: QuantFunc Base Model Auto Loader
+# ============================================================================
+
+def _get_base_model_repo_dropdowns():
+    """Get base model repo dropdown options from cache."""
+    try:
+        from .model_auto_loader import get_base_model_repo_options
+        return get_base_model_repo_options()
+    except Exception:
+        return ["None"]
+
+
+class QuantFuncBaseModelAutoLoader:
+    """Auto-discover and download base models from ModelScope upstream repos.
+
+    Searches Qwen/ for Image series (e.g. Qwen/Qwen-Image-2512) and
+    Tongyi-MAI/ for Z-Image series (e.g. Tongyi-MAI/Z-Image-Turbo).
+    Downloads the full model repo on first use.
+    Outputs the local model directory path as a string.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        from .model_auto_loader import _DATA_SOURCES
+        repo_opts = _get_base_model_repo_dropdowns()
+        return {
+            "required": {
+                "base_model_repo": (repo_opts, {"tooltip": "Upstream base model repository. Auto-discovered from ModelScope."}),
+                "data_source": (_DATA_SOURCES, {"default": "modelscope", "tooltip": "Download source: modelscope (China) or huggingface"}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("model_dir",)
+    FUNCTION = "load_base_model"
+    CATEGORY = "QuantFunc"
+
+    def load_base_model(self, base_model_repo, data_source):
+        if not base_model_repo or base_model_repo == "None":
+            return ("",)
+
+        from .model_auto_loader import download_base_model_repo
+        path = download_base_model_repo(base_model_repo, data_source)
+        return (path,)
+
+
+# ============================================================================
 # Node: QuantFunc LoRA
 # ============================================================================
 
@@ -1346,6 +1393,7 @@ NODE_CLASS_MAPPINGS = {
     "QuantFuncModelAutoLoader": QuantFuncModelAutoLoader,
     "QuantFuncPrequantAutoLoader": QuantFuncPrequantAutoLoader,
     "QuantFuncPrecisionConfigAutoLoader": QuantFuncPrecisionConfigAutoLoader,
+    "QuantFuncBaseModelAutoLoader": QuantFuncBaseModelAutoLoader,
     "QuantFuncLoRALoader": QuantFuncLoRALoader,
     "QuantFuncLoRAConfig": QuantFuncLoRAConfig,
     "QuantFuncGenerate": QuantFuncGenerate,
@@ -1359,6 +1407,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "QuantFuncModelAutoLoader": "QuantFunc Model Auto Loader",
     "QuantFuncPrequantAutoLoader": "QuantFunc Prequant Auto Loader",
     "QuantFuncPrecisionConfigAutoLoader": "QuantFunc Precision Config Auto Loader",
+    "QuantFuncBaseModelAutoLoader": "QuantFunc Base Model Auto Loader",
     "QuantFuncLoRALoader": "QuantFunc LoRA",
     "QuantFuncLoRAConfig": "QuantFunc LoRA Config",
     "QuantFuncGenerate": "QuantFunc Generate",

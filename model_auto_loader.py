@@ -487,5 +487,135 @@ def resolve_precision_config_selection(selection, model_series):
     return _resolve_selection(selection, model_series, "Precision config")
 
 
+# ============================================================================
+# Base model repo discovery and download
+# ============================================================================
+
+# Search configs: (org, keyword_filter)
+_BASE_MODEL_SEARCH_CONFIGS = [
+    ("Qwen", lambda name: "image" in name.lower()),
+    ("Tongyi-MAI", lambda name: "z-image" in name.lower() or "zimage" in name.lower()),
+]
+
+_BASE_MODEL_CACHE_KEY = "__base_model_repos__"
+_base_model_repos = []  # list of "org/repo" strings
+_base_model_lock = threading.Lock()
+
+
+def _search_base_model_repos():
+    """Search ModelScope for available base model repositories."""
+    if not _ensure_modelscope():
+        return []
+    from modelscope.hub.api import HubApi
+    api = HubApi()
+    repos = []
+    for org, name_filter in _BASE_MODEL_SEARCH_CONFIGS:
+        try:
+            result = api.list_models(org, page_size=100)
+            models = result.get("Models", []) if isinstance(result, dict) else result
+            if not models:
+                continue
+            for m in models:
+                name = m.get("Name", "") or ""
+                path = m.get("Path", "") or org
+                model_id = "{}/{}".format(path, name)
+                if name_filter(name):
+                    if model_id not in repos:
+                        repos.append(model_id)
+        except Exception as e:
+            logger.debug("Base model search failed for %s: %s", org, e)
+    return sorted(repos)
+
+
+def _refresh_base_model_repos():
+    """Refresh the list of available base model repos."""
+    global _base_model_repos
+    # ModelScope is a China service; proxies may interfere
+    saved = {}
+    for key in ("https_proxy", "http_proxy", "HTTPS_PROXY", "HTTP_PROXY"):
+        if key in os.environ:
+            saved[key] = os.environ.pop(key)
+    try:
+        repos = _search_base_model_repos()
+    finally:
+        os.environ.update(saved)
+    if repos:
+        with _base_model_lock:
+            _base_model_repos = repos
+            # Persist to resource cache
+            _resource_cache[_BASE_MODEL_CACHE_KEY] = repos
+            _save_cache()
+        print("[QuantFunc] Base model repos discovered: {}".format(repos))
+
+
+def _load_base_model_repos_from_cache():
+    """Load base model repo list from resource cache."""
+    global _base_model_repos
+    with _base_model_lock:
+        cached = _resource_cache.get(_BASE_MODEL_CACHE_KEY, [])
+        if cached:
+            _base_model_repos = cached
+
+
+def get_base_model_repo_options():
+    """Get dropdown options for base model repos."""
+    with _base_model_lock:
+        return list(_base_model_repos) if _base_model_repos else ["None"]
+
+
+def refresh_base_model_repos_background():
+    """Start background thread to refresh base model repo list."""
+    t = threading.Thread(target=_refresh_base_model_repos, daemon=True,
+                         name="QuantFunc-BaseModelRepoSearch")
+    t.start()
+
+
+def download_base_model_repo(repo_id, data_source):
+    """Download a base model from its upstream repo (e.g. Qwen/Qwen-Image-2512).
+
+    Downloads the full repo to ComfyUI/models/QuantFunc/<repo_name>/.
+    Returns local model directory path.
+    """
+    repo_name = repo_id.split("/")[-1]
+    local_dir = os.path.join(get_models_dir(), repo_name)
+    marker = os.path.join(local_dir, _DOWNLOAD_MARKER)
+
+    if os.path.exists(marker):
+        # Check vision_encoder integrity for Qwen-Image-Edit models
+        if "image-edit" in repo_name.lower() or "Image-Edit" in repo_name:
+            _check_vision_encoder(local_dir, marker)
+        if os.path.exists(marker):
+            return local_dir
+
+    os.makedirs(local_dir, exist_ok=True)
+    if os.path.isdir(local_dir) and os.listdir(local_dir):
+        print("[QuantFunc] Resuming incomplete download: {}...".format(repo_id))
+    else:
+        print("[QuantFunc] Downloading base model: {} from {}...".format(
+            repo_id, data_source))
+
+    if data_source == "huggingface":
+        if not _ensure_huggingface_hub():
+            raise RuntimeError("Cannot install huggingface_hub")
+        from huggingface_hub import snapshot_download
+        snapshot_download(repo_id=repo_id, local_dir=local_dir)
+    else:
+        if not _ensure_modelscope():
+            raise RuntimeError("Cannot install modelscope")
+        from modelscope import snapshot_download as ms_download
+        ms_download(model_id=repo_id, local_dir=local_dir)
+
+    if not os.path.exists(os.path.join(local_dir, "model_index.json")):
+        raise RuntimeError(
+            "Download completed but model_index.json not found in {}.\n"
+            "Check the repo structure.".format(local_dir))
+
+    with open(marker, "w") as f:
+        f.write("ok")
+    print("[QuantFunc] Base model ready: {}".format(local_dir))
+    return local_dir
+
+
 # ── Load cache on import ──
 _load_cache()
+_load_base_model_repos_from_cache()
