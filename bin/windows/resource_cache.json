@@ -56,5 +56,15 @@
       "50x-above-fp4-sample.json",
       "50x-below-int4-sample.json"
     ]
-  }
+  },
+  "__base_model_repos__": [
+    "Qwen/Qwen-Image",
+    "Qwen/Qwen-Image-2512",
+    "Qwen/Qwen-Image-Edit",
+    "Qwen/Qwen-Image-Edit-2509",
+    "Qwen/Qwen-Image-Edit-2511",
+    "Qwen/Qwen-Image-Layered",
+    "Tongyi-MAI/Z-Image",
+    "Tongyi-MAI/Z-Image-Turbo"
+  ]
 }

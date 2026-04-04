@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(GIT_COMMITTER_NAME=\"QuantFunc\" GIT_COMMITTER_EMAIL=\"dev@quantfunc.com\" git filter-branch -f --env-filter 'export GIT_AUTHOR_NAME=\"\"QuantFunc\"\"; export GIT_AUTHOR_EMAIL=\"\"dev@quantfunc.com\"\"; export GIT_COMMITTER_NAME=\"\"QuantFunc\"\"; export GIT_COMMITTER_EMAIL=\"\"dev@quantfunc.com\"\"' 537eacb~1..HEAD)",
+      "WebFetch(domain:www.modelscope.cn)",
+      "Bash(curl -s \"https://www.modelscope.cn/models/QuantFunc/Plugin/resolve/master/version.json\")",
+      "Bash(curl -sk \"https://www.modelscope.cn/models/QuantFunc/Plugin/resolve/master/version.json\")",
+      "Bash(curl:*)",
+      "Bash(python -c ':*)",
+      "Bash(python -c \"import sys,json; data=json.load\\(sys.stdin\\); print\\(json.dumps\\(data, indent=2\\)\\)\")",
+      "Bash(python:*)",
+      "Bash('g:\\\\ComfyUI_windows_portable_nvidia_cu121_or_cpu\\\\ComfyUI_windows_portable\\\\python_embeded\\\\python.exe' -c ':*)",
+      "Bash(g:\\\\ComfyUI_windows_portable_nvidia_cu121_or_cpu\\\\ComfyUI_windows_portable\\\\python_embeded\\\\python.exe:*)",
+      "Bash(timeout 15 'g:\\\\ComfyUI_windows_portable_nvidia_cu121_or_cpu\\\\ComfyUI_windows_portable\\\\python_embeded\\\\python.exe' -c ':*)"
+    ]
+  }
+}

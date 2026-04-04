@@ -13,3 +13,6 @@ __pycache__/
 
 # Keep bin directory structure but ignore libraries
 # config.json and other non-binary files are still tracked
+
+bin/linux/resource_cache.json
+bin/windows/resource_cache.json
