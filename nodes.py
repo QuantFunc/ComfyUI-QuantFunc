@@ -795,6 +795,8 @@ class QuantFuncModelLoader:
         transformer_path = transformer_path if isinstance(transformer_path, str) and transformer_path else ""
 
         api_key = api_key.strip() if isinstance(api_key, str) else ""
+        if api_key.lower() == "none":
+            api_key = ""
 
         # Load server_url (and fallback api_key) from config.json next to the library
         lib_config = _load_lib_config()
@@ -919,6 +921,8 @@ class QuantFuncModelAutoLoader:
 
         # ── Build pipeline config (same structure as ModelLoader) ──
         api_key = api_key.strip() if isinstance(api_key, str) else ""
+        if api_key.lower() == "none":
+            api_key = ""
 
         lib_config = _load_lib_config()
         if not api_key:

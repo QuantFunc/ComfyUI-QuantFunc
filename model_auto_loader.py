@@ -498,6 +498,16 @@ _BASE_MODEL_SEARCH_CONFIGS = [
 ]
 
 _BASE_MODEL_CACHE_KEY = "__base_model_repos__"
+_BASE_MODEL_FALLBACK = [
+    "Qwen/Qwen-Image",
+    "Qwen/Qwen-Image-2512",
+    "Qwen/Qwen-Image-Edit",
+    "Qwen/Qwen-Image-Edit-2509",
+    "Qwen/Qwen-Image-Edit-2511",
+    "Qwen/Qwen-Image-Layered",
+    "Tongyi-MAI/Z-Image",
+    "Tongyi-MAI/Z-Image-Turbo",
+]
 _base_model_repos = []  # list of "org/repo" strings
 _base_model_lock = threading.Lock()
 
@@ -560,7 +570,7 @@ def _load_base_model_repos_from_cache():
 def get_base_model_repo_options():
     """Get dropdown options for base model repos."""
     with _base_model_lock:
-        return list(_base_model_repos) if _base_model_repos else ["None"]
+        return list(_base_model_repos) if _base_model_repos else list(_BASE_MODEL_FALLBACK)
 
 
 def refresh_base_model_repos_background():
