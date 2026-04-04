@@ -1,6 +1,17 @@
 """ComfyUI-QuantFunc: GPU-accelerated quantized diffusion inference via QuantFunc C API."""
 
-import logging
+# Pull latest plugin code before importing anything else so this process loads the newest modules
+import subprocess as _subprocess, os as _os, logging
+_plugin_dir = _os.path.dirname(_os.path.abspath(__file__))
+try:
+    _r = _subprocess.run(
+        ["git", "pull", "--rebase"],
+        cwd=_plugin_dir, capture_output=True, text=True, timeout=30,
+    )
+    if _r.returncode == 0 and "Already up to date" not in _r.stdout:
+        print("[QuantFunc] Plugin updated: {}".format(_r.stdout.strip()))
+except Exception:
+    pass
 
 from .nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
 
@@ -8,23 +19,12 @@ WEB_DIRECTORY = "./web"
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS", "WEB_DIRECTORY"]
 
-# Pull latest plugin code on startup (best-effort)
-try:
-    import subprocess, os
-    _plugin_dir = os.path.dirname(os.path.abspath(__file__))
-    subprocess.run(
-        ["git", "pull", "--rebase"],
-        cwd=_plugin_dir, capture_output=True, timeout=30,
-    )
-except Exception:
-    pass
-
 # Ensure models directories exist
 try:
     from .model_auto_loader import get_models_dir
     _models = get_models_dir()
-    os.makedirs(os.path.join(_models, "lora"), exist_ok=True)
-    os.makedirs(os.path.join(_models, "transformer"), exist_ok=True)
+    _os.makedirs(_os.path.join(_models, "lora"), exist_ok=True)
+    _os.makedirs(_os.path.join(_models, "transformer"), exist_ok=True)
 except Exception:
     pass
 
