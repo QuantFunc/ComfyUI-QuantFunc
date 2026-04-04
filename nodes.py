@@ -1035,6 +1035,40 @@ class QuantFuncPrecisionConfigAutoLoader:
 
 
 # ============================================================================
+# Node: QuantFunc Base Series Model Auto Loader
+# ============================================================================
+
+class QuantFuncBaseSeriesModelAutoLoader:
+    """Auto-download base model from QuantFunc model series.
+
+    Selects the correct GPU variant (50x-below/50x-above) automatically.
+    Downloads the base model from QuantFunc series repos on first use.
+    Outputs the local model directory path as a string.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        from .model_auto_loader import MODEL_SERIES_LIST, _DATA_SOURCES
+        return {
+            "required": {
+                "model_series": (MODEL_SERIES_LIST, {"tooltip": "QuantFunc model series"}),
+                "data_source": (_DATA_SOURCES, {"default": "modelscope", "tooltip": "Download source: modelscope (China) or huggingface"}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("model_dir",)
+    FUNCTION = "load_base_model"
+    CATEGORY = "QuantFunc"
+
+    def load_base_model(self, model_series, data_source):
+        from .model_auto_loader import detect_gpu_variant, download_base_model
+        gpu_variant = detect_gpu_variant()
+        model_dir = download_base_model(model_series, gpu_variant, data_source)
+        return (model_dir,)
+
+
+# ============================================================================
 # Node: QuantFunc Base Model Auto Loader
 # ============================================================================
 
@@ -1514,6 +1548,7 @@ NODE_CLASS_MAPPINGS = {
     "QuantFuncModelAutoLoader": QuantFuncModelAutoLoader,
     "QuantFuncPrequantAutoLoader": QuantFuncPrequantAutoLoader,
     "QuantFuncPrecisionConfigAutoLoader": QuantFuncPrecisionConfigAutoLoader,
+    "QuantFuncBaseSeriesModelAutoLoader": QuantFuncBaseSeriesModelAutoLoader,
     "QuantFuncBaseModelAutoLoader": QuantFuncBaseModelAutoLoader,
     "QuantFuncTransformerAutoLoader": QuantFuncTransformerAutoLoader,
     "QuantFuncLoRAAutoLoader": QuantFuncLoRAAutoLoader,
@@ -1530,6 +1565,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "QuantFuncModelAutoLoader": "QuantFunc Model Auto Loader",
     "QuantFuncPrequantAutoLoader": "QuantFunc Prequant Auto Loader",
     "QuantFuncPrecisionConfigAutoLoader": "QuantFunc Precision Config Auto Loader",
+    "QuantFuncBaseSeriesModelAutoLoader": "QuantFunc Base Series Model Auto Loader",
     "QuantFuncBaseModelAutoLoader": "QuantFunc Base Model Auto Loader",
     "QuantFuncTransformerAutoLoader": "QuantFunc Transformer Auto Loader",
     "QuantFuncLoRAAutoLoader": "QuantFunc LoRA Auto Loader",
