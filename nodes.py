@@ -1479,8 +1479,7 @@ class QuantFuncGenerate:
                     i2i_opts["sampler"] = sampler_name
                 if sampler_eta > 0.0:
                     i2i_opts["eta"] = sampler_eta
-                if keep_ref_img_size:
-                    i2i_opts["keep_ref_img_size"] = True
+                i2i_opts["keep_ref_img_size"] = keep_ref_img_size
                 i2i_opts_json = json.dumps(i2i_opts) if i2i_opts else None
                 arr = _manager.image_to_image(
                     prompt=prompt, ref_paths=tmp_paths,
