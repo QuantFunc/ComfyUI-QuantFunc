@@ -1,0 +1,60 @@
+{
+  "QuantFunc/Qwen-Image-Edit-Series": {
+    "transformer": [
+      "qwen-image-2511-50x-above-lighting-4steps-prequant.safetensors",
+      "qwen-image-2511-50x-above-lighting-4steps.safetensors",
+      "qwen-image-2511-50x-above-svdq-4steps.safetensors",
+      "qwen-image-2511-50x-above-svdq.safetensors",
+      "qwen-image-2511-50x-below-lighting-4steps-prequant.safetensors",
+      "qwen-image-2511-50x-below-lighting-4steps-v2-prequant.safetensors",
+      "qwen-image-2511-50x-below-lighting-4steps-v2.safetensors",
+      "qwen-image-2511-50x-below-lighting-4steps.safetensors",
+      "qwen-image-2511-50x-below-svdq-4steps.safetensors",
+      "qwen-image-2511-50x-below-svdq.safetensors"
+    ],
+    "prequant": [
+      "qwen-image-edit-2509-50x-above.safetensors",
+      "qwen-image-edit-2511-50x-above.safetensors",
+      "qwen-image-edit-2511-50x-below.safetensors"
+    ],
+    "precision-config": [
+      "50x-above-fp4-sample.json",
+      "50x-below-int4-sample.json"
+    ]
+  },
+  "QuantFunc/Qwen-Image-Series": {
+    "transformer": [
+      "qwen-image-2512-50x-above-lighting-4steps-prequant.safetensors",
+      "qwen-image-2512-50x-above-lighting-4steps-v2-prequant.safetensors",
+      "qwen-image-2512-50x-above-lighting-4steps-v2.safetensors",
+      "qwen-image-2512-50x-above-lighting-4steps.safetensors",
+      "qwen-image-2512-50x-below-lighting-4steps-prequant.safetensors",
+      "qwen-image-2512-50x-below-lighting-4steps-v2-prequant.safetensors",
+      "qwen-image-2512-50x-below-lighting-4steps-v2.safetensors",
+      "qwen-image-2512-50x-below-lighting-4steps.safetensors",
+      "qwen-image-50x-below-lighting-4steps.safetensors"
+    ],
+    "prequant": [
+      "qwen-image-2512-50x-above.safetensors",
+      "qwen-image-2512-50x-below.safetensors",
+      "qwen-image-50x-above.safetensors",
+      "qwen-image-50x-below.safetensors"
+    ],
+    "precision-config": [
+      "50x-above-fp4-sample.json",
+      "50x-below-int4-sample.json"
+    ]
+  },
+  "QuantFunc/Z-Image-Series": {
+    "transformer": [
+      "z-image-turbo-50x-above-lighting-v2.safetensors",
+      "z-image-turbo-50x-above-lighting.safetensors",
+      "z-image-turbo-50x-below-lighting-v2.safetensors",
+      "z-image-turbo-50x-below-lighting.safetensors"
+    ],
+    "precision-config": [
+      "50x-above-fp4-sample.json",
+      "50x-below-int4-sample.json"
+    ]
+  }
+}

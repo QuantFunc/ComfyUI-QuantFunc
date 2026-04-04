@@ -202,7 +202,7 @@ class WorkerManager:
         self._stderr_thread.start()
 
         ready = self._read_response(timeout=60)
-        if ready is None or ready.get("type") != "ready":
+        if not isinstance(ready, dict) or ready.get("type") != "ready":
             try:
                 self._process.kill()
                 _, stderr_out = self._process.communicate(timeout=5)
