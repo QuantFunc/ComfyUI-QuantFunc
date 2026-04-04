@@ -19,6 +19,15 @@ try:
 except Exception:
     pass
 
+# Ensure models directories exist
+try:
+    from .model_auto_loader import get_models_dir
+    _models = get_models_dir()
+    os.makedirs(os.path.join(_models, "lora"), exist_ok=True)
+    os.makedirs(os.path.join(_models, "transformer"), exist_ok=True)
+except Exception:
+    pass
+
 # Auto-update check on startup (background, non-blocking)
 try:
     from .auto_update import check_for_updates
