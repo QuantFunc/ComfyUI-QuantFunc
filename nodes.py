@@ -1076,32 +1076,36 @@ class QuantFuncBaseSeriesModelAutoLoader:
 # Node: QuantFunc Base Model Auto Loader
 # ============================================================================
 
-def _get_base_model_repo_dropdowns():
-    """Get base model repo dropdown options from cache."""
+def _get_diffusers_model_options():
+    """Recursively scan ComfyUI/models/diffusers/ for model directories (containing model_index.json)."""
     try:
-        from .model_auto_loader import get_base_model_repo_options
-        return get_base_model_repo_options()
+        dm_dir = os.path.join(_get_comfyui_dir(), "models", "diffusers")
+        if os.path.isdir(dm_dir):
+            dirs = []
+            for root, subdirs, filenames in os.walk(dm_dir):
+                if "model_index.json" in filenames:
+                    rel = os.path.relpath(root, dm_dir)
+                    dirs.append(rel.replace("\\", "/"))
+            if dirs:
+                return ["None"] + sorted(dirs)
     except Exception:
-        return ["None"]
+        pass
+    return ["None"]
 
 
 class QuantFuncBaseModelAutoLoader:
-    """Auto-discover and download base models from ModelScope upstream repos.
+    """Load base models from ComfyUI/models/diffusers/ directory.
 
-    Searches Qwen/ for Image series (e.g. Qwen/Qwen-Image-2512) and
-    Tongyi-MAI/ for Z-Image series (e.g. Tongyi-MAI/Z-Image-Turbo).
-    Downloads the full model repo on first use.
+    Scans for subdirectories containing model_index.json.
     Outputs the local model directory path as a string.
     """
 
     @classmethod
     def INPUT_TYPES(cls):
-        from .model_auto_loader import _DATA_SOURCES
-        repo_opts = _get_base_model_repo_dropdowns()
+        model_opts = _get_diffusers_model_options()
         return {
             "required": {
-                "base_model_repo": (repo_opts, {"tooltip": "Upstream base model repository. Auto-discovered from ModelScope."}),
-                "data_source": (_DATA_SOURCES, {"default": "modelscope", "tooltip": "Download source: modelscope (China) or huggingface"}),
+                "model_dir": (model_opts, {"tooltip": "Base model from models/diffusers/"}),
             },
         }
 
@@ -1110,13 +1114,14 @@ class QuantFuncBaseModelAutoLoader:
     FUNCTION = "load_base_model"
     CATEGORY = "QuantFunc"
 
-    def load_base_model(self, base_model_repo, data_source):
-        if not base_model_repo or base_model_repo == "None":
+    def load_base_model(self, model_dir):
+        if not model_dir or model_dir == "None":
             return ("",)
 
-        from .model_auto_loader import download_base_model_repo
-        path = download_base_model_repo(base_model_repo, data_source)
-        return (path,)
+        full_path = os.path.join(_get_comfyui_dir(), "models", "diffusers", model_dir)
+        if not os.path.isdir(full_path):
+            raise RuntimeError("Model directory not found: {}".format(full_path))
+        return (full_path,)
 
 
 # ============================================================================
@@ -1178,11 +1183,15 @@ class QuantFuncTransformerAutoLoader:
 # Node: QuantFunc LoRA Auto Loader
 # ============================================================================
 
+def _get_comfyui_dir():
+    """Return the ComfyUI root directory (parent of custom_nodes)."""
+    return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
 def _get_lora_file_options():
-    """Recursively scan models/QuantFunc/lora/ for .safetensors files."""
+    """Recursively scan ComfyUI/models/loras/ for .safetensors files."""
     try:
-        from .model_auto_loader import get_models_dir
-        lora_dir = os.path.join(get_models_dir(), "lora")
+        lora_dir = os.path.join(_get_comfyui_dir(), "models", "loras")
         if os.path.isdir(lora_dir):
             files = []
             for root, _, filenames in os.walk(lora_dir):
@@ -1210,7 +1219,7 @@ class QuantFuncLoRAAutoLoader:
         return {
             "required": {
                 "pipeline": ("QUANTFUNC_PIPELINE",),
-                "lora_file": (lora_opts, {"tooltip": "LoRA weights from models/QuantFunc/lora/"}),
+                "lora_file": (lora_opts, {"tooltip": "LoRA weights from models/loras/"}),
                 "scale": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05,
                            "tooltip": "LoRA weight scale (1.0 = full strength)"}),
             },
@@ -1226,8 +1235,7 @@ class QuantFuncLoRAAutoLoader:
         cfg["options"] = dict(cfg.get("options", {}))
 
         if lora_file and lora_file != "None":
-            from .model_auto_loader import get_models_dir
-            lora_path = os.path.join(get_models_dir(), "lora", lora_file)
+            lora_path = os.path.join(_get_comfyui_dir(), "models", "loras", lora_file)
             if not os.path.exists(lora_path):
                 raise RuntimeError("LoRA file not found: {}".format(lora_path))
             loras = list(cfg["options"].get("lora", []))
