@@ -1086,12 +1086,17 @@ class QuantFuncBaseModelAutoLoader:
 # ============================================================================
 
 def _get_lora_file_options():
-    """Scan models/QuantFunc/lora/ for .safetensors files."""
+    """Recursively scan models/QuantFunc/lora/ for .safetensors files."""
     try:
         from .model_auto_loader import get_models_dir
         lora_dir = os.path.join(get_models_dir(), "lora")
         if os.path.isdir(lora_dir):
-            files = [f for f in os.listdir(lora_dir) if f.endswith(".safetensors")]
+            files = []
+            for root, _, filenames in os.walk(lora_dir):
+                for f in filenames:
+                    if f.endswith(".safetensors"):
+                        rel = os.path.relpath(os.path.join(root, f), lora_dir)
+                        files.append(rel.replace("\\", "/"))
             if files:
                 return ["None"] + sorted(files)
     except Exception:
