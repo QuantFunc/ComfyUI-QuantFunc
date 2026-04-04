@@ -576,13 +576,13 @@ def download_base_model_repo(repo_id, data_source):
     Downloads the full repo to ComfyUI/models/QuantFunc/<repo_name>/.
     Returns local model directory path.
     """
-    repo_name = repo_id.split("/")[-1]
-    local_dir = os.path.join(get_models_dir(), repo_name)
+    # Use org/repo structure: models/QuantFunc/Qwen/Qwen-Image-2512/
+    local_dir = os.path.join(get_models_dir(), *repo_id.split("/"))
     marker = os.path.join(local_dir, _DOWNLOAD_MARKER)
 
     if os.path.exists(marker):
         # Check vision_encoder integrity for Qwen-Image-Edit models
-        if "image-edit" in repo_name.lower() or "Image-Edit" in repo_name:
+        if "image-edit" in repo_id.lower():
             _check_vision_encoder(local_dir, marker)
         if os.path.exists(marker):
             return local_dir
