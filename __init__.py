@@ -23,7 +23,6 @@ __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS", "WEB_DIRECTORY"]
 try:
     from .model_auto_loader import get_models_dir
     _models = get_models_dir()
-    _os.makedirs(_os.path.join(_models, "lora"), exist_ok=True)
     _os.makedirs(_os.path.join(_models, "transformer"), exist_ok=True)
 except Exception:
     pass
