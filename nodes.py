@@ -1125,6 +1125,52 @@ class QuantFuncBaseModelAutoLoader:
 
 
 # ============================================================================
+# Node: QuantFunc Base Model Auto Loader with Download
+# ============================================================================
+
+def _get_base_model_repo_dropdowns():
+    """Get base model repo dropdown options from cache."""
+    try:
+        from .model_auto_loader import get_base_model_repo_options
+        return get_base_model_repo_options()
+    except Exception:
+        return ["None"]
+
+
+class QuantFuncBaseModelAutoLoaderWithDownload:
+    """Auto-discover and download base models from ModelScope/HuggingFace.
+
+    Searches upstream repos for available base models and downloads
+    to ComfyUI/models/diffusers/ on first use.
+    Outputs the local model directory path as a string.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        from .model_auto_loader import _DATA_SOURCES
+        repo_opts = _get_base_model_repo_dropdowns()
+        return {
+            "required": {
+                "base_model_repo": (repo_opts, {"tooltip": "Upstream base model repository. Auto-discovered from ModelScope."}),
+                "data_source": (_DATA_SOURCES, {"default": "modelscope", "tooltip": "Download source: modelscope (China) or huggingface"}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("model_dir",)
+    FUNCTION = "load_base_model"
+    CATEGORY = "QuantFunc"
+
+    def load_base_model(self, base_model_repo, data_source):
+        if not base_model_repo or base_model_repo == "None":
+            return ("",)
+
+        from .model_auto_loader import download_base_model_to_diffusers
+        path = download_base_model_to_diffusers(base_model_repo, data_source)
+        return (path,)
+
+
+# ============================================================================
 # Node: QuantFunc Transformer Auto Loader
 # ============================================================================
 
@@ -1562,6 +1608,7 @@ NODE_CLASS_MAPPINGS = {
     "QuantFuncPrecisionConfigAutoLoader": QuantFuncPrecisionConfigAutoLoader,
     "QuantFuncBaseSeriesModelAutoLoader": QuantFuncBaseSeriesModelAutoLoader,
     "QuantFuncBaseModelAutoLoader": QuantFuncBaseModelAutoLoader,
+    "QuantFuncBaseModelAutoLoaderWithDownload": QuantFuncBaseModelAutoLoaderWithDownload,
     "QuantFuncTransformerAutoLoader": QuantFuncTransformerAutoLoader,
     "QuantFuncLoRAAutoLoader": QuantFuncLoRAAutoLoader,
     "QuantFuncLoRALoader": QuantFuncLoRALoader,
@@ -1579,6 +1626,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "QuantFuncPrecisionConfigAutoLoader": "QuantFunc Precision Config Auto Loader",
     "QuantFuncBaseSeriesModelAutoLoader": "QuantFunc Base Series Model Auto Loader",
     "QuantFuncBaseModelAutoLoader": "QuantFunc Base Model Auto Loader",
+    "QuantFuncBaseModelAutoLoaderWithDownload": "QuantFunc Base Model Auto Loader with Download",
     "QuantFuncTransformerAutoLoader": "QuantFunc Transformer Auto Loader",
     "QuantFuncLoRAAutoLoader": "QuantFunc LoRA Auto Loader",
     "QuantFuncLoRALoader": "QuantFunc LoRA",

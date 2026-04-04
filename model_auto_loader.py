@@ -626,6 +626,51 @@ def download_base_model_repo(repo_id, data_source):
     return local_dir
 
 
+def download_base_model_to_diffusers(repo_id, data_source):
+    """Download a base model to ComfyUI/models/diffusers/<org>/<repo>/.
+
+    Returns local model directory path.
+    """
+    pkg_dir = os.path.dirname(os.path.abspath(__file__))
+    comfyui_dir = os.path.dirname(os.path.dirname(pkg_dir))
+    local_dir = os.path.join(comfyui_dir, "models", "diffusers", *repo_id.split("/"))
+    marker = os.path.join(local_dir, _DOWNLOAD_MARKER)
+
+    if os.path.exists(marker):
+        if "image-edit" in repo_id.lower():
+            _check_vision_encoder(local_dir, marker)
+        if os.path.exists(marker):
+            return local_dir
+
+    os.makedirs(local_dir, exist_ok=True)
+    if os.path.isdir(local_dir) and os.listdir(local_dir):
+        print("[QuantFunc] Resuming incomplete download: {}...".format(repo_id))
+    else:
+        print("[QuantFunc] Downloading base model: {} from {} to models/diffusers/...".format(
+            repo_id, data_source))
+
+    if data_source == "huggingface":
+        if not _ensure_huggingface_hub():
+            raise RuntimeError("Cannot install huggingface_hub")
+        from huggingface_hub import snapshot_download
+        snapshot_download(repo_id=repo_id, local_dir=local_dir)
+    else:
+        if not _ensure_modelscope():
+            raise RuntimeError("Cannot install modelscope")
+        from modelscope import snapshot_download as ms_download
+        ms_download(model_id=repo_id, local_dir=local_dir)
+
+    if not os.path.exists(os.path.join(local_dir, "model_index.json")):
+        raise RuntimeError(
+            "Download completed but model_index.json not found in {}.\n"
+            "Check the repo structure.".format(local_dir))
+
+    with open(marker, "w") as f:
+        f.write("ok")
+    print("[QuantFunc] Base model ready: {}".format(local_dir))
+    return local_dir
+
+
 # ── Load cache on import ──
 _load_cache()
 _load_base_model_repos_from_cache()
