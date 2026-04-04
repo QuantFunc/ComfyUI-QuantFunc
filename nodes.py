@@ -1082,6 +1082,61 @@ class QuantFuncBaseModelAutoLoader:
 
 
 # ============================================================================
+# Node: QuantFunc Transformer Auto Loader
+# ============================================================================
+
+def _get_local_transformer_file_options():
+    """Recursively scan models/QuantFunc/transformer/ for .safetensors files."""
+    try:
+        from .model_auto_loader import get_models_dir
+        tf_dir = os.path.join(get_models_dir(), "transformer")
+        if os.path.isdir(tf_dir):
+            files = []
+            for root, _, filenames in os.walk(tf_dir):
+                for f in filenames:
+                    if f.endswith(".safetensors"):
+                        rel = os.path.relpath(os.path.join(root, f), tf_dir)
+                        files.append(rel.replace("\\", "/"))
+            if files:
+                return ["None"] + sorted(files)
+    except Exception:
+        pass
+    return ["None"]
+
+
+class QuantFuncTransformerAutoLoader:
+    """Auto-load transformer weights from models/QuantFunc/transformer/ directory.
+
+    Recursively scans for .safetensors files and presents them as a dropdown.
+    Outputs the file path as a string for connecting to ModelLoader's transformer input.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        tf_opts = _get_local_transformer_file_options()
+        return {
+            "required": {
+                "transformer_file": (tf_opts, {"tooltip": "Transformer weights from models/QuantFunc/transformer/"}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("transformer_path",)
+    FUNCTION = "load_transformer"
+    CATEGORY = "QuantFunc"
+
+    def load_transformer(self, transformer_file):
+        if not transformer_file or transformer_file == "None":
+            return ("",)
+
+        from .model_auto_loader import get_models_dir
+        tf_path = os.path.join(get_models_dir(), "transformer", transformer_file)
+        if not os.path.exists(tf_path):
+            raise RuntimeError("Transformer file not found: {}".format(tf_path))
+        return (tf_path,)
+
+
+# ============================================================================
 # Node: QuantFunc LoRA Auto Loader
 # ============================================================================
 
@@ -1460,6 +1515,7 @@ NODE_CLASS_MAPPINGS = {
     "QuantFuncPrequantAutoLoader": QuantFuncPrequantAutoLoader,
     "QuantFuncPrecisionConfigAutoLoader": QuantFuncPrecisionConfigAutoLoader,
     "QuantFuncBaseModelAutoLoader": QuantFuncBaseModelAutoLoader,
+    "QuantFuncTransformerAutoLoader": QuantFuncTransformerAutoLoader,
     "QuantFuncLoRAAutoLoader": QuantFuncLoRAAutoLoader,
     "QuantFuncLoRALoader": QuantFuncLoRALoader,
     "QuantFuncLoRAConfig": QuantFuncLoRAConfig,
@@ -1475,6 +1531,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "QuantFuncPrequantAutoLoader": "QuantFunc Prequant Auto Loader",
     "QuantFuncPrecisionConfigAutoLoader": "QuantFunc Precision Config Auto Loader",
     "QuantFuncBaseModelAutoLoader": "QuantFunc Base Model Auto Loader",
+    "QuantFuncTransformerAutoLoader": "QuantFunc Transformer Auto Loader",
     "QuantFuncLoRAAutoLoader": "QuantFunc LoRA Auto Loader",
     "QuantFuncLoRALoader": "QuantFunc LoRA",
     "QuantFuncLoRAConfig": "QuantFunc LoRA Config",
