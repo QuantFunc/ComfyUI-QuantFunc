@@ -1082,6 +1082,67 @@ class QuantFuncBaseModelAutoLoader:
 
 
 # ============================================================================
+# Node: QuantFunc LoRA Auto Loader
+# ============================================================================
+
+def _get_lora_file_options():
+    """Scan models/QuantFunc/lora/ for .safetensors files."""
+    try:
+        from .model_auto_loader import get_models_dir
+        lora_dir = os.path.join(get_models_dir(), "lora")
+        if os.path.isdir(lora_dir):
+            files = [f for f in os.listdir(lora_dir) if f.endswith(".safetensors")]
+            if files:
+                return ["None"] + sorted(files)
+    except Exception:
+        pass
+    return ["None"]
+
+
+class QuantFuncLoRAAutoLoader:
+    """Auto-load LoRA weights from models/QuantFunc/lora/ directory.
+
+    Scans the lora directory for .safetensors files and presents them
+    as a dropdown. Appends the selected LoRA to the pipeline.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        lora_opts = _get_lora_file_options()
+        return {
+            "required": {
+                "pipeline": ("QUANTFUNC_PIPELINE",),
+                "lora_file": (lora_opts, {"tooltip": "LoRA weights from models/QuantFunc/lora/"}),
+                "scale": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05,
+                           "tooltip": "LoRA weight scale (1.0 = full strength)"}),
+            },
+        }
+
+    RETURN_TYPES = ("QUANTFUNC_PIPELINE",)
+    RETURN_NAMES = ("pipeline",)
+    FUNCTION = "add_lora"
+    CATEGORY = "QuantFunc"
+
+    def add_lora(self, pipeline, lora_file, scale):
+        cfg = dict(pipeline)
+        cfg["options"] = dict(cfg.get("options", {}))
+
+        if lora_file and lora_file != "None":
+            from .model_auto_loader import get_models_dir
+            lora_path = os.path.join(get_models_dir(), "lora", lora_file)
+            if not os.path.exists(lora_path):
+                raise RuntimeError("LoRA file not found: {}".format(lora_path))
+            loras = list(cfg["options"].get("lora", []))
+            if scale != 1.0:
+                loras.append("{}:{}".format(lora_path, scale))
+            else:
+                loras.append(lora_path)
+            cfg["options"]["lora"] = loras
+
+        return (cfg,)
+
+
+# ============================================================================
 # Node: QuantFunc LoRA
 # ============================================================================
 
@@ -1394,6 +1455,7 @@ NODE_CLASS_MAPPINGS = {
     "QuantFuncPrequantAutoLoader": QuantFuncPrequantAutoLoader,
     "QuantFuncPrecisionConfigAutoLoader": QuantFuncPrecisionConfigAutoLoader,
     "QuantFuncBaseModelAutoLoader": QuantFuncBaseModelAutoLoader,
+    "QuantFuncLoRAAutoLoader": QuantFuncLoRAAutoLoader,
     "QuantFuncLoRALoader": QuantFuncLoRALoader,
     "QuantFuncLoRAConfig": QuantFuncLoRAConfig,
     "QuantFuncGenerate": QuantFuncGenerate,
@@ -1408,6 +1470,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "QuantFuncPrequantAutoLoader": "QuantFunc Prequant Auto Loader",
     "QuantFuncPrecisionConfigAutoLoader": "QuantFunc Precision Config Auto Loader",
     "QuantFuncBaseModelAutoLoader": "QuantFunc Base Model Auto Loader",
+    "QuantFuncLoRAAutoLoader": "QuantFunc LoRA Auto Loader",
     "QuantFuncLoRALoader": "QuantFunc LoRA",
     "QuantFuncLoRAConfig": "QuantFunc LoRA Config",
     "QuantFuncGenerate": "QuantFunc Generate",
