@@ -771,6 +771,12 @@ class QuantFuncModelLoader:
                 "precision_config": ("STRING", {"default": "", "tooltip": "Per-layer precision config JSON path (Lighting backend only)"}),
                 "prequant_weights": ("STRING", {"default": "", "tooltip": "Pre-quantized modulation weights safetensors path (Lighting backend only)"}),
                 "fused_mod": ("BOOLEAN", {"default": False, "tooltip": "Fused INT8 SiLU+GEMV+bias+split6 for W8A8 modulation layers (Lighting backend only)"}),
+                "act_quant_mode": (["absmax", "mse"], {
+                    "default": "absmax",
+                    "tooltip": "Activation quantization scale algorithm (Lighting backend only):\n"
+                               "• absmax — fast, scale = absmax/7 (default)\n"
+                               "• mse — search ~5 candidates for min MSE (+1dB quality, ~8% slower)",
+                }),
                 "manual_unload_model": ("BOOLEAN", {"default": False, "tooltip": "Activate to manually unload the model and free GPU memory. No image will be generated."}),
             }
         }
@@ -784,7 +790,7 @@ class QuantFuncModelLoader:
                    device, config=None, manual_unload_model=False,
                    api_key="", scheduler_config="",
                    precision_config="", prequant_weights="",
-                   fused_mod=False, **kwargs):
+                   fused_mod=False, act_quant_mode="absmax", **kwargs):
         scheduler_config = scheduler_config.strip() if isinstance(scheduler_config, str) else ""
         # Validate: scheduler_config must be a file path (not a bare number or random text)
         if scheduler_config and not os.path.exists(scheduler_config):
@@ -817,6 +823,7 @@ class QuantFuncModelLoader:
             options["server_url"] = server_url
         if model_backend == "lighting":
             options.setdefault("rotation_block_size", 256)
+        options["act_quant_mode"] = act_quant_mode
 
         text_precision = "int4"
         if config and isinstance(config, dict):
@@ -890,6 +897,12 @@ class QuantFuncModelAutoLoader:
                 "transformer": (transformer_opts, {"default": "None", "tooltip": "Transformer model variant. Format: Series/name. Select None to use base model's default transformer."}),
                 "config": ("QUANTFUNC_CONFIG", {"tooltip": "Advanced pipeline config (from PipelineConfig node)"}),
                 "api_key": ("STRING", {"default": "", "tooltip": "QuantFunc API key for model authentication"}),
+                "act_quant_mode": (["absmax", "mse"], {
+                    "default": "absmax",
+                    "tooltip": "Activation quantization scale algorithm (Lighting backend only):\n"
+                               "• absmax — fast, scale = absmax/7 (default)\n"
+                               "• mse — search ~5 candidates for min MSE (+1dB quality, ~8% slower)",
+                }),
                 "manual_unload_model": ("BOOLEAN", {"default": False, "tooltip": "Activate to manually unload the model and free GPU memory."}),
             }
         }
@@ -902,6 +915,7 @@ class QuantFuncModelAutoLoader:
     def load_model(self, model_series, model_backend, device, data_source,
                    config=None, manual_unload_model=False,
                    transformer="None", api_key="",
+                   act_quant_mode="absmax",
                    **kwargs):
         from .model_auto_loader import (
             detect_gpu_variant, download_base_model,
@@ -936,6 +950,7 @@ class QuantFuncModelAutoLoader:
             options["server_url"] = server_url
         if model_backend == "lighting":
             options.setdefault("rotation_block_size", 256)
+        options["act_quant_mode"] = act_quant_mode
 
         text_precision = "int4"
         if config and isinstance(config, dict):
