@@ -664,18 +664,31 @@ try:
 
     _original_free_memory = _mm.free_memory
 
+    # Threshold to distinguish real VRAM requests from ComfyUI's blanket
+    # unload_all_models() which passes 1e30.  256 TB is far beyond any real
+    # GPU memory request but still well below 1e30.
+    _UNREALISTIC_VRAM_REQUEST = 256 * 1024 * 1024 * 1024 * 1024  # 256 TB
+
     def _hooked_free_memory(memory_required, device, keep_loaded=[], **kwargs):
         if _manager._current_key is not None and memory_required > 0:
-            # Only unload if there isn't enough free VRAM to satisfy the request
-            try:
-                import torch
-                free_vram, _ = torch.cuda.mem_get_info(device)
-            except Exception:
-                free_vram = 0
-            if free_vram < memory_required:
-                logging.info("[QuantFunc] Auto-unloading pipelines to free VRAM for other models "
-                             f"(need {memory_required // 1024**2} MB, free {free_vram // 1024**2} MB)")
-                _manager.destroy_all()
+            # Ignore blanket "free everything" calls (e.g. unload_all_models
+            # passes 1e30).  These happen after every prompt execution when
+            # smart memory management is disabled and would needlessly destroy
+            # the pipeline, forcing expensive re-creation on the next run.
+            if memory_required >= _UNREALISTIC_VRAM_REQUEST:
+                logging.debug("[QuantFunc] Ignoring blanket free_memory call "
+                              f"(requested {memory_required:.2e} bytes)")
+            else:
+                # Only unload if there isn't enough free VRAM to satisfy the request
+                try:
+                    import torch
+                    free_vram, _ = torch.cuda.mem_get_info(device)
+                except Exception:
+                    free_vram = 0
+                if free_vram < memory_required:
+                    logging.info("[QuantFunc] Auto-unloading pipelines to free VRAM for other models "
+                                 f"(need {memory_required // 1024**2} MB, free {free_vram // 1024**2} MB)")
+                    _manager.destroy_all()
         return _original_free_memory(memory_required, device, keep_loaded=keep_loaded, **kwargs)
 
     _mm.free_memory = _hooked_free_memory
