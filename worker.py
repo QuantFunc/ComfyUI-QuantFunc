@@ -254,6 +254,13 @@ def _load_dll(dll_path):
     except AttributeError:
         pass  # Old DLL without set_api_key
 
+    # Optional: quantfunc_unload (may not exist in older DLLs)
+    try:
+        _lib.quantfunc_unload.restype = ctypes.c_int
+        _lib.quantfunc_unload.argtypes = [PIPE_PTR]
+    except AttributeError:
+        pass  # Old DLL without unload
+
     version = _lib.quantfunc_version().decode()
     log(f"Loaded DLL version {version} from {dll_path}")
 
@@ -474,6 +481,26 @@ def handle_set_api_key(msg):
     send_json({"type": "result", "req_id": req_id, "status": "ok"})
 
 
+def handle_unload(msg):
+    req_id = msg["req_id"]
+    if _pipeline is None:
+        send_json({"type": "result", "req_id": req_id, "status": "error",
+                   "error_code": -1, "error_message": "No pipeline loaded"})
+        return
+
+    if not hasattr(_lib, "quantfunc_unload"):
+        send_json({"type": "result", "req_id": req_id, "status": "error",
+                   "error_code": -1, "error_message": "DLL does not support unload"})
+        return
+
+    status = _lib.quantfunc_unload(_pipeline)
+    if status != QUANTFUNC_OK:
+        send_json({"type": "result", "req_id": req_id, "status": "error",
+                   "error_code": status, "error_message": _get_error()})
+        return
+    send_json({"type": "result", "req_id": req_id, "status": "ok"})
+
+
 def handle_destroy(msg):
     global _pipeline, _cache_key
     req_id = msg["req_id"]
@@ -520,6 +547,7 @@ HANDLERS = {
     "image_to_image": handle_image_to_image,
     "export":         handle_export,
     "set_api_key":    handle_set_api_key,
+    "unload":         handle_unload,
     "destroy":        handle_destroy,
 }
 

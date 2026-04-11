@@ -607,6 +607,16 @@ class WorkerManager:
             except Exception:
                 pass
 
+    def unload_pipeline(self):
+        """Offload all models from GPU to CPU, freeing VRAM. Pipeline stays alive for fast reload."""
+        with self._lock:
+            if self._process and self._process.poll() is None and self._current_key is not None:
+                try:
+                    self._call({"cmd": "unload", "req_id": self._next_req_id()}, timeout=30)
+                    logging.info("[QuantFunc] Models offloaded to CPU — VRAM freed")
+                except Exception as e:
+                    logging.warning("[QuantFunc] Unload failed: %s", e)
+
     def destroy_all(self):
         """Destroy loaded pipeline (keep worker alive)."""
         with self._lock:
@@ -840,6 +850,7 @@ class QuantFuncModelLoader:
 
         text_precision = "int4"
         if config and isinstance(config, dict):
+            config = dict(config)  # copy to avoid mutating cached PipelineConfig output
             text_precision = config.pop("text_precision", text_precision)
             options.update(config)
 
@@ -967,6 +978,7 @@ class QuantFuncModelAutoLoader:
 
         text_precision = "int4"
         if config and isinstance(config, dict):
+            config = dict(config)  # copy to avoid mutating cached PipelineConfig output
             text_precision = config.pop("text_precision", text_precision)
             options.update(config)
 
@@ -1440,6 +1452,12 @@ class QuantFuncGenerate:
                                "0 = deterministic (no effect). Only used by stochastic samplers.\n"
                                "Recommended 0.2~0.5 for ≤20 steps. Higher eta needs more steps.",
                 }),
+                "unload_every_time": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Offload all models from GPU to CPU after generation, freeing VRAM.\n"
+                               "Models stay in CPU RAM for fast reload on the next run.\n"
+                               "Enable this when sharing VRAM with other ComfyUI nodes.",
+                }),
             }
         }
 
@@ -1452,7 +1470,8 @@ class QuantFuncGenerate:
     def generate(self, pipeline, prompt, width, height, steps, seed,
                  guidance_scale, ref_images=None,
                  negative_prompt="", true_cfg_scale=4.0,
-                 sampler_name="euler", sampler_eta=0.0):
+                 sampler_name="euler", sampler_eta=0.0,
+                 unload_every_time=False):
         import torch
 
         # Handle unload request
@@ -1536,6 +1555,9 @@ class QuantFuncGenerate:
                     prompt=prompt, height=height, width=width,
                     steps=steps, seed=seed, guidance_scale=guidance_scale,
                     options_json=opts_json, pbar=pbar)
+
+            if unload_every_time:
+                _manager.unload_pipeline()
 
             return (torch.from_numpy(arr).unsqueeze(0),)  # [1, H, W, 3]
 

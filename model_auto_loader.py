@@ -293,7 +293,8 @@ def _check_vision_encoder(local_dir, marker_path):
     """Check vision_encoder/model.safetensors size for Qwen-Edit models.
 
     If the file exists but is smaller than 600MB, it's likely corrupt or
-    truncated. Delete it and remove the download marker so it gets re-downloaded.
+    truncated. Delete it, remove the download marker and quantfunc_config.json
+    so they get re-downloaded together.
     """
     ve_model = os.path.join(local_dir, "vision_encoder", "model.safetensors")
     if not os.path.exists(ve_model):
@@ -305,6 +306,11 @@ def _check_vision_encoder(local_dir, marker_path):
               "({:.1f}MB < 600MB), likely corrupt. Re-downloading...".format(size_mb))
         try:
             os.remove(ve_model)
+            # Remove quantfunc_config.json so it gets refreshed on re-download
+            nc_path = os.path.join(local_dir, "quantfunc_config.json")
+            if os.path.exists(nc_path):
+                os.remove(nc_path)
+                print("[QuantFunc] Removed quantfunc_config.json for re-download")
             if os.path.exists(marker_path):
                 os.remove(marker_path)
         except OSError as e:
@@ -330,7 +336,7 @@ def download_base_model(series, gpu_variant, data_source):
     # Already downloaded and verified?
     if os.path.exists(marker):
         # Qwen-Edit: check vision_encoder model.safetensors integrity
-        if "Qwen-Image-Edit" in series:
+        if "image-edit" in series.lower():
             _check_vision_encoder(local_dir, marker)
         # Re-check marker (may have been removed by integrity check)
         if os.path.exists(marker):
