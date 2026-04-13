@@ -712,27 +712,29 @@ except Exception:
 
 class QuantFuncPipelineConfig:
     """Advanced pipeline configuration for model initialization.
-    Overrides auto_optimize defaults. If not connected, model uses auto_optimize with no overrides.
+
+    VRAM/offload strategy is chosen automatically by libquantfunc based on
+    your GPU's free VRAM and the loaded model size — no offload knobs are
+    exposed here. Old workflows that still set cpu_offload / layer_offload /
+    adaptive_offload / offload_compression will continue to load (libquantfunc
+    silently ignores those config keys with a one-time deprecation warning),
+    but the values have no effect.
     """
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "cpu_offload": ("BOOLEAN", {"default": True, "tooltip": "Offload idle models to CPU to save VRAM"}),
-                "layer_offload": ("BOOLEAN", {"default": False, "tooltip": "Per-layer offload for transformer (slower but uses less VRAM)"}),
                 "tiled_vae": ("BOOLEAN", {"default": False, "tooltip": "Tile-based VAE decoding to reduce VRAM (auto-enabled at high resolution)"}),
                 "attention_backend": (["auto", "sage", "flash", "sdpa"], {"default": "auto",
                                       "tooltip": "Attention implementation: auto picks best for your GPU"}),
                 "precision": (["bf16", "fp16"], {"default": "bf16", "tooltip": "Compute precision for pipeline"}),
                 "text_precision": (["int4", "int8", "fp4", "fp8", "fp16"], {"default": "int4",
                                     "tooltip": "Text encoder quantization precision (fp4 requires SM120+/Blackwell)"}),
+                "vision_quant": (["int8", "int4", "fp8", "fp4", "fp16"], {"default": "int8",
+                                  "tooltip": "Vision encoder quantization (int8 = INT8 weights + FP16 compute, best quality/size tradeoff)"}),
             },
             "optional": {
-                "adaptive_offload": (["off", "normal", "aggressive"], {"default": "aggressive",
-                                     "tooltip": "Adaptive GPU caching: aggressive keeps more blocks on GPU between runs"}),
-                "offload_compression": (["none", "auto", "int8", "fp8"], {"default": "auto",
-                                        "tooltip": "Compress offloaded weights to reduce PCIe transfer time"}),
                 "vae_tile_size": ("INT", {"default": 0, "min": 0, "max": 2048, "step": 64,
                                   "tooltip": "VAE tile size in pixels (0 = auto)"}),
                 "pinned_memory_limit": ("STRING", {"default": "", "tooltip": "Max pinned CPU memory: '60%', '48G', '48M', or empty for auto"}),
@@ -744,23 +746,15 @@ class QuantFuncPipelineConfig:
     FUNCTION = "build_config"
     CATEGORY = "QuantFunc"
 
-    def build_config(self, cpu_offload, layer_offload, tiled_vae, attention_backend,
-                     precision, text_precision, adaptive_offload="aggressive",
-                     offload_compression="auto", vae_tile_size=0, pinned_memory_limit=""):
+    def build_config(self, tiled_vae, attention_backend, precision, text_precision,
+                     vision_quant="int8", vae_tile_size=0, pinned_memory_limit=""):
         config = {
-            "cpu_offload": cpu_offload,
-            "layer_offload": layer_offload,
             "tiled_vae": tiled_vae,
             "attention_backend": attention_backend,
             "precision": precision,
             "text_precision": text_precision,
+            "vision_quant": vision_quant,
         }
-        if adaptive_offload == "off":
-            config["adaptive_offload"] = ""
-        else:
-            config["adaptive_offload"] = adaptive_offload
-
-        config["offload_compression"] = offload_compression
 
         if vae_tile_size > 0:
             config["vae_tile_size"] = vae_tile_size
