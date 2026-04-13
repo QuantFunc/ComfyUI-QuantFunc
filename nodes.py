@@ -1484,14 +1484,9 @@ class QuantFuncGenerate:
         cfg = dict(pipeline)
         cfg["options"] = dict(cfg.get("options", {}))
         # Unpack ImageList dict format
-        ref_img_resize = "720"
+        keep_ref_img_size = False
         if ref_images is not None and isinstance(ref_images, dict):
-            # New: ref_img_resize ("720" / "1024" / "origin")
-            # Backwards compat: old workflows may still send keep_ref_img_size (bool)
-            if "ref_img_resize" in ref_images:
-                ref_img_resize = ref_images["ref_img_resize"]
-            elif ref_images.get("keep_ref_img_size"):
-                ref_img_resize = "1024"
+            keep_ref_img_size = bool(ref_images.get("keep_ref_img_size", False))
             ref_images = ref_images["images"]
         if ref_images is not None:
             cfg["options"]["edit_mode"] = True
@@ -1525,7 +1520,7 @@ class QuantFuncGenerate:
                     i2i_opts["sampler"] = sampler_name
                 if sampler_eta > 0.0:
                     i2i_opts["eta"] = sampler_eta
-                i2i_opts["ref_img_resize"] = ref_img_resize
+                i2i_opts["keep_ref_img_size"] = keep_ref_img_size
                 i2i_opts_json = json.dumps(i2i_opts) if i2i_opts else None
                 arr = _manager.image_to_image(
                     prompt=prompt, ref_paths=tmp_paths,
@@ -1571,12 +1566,10 @@ class QuantFuncImageList:
     @classmethod
     def INPUT_TYPES(cls):
         optional = {f"image{i}": ("IMAGE",) for i in range(2, 11)}
-        optional["ref_img_resize"] = (["720", "1024", "origin"], {
-            "default": "720",
-            "tooltip": "Reference image resize mode (edit pipelines):\n"
-                       "  720  — long-side cap at 720 px (default, fastest)\n"
-                       "  1024 — long-side cap at 1024 px (better quality, slower)\n"
-                       "  origin — keep original size, only floor each dim to a multiple of 16",
+        optional["keep_ref_img_size"] = ("BOOLEAN", {
+            "default": False,
+            "tooltip": "Keep reference image at original size (better quality, slower).\n"
+                       "Off (default) resizes long side to 720 px for faster edits.",
         })
         return {
             "required": {
@@ -1590,13 +1583,13 @@ class QuantFuncImageList:
     FUNCTION = "combine"
     CATEGORY = "QuantFunc"
 
-    def combine(self, image1, ref_img_resize="720", **kwargs):
+    def combine(self, image1, keep_ref_img_size=False, **kwargs):
         images = [image1]
         for i in range(2, 11):
             img = kwargs.get(f"image{i}")
             if img is not None:
                 images.append(img)
-        return ({"images": images, "ref_img_resize": ref_img_resize},)
+        return ({"images": images, "keep_ref_img_size": keep_ref_img_size},)
 
 
 # ============================================================================
