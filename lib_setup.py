@@ -14,7 +14,6 @@ import logging
 import os
 import platform
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -34,32 +33,32 @@ def _get_bin_dir() -> str:
 
 
 def detect_cuda_major() -> int:
-    """Detect CUDA major version available on this system.
+    """Detect CUDA major version actually installed on this system.
     Returns 13, 12, or 0 (unknown).
+
+    The worker is an independent subprocess that loads quantfunc.dll via
+    ctypes — it does NOT import torch. DLL resolution scans CUDA_PATH,
+    system toolkit dirs, PATH and LD_LIBRARY_PATH, so detection must
+    reflect the system-installed CUDA, not torch's bundled runtime.
     """
-    # Method 1: check CUDA_PATH environment
+    # Method 1: CUDA_PATH (user-explicit install — also the first dir the
+    # worker scans for DLL deps, so matching it is load-consistent)
     cuda_path = os.environ.get("CUDA_PATH", "")
     if cuda_path:
-        m = re.search(r'v(\d+)', cuda_path)
+        base = os.path.basename(cuda_path.rstrip("\\/"))
+        m = re.search(r'v?(\d+)', base)
         if m:
             return int(m.group(1))
+        # Symlink like /usr/local/cuda → resolve to real target
+        try:
+            real = os.path.realpath(cuda_path)
+            m = re.search(r'v?(\d+)', os.path.basename(real.rstrip("\\/")))
+            if m:
+                return int(m.group(1))
+        except Exception:
+            pass
 
-    # Method 2: nvidia-smi CUDA version
-    try:
-        out = subprocess.check_output(
-            ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
-            timeout=5, stderr=subprocess.DEVNULL
-        ).decode().strip()
-        # Driver >= 560 supports CUDA 13, >= 525 supports CUDA 12
-        driver_ver = int(out.split(".")[0]) if out else 0
-        if driver_ver >= 560:
-            return 13
-        elif driver_ver >= 525:
-            return 12
-    except Exception:
-        pass
-
-    # Method 3: check installed CUDA toolkit
+    # Method 2: installed CUDA toolkit on disk
     if _IS_WINDOWS:
         base = r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA"
         if os.path.isdir(base):
@@ -70,17 +69,43 @@ def detect_cuda_major() -> int:
                     return int(m.group(1))
     else:
         for ver in [13, 12]:
-            if shutil.which(f"nvcc") or os.path.exists(f"/usr/local/cuda-{ver}"):
-                return ver
+            for prefix in ("/usr/local", "/opt", "/usr/lib"):
+                if os.path.isdir(f"{prefix}/cuda-{ver}"):
+                    return ver
+        # Unversioned symlink (e.g. /usr/local/cuda → cuda-12.4)
+        for link in ("/usr/local/cuda", "/opt/cuda", "/usr/lib/cuda"):
+            if os.path.isdir(link):
+                try:
+                    real = os.path.basename(os.path.realpath(link))
+                    m = re.search(r'(\d+)', real)
+                    if m:
+                        return int(m.group(1))
+                except Exception:
+                    pass
 
-    # Method 4: try torch
+    # Method 3: nvidia-smi driver cap — hard ceiling on what CAN run.
+    # Only the driver max, not the installed toolkit version.
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
+            timeout=5, stderr=subprocess.DEVNULL
+        ).decode().strip()
+        driver_ver = int(out.split(".")[0]) if out else 0
+        if driver_ver >= 560:
+            return 13
+        elif driver_ver >= 525:
+            return 12
+    except Exception:
+        pass
+
+    # Method 4: last-resort — torch's build. Does NOT describe system CUDA;
+    # the worker subprocess never loads torch, so this is just a guess.
     try:
         import torch
-        if torch.cuda.is_available():
-            cuda_ver = torch.version.cuda or ""
-            m = re.match(r'(\d+)', cuda_ver)
-            if m:
-                return int(m.group(1))
+        cuda_ver = torch.version.cuda or ""
+        m = re.match(r'(\d+)', cuda_ver)
+        if m:
+            return int(m.group(1))
     except Exception:
         pass
 
