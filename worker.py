@@ -275,12 +275,34 @@ def _get_error():
 # Pipeline state
 # ============================================================================
 
-_pipeline = None      # PIPE_PTR
-_cache_key = None     # str
+_pipelines = {}       # Dict[cache_key: str, PIPE_PTR]
 _cancel_flag = threading.Event()
 
 # Keep reference to current callback to prevent GC during ctypes call
 _current_cb = None
+
+
+def _get_pipeline(msg, req_id):
+    """Look up pipeline by cache_key. Send error if missing; return None.
+    Fallback: if cache_key is missing and exactly one pipeline loaded, use it
+    (backwards-compat for older callers that don't pass cache_key)."""
+    key = msg.get("cache_key")
+    if key is None:
+        if len(_pipelines) == 1:
+            return next(iter(_pipelines.values()))
+        send_json({"type": "result", "req_id": req_id, "status": "error",
+                   "error_code": -1,
+                   "error_message": "cache_key required (loaded: {})".format(
+                       list(_pipelines.keys()))})
+        return None
+    pipe = _pipelines.get(key)
+    if pipe is None:
+        send_json({"type": "result", "req_id": req_id, "status": "error",
+                   "error_code": -1,
+                   "error_message": "No pipeline for cache_key={!r} (loaded: {})".format(
+                       key, list(_pipelines.keys()))})
+        return None
+    return pipe
 
 
 def _make_progress_cb(req_id):
@@ -328,14 +350,14 @@ QUANTFUNC_ERROR_CANCELLED = 6
 
 
 def handle_create(msg):
-    global _pipeline, _cache_key
     req_id = msg["req_id"]
+    key = msg.get("cache_key", "")
 
-    # Destroy existing pipeline if any
-    if _pipeline is not None:
-        _lib.quantfunc_destroy(_pipeline)
-        _pipeline = None
-        _cache_key = None
+    # Reuse existing pipeline for this key (idempotent)
+    if key and key in _pipelines:
+        send_json({"type": "result", "req_id": req_id, "status": "ok",
+                   "cache_key": key, "reused": True})
+        return
 
     params = InitParams()
     params.model_dir = msg["model_dir"].encode() if msg.get("model_dir") else None
@@ -356,16 +378,14 @@ def handle_create(msg):
                    "error_code": status, "error_message": _get_error()})
         return
 
-    _pipeline = pipe
-    _cache_key = msg.get("cache_key", "")
-    send_json({"type": "result", "req_id": req_id, "status": "ok", "cache_key": _cache_key})
+    _pipelines[key] = pipe
+    send_json({"type": "result", "req_id": req_id, "status": "ok", "cache_key": key})
 
 
 def handle_text_to_image(msg):
     req_id = msg["req_id"]
-    if _pipeline is None:
-        send_json({"type": "result", "req_id": req_id, "status": "error",
-                   "error_code": -1, "error_message": "No pipeline loaded"})
+    pipe = _get_pipeline(msg, req_id)
+    if pipe is None:
         return
 
     _cancel_flag.clear()
@@ -383,7 +403,7 @@ def handle_text_to_image(msg):
     t2i.callback_user_data = None
 
     img = IMG_PTR()
-    status = _lib.quantfunc_text_to_image(_pipeline, ctypes.byref(t2i), ctypes.byref(img))
+    status = _lib.quantfunc_text_to_image(pipe, ctypes.byref(t2i), ctypes.byref(img))
 
     if status == QUANTFUNC_ERROR_CANCELLED:
         send_json({"type": "result", "req_id": req_id, "status": "cancelled"})
@@ -398,9 +418,8 @@ def handle_text_to_image(msg):
 
 def handle_image_to_image(msg):
     req_id = msg["req_id"]
-    if _pipeline is None:
-        send_json({"type": "result", "req_id": req_id, "status": "error",
-                   "error_code": -1, "error_message": "No pipeline loaded"})
+    pipe = _get_pipeline(msg, req_id)
+    if pipe is None:
         return
 
     _cancel_flag.clear()
@@ -427,7 +446,7 @@ def handle_image_to_image(msg):
     i2i.callback_user_data = None
 
     img = IMG_PTR()
-    status = _lib.quantfunc_image_to_image(_pipeline, ctypes.byref(i2i), ctypes.byref(img))
+    status = _lib.quantfunc_image_to_image(pipe, ctypes.byref(i2i), ctypes.byref(img))
 
     if status == QUANTFUNC_ERROR_CANCELLED:
         send_json({"type": "result", "req_id": req_id, "status": "cancelled"})
@@ -462,9 +481,8 @@ def handle_export(msg):
 
 def handle_set_api_key(msg):
     req_id = msg["req_id"]
-    if _pipeline is None:
-        send_json({"type": "result", "req_id": req_id, "status": "error",
-                   "error_code": -1, "error_message": "No pipeline loaded"})
+    pipe = _get_pipeline(msg, req_id)
+    if pipe is None:
         return
 
     api_key = msg.get("api_key", "")
@@ -473,7 +491,7 @@ def handle_set_api_key(msg):
                    "error_code": -1, "error_message": "DLL does not support set_api_key"})
         return
 
-    status = _lib.quantfunc_set_api_key(_pipeline, api_key.encode() if api_key else None)
+    status = _lib.quantfunc_set_api_key(pipe, api_key.encode() if api_key else None)
     if status != QUANTFUNC_OK:
         send_json({"type": "result", "req_id": req_id, "status": "error",
                    "error_code": status, "error_message": _get_error()})
@@ -482,33 +500,56 @@ def handle_set_api_key(msg):
 
 
 def handle_unload(msg):
+    """Offload pipeline(s) from GPU to CPU.
+    If cache_key given, unload that one; otherwise unload all."""
     req_id = msg["req_id"]
-    if _pipeline is None:
-        send_json({"type": "result", "req_id": req_id, "status": "error",
-                   "error_code": -1, "error_message": "No pipeline loaded"})
-        return
 
     if not hasattr(_lib, "quantfunc_unload"):
         send_json({"type": "result", "req_id": req_id, "status": "error",
                    "error_code": -1, "error_message": "DLL does not support unload"})
         return
 
-    status = _lib.quantfunc_unload(_pipeline)
-    if status != QUANTFUNC_OK:
-        send_json({"type": "result", "req_id": req_id, "status": "error",
-                   "error_code": status, "error_message": _get_error()})
-        return
-    send_json({"type": "result", "req_id": req_id, "status": "ok"})
+    key = msg.get("cache_key")
+    if key is not None:
+        pipe = _pipelines.get(key)
+        if pipe is None:
+            send_json({"type": "result", "req_id": req_id, "status": "error",
+                       "error_code": -1,
+                       "error_message": "No pipeline for cache_key={!r}".format(key)})
+            return
+        targets = [(key, pipe)]
+    else:
+        targets = list(_pipelines.items())
+
+    for k, pipe in targets:
+        status = _lib.quantfunc_unload(pipe)
+        if status != QUANTFUNC_OK:
+            send_json({"type": "result", "req_id": req_id, "status": "error",
+                       "error_code": status,
+                       "error_message": "unload({}) failed: {}".format(k, _get_error())})
+            return
+    send_json({"type": "result", "req_id": req_id, "status": "ok",
+               "unloaded": [k for k, _ in targets]})
 
 
 def handle_destroy(msg):
-    global _pipeline, _cache_key
+    """Destroy pipeline(s).
+    If cache_key given, destroy that one; otherwise destroy all."""
     req_id = msg["req_id"]
-    if _pipeline is not None:
-        _lib.quantfunc_destroy(_pipeline)
-        _pipeline = None
-        _cache_key = None
-    send_json({"type": "result", "req_id": req_id, "status": "ok"})
+    key = msg.get("cache_key")
+    if key is not None:
+        pipe = _pipelines.pop(key, None)
+        if pipe is not None:
+            _lib.quantfunc_destroy(pipe)
+        send_json({"type": "result", "req_id": req_id, "status": "ok",
+                   "destroyed": [key] if pipe is not None else []})
+        return
+    destroyed = list(_pipelines.keys())
+    for _, pipe in _pipelines.items():
+        _lib.quantfunc_destroy(pipe)
+    _pipelines.clear()
+    send_json({"type": "result", "req_id": req_id, "status": "ok",
+               "destroyed": destroyed})
 
 
 # ============================================================================
@@ -553,15 +594,14 @@ HANDLERS = {
 
 
 def _cleanup_and_exit(signum=None, frame=None):
-    """Clean up pipeline and exit. Called on SIGTERM/SIGINT."""
-    global _pipeline
+    """Clean up all pipelines and exit. Called on SIGTERM/SIGINT."""
     sig_name = f" (signal {signum})" if signum else ""
-    log(f"Cleanup{sig_name}: destroying pipeline...")
+    log(f"Cleanup{sig_name}: destroying {len(_pipelines)} pipeline(s)...")
     try:
-        if _pipeline is not None and _lib is not None:
-            _lib.quantfunc_destroy(_pipeline)
-            _pipeline = None
-            log("Pipeline destroyed")
+        if _lib is not None:
+            for _, pipe in _pipelines.items():
+                _lib.quantfunc_destroy(pipe)
+            _pipelines.clear()
     except Exception as e:
         log(f"Cleanup error: {e}")
     # Force exit — don't let CUDA atexit handlers hang
@@ -581,6 +621,17 @@ def main():
     # Install signal handlers for graceful shutdown (release GPU before dying)
     signal.signal(signal.SIGTERM, _cleanup_and_exit)
     signal.signal(signal.SIGINT, _cleanup_and_exit)
+
+    # Linux: ask the kernel to send SIGTERM to this worker whenever the parent
+    # process (ComfyUI) dies — covers SIGKILL / crash / force-quit that skip
+    # parent's atexit handlers. Harmless if preexec_fn already set it.
+    if platform.system() == "Linux":
+        try:
+            libc = ctypes.CDLL("libc.so.6", use_errno=True)
+            PR_SET_PDEATHSIG = 1
+            libc.prctl(PR_SET_PDEATHSIG, signal.SIGTERM, 0, 0, 0)
+        except Exception as e:
+            log(f"prctl(PR_SET_PDEATHSIG) failed: {e}")
 
     log(f"Starting worker (pid={os.getpid()}, dll={args.dll_path})")
     _load_dll(args.dll_path)
@@ -614,9 +665,10 @@ def main():
         req_id = msg.get("req_id", 0)
 
         if cmd == "shutdown":
-            log("Shutting down")
-            if _pipeline is not None:
-                _lib.quantfunc_destroy(_pipeline)
+            log(f"Shutting down ({len(_pipelines)} pipeline(s))")
+            for _, pipe in _pipelines.items():
+                _lib.quantfunc_destroy(pipe)
+            _pipelines.clear()
             break
 
         if cmd == "ping":
