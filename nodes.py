@@ -12,12 +12,14 @@ from ComfyUI's PyTorch (avoids DLL version conflicts on Windows).
 """
 
 import atexit
+import ctypes
 import hashlib
 import json
 import logging
 import numpy as np
 import os
 import platform
+import signal
 import struct
 import subprocess
 import sys
@@ -134,6 +136,107 @@ _dep_downloading = False  # True while download is in progress
 _dep_downloaded = False   # True after dep download attempted (success or fail)
 
 
+if not _IS_WINDOWS:
+    try:
+        _libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        _PR_SET_PDEATHSIG = 1
+
+        def _linux_die_with_parent():
+            """preexec_fn: kernel will send SIGTERM to this worker when its
+            parent process (ComfyUI) dies, even from SIGKILL or crash."""
+            _libc.prctl(_PR_SET_PDEATHSIG, signal.SIGTERM, 0, 0, 0)
+    except Exception:
+        _linux_die_with_parent = None
+else:
+    _linux_die_with_parent = None
+
+
+def _kill_stale_workers(dll_path):
+    """Find and kill leftover worker.py subprocesses from previous ComfyUI
+    runs that didn't exit cleanly. Identified by matching the --dll-path arg
+    in their cmdline. Must only match OUR workers, not other tools.
+    """
+    my_pid = os.getpid()
+    worker_script = os.path.abspath(_WORKER_PY)
+    dll_abs = os.path.abspath(dll_path)
+    candidates = []
+
+    if _IS_WINDOWS:
+        # psutil would be cleanest but we can't assume it. Use WMIC.
+        # /format:list output is blocks of Key=Value lines separated by blank
+        # lines. Key order inside a block is not guaranteed.
+        try:
+            out = subprocess.check_output(
+                ["wmic", "process", "where",
+                 "name='python.exe' or name='pythonw.exe'",
+                 "get", "ProcessId,CommandLine", "/format:list"],
+                stderr=subprocess.DEVNULL, timeout=5).decode("utf-8", "replace")
+            block = {}
+            def flush_block():
+                cmd = block.get("CommandLine", "")
+                pid_str = block.get("ProcessId", "").strip()
+                if pid_str.isdigit() and cmd:
+                    pid = int(pid_str)
+                    if (pid != my_pid and worker_script in cmd
+                            and dll_abs in cmd):
+                        candidates.append(pid)
+            for line in out.splitlines():
+                line = line.strip()
+                if not line:
+                    if block:
+                        flush_block()
+                        block = {}
+                    continue
+                if "=" in line:
+                    k, _, v = line.partition("=")
+                    block[k.strip()] = v
+            if block:
+                flush_block()
+        except Exception as e:
+            logging.debug("[QuantFunc] stale-worker scan (wmic) failed: %s", e)
+    else:
+        # Linux: walk /proc
+        try:
+            for pid_entry in os.listdir("/proc"):
+                if not pid_entry.isdigit():
+                    continue
+                pid = int(pid_entry)
+                if pid == my_pid:
+                    continue
+                try:
+                    with open("/proc/%d/cmdline" % pid, "rb") as f:
+                        cmdline = f.read().decode("utf-8", "replace")
+                except (OSError, IOError):
+                    continue
+                # Args are NUL-separated; also match if joined with spaces
+                if worker_script in cmdline and dll_abs in cmdline:
+                    candidates.append(pid)
+        except Exception as e:
+            logging.debug("[QuantFunc] stale-worker scan (/proc) failed: %s", e)
+
+    if not candidates:
+        return
+    logging.warning("[QuantFunc] Killing %d stale worker process(es) from previous run: %s",
+                    len(candidates), candidates)
+    for pid in candidates:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    # Give them 3 seconds to exit gracefully, then SIGKILL leftovers
+    time.sleep(3)
+    for pid in candidates:
+        try:
+            os.kill(pid, 0)  # still alive?
+        except OSError:
+            continue
+        try:
+            os.kill(pid, signal.SIGKILL)
+            logging.warning("[QuantFunc] SIGKILL'd stale worker pid %d", pid)
+        except OSError:
+            pass
+
+
 class WorkerManager:
     """Manages a QuantFunc worker subprocess with isolated CUDA libraries."""
 
@@ -142,7 +245,9 @@ class WorkerManager:
         self._stdin = None
         self._stdout = None
         self._stderr_thread = None
-        self._current_key = None
+        self._loaded_keys = set()          # keys currently alive in worker
+        self._api_keys = {}                # cache_key -> api_key last set
+        self._node_refs = {}               # generate_node_id -> cache_key (owner tracking)
         self._req_counter = 0
         self._lock = threading.Lock()
 
@@ -178,9 +283,20 @@ class WorkerManager:
         python_exe = os.environ.get("QUANTFUNC_PYTHON", "") or sys.executable
         cmd = [python_exe, _WORKER_PY, "--dll-path", dll_path]
 
+        # Kill leftover workers from a previous ComfyUI run that didn't exit
+        # cleanly (SIGKILL / reboot / force-quit). They still hold VRAM.
+        _kill_stale_workers(dll_path)
+
         creation_flags = 0
+        preexec = None
         if _IS_WINDOWS:
             creation_flags = subprocess.CREATE_NO_WINDOW
+        else:
+            # Linux: ask the kernel to send SIGTERM to the worker whenever our
+            # process dies (PR_SET_PDEATHSIG). Without this, if ComfyUI gets
+            # SIGKILL'd or crashes, the worker is reparented to init and keeps
+            # holding ~15 GB of VRAM until the user manually kills it.
+            preexec = _linux_die_with_parent
 
         logging.info("[QuantFunc] Starting worker: %s (python=%s)",
                      " ".join(cmd[:4]), python_exe)
@@ -188,7 +304,8 @@ class WorkerManager:
         try:
             self._process = subprocess.Popen(
                 cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE, env=env, creationflags=creation_flags)
+                stderr=subprocess.PIPE, env=env, creationflags=creation_flags,
+                preexec_fn=preexec)
         except Exception as e:
             return False, (f"Failed to start worker process: {e}\n"
                            f"Python: {python_exe}\n"
@@ -272,7 +389,9 @@ class WorkerManager:
 
         if self._process is not None:
             logging.warning("[QuantFunc] Worker process died, restarting...")
-            self._current_key = None
+            self._loaded_keys.clear()
+            self._api_keys.clear()
+            self._node_refs.clear()
 
         dll_path = _LIB_PATH
         if not os.path.exists(dll_path):
@@ -342,7 +461,9 @@ class WorkerManager:
                                   "process may be stuck in CUDA driver (D state). "
                                   "GPU resources may remain occupied until reboot.", pid)
             self._process = None
-            self._current_key = None
+            self._loaded_keys.clear()
+            self._api_keys.clear()
+            self._node_refs.clear()
 
     # ── IPC ──
 
@@ -447,21 +568,37 @@ class WorkerManager:
 
     # ── Public API ──
 
-    def set_api_key(self, api_key):
-        """Hot-swap API key on the loaded pipeline (no pipeline recreation)."""
+    def set_api_key(self, cache_key, api_key):
+        """Hot-swap API key on the specified pipeline (no pipeline recreation)."""
         with self._lock:
             if self._process is None or self._process.poll() is not None:
-                return  # no worker running
-            cmd = {
-                "cmd": "set_api_key",
-                "req_id": self._next_req_id(),
-                "api_key": api_key,
-            }
-            self._call(cmd, timeout=30)
-            self._current_api_key = api_key
+                return
+            if cache_key not in self._loaded_keys:
+                return
+            self._set_api_key_locked(cache_key, api_key)
 
-    def ensure_pipeline(self, cfg):
-        """Ensure pipeline matching cfg is loaded in worker."""
+    def _unload_others_locked(self, keep_key):
+        """Offload all pipelines except keep_key to CPU, to free VRAM before
+        loading/running keep_key. Must be called with self._lock held."""
+        others = [k for k in self._loaded_keys if k != keep_key]
+        for k in others:
+            try:
+                self._call({"cmd": "unload", "req_id": self._next_req_id(),
+                            "cache_key": k}, timeout=60)
+                logging.info("[QuantFunc] Offloaded pipeline %s to CPU", k[:8])
+            except Exception as e:
+                logging.warning("[QuantFunc] Failed to offload %s: %s", k[:8], e)
+
+    def ensure_pipeline(self, cfg, node_id=None, alive_node_ids=None):
+        """Ensure pipeline matching cfg is loaded in worker. Returns its cache key.
+        `node_id` is the caller's ComfyUI UNIQUE_ID. If provided, we track which
+        node references which cache key and destroy pipelines that no node
+        references anymore (e.g. when a loader node's transformer path changes).
+        `alive_node_ids` is the set of Generate node ids present in the current
+        workflow — any _node_refs entry not in this set is considered stale
+        (node was deleted from the workflow) and its pipeline is destroyed if
+        no one else references it.
+        """
         with self._lock:
             self._ensure_worker()
 
@@ -469,14 +606,57 @@ class WorkerManager:
             opts = cfg.get("options", {})
             new_api_key = opts.get("api_key", "")
 
-            if key == self._current_key:
-                # Pipeline config unchanged — check if API key changed
-                if new_api_key and new_api_key != getattr(self, "_current_api_key", ""):
-                    self._set_api_key_locked(new_api_key)
-                return  # reuse existing pipeline
+            # Evict stale refs from deleted/disconnected Generate nodes
+            if alive_node_ids is not None:
+                stale = [nid for nid in self._node_refs if nid not in alive_node_ids]
+                for nid in stale:
+                    dropped_key = self._node_refs.pop(nid)
+                    logging.info("[QuantFunc] Dropping stale node ref %s -> %s",
+                                 nid, dropped_key[:8] if dropped_key else None)
+                    if (dropped_key and
+                            dropped_key not in self._node_refs.values() and
+                            dropped_key != key and
+                            dropped_key in self._loaded_keys):
+                        logging.info("[QuantFunc] Destroying orphan pipeline %s (no nodes reference it)",
+                                     dropped_key[:8])
+                        try:
+                            self._call({"cmd": "destroy",
+                                        "req_id": self._next_req_id(),
+                                        "cache_key": dropped_key}, timeout=30)
+                        except Exception as e:
+                            logging.warning("[QuantFunc] destroy(%s) failed: %s", dropped_key[:8], e)
+                        self._loaded_keys.discard(dropped_key)
+                        self._api_keys.pop(dropped_key, None)
 
-            if self._current_key is not None:
-                logging.info("[QuantFunc] Config changed, recreating pipeline...")
+            # Update node→key ownership and release orphaned pipelines
+            if node_id is not None:
+                old_key = self._node_refs.get(node_id)
+                self._node_refs[node_id] = key
+                if old_key and old_key != key:
+                    # If no other node still references the old key, destroy it
+                    if old_key not in self._node_refs.values() and old_key in self._loaded_keys:
+                        logging.info("[QuantFunc] Destroying orphan pipeline %s (node %s changed config)",
+                                     old_key[:8], node_id)
+                        try:
+                            self._call({"cmd": "destroy",
+                                        "req_id": self._next_req_id(),
+                                        "cache_key": old_key}, timeout=30)
+                        except Exception as e:
+                            logging.warning("[QuantFunc] destroy(%s) failed: %s", old_key[:8], e)
+                        self._loaded_keys.discard(old_key)
+                        self._api_keys.pop(old_key, None)
+
+            if key in self._loaded_keys:
+                # Pipeline already loaded — check if API key changed
+                if new_api_key and new_api_key != self._api_keys.get(key, ""):
+                    self._set_api_key_locked(key, new_api_key)
+                return key
+
+            if self._loaded_keys:
+                logging.info("[QuantFunc] New pipeline requested, offloading %d existing to CPU...",
+                             len(self._loaded_keys))
+                # Free VRAM before creating new pipeline
+                self._unload_others_locked(keep_key=key)
 
             # Build create command
             create_cmd = {
@@ -500,26 +680,31 @@ class WorkerManager:
                          f"config_json={create_cmd['config_json']!r}")
 
             self._call(create_cmd, timeout=1800)
-            self._current_key = key
-            self._current_api_key = new_api_key
-            logging.info("[QuantFunc] Pipeline ready.")
+            self._loaded_keys.add(key)
+            self._api_keys[key] = new_api_key
+            logging.info("[QuantFunc] Pipeline ready (%d loaded).", len(self._loaded_keys))
+            return key
 
-    def _set_api_key_locked(self, api_key):
+    def _set_api_key_locked(self, cache_key, api_key):
         """Internal: set API key while already holding self._lock."""
         cmd = {
             "cmd": "set_api_key",
             "req_id": self._next_req_id(),
+            "cache_key": cache_key,
             "api_key": api_key,
         }
         self._call(cmd, timeout=30)
-        self._current_api_key = api_key
+        self._api_keys[cache_key] = api_key
         logging.info("[QuantFunc] API key updated (hot-swap).")
 
-    def text_to_image(self, prompt, height, width, steps, seed,
+    def text_to_image(self, cache_key, prompt, height, width, steps, seed,
                       guidance_scale, options_json=None, pbar=None):
-        """Generate text-to-image. Returns [H, W, 3] float32 numpy array."""
+        """Generate text-to-image on the specified pipeline. Returns [H, W, 3] float32 numpy array."""
         with self._lock:
             self._ensure_worker()
+
+            # Before running, make sure only the target pipeline is GPU-resident
+            self._unload_others_locked(keep_key=cache_key)
 
             def on_progress(step, total):
                 if pbar is not None:
@@ -528,6 +713,7 @@ class WorkerManager:
             cmd = {
                 "cmd": "text_to_image",
                 "req_id": self._next_req_id(),
+                "cache_key": cache_key,
                 "prompt": prompt,
                 "height": height,
                 "width": width,
@@ -540,12 +726,15 @@ class WorkerManager:
             resp = self._call(cmd, progress_cb=on_progress, timeout=600)
             return self._read_image(resp)
 
-    def image_to_image(self, prompt, ref_paths, height, width, steps, seed,
+    def image_to_image(self, cache_key, prompt, ref_paths, height, width, steps, seed,
                        true_cfg_scale=4.0, negative_prompt="",
                        options_json=None, pbar=None):
-        """Generate image-to-image. Returns [H, W, 3] float32 numpy array."""
+        """Generate image-to-image on the specified pipeline. Returns [H, W, 3] float32 numpy array."""
         with self._lock:
             self._ensure_worker()
+
+            # Before running, make sure only the target pipeline is GPU-resident
+            self._unload_others_locked(keep_key=cache_key)
 
             def on_progress(step, total):
                 if pbar is not None:
@@ -554,6 +743,7 @@ class WorkerManager:
             cmd = {
                 "cmd": "image_to_image",
                 "req_id": self._next_req_id(),
+                "cache_key": cache_key,
                 "prompt": prompt,
                 "ref_image_paths": ref_paths,
                 "height": height,
@@ -573,10 +763,11 @@ class WorkerManager:
         with self._lock:
             self._ensure_worker()
 
-            # Destroy loaded pipeline first to free VRAM
-            if self._current_key is not None:
+            # Destroy all loaded pipelines first to free VRAM
+            if self._loaded_keys:
                 self._call({"cmd": "destroy", "req_id": self._next_req_id()})
-                self._current_key = None
+                self._loaded_keys.clear()
+                self._api_keys.clear()
 
             opts = dict(cfg.get("options", {}))
             sched = cfg.get("scheduler", "")
@@ -607,25 +798,36 @@ class WorkerManager:
             except Exception:
                 pass
 
-    def unload_pipeline(self):
-        """Offload all models from GPU to CPU, freeing VRAM. Pipeline stays alive for fast reload."""
+    def unload_pipeline(self, cache_key=None):
+        """Offload models from GPU to CPU, freeing VRAM. Pipelines stay alive for fast reload.
+        If cache_key given, unload that one; otherwise unload all."""
         with self._lock:
-            if self._process and self._process.poll() is None and self._current_key is not None:
-                try:
-                    self._call({"cmd": "unload", "req_id": self._next_req_id()}, timeout=30)
-                    logging.info("[QuantFunc] Models offloaded to CPU — VRAM freed")
-                except Exception as e:
-                    logging.warning("[QuantFunc] Unload failed: %s", e)
+            if self._process is None or self._process.poll() is not None:
+                return
+            if not self._loaded_keys:
+                return
+            cmd = {"cmd": "unload", "req_id": self._next_req_id()}
+            if cache_key is not None:
+                if cache_key not in self._loaded_keys:
+                    return
+                cmd["cache_key"] = cache_key
+            try:
+                self._call(cmd, timeout=30)
+                logging.info("[QuantFunc] Models offloaded to CPU — VRAM freed (%s)",
+                             cache_key if cache_key else "all")
+            except Exception as e:
+                logging.warning("[QuantFunc] Unload failed: %s", e)
 
     def destroy_all(self):
-        """Destroy loaded pipeline (keep worker alive)."""
+        """Destroy all loaded pipelines (keep worker alive)."""
         with self._lock:
-            if self._process and self._process.poll() is None and self._current_key is not None:
+            if self._process and self._process.poll() is None and self._loaded_keys:
                 try:
                     self._call({"cmd": "destroy", "req_id": self._next_req_id()}, timeout=30)
                 except Exception:
                     pass
-                self._current_key = None
+                self._loaded_keys.clear()
+                self._api_keys.clear()
 
     def shutdown(self):
         """Shutdown worker process."""
@@ -641,7 +843,8 @@ class WorkerManager:
                     # IPC failed (broken pipe, etc.) — use signal-based kill
                     self._kill_worker()
             self._process = None
-            self._current_key = None
+            self._loaded_keys.clear()
+            self._api_keys.clear()
 
     def _read_image(self, resp):
         """Read binary image data following a result response."""
@@ -680,7 +883,7 @@ try:
     _UNREALISTIC_VRAM_REQUEST = 256 * 1024 * 1024 * 1024 * 1024  # 256 TB
 
     def _hooked_free_memory(memory_required, device, keep_loaded=[], **kwargs):
-        if _manager._current_key is not None and memory_required > 0:
+        if _manager._loaded_keys and memory_required > 0:
             # Ignore blanket "free everything" calls (e.g. unload_all_models
             # passes 1e30).  These happen after every prompt execution when
             # smart memory management is disabled and would needlessly destroy
@@ -696,9 +899,9 @@ try:
                 except Exception:
                     free_vram = 0
                 if free_vram < memory_required:
-                    logging.info("[QuantFunc] Auto-unloading pipelines to free VRAM for other models "
+                    logging.info("[QuantFunc] Auto-offloading pipelines to free VRAM for other models "
                                  f"(need {memory_required // 1024**2} MB, free {free_vram // 1024**2} MB)")
-                    _manager.destroy_all()
+                    _manager.unload_pipeline()  # offload all to CPU, keep alive
         return _original_free_memory(memory_required, device, keep_loaded=keep_loaded, **kwargs)
 
     _mm.free_memory = _hooked_free_memory
@@ -1452,7 +1655,8 @@ class QuantFuncGenerate:
                                "Models stay in CPU RAM for fast reload on the next run.\n"
                                "Enable this when sharing VRAM with other ComfyUI nodes.",
                 }),
-            }
+            },
+            "hidden": {"unique_id": "UNIQUE_ID", "workflow_prompt": "PROMPT"},
         }
 
     RETURN_TYPES = ("IMAGE",)
@@ -1465,7 +1669,8 @@ class QuantFuncGenerate:
                  guidance_scale, ref_images=None,
                  negative_prompt="", true_cfg_scale=4.0,
                  sampler_name="euler", sampler_eta=0.0,
-                 unload_every_time=False):
+                 unload_every_time=False, unique_id=None,
+                 workflow_prompt=None):
         import torch
 
         # Handle unload request
@@ -1484,14 +1689,35 @@ class QuantFuncGenerate:
         cfg = dict(pipeline)
         cfg["options"] = dict(cfg.get("options", {}))
         # Unpack ImageList dict format
-        keep_ref_img_size = False
+        ref_img_resize = "720"
         if ref_images is not None and isinstance(ref_images, dict):
-            keep_ref_img_size = bool(ref_images.get("keep_ref_img_size", False))
+            # New: ref_img_resize ("720" / "1024" / "origin")
+            # Backwards compat: old workflows may still send keep_ref_img_size (bool)
+            if "ref_img_resize" in ref_images:
+                ref_img_resize = ref_images["ref_img_resize"]
+            elif ref_images.get("keep_ref_img_size"):
+                ref_img_resize = "1024"
             ref_images = ref_images["images"]
         if ref_images is not None:
             cfg["options"]["edit_mode"] = True
 
-        _manager.ensure_pipeline(cfg)
+        # Collect live QuantFuncGenerate node ids from the current workflow.
+        # Exclude nodes whose required `pipeline` input isn't connected — those
+        # never execute and should release their cached pipeline refs.
+        alive_ids = None
+        if isinstance(workflow_prompt, dict):
+            alive_ids = set()
+            for nid, node in workflow_prompt.items():
+                if not (isinstance(node, dict) and node.get("class_type") == "QuantFuncGenerate"):
+                    continue
+                pipe_in = node.get("inputs", {}).get("pipeline")
+                # Connected inputs are [source_node_id, output_slot]; anything
+                # else (None / missing) means dangling.
+                if not (isinstance(pipe_in, list) and len(pipe_in) == 2):
+                    continue
+                alive_ids.add(nid)
+        cache_key = _manager.ensure_pipeline(cfg, node_id=unique_id,
+                                             alive_node_ids=alive_ids)
 
         # Create ComfyUI progress bar
         pbar = None
@@ -1520,9 +1746,10 @@ class QuantFuncGenerate:
                     i2i_opts["sampler"] = sampler_name
                 if sampler_eta > 0.0:
                     i2i_opts["eta"] = sampler_eta
-                i2i_opts["keep_ref_img_size"] = keep_ref_img_size
+                i2i_opts["ref_img_resize"] = ref_img_resize
                 i2i_opts_json = json.dumps(i2i_opts) if i2i_opts else None
                 arr = _manager.image_to_image(
+                    cache_key=cache_key,
                     prompt=prompt, ref_paths=tmp_paths,
                     height=height, width=width, steps=steps, seed=seed,
                     true_cfg_scale=true_cfg_scale, negative_prompt=neg,
@@ -1541,12 +1768,13 @@ class QuantFuncGenerate:
                              sampler_name, sampler_eta, opts_json)
 
                 arr = _manager.text_to_image(
+                    cache_key=cache_key,
                     prompt=prompt, height=height, width=width,
                     steps=steps, seed=seed, guidance_scale=guidance_scale,
                     options_json=opts_json, pbar=pbar)
 
             if unload_every_time:
-                _manager.unload_pipeline()
+                _manager.unload_pipeline(cache_key)
 
             return (torch.from_numpy(arr).unsqueeze(0),)  # [1, H, W, 3]
 
@@ -1566,10 +1794,12 @@ class QuantFuncImageList:
     @classmethod
     def INPUT_TYPES(cls):
         optional = {f"image{i}": ("IMAGE",) for i in range(2, 11)}
-        optional["keep_ref_img_size"] = ("BOOLEAN", {
-            "default": False,
-            "tooltip": "Keep reference image at original size (better quality, slower).\n"
-                       "Off (default) resizes long side to 720 px for faster edits.",
+        optional["ref_img_resize"] = (["720", "1024", "origin"], {
+            "default": "720",
+            "tooltip": "Reference image resize mode (edit pipelines):\n"
+                       "  720  — long-side cap at 720 px (default, fastest)\n"
+                       "  1024 — long-side cap at 1024 px (better quality, slower)\n"
+                       "  origin — keep original size, only floor each dim to a multiple of 16",
         })
         return {
             "required": {
@@ -1583,13 +1813,13 @@ class QuantFuncImageList:
     FUNCTION = "combine"
     CATEGORY = "QuantFunc"
 
-    def combine(self, image1, keep_ref_img_size=False, **kwargs):
+    def combine(self, image1, ref_img_resize="720", **kwargs):
         images = [image1]
         for i in range(2, 11):
             img = kwargs.get(f"image{i}")
             if img is not None:
                 images.append(img)
-        return ({"images": images, "keep_ref_img_size": keep_ref_img_size},)
+        return ({"images": images, "ref_img_resize": ref_img_resize},)
 
 
 # ============================================================================

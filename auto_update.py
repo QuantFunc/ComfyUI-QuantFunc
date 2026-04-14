@@ -219,6 +219,20 @@ def _find_best_compatible_version(
     lib_key = "lib" + _CUDA_SUFFIX        # "lib" or "lib-12"
     comfy_key = "comfy" + _CUDA_SUFFIX    # "comfy" or "comfy-12"
 
+    # Find the highest remote lib version first. If local is already newer
+    # (e.g. a locally compiled dev build), skip update entirely so we don't
+    # accidentally downgrade a freshly built binary.
+    if local_lib is not None:
+        highest_remote = None
+        for info in remote_versions.values():
+            lib_version = info.get(lib_key, info.get("lib", "0.0.00"))
+            if highest_remote is None or _ver_cmp(lib_version, highest_remote) > 0:
+                highest_remote = lib_version
+        if highest_remote is not None and _ver_cmp(local_lib, highest_remote) > 0:
+            logger.debug("Local lib %s is newer than highest remote %s, skipping update",
+                         local_lib, highest_remote)
+            return None
+
     best_key = None
     best_lib = None
     best_info = None
@@ -365,12 +379,21 @@ def _check_and_update():
 
         comfy_version = _read_comfy_version()
         local_lib = _read_lib_version()
+        lib_path = os.path.join(_get_bin_dir(), _LIB_NAME)
+        lib_file_exists = os.path.exists(lib_path)
 
-        if local_lib is None:
+        if local_lib is None and not lib_file_exists:
             print(
                 "[QuantFunc] No library found, checking ModelScope for download "
                 "(plugin v{})...".format(comfy_version)
             )
+        elif local_lib is None and lib_file_exists:
+            # Library file exists but version can't be read (e.g. locally compiled
+            # build, or incompatible binary). Don't overwrite it.
+            print(
+                "[QuantFunc] Library exists but version unreadable, skipping update"
+            )
+            return
         else:
             print(
                 "[QuantFunc] Checking for updates (plugin v{}, lib v{})...".format(
