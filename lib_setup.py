@@ -33,58 +33,29 @@ def _get_bin_dir() -> str:
 
 
 def detect_cuda_major() -> int:
-    """Detect CUDA major version actually installed on this system.
+    """Detect the CUDA major version this system can run.
     Returns 13, 12, or 0 (unknown).
 
-    The worker is an independent subprocess that loads quantfunc.dll via
-    ctypes — it does NOT import torch. DLL resolution scans CUDA_PATH,
-    system toolkit dirs, PATH and LD_LIBRARY_PATH, so detection must
-    reflect the system-installed CUDA, not torch's bundled runtime.
+    Primary signal: nvidia-smi's "CUDA Version" header (driver-supported max).
+    This is the authoritative answer — it's what the user sees when they run
+    nvidia-smi, and the worker ships its own runtime libs via the dep zip,
+    so anything the driver supports will load.
+
+    Fallbacks (only if nvidia-smi unavailable, e.g. no GPU at install time):
+    driver_version → CUDA cap, installed toolkit dirs, CUDA_PATH, torch.
     """
-    # Method 1: CUDA_PATH (user-explicit install — also the first dir the
-    # worker scans for DLL deps, so matching it is load-consistent)
-    cuda_path = os.environ.get("CUDA_PATH", "")
-    if cuda_path:
-        base = os.path.basename(cuda_path.rstrip("\\/"))
-        m = re.search(r'v?(\d+)', base)
+    # Primary: nvidia-smi "CUDA Version" header
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi"], timeout=5, stderr=subprocess.DEVNULL,
+        ).decode("utf-8", errors="replace")
+        m = re.search(r'CUDA Version:\s*(\d+)', out)
         if m:
             return int(m.group(1))
-        # Symlink like /usr/local/cuda → resolve to real target
-        try:
-            real = os.path.realpath(cuda_path)
-            m = re.search(r'v?(\d+)', os.path.basename(real.rstrip("\\/")))
-            if m:
-                return int(m.group(1))
-        except Exception:
-            pass
+    except Exception:
+        pass
 
-    # Method 2: installed CUDA toolkit on disk
-    if _IS_WINDOWS:
-        base = r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA"
-        if os.path.isdir(base):
-            versions = sorted(os.listdir(base), reverse=True)
-            for v in versions:
-                m = re.match(r'v(\d+)', v)
-                if m:
-                    return int(m.group(1))
-    else:
-        for ver in [13, 12]:
-            for prefix in ("/usr/local", "/opt", "/usr/lib"):
-                if os.path.isdir(f"{prefix}/cuda-{ver}"):
-                    return ver
-        # Unversioned symlink (e.g. /usr/local/cuda → cuda-12.4)
-        for link in ("/usr/local/cuda", "/opt/cuda", "/usr/lib/cuda"):
-            if os.path.isdir(link):
-                try:
-                    real = os.path.basename(os.path.realpath(link))
-                    m = re.search(r'(\d+)', real)
-                    if m:
-                        return int(m.group(1))
-                except Exception:
-                    pass
-
-    # Method 3: nvidia-smi driver cap — hard ceiling on what CAN run.
-    # Only the driver max, not the installed toolkit version.
+    # Fallback: driver_version → CUDA cap
     try:
         out = subprocess.check_output(
             ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
@@ -93,13 +64,55 @@ def detect_cuda_major() -> int:
         driver_ver = int(out.split(".")[0]) if out else 0
         if driver_ver >= 560:
             return 13
-        elif driver_ver >= 525:
+        if driver_ver >= 525:
             return 12
     except Exception:
         pass
 
-    # Method 4: last-resort — torch's build. Does NOT describe system CUDA;
-    # the worker subprocess never loads torch, so this is just a guess.
+    # Fallback: installed toolkit dirs (scan all cuda-X.Y, take max)
+    candidates = []
+    if _IS_WINDOWS:
+        base = r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA"
+        if os.path.isdir(base):
+            try:
+                for entry in os.listdir(base):
+                    m = re.match(r'v(\d+)', entry)
+                    if m and os.path.isdir(os.path.join(base, entry)):
+                        candidates.append(int(m.group(1)))
+            except OSError:
+                pass
+    else:
+        for prefix in ("/usr/local", "/opt", "/usr/lib"):
+            if not os.path.isdir(prefix):
+                continue
+            try:
+                for entry in os.listdir(prefix):
+                    m = re.match(r'cuda-(\d+)', entry)
+                    if m and os.path.isdir(os.path.join(prefix, entry)):
+                        candidates.append(int(m.group(1)))
+            except OSError:
+                pass
+        for link in ("/usr/local/cuda", "/opt/cuda", "/usr/lib/cuda"):
+            if os.path.islink(link) or os.path.isdir(link):
+                try:
+                    real = os.path.basename(os.path.realpath(link))
+                    m = re.search(r'(\d+)', real)
+                    if m:
+                        candidates.append(int(m.group(1)))
+                except Exception:
+                    pass
+    if candidates:
+        return max(candidates)
+
+    # Fallback: CUDA_PATH env hint
+    cuda_path = os.environ.get("CUDA_PATH", "")
+    if cuda_path:
+        target = os.path.realpath(cuda_path) if os.path.exists(cuda_path) else cuda_path
+        m = re.search(r'(\d+)', os.path.basename(target.rstrip("\\/")))
+        if m:
+            return int(m.group(1))
+
+    # Last resort: torch's bundled cuda
     try:
         import torch
         cuda_ver = torch.version.cuda or ""
@@ -110,6 +123,25 @@ def detect_cuda_major() -> int:
         pass
 
     return 0
+
+
+def select_cuda_major() -> int:
+    """Pick the effective CUDA major for binary selection.
+
+    detect_cuda_major() reports what's installed on disk, but on RTX 50-series
+    (SM120+) the GPU REQUIRES CUDA 13 PTX regardless. The cu13 dep zip ships
+    its own libcudart.so.13/libcublas.so.13/etc., so a system with only cu12
+    toolkit installed can still run the cu13 binary. Trust the GPU.
+    """
+    detected = detect_cuda_major()
+    try:
+        gpu_sm = _detect_gpu_sm()
+    except Exception:
+        gpu_sm = 0
+    if gpu_sm >= 120 and detected != 13:
+        logger.info("SM%d GPU detected, forcing CUDA 13 (detected %d)", gpu_sm, detected)
+        return 13
+    return detected if detected > 0 else 13
 
 
 def get_lib_names(cuda_major: int):
@@ -378,23 +410,7 @@ def resolve_library() -> str:
     Raises RuntimeError if SM120+ GPU detected with CUDA 12 (unsupported).
     """
     bin_dir = _get_bin_dir()
-    cuda_major = detect_cuda_major()
-    gpu_sm = _detect_gpu_sm()
-
-    # SM120+ (RTX 50 series) requires CUDA 13. CUDA 12 cannot compile PTX for SM120.
-    if gpu_sm >= 120 and cuda_major <= 12 and cuda_major > 0:
-        msg = (
-            f"[QuantFunc] FATAL: RTX 50-series GPU detected (SM{gpu_sm}) but only "
-            f"CUDA {cuda_major} is available.\n"
-            f"[QuantFunc] SM120+ requires CUDA 13.x. Please upgrade:\n"
-            f"[QuantFunc]   https://developer.nvidia.com/cuda-downloads\n"
-            f"[QuantFunc] After installing CUDA 13, restart ComfyUI."
-        )
-        print(msg)
-        raise RuntimeError(
-            f"SM{gpu_sm} GPU requires CUDA 13+ (found CUDA {cuda_major}). "
-            f"Install CUDA 13.x from https://developer.nvidia.com/cuda-downloads"
-        )
+    cuda_major = select_cuda_major()
     dll_name, _ = get_lib_names(cuda_major)
     dll_path = os.path.join(bin_dir, dll_name)
 
