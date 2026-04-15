@@ -42,8 +42,8 @@ _PLATFORM = "win32" if _IS_WINDOWS else "linux"
 def _get_lib_name() -> str:
     """Get the correct library filename based on CUDA version."""
     try:
-        from .lib_setup import detect_cuda_major, get_lib_names
-        cuda_major = detect_cuda_major()
+        from .lib_setup import select_cuda_major, get_lib_names
+        cuda_major = select_cuda_major()
         lib_name, _ = get_lib_names(cuda_major)
         return lib_name
     except Exception:
@@ -193,8 +193,8 @@ def _fetch_remote_versions() -> Optional[Dict]:
 def _get_cuda_suffix() -> str:
     """Return version.json key suffix based on CUDA version: '' for CUDA 13, '-12' for CUDA 12."""
     try:
-        from .lib_setup import detect_cuda_major
-        cuda_major = detect_cuda_major()
+        from .lib_setup import select_cuda_major
+        cuda_major = select_cuda_major()
         return "-12" if cuda_major <= 12 else ""
     except Exception:
         return ""

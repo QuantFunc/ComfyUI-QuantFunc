@@ -46,6 +46,10 @@ def _resolve_lib_path():
     try:
         from .lib_setup import resolve_library
         return resolve_library()
+    except RuntimeError:
+        # Intentional fatal config errors (e.g. SM120 GPU without CUDA 13)
+        # must surface, not silently fall back to a mismatched default name.
+        raise
     except Exception as e:
         logging.getLogger("QuantFunc").warning("lib_setup failed: %s, using default", e)
 
@@ -357,8 +361,8 @@ class WorkerManager:
                 return False
             _dep_downloading = True
             try:
-                from .lib_setup import detect_cuda_major, _download_dep_zip
-                cuda_major = detect_cuda_major()
+                from .lib_setup import select_cuda_major, _download_dep_zip
+                cuda_major = select_cuda_major()
                 bin_dir = os.path.dirname(os.path.abspath(dll_path))
                 logging.warning("[QuantFunc] Worker failed to load DLL, "
                                 "downloading dependency libraries...")
