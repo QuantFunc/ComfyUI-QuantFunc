@@ -2046,7 +2046,10 @@ def _get_auto_loader_dropdowns():
         from .model_auto_loader import get_transformer_options
         return get_transformer_options()
     except Exception:
-        return ["None"]
+        # Fallback must still contain the INPUT_TYPES default ([auto-detect]) so
+        # ComfyUI never flags the saved default as "value not in list".
+        from .model_auto_loader import AUTO_DETECT
+        return [AUTO_DETECT, "None"]
 
 
 def _get_prequant_dropdowns():

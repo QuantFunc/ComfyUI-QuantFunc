@@ -410,12 +410,18 @@ def _detect_all_gpu_sms() -> list:
             ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
             timeout=5, stderr=subprocess.DEVNULL
         ).decode().strip()
-        # One line per GPU: "12.0" → 120, "8.6" → 86.
+        # One line per GPU: "12.0" → 120, "8.6" → 86. Parse each line under its
+        # OWN guard so one malformed line (e.g. "N/A") skips that GPU rather than
+        # aborting the loop and silently dropping every GPU after it.
         for line in out.split("\n"):
             line = line.strip()
-            if "." in line:
+            if "." not in line:
+                continue
+            try:
                 major, minor = line.split(".")[:2]
                 sms.append(int(major) * 10 + int(minor))
+            except (ValueError, IndexError):
+                continue
     except Exception:
         pass
     if sms:
