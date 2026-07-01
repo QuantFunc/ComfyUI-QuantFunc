@@ -346,6 +346,41 @@ def test_generate_video_widget_order_backcompat():
         opt_widgets.index("fps") > opt_widgets.index("negative_prompt"), opt_widgets  # appended
 
 
+def test_generate_video_old_widgets_values_positional_backcompat():
+    """Simulate ComfyUI restoring an OLD (#344) saved graph's POSITIONAL
+    widgets_values against the NEW widget order (ComfyUI applies widgets_values by
+    array index for classic dict-INPUT_TYPES nodes). The old num_frames value (slot
+    4) must land in `length`, and steps/guidance_scale/seed/negative_prompt must keep
+    their slots — i.e. NO silent corruption. fps (a NEW slot-9 widget) is absent from
+    the old 8-value array → falls to its default."""
+    # An OLD saved graph's positional widgets_values (8 values, no fps), matching the
+    # #344 widget order [prompt, width, height, num_frames, steps, guidance_scale,
+    # seed, negative_prompt] (pipeline is a socket, not a widget).
+    old_values = ["a scenic river", 640, 480, 81, 30, 4.0, 1234, "the negatives"]
+
+    # NEW widget order derived from the LIVE INPUT_TYPES: ComfyUI builds widgets as
+    # required-then-optional, skipping non-widget sockets (pipeline / IMAGE / AUDIO).
+    it = nodes.QuantFuncGenerateVideo.INPUT_TYPES()
+    def _is_socket(spec):
+        return spec[0] in ("QUANTFUNC_PIPELINE", "IMAGE", "AUDIO")
+    new_widget_order = [k for k, s in it["required"].items() if not _is_socket(s)] \
+        + [k for k, s in it["optional"].items() if not _is_socket(s)]
+
+    # ComfyUI applies old_values by index against new_widget_order.
+    restored = dict(zip(new_widget_order, old_values))
+    assert restored["length"] == 81, restored          # old num_frames → length (slot 4), not corrupted
+    assert restored["steps"] == 30                      # NOT shifted
+    assert restored["guidance_scale"] == 4.0
+    assert restored["seed"] == 1234
+    assert restored["negative_prompt"] == "the negatives"
+    # fps is appended BEYOND the old 8-value array → never receives an old value.
+    assert new_widget_order.index("fps") >= len(old_values), new_widget_order
+    # The first 8 new slots line up name-for-name with the old order except slot 3
+    # (num_frames→length renamed in place).
+    assert new_widget_order[:8] == ["prompt", "width", "height", "length",
+                                    "steps", "guidance_scale", "seed", "negative_prompt"], new_widget_order
+
+
 def test_generate_video_length_is_required():
     it = nodes.QuantFuncGenerateVideo.INPUT_TYPES()
     assert "length" in it["required"] and "length" not in it.get("optional", {})
