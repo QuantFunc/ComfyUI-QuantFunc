@@ -2165,11 +2165,13 @@ class QuantFuncWanCombineExperts:
     `model_index.json` carrying `boundary_ratio`), then outputs the staged
     `model_dir` STRING — wire it into `QuantFunc Model Loader`.
 
-    The expert modality is auto-detected from the weights — t2v when in==out
-    channels (→ WanPipeline), A14B channel-concat i2v when in>out (→
-    WanImageToVideoPipeline) — and the synthesized transformer channels + model_index
-    follow it. (t2v is the path exercised end-to-end here; i2v relies on the engine's
-    channel-concat i2v support.)
+    The expert modality is auto-detected from the weights (t2v: in==out channels;
+    A14B channel-concat i2v: in>out) and written into the synthesized transformer
+    configs. The model_index always carries `_class_name="WanPipeline"` — the one
+    value the engine's family detect accepts — because the engine dispatches
+    t2v-vs-i2v by the transformer's CHANNELS, not the pipeline class string.
+    (t2v is the path exercised end-to-end here; i2v staging emits the same loadable
+    class + i2v channels, relying on the engine's channel-driven i2v dispatch.)
 
     ComfyUI/original-Wan single-file keys are remapped to diffusers keys; fp8
     `*_scaled` experts are dequantized to fp16 (the engine's Wan transformer

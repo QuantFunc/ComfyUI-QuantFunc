@@ -6,7 +6,8 @@ Covers, CPU-only (no engine .so, no GPU):
   - stage_two_expert(): full staging (dequant + raw modes) into the two-expert
     diffusers layout — transformer/config channel+depth, remapped+dequant'd
     weights, transformer_2, shared symlinks, VAE absent-key fix, model_index
-    with _class_name (t2v→WanPipeline, i2v→WanImageToVideoPipeline) + boundary_ratio.
+    with the engine-loadable _class_name ("WanPipeline" for BOTH modalities; the
+    engine dispatches i2v by channels, and matches no other Wan class) + boundary_ratio.
   - caching (idempotent skip), modality-mismatch guard.
   - QuantFuncWanCombineExperts node: INPUT_TYPES + registration + required inputs.
   - GUARDED real-file check: single-file → diffusers key-exactness (skips if the
@@ -68,9 +69,14 @@ def test_remap_key_top_level():
     assert W.remap_key("patch_embedding.weight") == "patch_embedding.weight"
 
 
-def test_class_name_for_modality():
-    assert W._class_name_for_modality(16, 16) == "WanPipeline"           # t2v
-    assert W._class_name_for_modality(36, 16) == "WanImageToVideoPipeline"  # i2v
+def test_model_index_class_name_always_engine_loadable():
+    """The synthesized model_index must carry the ONE class the engine's family
+    detect exact-matches ("WanPipeline") — for BOTH modalities. The engine has no
+    "WanImageToVideoPipeline" registration; writing it would throw at load
+    (t2v-vs-i2v is channel-driven in the engine, not class-string-driven)."""
+    assert W._ENGINE_WAN_PIPELINE_CLASS == "WanPipeline"
+    mi = W.synthesize_model_index(None, W._ENGINE_WAN_PIPELINE_CLASS, 0.9)
+    assert mi["_class_name"] == "WanPipeline"
 
 
 def test_vae_absent_key_fix_only_fills_absent():
@@ -412,8 +418,11 @@ def test_expert_depth_mismatch_raises():
         W.stage_two_expert(high, low, shared, out)
 
 
-def test_i2v_experts_get_i2v_class_name():
-    """Two i2v experts (in>out) → model_index _class_name WanImageToVideoPipeline."""
+def test_i2v_experts_stage_engine_loadable_class_with_i2v_channels():
+    """Two i2v experts (in>out): the staged model_index carries the ENGINE-LOADABLE
+    "WanPipeline" (NOT "WanImageToVideoPipeline", which no engine pipeline matches —
+    it would throw at load); i2v-ness is carried by the transformer config channels,
+    which is what the engine's is_i2v/vae-encoder gates actually read."""
     if not _HAS_TORCH:
         pytest.skip("needs torch")
     src = tempfile.mkdtemp(prefix="qfwan_i2v_")
@@ -425,9 +434,13 @@ def test_i2v_experts_get_i2v_class_name():
     out = tempfile.mkdtemp(prefix="qfwan_i2vout_") + "/stage"
     W.stage_two_expert(high, low, shared, out)
     mi = json.load(open(os.path.join(out, "model_index.json")))
-    assert mi["_class_name"] == "WanImageToVideoPipeline"
-    cfg = json.load(open(os.path.join(out, "transformer", "config.json")))
-    assert cfg["in_channels"] == 36 and cfg["out_channels"] == 16
+    # the literal rule of the engine's wan_detect: pipeline_class == "WanPipeline"
+    # (the transformer_class fallback never fires when _class_name is present)
+    assert mi["_class_name"] == "WanPipeline"
+    for sub in ("transformer", "transformer_2"):
+        cfg = json.load(open(os.path.join(out, sub, "config.json")))
+        assert cfg["in_channels"] == 36 and cfg["out_channels"] == 16
+        assert cfg["_class_name"] == "WanTransformer3DModel"
 
 
 # --------------------------- node registration ---------------------------

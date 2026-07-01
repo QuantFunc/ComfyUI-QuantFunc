@@ -305,10 +305,10 @@ def remap_dequant_file(src: str | Path, dst: str | Path) -> int:
 
     TRULY memory-bounded: each tensor is read with a plain `seek`+`read` of just its
     byte slice (NO persistent whole-file mmap) and the output safetensors is written
-    incrementally, freeing each tensor. Peak RSS scales with ONE tensor (its fp32
-    transient + product) — MEASURED ~2.1 GB total converting a real 14 GB A14B expert
-    (dominated by the largest single weight ~1.4 GB), independent of model size — vs a
-    naive load-all-and-accumulate that needed ~70 GB, and an mmap variant that kept the
+    incrementally, freeing each tensor. Peak RSS scales with ONE tensor's working set
+    (its fp8 bytes + fp32 transient + product + torch runtime) — MEASURED ~2.1 GB
+    total converting a real 14 GB A14B expert, independent of model size — vs a naive
+    load-all-and-accumulate that needed ~70 GB, and an mmap variant that kept the
     whole ~14 GB source page-cache-resident. Safe on a modest-RAM host.
     """
     import torch
@@ -316,9 +316,13 @@ def remap_dequant_file(src: str | Path, dst: str | Path) -> int:
     src, dst = str(src), str(dst)
     st2torch = {"F64": torch.float64, "F32": torch.float32, "F16": torch.float16,
                 "BF16": torch.bfloat16, "F8_E4M3": torch.float8_e4m3fn,
-                "F8_E5M2": getattr(torch, "float8_e5m2", torch.float8_e4m3fn),
                 "I64": torch.int64, "I32": torch.int32, "I16": torch.int16,
                 "I8": torch.int8, "U8": torch.uint8, "BOOL": torch.bool}
+    # F8_E5M2 only when this torch actually has the dtype — silently reinterpreting
+    # E5M2 bits as E4M3 would be numerically wrong; absent → the plan loop's
+    # unsupported-dtype check below fails LOUD instead.
+    if hasattr(torch, "float8_e5m2"):
+        st2torch["F8_E5M2"] = torch.float8_e5m2
     total = os.path.getsize(src)
     with open(src, "rb") as fh:
         hlen = struct.unpack("<Q", fh.read(8))[0]
@@ -403,11 +407,18 @@ def remap_dequant_file(src: str | Path, dst: str | Path) -> int:
 # Config synthesis
 # ============================================================================
 
-def _class_name_for_modality(in_ch: int, out_ch: int) -> str:
-    """t2v (in == out) → WanPipeline ; i2v (in > out, channel-concat) →
-    WanImageToVideoPipeline. Both detect as Wan via the engine's
-    startswith('Wan') wan_detect."""
-    return "WanImageToVideoPipeline" if in_ch > out_ch else "WanPipeline"
+# The synthesized model_index ALWAYS carries _class_name="WanPipeline" — for BOTH
+# t2v and i2v experts. Rationale (engine-verified):
+#   * The engine's family detect (wan_detect, WanVideoPipeline.cpp) EXACT-matches
+#     pipeline_class=="WanPipeline"; its transformer_class fallback only fires when
+#     model_index has NO _class_name. "WanImageToVideoPipeline" is registered NOWHERE
+#     in the engine — writing it would make the staged dir throw at load.
+#   * t2v-vs-i2v behavior is CHANNEL-driven in the engine (is_i2v = in_channels >
+#     latent channels; the VAE encoder loads when xfm_in > xfm_out), so the modality
+#     information lives in the transformer config's in/out_channels we synthesize —
+#     the pipeline-level class string plays no role in it.
+# We own this synthesized file, so we write the value that is loadable everywhere.
+_ENGINE_WAN_PIPELINE_CLASS = "WanPipeline"
 
 
 def synthesize_transformer_config(base_config: dict, in_ch: int, out_ch: int,
@@ -569,7 +580,7 @@ def stage_two_expert(high_expert: str, low_expert: str, shared_dir: str,
         raise RuntimeError(
             f"expert depth mismatch: high={hi_layers} vs low={lo_layers} blocks — "
             f"the two experts must be the same Wan variant")
-    class_name = _class_name_for_modality(in_ch, out_ch)
+    class_name = _ENGINE_WAN_PIPELINE_CLASS   # loadable for BOTH modalities (see above)
 
     # Safety: never let a mis-pointed / workflow-supplied output_dir clobber the
     # experts, the shared model, or a directory holding the user's own content.
