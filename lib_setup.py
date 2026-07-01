@@ -393,29 +393,43 @@ def _detect_gpu_sm() -> int:
     return sms[0] if sms else 0
 
 
+def _detect_default_device_sm() -> int:
+    """SM of the DEFAULT CUDA device (index 0) via torch, e.g. 120 / 89 / 86; 0 if
+    no CUDA / no torch.
+
+    This is what the transformer GPU-match filter keys on (`_target_gpu_sm`): torch
+    device 0 is the SAME device index BuildPipeline runs the transformer on by
+    default, so a weight offered/auto-picked against it is guaranteed runnable on
+    the actual default run-device — no `CUDA_VISIBLE_DEVICES` mask or
+    `CUDA_DEVICE_ORDER` can make them disagree (both are "CUDA device 0"). Under
+    the default FASTEST_FIRST ordering device 0 is the BEST GPU, so on a 3060+4090
+    box device 0 is the 4090 (SM89) → the 40x/FP8 tier shows + auto-picks (the
+    user's reported ask). Deliberately TORCH, not nvidia-smi: nvidia-smi is
+    CVD-UNAWARE and PCI-bus-ordered, so its "device 0" can be a hidden or different
+    physical GPU than CUDA device 0 — keying on it could offer a tier the actual
+    run-device can't run (→ __trap). CPU-only / no CUDA → 0 (caller does NOT
+    filter). (History: keying the filter on max/min OVER ALL GPUs was unsafe —
+    min over-hid the user's 40x; max over the physical set could over-offer a tier
+    the CVD-visible or PCI-slot-0 run-device couldn't run. Keying on the actual
+    default run-device — CUDA device 0 — is safe under every CVD/ordering.)"""
+    try:
+        import torch
+        if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+            cap = torch.cuda.get_device_capability(0)
+            return cap[0] * 10 + cap[1]
+    except Exception:
+        pass
+    return 0
+
+
 def _detect_all_gpu_sms() -> list:
-    """Compute capabilities (SM) of EVERY visible CUDA GPU, e.g. [120, 86].
-
-    Returns [] if none can be determined. Used for the multi-GPU-aware
-    transformer GPU-match: on a mixed-SM box the caller (`_target_gpu_sm`) keys
-    on the MAX SM — the BEST card the machine has — so everything that best GPU
-    can run is offered (the user routes the model to it via BuildPipeline's
-    `device` input). `max()` is order-independent, so the PCI-vs-CUDA ordering
-    difference between nvidia-smi and torch does not matter here (it WOULD matter
-    for a per-index query, which is why the caller never pins a single device
-    index against this PCI-ordered list).
-
-    ENUMERATION SCOPE: the PRIMARY path (nvidia-smi) reports ALL PHYSICAL GPUs.
-    Under MAX-keying this offers every tier the best PHYSICAL GPU runs. Caveat
-    (documented, accepted): a CUDA_VISIBLE_DEVICES mask that HIDES the best GPU
-    could then over-offer a tier the visible subset can't run — but in that case
-    BuildPipeline's device list (torch, CVD-aware) also can't route to the hidden
-    GPU, so this is an advanced-config corner, not the common path; the user's
-    reported box has both GPUs visible. The torch FALLBACK (below) only fires
-    when nvidia-smi is entirely unavailable and IS CVD-aware. (History: the
-    filter previously keyed on MIN-SM to be conservative under CVD, but that HID
-    a 40x/FP8 weight the user's RTX 4090 could run on a 3060+4090 box — the
-    user-reported regression this MAX change fixes.)
+    """Compute capabilities (SM) of every visible CUDA GPU, e.g. [120, 86]; [] if
+    none. Consumed only by `_detect_gpu_sm` (which takes the first entry) for the
+    base-model 50x-above/50x-below variant pick in `detect_gpu_variant`. The
+    transformer GPU-match filter does NOT use this — it keys on the DEFAULT CUDA
+    device via `_detect_default_device_sm` (the device that actually runs the
+    transformer). PRIMARY nvidia-smi (per-line-guarded), torch FALLBACK
+    (per-device-guarded) when nvidia-smi is unavailable.
     """
     sms = []
     try:

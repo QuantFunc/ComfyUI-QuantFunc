@@ -314,52 +314,46 @@ def _transformer_min_sm(filename):
     return _SM_UNKNOWN
 
 
-# Memoized once — the visible GPU set is fixed for the process, and
-# get_transformer_options() runs on ComfyUI's INPUT_TYPES / /object_info hot
-# path, so we must NOT re-shell to nvidia-smi on every call. A failed/empty
-# probe is NOT cached, so a transient nvidia-smi hiccup simply retries next time.
-# (Kept a module-level function so tests can stub it without a real CUDA device.)
-_gpu_sms_cache = None
+# Memoized once — the default CUDA device is fixed for the process, and
+# get_transformer_options() runs on ComfyUI's INPUT_TYPES / /object_info hot path,
+# so we must NOT re-query on every call. A failed/0 probe is NOT cached, so a
+# transient hiccup simply retries next time. (Module-level so tests can stub it.)
+_default_device_sm_cache = None
 
 
-def _all_gpu_sms():
-    """All visible GPUs' compute capabilities (SM), memoized. [] if undetectable."""
-    global _gpu_sms_cache
-    if _gpu_sms_cache:
-        return list(_gpu_sms_cache)
+def _default_device_sm():
+    """SM of the DEFAULT CUDA device (torch device 0) — the device BuildPipeline
+    runs the transformer on by default. Memoized; 0 if no CUDA / CPU-only."""
+    global _default_device_sm_cache
+    if _default_device_sm_cache:
+        return _default_device_sm_cache
     try:
-        from .lib_setup import _detect_all_gpu_sms
-        sms = list(_detect_all_gpu_sms())
+        from .lib_setup import _detect_default_device_sm
+        sm = _detect_default_device_sm()
     except Exception:
-        sms = []
-    if sms:
-        _gpu_sms_cache = list(sms)
-    return sms
+        sm = _SM_UNKNOWN
+    if sm:
+        _default_device_sm_cache = sm
+    return sm
 
 
 def _target_gpu_sm():
-    """The SM to key transformer GPU-compatibility on.
+    """The SM to key transformer GPU-compatibility on: the DEFAULT CUDA device
+    (torch device 0) — the GPU BuildPipeline runs the transformer on by default.
 
-    This node SELECTS/downloads the transformer weights; the GPU that actually
-    RUNS them is chosen later (BuildPipeline's own `device` input). On a mixed-SM
-    multi-GPU box we key on the MAX SM across all visible GPUs — the BEST card
-    the machine has. Rationale: the set of weights runnable on the best GPU is a
-    SUPERSET of what the weaker cards run, so keying on MAX hides NOTHING the
-    hardware can run anywhere; the user then routes the model to that capable GPU
-    via BuildPipeline's `device` input. (Keying on MIN — the earlier choice — was
-    too conservative: it HID a weight the best GPU could run, e.g. a 40x/FP8
-    weight on an RTX 3060 SM86 + RTX 4090 SM89 box, which the user reported as
-    "我有 40x 的模型却没展示". A weight is only ever HIDDEN when NO GPU can run it.)
-    Nothing detectable → _SM_UNKNOWN (0), and the caller then does NOT filter."""
-    sms = _all_gpu_sms()
-    if not sms:
-        return _SM_UNKNOWN
-    chosen = max(sms)
-    if len(set(sms)) > 1:
-        logger.info("[QuantFunc] transformer GPU-match: mixed-SM machine %s -> "
-                    "using MAX SM%d (best GPU; route the model to that GPU via "
-                    "BuildPipeline's device input)", sms, chosen)
-    return chosen
+    Keying on the ACTUAL default run-device (NOT max/min over the whole GPU set)
+    means a weight offered / auto-picked here is guaranteed runnable on that
+    device under ANY `CUDA_VISIBLE_DEVICES` mask or `CUDA_DEVICE_ORDER` — torch's
+    "device 0" is the same index BuildPipeline defaults to, so the keyed GPU and
+    the run-device can never disagree → it can never __trap. Under the default
+    FASTEST_FIRST ordering device 0 IS the best GPU, so on a 3060+4090 box device
+    0 is the 4090 (SM89) → the 40x/FP8 tier shows + auto-picks (the user's
+    reported ask). Undetectable (CPU-only / no torch) → _SM_UNKNOWN (0), and the
+    caller then does NOT filter. (Earlier keyings were unsafe: MIN over all GPUs
+    over-hid the user's 40x; MAX over the physical set could offer a tier the
+    CVD-visible / PCI-slot-0 run-device couldn't run — a __trap. Keying on the
+    real default run-device is safe under every CVD/ordering.)"""
+    return _default_device_sm()
 
 
 def _available_transformer_names(model_series):
