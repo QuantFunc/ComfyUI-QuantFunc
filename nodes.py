@@ -2131,6 +2131,112 @@ class QuantFuncModelLoader:
 
 
 # ============================================================================
+# Node: QuantFunc Wan Combine Experts (A14B two-transformer combine-picker)
+# ============================================================================
+
+def _wan_combine_stage_root() -> str:
+    """Root for staged two-expert Wan dirs. Honors $QUANTFUNC_CACHE_DIR (the same
+    override the rest of the adapter layer respects), else ComfyUI temp (large,
+    already outside the repo), else a plugin-local cache dir. Unlike the format-
+    adapter build path this node symlinks (not hardlinks) its large components, so a
+    same-volume-as-source root is not required. NOTE: a staged A14B (14B×2 dequant→
+    fp16) is ~56 GB — point `output_dir` at a roomy disk if the default temp is small."""
+    env = os.environ.get("QUANTFUNC_CACHE_DIR")
+    if env:
+        return os.path.join(env, "qf_wan_combined")
+    try:
+        import folder_paths
+        return os.path.join(folder_paths.get_temp_directory(), "qf_wan_combined")
+    except Exception:
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "cache", "wan_combined")
+
+
+class QuantFuncWanCombineExperts:
+    """Combine two single-file Wan2.2-A14B experts (high-noise + low-noise) into a
+    single two-expert model_dir the QuantFunc engine loads.
+
+    Wan2.2-A14B is a DUAL-transformer model: a high-noise expert drives the early
+    (high-noise) denoise steps and a low-noise expert the later steps, switching at
+    `boundary_ratio`. It is distributed as TWO separate single-file checkpoints,
+    not a diffusers dir. This node stages them into the engine's expected layout
+    (`transformer/` = high, `transformer_2/` = low, shared `text_encoder`/`vae`/
+    `tokenizer`/`scheduler` from a Wan diffusers dir, and a synthesized
+    `model_index.json` carrying `boundary_ratio`), then outputs the staged
+    `model_dir` STRING — wire it into `QuantFunc Model Loader`.
+
+    The expert modality is auto-detected from the weights — t2v when in==out
+    channels (→ WanPipeline), A14B channel-concat i2v when in>out (→
+    WanImageToVideoPipeline) — and the synthesized transformer channels + model_index
+    follow it. (t2v is the path exercised end-to-end here; i2v relies on the engine's
+    channel-concat i2v support.)
+
+    ComfyUI/original-Wan single-file keys are remapped to diffusers keys; fp8
+    `*_scaled` experts are dequantized to fp16 (the engine's Wan transformer
+    factory does not yet consume fp8 inline); the Wan2.1 16-ch VAE config is
+    absent-key-fixed. Staging is cached (idempotent on identical sources).
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "high_noise_expert": ("STRING", {"default": "", "tooltip":
+                    "Path to the HIGH-noise A14B expert (.safetensors single file)"}),
+                "low_noise_expert": ("STRING", {"default": "", "tooltip":
+                    "Path to the LOW-noise A14B expert (.safetensors single file)"}),
+                "shared_components": ("STRING", {"default": "", "tooltip":
+                    "Path to a Wan diffusers dir supplying the shared vae / "
+                    "text_encoder / tokenizer / scheduler (+ transformer config base)"}),
+                "boundary_ratio": ("FLOAT", {"default": 0.9, "min": 0.0, "max": 1.0,
+                    "step": 0.01, "tooltip":
+                    "Denoise fraction at which the high→low expert switch happens "
+                    "(Wan2.2-A14B default 0.9)"}),
+            },
+            "optional": {
+                "output_dir": ("STRING", {"default": "", "tooltip":
+                    "Staging output dir (empty = ComfyUI temp / plugin cache). "
+                    "Point at a roomy disk — a staged A14B is ~56 GB."}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("model_dir",)
+    FUNCTION = "combine"
+    CATEGORY = "QuantFunc"
+
+    def combine(self, high_noise_expert, low_noise_expert, shared_components,
+                boundary_ratio, output_dir="", **kwargs):
+        from .format_adapters.comfyui_wan_remap import stage_two_expert, _fingerprint
+
+        high = (high_noise_expert or "").strip()
+        low = (low_noise_expert or "").strip()
+        shared = (shared_components or "").strip()
+        if not high or not low or not shared:
+            raise RuntimeError(
+                "QuantFunc Wan Combine Experts: high_noise_expert, "
+                "low_noise_expert and shared_components are all required.")
+
+        out = (output_dir or "").strip()
+        if not out:
+            fp = _fingerprint([os.path.abspath(high), os.path.abspath(low),
+                               os.path.abspath(shared)],
+                              extra="{}".format(boundary_ratio))
+            out = os.path.join(_wan_combine_stage_root(), fp)
+
+        # The engine's Wan transformer factory does not consume fp8 inline, so the
+        # node always dequantizes to fp16 (the loadable path). The module retains a
+        # fp8-preserving mode for a future engine that wires DequantFP8 — not exposed
+        # as a node option so a user can't pick a currently-unloadable output.
+        model_dir = stage_two_expert(
+            high, low, shared, out,
+            boundary_ratio=float(boundary_ratio),
+            dequant_fp8=True)
+        logging.info("[QuantFunc] Wan two-expert staged → %s", model_dir)
+        return (model_dir,)
+
+
+# ============================================================================
 # Node: QuantFunc Model Auto Loader
 # ============================================================================
 
@@ -4765,6 +4871,7 @@ NODE_CLASS_MAPPINGS = {
     "QuantFuncVideoPreview": QuantFuncVideoPreview,
     "QuantFuncPipelineConfig": QuantFuncPipelineConfig,
     "QuantFuncModelLoader": QuantFuncModelLoader,
+    "QuantFuncWanCombineExperts": QuantFuncWanCombineExperts,
     "QuantFuncModelAutoLoader": QuantFuncModelAutoLoader,
     # QuantFuncBuildPipeline lives in nodes_format_adapters.py (one canonical
     # implementation; loaded after this map → __init__.py's update() lifts it
@@ -4793,6 +4900,7 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "QuantFuncPipelineConfig": "QuantFunc Pipeline Config",
     "QuantFuncModelLoader": "QuantFunc Model Loader",
+    "QuantFuncWanCombineExperts": "QuantFunc Wan Combine Experts (A14B two-transformer)",
     "QuantFuncModelAutoLoader": "QuantFunc Model Auto Loader",
     # QuantFuncBuildPipeline display name is set in nodes_format_adapters.py.
     "QuantFuncPrequantAutoLoader": "QuantFunc Prequant Auto Loader",
