@@ -2088,7 +2088,7 @@ class QuantFuncModelAutoLoader:
 
     @classmethod
     def INPUT_TYPES(cls):
-        from .model_auto_loader import MODEL_SERIES_LIST, _DATA_SOURCES
+        from .model_auto_loader import MODEL_SERIES_LIST, _DATA_SOURCES, AUTO_DETECT
         transformer_opts = _get_auto_loader_dropdowns()
         return {
             "required": {
@@ -2096,7 +2096,7 @@ class QuantFuncModelAutoLoader:
                 "data_source": (_DATA_SOURCES, {"default": "modelscope", "tooltip": "Download source: modelscope (China) or huggingface"}),
             },
             "optional": {
-                "transformer": (transformer_opts, {"default": "None", "tooltip": "Transformer model variant. Format: Series/name. Select None to use base model's default transformer."}),
+                "transformer": (transformer_opts, {"default": AUTO_DETECT, "tooltip": "Transformer weight. [auto-detect] (default) picks the highest-tier weight your GPU can run (weights that need a newer GPU are hidden). None = use the base model's default transformer. Or pick an explicit Series/name."}),
             },
         }
 

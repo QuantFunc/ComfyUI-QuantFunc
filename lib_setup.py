@@ -412,6 +412,64 @@ def _detect_gpu_sm() -> int:
     return 0
 
 
+def _detect_all_gpu_sms() -> list:
+    """Compute capabilities (SM) of EVERY visible CUDA GPU, e.g. [120, 86].
+
+    Returns [] if none can be determined. Used for the multi-GPU-aware
+    transformer GPU-match: on a mixed-SM box with no pinned device the loader
+    keys on the MIN SM (the safest — a shown/auto-picked weight must run on
+    whichever GPU is used). `min()` is order-independent, so the PCI-vs-CUDA
+    ordering difference between nvidia-smi and torch does not matter here
+    (unlike a per-INDEX query — see `_detect_gpu_sm_for_device`).
+    """
+    sms = []
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
+            timeout=5, stderr=subprocess.DEVNULL
+        ).decode().strip()
+        # One line per GPU: "12.0" → 120, "8.6" → 86.
+        for line in out.split("\n"):
+            line = line.strip()
+            if "." in line:
+                major, minor = line.split(".")[:2]
+                sms.append(int(major) * 10 + int(minor))
+    except Exception:
+        pass
+    if sms:
+        return sms
+
+    # Fallback: torch enumerates every device.
+    try:
+        import torch
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                cap = torch.cuda.get_device_capability(i)
+                sms.append(cap[0] * 10 + cap[1])
+    except Exception:
+        pass
+    return sms
+
+
+def _detect_gpu_sm_for_device(index) -> int:
+    """SM of a SPECIFIC CUDA device index, via torch (CUDA capability ordering).
+
+    Deliberately NOT nvidia-smi: nvidia-smi orders GPUs by PCI bus while CUDA
+    (and the ComfyUI device dropdown, built from torch.cuda) orders by
+    capability, so nvidia-smi's Nth line can be a DIFFERENT physical GPU than
+    CUDA device N — pinning a device by nvidia-smi index would read the wrong
+    card's SM (the 本地 4090/3060 trap). Returns 0 if it can't be determined.
+    """
+    try:
+        import torch
+        if torch.cuda.is_available() and 0 <= int(index) < torch.cuda.device_count():
+            cap = torch.cuda.get_device_capability(int(index))
+            return cap[0] * 10 + cap[1]
+    except Exception:
+        pass
+    return 0
+
+
 def resolve_library() -> str:
     """Main entry point: detect CUDA, select DLL, ensure deps, return DLL path.
 
