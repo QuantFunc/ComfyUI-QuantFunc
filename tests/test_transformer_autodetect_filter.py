@@ -3,12 +3,15 @@
 The transformer dropdown must (a) default to '[auto-detect]', which resolves to
 the HIGHEST-tier weight the target GPU can run, and (b) HIDE weights whose
 minimum SM exceeds the target GPU (a 50x FP4 weight must not be offered on an
-SM86 card — it __trap()s at runtime). The TARGET GPU is the DEFAULT CUDA device
-(torch device 0) — the device BuildPipeline runs the transformer on by default —
-so a weight offered/auto-picked is ALWAYS runnable on the actual run-device under
-any CUDA_VISIBLE_DEVICES mask or CUDA_DEVICE_ORDER (torch "device 0" == the index
-BuildPipeline defaults to). Under the default FASTEST_FIRST ordering device 0 is
-the best GPU (e.g. the 4090 on a 3060+4090 box → the 40x/FP8 tier shows).
+SM86 card — it __trap()s at runtime). TWO-STAGE design: the dropdown DISPLAY is
+filtered for the DEFAULT CUDA device (torch device 0), but the authoritative
+[auto-detect] PICK is RE-RESOLVED for the device the user SELECTS in Build
+Pipeline at build() time (_reresolve_auto_transformer_for_device) — so switching
+to a weaker non-default GPU (e.g. device 1 = a 3060 SM86 on a 3060+4090 box)
+re-picks a compatible weight instead of the device-0 40x/FP8 tier. torch
+per-index capability respects CUDA_VISIBLE_DEVICES / CUDA_DEVICE_ORDER, and the
+engine worker runs on the same index, so the re-resolved weight matches the
+run-device.
 
 Tier tokens (confirmed from real weight names — klein-9b-50x-lighting.safetensors,
 qwen 50x-above / 30x-below — and the engine precision rules):

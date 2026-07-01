@@ -382,9 +382,11 @@ def _device_sm(device_idx: int) -> int:
     """Compute capability (e.g. 120, 89, 86) of the user-selected CUDA device.
     Returns 0 if it can't be determined.
 
-    Single source of truth: delegates to the canonical per-index detector
+    Thin convenience wrapper — delegates to the canonical per-index detector
     `lib_setup._detect_device_sm` (torch `get_device_capability(idx)`, CVD-aware,
-    bounds-checked). We deliberately do NOT probe a first GPU / nvidia-smi here:
+    bounds-checked), which is the single source of truth for per-index SM (callers
+    may also import `_detect_device_sm` directly). We deliberately do NOT probe a
+    first GPU / nvidia-smi here:
     nvidia-smi orders by PCI bus while CUDA orders by capability, so it can return
     the WRONG device's SM and wrongly pick FP4 on a non-Blackwell card (the 本地
     4090/3060 trap — FP4 __trap()s below SM120). 0 → the caller falls back to INT4

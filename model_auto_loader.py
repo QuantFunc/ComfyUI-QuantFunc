@@ -322,8 +322,10 @@ _default_device_sm_cache = None
 
 
 def _default_device_sm():
-    """SM of the DEFAULT CUDA device (torch device 0) — the device BuildPipeline
-    runs the transformer on by default. Memoized; 0 if no CUDA / CPU-only."""
+    """SM of the DEFAULT CUDA device (torch device 0). Used for the dropdown
+    DISPLAY filter + the pre-device fallback ONLY; the authoritative [auto-detect]
+    pick is RE-RESOLVED for the SELECTED device at BuildPipeline.build() time (see
+    _reresolve_auto_transformer_for_device). Memoized; 0 if no CUDA / CPU-only."""
     global _default_device_sm_cache
     if _default_device_sm_cache:
         return _default_device_sm_cache
