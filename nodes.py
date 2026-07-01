@@ -362,6 +362,64 @@ def _detect_model_backend(transformer_path: str, model_dir: str) -> str:
     return "lighting"
 
 
+def _read_class_name(json_path):
+    """Best-effort read of `_class_name` from a diffusers config/model_index JSON.
+    Returns "" on any failure (missing file, bad JSON)."""
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            return str(json.load(f).get("_class_name", "") or "")
+    except Exception:
+        return ""
+
+
+def _pipeline_video_family(cfg):
+    """Return 'wan' | 'ltx' | None — a best-effort, ADVISORY classification of the
+    loaded pipeline's video family, used ONLY to pick the plugin's node behavior
+    (video path vs image path). It reads the same SOURCES in the same ORDER as the
+    engine's detectPipelineKind() (PipelineLoader.cpp): model_dir/model_index.json
+    `_class_name` first, then transformer/config.json `_class_name` (only when the
+    former is empty).
+
+    The MATCH here is a deliberate SUPERSET of the engine's exact-match registrars,
+    NOT a mirror of them: it treats any `_class_name` starting with "Wan"/"LTX"
+    (plus the transformer classes WanTransformer3DModel / LTX2VideoTransformer3DModel)
+    as that family. The engine's own detectors are NARROWER — wan_detect
+    (WanVideoPipeline.cpp) exact-matches pipeline_class=="WanPipeline" OR
+    transformer_class=="WanTransformer3DModel"; ltx2_pipeline_detect
+    (LTX2VideoPipeline.cpp) exact-matches pipeline_class=="LTX2Pipeline" only (no
+    transformer-class fallback). So a match HERE is NOT a guarantee the engine can
+    load the model (e.g. a Wan I2V-A14B dir whose _class_name is
+    "WanImageToVideoPipeline" is classified "wan" here but the current engine's
+    wan_detect would reject it). That is intentional + safe: the superset routes
+    anything Wan/LTX-shaped to the video path so the user gets a clear LOUD video/
+    load error (the engine throws at create time, and generate_video throws on a
+    non-video pipeline) rather than the wrong image-node behavior — never a silent
+    misroute. Returns None for every image pipeline (QwenImage/ZImage/Klein/
+    Ideogram/Flux), keeping the image node's video branch guarded (byte-unchanged)."""
+    model_dir = str((cfg or {}).get("model_dir", "") or "")
+    pipeline_cls = ""
+    transformer_cls = ""
+    if model_dir:
+        pipeline_cls = _read_class_name(os.path.join(model_dir, "model_index.json"))
+        if not pipeline_cls:
+            transformer_cls = _read_class_name(
+                os.path.join(model_dir, "transformer", "config.json"))
+    # `_arch` hint the loader may have recorded is a cheap secondary signal.
+    arch = str((cfg or {}).get("_arch", "") or "")
+
+    def _is_wan(s):
+        return s.startswith("Wan")
+    def _is_ltx(s):
+        return s.startswith("LTX") or s.startswith("Ltx")
+
+    if _is_wan(pipeline_cls) or transformer_cls == "WanTransformer3DModel" or _is_wan(arch):
+        return "wan"
+    if (_is_ltx(pipeline_cls) or transformer_cls == "LTX2VideoTransformer3DModel"
+            or _is_ltx(arch)):
+        return "ltx"
+    return None
+
+
 def _load_lib_config():
     """Load config.json from the same directory as the quantfunc library binary.
     Returns dict with server_url and api_key (empty strings if not found).
@@ -1478,6 +1536,42 @@ class WorkerManager:
                 print(f"[QuantFunc] implausible audio dims ch={ch} ns={ns} "
                       f"— dropping audio", file=sys.stderr)
         return frames, audio
+
+    def image_to_video(self, cache_key, prompt, ref_paths, height, width, steps, seed,
+                       guidance_scale, num_frames, negative_prompt="",
+                       options_json=None, pbar=None):
+        """#329/#330 — image-to-video via the generic quantfunc_image_to_video C-API.
+        The FIRST ref path is the first-frame condition. Whether the engine actually
+        honors it is the ENGINE's decision (Wan i2v-capable checkpoints do; a t2v-only
+        Wan checkpoint throws; LTX i2v is not yet engine-wired → the ref is ignored,
+        the node warns). Returns (frames, audio) like text_to_video — frames is a
+        [N, H, W, 3] float32 numpy array and audio is None or
+        {"waveform": np[C, N], "sample_rate": int}."""
+        with self._lock:
+            self._ensure_worker()
+            self._unload_others_locked(keep_key=cache_key)
+            on_progress, _ = _make_progress_preview_cbs(pbar, None)
+            # num_frames/fps ride in options_json (mirrors the C-API i2v contract).
+            opts = json.loads(options_json) if options_json else {}
+            opts["num_frames"] = int(num_frames)
+            cmd = {
+                "cmd": "image_to_video",
+                "req_id": self._next_req_id(),
+                "cache_key": cache_key,
+                "prompt": prompt,
+                "ref_image_paths": ref_paths,
+                "height": height,
+                "width": width,
+                "num_steps": steps,
+                # Video CFG rides in guidance_scale; the worker maps it onto the i2i
+                # struct's true_cfg_scale (the field the engine's i2v reads).
+                "guidance_scale": guidance_scale,
+                "negative_prompt": negative_prompt or "",
+                "seed": seed,
+                "options_json": json.dumps(opts),
+            }
+            resp = self._call(cmd, progress_cb=on_progress, timeout=1800)
+            return self._read_video(resp)
 
     def image_to_image(self, cache_key, prompt, ref_paths, height, width, steps, seed,
                        true_cfg_scale=1.0, negative_prompt="",
@@ -3299,6 +3393,36 @@ class QuantFuncGenerate:
                 "(%s) — running WITHOUT the cap (unlimited).", pct, device, e)
             return None
 
+    def _generate_video_single_frame(self, cfg, prompt, width, height, steps, seed,
+                                     guidance_scale, negative_prompt, unique_id, family):
+        """#329/#330 — render ONE image from a video (Wan / LTX) pipeline via a
+        1-frame text-to-video. Returns the image node's 3-tuple
+        (IMAGE, MASK, latent_preview) with the single frame as a [1,H,W,3] IMAGE +
+        an opaque mask. We request num_frames=1; the engine may still decode more
+        than one frame (a video VAE has a minimum temporal decode — Wan TI2V-5B
+        returns 4), so we slice frames[:1] to guarantee exactly one image."""
+        import torch
+        cache_key = _manager.ensure_pipeline(cfg, node_id=unique_id)
+        opts = {}
+        neg = negative_prompt if (isinstance(negative_prompt, str) and negative_prompt) else ""
+        if neg:
+            opts["negative_prompt"] = neg
+        pbar = None
+        try:
+            from comfy.utils import ProgressBar
+            pbar = ProgressBar(steps)
+        except Exception:
+            pass
+        logging.info("[QuantFunc] image node → video pipeline (%s): 1-frame t2v %dx%d",
+                     family, width, height)
+        frames, _audio = _manager.text_to_video(
+            cache_key, prompt, height, width, steps, seed, float(guidance_scale),
+            1, options_json=(json.dumps(opts) if opts else None), pbar=pbar)
+        # frames: [1, H, W, 3] float32 [0,1] — take the single frame as the IMAGE.
+        image = torch.from_numpy(frames[:1])                      # [1, H, W, 3]
+        mask = torch.ones(image.shape[:3], dtype=torch.float32)   # [1, H, W] opaque
+        return (image, mask, None)
+
     def generate(self, pipeline, prompt, width, height, steps, seed,
                  guidance_scale, ref_images=None,
                  negative_prompt="", true_cfg_scale=1.0,
@@ -3328,6 +3452,29 @@ class QuantFuncGenerate:
         # Auto-detect edit mode from ref_images
         cfg = dict(pipeline)
         cfg["options"] = dict(cfg.get("options", {}))
+        # #329/#330 — a VIDEO pipeline (Wan / LTX) loaded into the IMAGE Generate
+        # node produces a SINGLE image = a 1-frame text-to-video. Detect the video
+        # family and route to the video C-API (num_frames=1) instead of the image
+        # t2i/i2i path — the t2i C-API throws on a video pipeline (WanVideoPipeline /
+        # LTX2VideoPipeline have no image path). Guarded: None (every image pipeline)
+        # → the branch is skipped and the image path below is BYTE-UNCHANGED.
+        _video_family = _pipeline_video_family(cfg)
+        if _video_family is not None:
+            # The image node produces a 1-frame t2v for a video pipeline; a wired
+            # ref_images/edit input is NOT used on this path (i2v-via-image-node is
+            # out of scope — use the dedicated 'QuantFunc Generate Video' node's
+            # first_frame for image-to-video). Warn LOUDLY so it isn't silently
+            # dropped.
+            if ref_images is not None:
+                logging.warning(
+                    "[QuantFunc] %s is a VIDEO pipeline loaded into the image "
+                    "'QuantFunc Generate' node → producing a SINGLE frame (1-frame "
+                    "text-to-video); the wired ref_images are IGNORED here. For "
+                    "image-to-video, use the 'QuantFunc Generate Video' node's "
+                    "`first_frame` input.", _video_family)
+            return self._generate_video_single_frame(
+                cfg, prompt, width, height, steps, seed, guidance_scale,
+                negative_prompt, unique_id, _video_family)
         # Qwen-Image-Layered guidance — NON-intrusive: we NEVER override your widget
         # values (you control steps / true_cfg / negative_prompt / resolution). We only
         # warn when the current settings are likely to under-perform vs the official
@@ -4154,25 +4301,70 @@ class QuantFuncLatentPreview:
 
 
 class QuantFuncGenerateVideo:
-    """#344 — LTX-2 text-to-video (+ audio). Outputs the frame batch as ComfyUI
-    IMAGE and the vocoder waveform as ComfyUI AUDIO. Requires an LTX-2 (lighting)
-    pipeline; non-AV / non-LTX pipelines return no audio (AUDIO output is None)."""
+    """Wan / LTX video generation (text-to-video, + image-to-video on capable
+    checkpoints). Outputs the frame batch as ComfyUI IMAGE and, for AV models
+    (LTX-2), the vocoder waveform as ComfyUI AUDIO.
+
+    Family-agnostic: works with any loaded video pipeline (Wan 2.2 TI2V-5B /
+    I2V-A14B, LTX-2). Wan produces no audio → the AUDIO output is None (silent
+    playback); LTX-2 emits an audio track. Wire an optional `start_image` IMAGE
+    (ComfyUI Wan convention) to condition the clip on a starting frame (image-to-
+    video) — absent → text-to-video. NOTE on i2v support: it is the ENGINE that
+    decides — a Wan i2v-capable checkpoint honors the start image (a t2v-only Wan
+    checkpoint throws a clear error); LTX i2v is not yet wired in the engine, so on
+    LTX the start_image is currently IGNORED (a loud warning is logged) and a t2v
+    clip is produced. Inputs use the ComfyUI Wan/LTX names (`length` = frame count,
+    `start_image` = first-frame condition). Feed `frames` (+ `audio`) into
+    'QuantFunc Video Preview' for in-graph A/V playback, or the core CreateVideo →
+    SaveVideo (or VHS) nodes."""
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
+            # WIDGET-ORDER BACK-COMPAT (graph-format .json workflows): ComfyUI restores
+            # a saved node's `widgets_values` by ARRAY POSITION for classic dict-
+            # INPUT_TYPES nodes, NOT by name. This node (#344) originally shipped the
+            # widget order [prompt, width, height, num_frames, steps, guidance_scale,
+            # seed, negative_prompt]. To keep an OLD saved graph from misaligning its
+            # steps/cfg/seed into the wrong slots, we preserve those positions exactly:
+            # the frame-count widget stays at slot 4 (just RENAMED num_frames→`length`,
+            # which is semantically the same value, so an old array maps correctly),
+            # steps/guidance_scale/seed keep their slots, negative_prompt stays the
+            # first optional widget (slot 8), and any NEW widget (fps) is APPENDED after
+            # it so a shorter old array never reaches it. `start_image` is an IMAGE
+            # SOCKET (not a positional widget), so it doesn't shift widget indices.
             "required": {
                 "pipeline": ("QUANTFUNC_PIPELINE",),
                 "prompt": ("STRING", {"multiline": True, "default": ""}),
                 "width": ("INT", {"default": 512, "min": 64, "max": 2048, "step": 8}),
                 "height": ("INT", {"default": 512, "min": 64, "max": 2048, "step": 8}),
-                "num_frames": ("INT", {"default": 49, "min": 1, "max": 257, "step": 1}),
+                # `length` = frame count (ComfyUI Wan/LTX convention, cf. the core
+                # WanImageToVideo/EmptyLTXVLatentVideo `length` input) — RENAMED IN PLACE
+                # from the old `num_frames` (SAME widget slot 4 → old saved values map
+                # correctly). Wan needs (length-1)%4==0 (e.g. 49=48+1, or the Wan-native
+                # 81); LTX needs (length-1)%8==0 (e.g. 49, or the LTX-native 97). 49 fits both.
+                "length": ("INT", {"default": 49, "min": 1, "max": 257, "step": 4,
+                    "tooltip": "Number of frames (ComfyUI Wan/LTX 'length'; formerly "
+                               "'num_frames'). Wan: (length-1)%4==0 (49, 81, …); "
+                               "LTX: (length-1)%8==0 (49, 97, …)."}),
                 "steps": ("INT", {"default": 30, "min": 1, "max": 100}),
                 "guidance_scale": ("FLOAT", {"default": 4.0, "min": 0.0, "max": 20.0, "step": 0.1}),
                 "seed": ("INT", {"default": 42, "min": 0, "max": 0xffffffffffffffff}),
             },
             "optional": {
+                # negative_prompt stays the FIRST optional widget (slot 8, as in #344).
                 "negative_prompt": ("STRING", {"multiline": True, "default": ""}),
+                # fps APPENDED after negative_prompt (new slot 9) so an old 8-slot saved
+                # array never lands a value here (falls to the method default 24.0).
+                "fps": ("FLOAT", {"default": 24.0, "min": 1.0, "max": 60.0, "step": 1.0,
+                    "tooltip": "Playback fps (rides in options_json; Wan + LTX both read it)."}),
+                # `start_image` = the first-frame condition (ComfyUI Wan i2v convention,
+                # cf. the core WanImageToVideo `start_image` input). IMAGE = a socket, not
+                # a widget → does not consume a widgets_values slot.
+                "start_image": ("IMAGE", {"tooltip": "Optional first-frame condition "
+                    "(ComfyUI 'start_image') → image-to-video. Honored by Wan i2v-capable "
+                    "checkpoints; LTX i2v is not yet engine-wired (start_image ignored on "
+                    "LTX → t2v). Absent → text-to-video."}),
             },
             "hidden": {"unique_id": "UNIQUE_ID"},
         }
@@ -4182,31 +4374,292 @@ class QuantFuncGenerateVideo:
     FUNCTION = "generate_video"
     CATEGORY = "QuantFunc"
 
-    def generate_video(self, pipeline, prompt, width, height, num_frames, steps,
-                       guidance_scale, seed, negative_prompt="", unique_id=None):
+    def generate_video(self, pipeline, prompt, width, height, length, steps,
+                       guidance_scale, seed, fps=24.0,
+                       negative_prompt="", start_image=None, unique_id=None):
         import torch
+        # `length` was renamed IN PLACE from the old required `num_frames` (same widget
+        # slot — see the INPUT_TYPES widget-order note), so an old graph-format saved
+        # workflow's slot-4 value maps here correctly.
+        length = int(length)
         cfg = dict(pipeline)
         cfg["options"] = dict(cfg.get("options", {}))
+        family = _pipeline_video_family(cfg)  # 'wan' | 'ltx' | None (advisory/logging)
         cache_key = _manager.ensure_pipeline(cfg, node_id=unique_id)
-        # negative_prompt rides in options_json (the C-API t2v contract).
+        # length (frame count) rides in the manager call; fps + negative_prompt ride
+        # in options_json (the C-API t2v/i2v contract).
         opts = {}
-        if isinstance(negative_prompt, str) and negative_prompt:
-            opts["negative_prompt"] = negative_prompt
+        if fps and float(fps) > 0.0:
+            opts["fps"] = float(fps)
+        neg = negative_prompt if (isinstance(negative_prompt, str) and negative_prompt) else ""
+        if neg:
+            opts["negative_prompt"] = neg
+        opts_json = json.dumps(opts) if opts else None
         pbar = None
         try:
             from comfy.utils import ProgressBar
             pbar = ProgressBar(steps)
         except Exception:
             pass
-        frames, audio = _manager.text_to_video(
-            cache_key, prompt, height, width, steps, seed, float(guidance_scale),
-            num_frames, options_json=(json.dumps(opts) if opts else None), pbar=pbar)
+
+        # image-to-video when a start_image is wired; else text-to-video. The start
+        # image is staged as a QFRAW01 raw-RGB blob (engine load_image reads it
+        # directly) and passed as the sole ref path (= first-frame condition).
+        staging_dir = "/dev/shm" if (os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK)) \
+            else tempfile.gettempdir()
+        start_image_path = None
+        try:
+            if start_image is not None:
+                # LTX i2v (first-frame conditioning) is NOT yet wired in the engine
+                # (LTX2VideoPipeline::generate_video ignores cond_images — "P5"), so on
+                # an LTX pipeline the start_image is silently discarded and a plain t2v
+                # clip is produced. Warn LOUDLY rather than silently mislead. Wan I2V is
+                # supported by capable Wan checkpoints (a t2v-only Wan checkpoint throws
+                # a clear engine error instead of ignoring it). We still forward the
+                # start_image so a future LTX-i2v-capable engine works unchanged.
+                if family == "ltx":
+                    logging.warning(
+                        "[QuantFunc] LTX i2v (start_image conditioning) is not yet "
+                        "supported by the engine — the start_image will likely be "
+                        "IGNORED and a text-to-video clip produced. (Wan I2V is "
+                        "supported on capable Wan checkpoints.)")
+                start_image_path = _write_qfraw_image(start_image, staging_dir)
+                if not start_image_path:
+                    raise RuntimeError("Failed to stage start_image for image-to-video")
+                logging.info("[QuantFunc] video i2v (%s): start_image conditioned, "
+                             "%d frames @ %.1f fps", family or "auto", length, fps)
+                frames, audio = _manager.image_to_video(
+                    cache_key, prompt, [start_image_path], height, width, steps, seed,
+                    float(guidance_scale), length, negative_prompt=neg,
+                    options_json=opts_json, pbar=pbar)
+            else:
+                logging.info("[QuantFunc] video t2v (%s): %d frames @ %.1f fps",
+                             family or "auto", length, fps)
+                frames, audio = _manager.text_to_video(
+                    cache_key, prompt, height, width, steps, seed, float(guidance_scale),
+                    length, options_json=opts_json, pbar=pbar)
+        finally:
+            if start_image_path:
+                try:
+                    os.unlink(start_image_path)
+                except OSError:
+                    pass
+
         image = torch.from_numpy(frames)                 # [N, H, W, 3] float32 [0,1] = IMAGE
         audio_out = None
         if audio is not None:
             wav = torch.from_numpy(audio["waveform"]).unsqueeze(0)  # [1, C, N]
             audio_out = {"waveform": wav, "sample_rate": int(audio["sample_rate"])}
         return (image, audio_out)
+
+
+def _encode_video_preview(frames_u8, fps, audio, out_path, container_fmt):
+    """Encode a [N,H,W,3] uint8 RGB frame batch (+ optional audio) into a
+    browser-playable clip at `out_path`.
+
+    audio: None or {"waveform": np.float32 [C, N], "sample_rate": int}.
+    Primary encoder is PyAV (bundles ffmpeg libs → muxes video + audio in ONE
+    container with NO external ffmpeg binary). Falls back to cv2 VideoWriter
+    (video-only) when PyAV is unavailable. Returns True if audio was muxed, False
+    if the clip is video-only. Raises when NO encoder is available."""
+    N, H, W = int(frames_u8.shape[0]), int(frames_u8.shape[1]), int(frames_u8.shape[2])
+    # yuv420p (h264/vp9) needs even width/height — crop the last row/col if odd.
+    if W % 2:
+        frames_u8 = frames_u8[:, :, :W - 1, :]; W -= 1
+    if H % 2:
+        frames_u8 = frames_u8[:, :H - 1, :, :]; H -= 1
+    rate = max(1, int(round(float(fps) or 24.0)))
+
+    # ---- Primary: PyAV (video + optional audio, single container) ----
+    # Recipe mirrors ComfyUI core's VideoFromComponents.save_to (h264 + per-frame
+    # reformat('yuv420p'); audio = planar 'fltp' [C,N] frame with pts=0). CRUCIAL:
+    # BOTH streams are created UP FRONT, before muxing any packet — the muxer
+    # writes the container header on the first mux and assigns each stream a
+    # time_base then; an audio stream added AFTER the first video mux keeps
+    # time_base=0 → PyAV crashes "Cannot rebase to zero time" at the audio mux
+    # (verified on PyAV 17.1.0).
+    container = None
+    try:
+        import av
+        from fractions import Fraction
+        vcodec = "h264" if container_fmt == "mp4" else "libvpx-vp9"
+        acodec = "aac" if container_fmt == "mp4" else "libopus"
+        container = av.open(out_path, mode="w")
+        vstream = container.add_stream(vcodec, rate=Fraction(rate, 1))
+        vstream.width = W
+        vstream.height = H
+        vstream.pix_fmt = "yuv420p"
+
+        # Prepare the audio stream BEFORE encoding any video (see note above).
+        astream = None
+        wav = None
+        layout = "stereo"
+        sr = 16000
+        if audio is not None:
+            try:
+                wav = np.asarray(audio["waveform"], dtype=np.float32)  # [C, N] planar
+                if wav.ndim == 1:
+                    wav = wav[None, :]
+                ch = int(wav.shape[0])
+                if ch > 2:                       # downmix >2ch to stereo (keep 0,1)
+                    wav = np.ascontiguousarray(wav[:2]); ch = 2
+                else:
+                    wav = np.ascontiguousarray(wav)
+                sr = int(audio.get("sample_rate", 16000)) or 16000
+                layout = {1: "mono", 2: "stereo"}.get(ch, "stereo")
+                astream = container.add_stream(acodec, rate=sr, layout=layout)
+            except Exception as ae:
+                logging.warning("[QuantFunc] video preview: audio stream setup "
+                                "failed (%s) — video-only", ae)
+                astream = None
+
+        # Encode + mux the video frames.
+        for i in range(N):
+            vframe = av.VideoFrame.from_ndarray(np.ascontiguousarray(frames_u8[i]),
+                                                format="rgb24").reformat(format="yuv420p")
+            for pkt in vstream.encode(vframe):
+                container.mux(pkt)
+        for pkt in vstream.encode():  # flush video
+            container.mux(pkt)
+
+        # Encode + mux the audio (stream already registered up front).
+        has_audio = False
+        if astream is not None:
+            try:
+                aframe = av.AudioFrame.from_ndarray(wav, format="fltp", layout=layout)
+                aframe.sample_rate = sr
+                aframe.pts = 0
+                container.mux(astream.encode(aframe))
+                container.mux(astream.encode(None))  # flush audio
+                has_audio = True
+            except Exception as ae:
+                logging.warning("[QuantFunc] video preview: audio mux failed "
+                                "(%s) — video-only", ae)
+        container.close()
+        return has_audio
+    except Exception as e:
+        logging.warning("[QuantFunc] video preview: PyAV encode failed (%s) — "
+                        "falling back to cv2 (video-only)", e)
+        # Close the open container's fd + drop the partially-written file so the
+        # cv2 fallback re-opens a clean out_path (no fd/partial-file leak).
+        if container is not None:
+            try:
+                container.close()
+            except Exception:
+                pass
+        try:
+            if os.path.exists(out_path):
+                os.unlink(out_path)
+        except OSError:
+            pass
+
+    # ---- Fallback: cv2 VideoWriter (video-only) ----
+    try:
+        import cv2
+        fourcc = cv2.VideoWriter_fourcc(*("mp4v" if container_fmt == "mp4" else "VP80"))
+        vw = cv2.VideoWriter(out_path, fourcc, float(rate), (W, H))
+        if not vw.isOpened():
+            raise RuntimeError("cv2.VideoWriter failed to open")
+        for i in range(N):
+            bgr = cv2.cvtColor(np.ascontiguousarray(frames_u8[i]), cv2.COLOR_RGB2BGR)
+            vw.write(bgr)
+        vw.release()
+        if audio is not None:
+            logging.warning("[QuantFunc] video preview: cv2 fallback cannot mux "
+                            "audio — clip is silent (install PyAV for A/V).")
+        return False
+    except Exception as e2:
+        raise RuntimeError(
+            "No usable video encoder — install PyAV (`pip install av`) or a cv2 "
+            f"with video support. PyAV+cv2 both failed: {e2}")
+
+
+class QuantFuncVideoPreview:
+    """In-graph A/V playback for QuantFunc video output. Wire the `frames` IMAGE
+    (and optional `audio` AUDIO) from 'QuantFunc Generate Video'.
+
+    Encodes the frames to a browser-playable clip (H.264 mp4 by default, muxing the
+    AUDIO track when present via PyAV — no external ffmpeg binary needed) into
+    ComfyUI's temp dir and returns ComfyUI's NATIVE video-preview payload
+    ({"ui": {"images": [...], "animated": (True,)}}), the SAME mechanism the core
+    SaveVideo / SaveWEBM nodes use (ui.PreviewVideo) — so ComfyUI renders its own
+    <video> player with controls + audio on this node, no custom widget. Wan clips
+    (no audio) play silently. The `frames` remain a standard IMAGE elsewhere in the
+    graph (this node is a terminal viewer), so the core CreateVideo/SaveVideo and
+    VHS nodes still work off the same output. For the fully-official flow you can
+    instead wire frames+audio into CreateVideo → SaveVideo."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "frames": ("IMAGE",),
+                "fps": ("FLOAT", {"default": 24.0, "min": 1.0, "max": 60.0, "step": 1.0,
+                    "tooltip": "Playback frame rate. Match the value used on Generate Video."}),
+            },
+            "optional": {
+                "audio": ("AUDIO", {"tooltip": "Optional audio track (LTX-2). Muxed into "
+                    "the clip when present; Wan has none → silent."}),
+                "container": (["mp4", "webm"], {"default": "mp4"}),
+            },
+            "hidden": {"unique_id": "UNIQUE_ID"},
+        }
+
+    RETURN_TYPES = ()
+    FUNCTION = "preview"
+    OUTPUT_NODE = True
+    CATEGORY = "QuantFunc"
+
+    def preview(self, frames, fps, audio=None, container="mp4", unique_id=None):
+        import random
+        import folder_paths
+
+        imgs = frames.detach().cpu().numpy()            # [N,H,W,3] float [0,1]
+        if imgs.ndim == 3:
+            imgs = imgs[None, ...]
+        frames_u8 = (np.clip(imgs, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
+        N, H, W = frames_u8.shape[0], frames_u8.shape[1], frames_u8.shape[2]
+
+        temp_dir = folder_paths.get_temp_directory()
+        os.makedirs(temp_dir, exist_ok=True)
+        ext = "webm" if container == "webm" else "mp4"
+        prefix = "qfvideo_" + "".join(random.choice("abcdefghijklmnopqrstuvwxyz") for _ in range(6))
+        filename = f"{prefix}.{ext}"
+        out_path = os.path.join(temp_dir, filename)
+
+        # Convert a ComfyUI AUDIO dict ({"waveform": [B,C,N] tensor, "sample_rate"})
+        # to the planar numpy [C, N] the encoder expects (first batch item).
+        audio_np = None
+        if isinstance(audio, dict) and audio.get("waveform") is not None:
+            try:
+                wf = audio["waveform"]
+                w = wf.detach().cpu().numpy() if hasattr(wf, "detach") else np.asarray(wf)
+                if w.ndim == 3:      # [B, C, N] → first batch
+                    w = w[0]
+                elif w.ndim == 1:    # [N] → mono
+                    w = w[None, :]
+                audio_np = {"waveform": w.astype(np.float32),
+                            "sample_rate": int(audio.get("sample_rate", 16000))}
+            except Exception as e:
+                logging.warning("[QuantFunc] video preview: bad AUDIO input (%s) — silent", e)
+
+        try:
+            _encode_video_preview(frames_u8, fps, audio_np, out_path, ext)
+        except Exception as e:
+            logging.error("[QuantFunc] video preview encode failed: %s", e)
+            return {"ui": {"text": [f"video preview encode failed: {e}"]}}
+
+        # ComfyUI NATIVE video-preview payload (== ui.PreviewVideo.as_dict()): a
+        # SavedResult {filename, subfolder, type} list under "images" + animated=(True,).
+        # The frontend infers a video from the .mp4/.webm extension and renders its
+        # own <video> player (audio via the muxed track). `format` is an extra hint
+        # some frontend builds use to pick the video widget.
+        return {"ui": {"images": [{
+            "filename": filename,
+            "subfolder": "",
+            "type": "temp",
+            "format": f"video/{ext}",
+        }], "animated": (True,)}}
 
 
 class QuantFuncLayerViewer:
@@ -4306,6 +4759,7 @@ class QuantFuncLayerViewer:
 NODE_CLASS_MAPPINGS = {
     "QuantFuncLayerViewer": QuantFuncLayerViewer,
     "QuantFuncGenerateVideo": QuantFuncGenerateVideo,
+    "QuantFuncVideoPreview": QuantFuncVideoPreview,
     "QuantFuncPipelineConfig": QuantFuncPipelineConfig,
     "QuantFuncModelLoader": QuantFuncModelLoader,
     "QuantFuncModelAutoLoader": QuantFuncModelAutoLoader,
@@ -4353,7 +4807,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "QuantFuncLayeredConfig": "QuantFunc Layered Config",
     "QuantFuncGenerate": "QuantFunc Generate",
     "QuantFuncLayerViewer": "QuantFunc Layer Viewer",
-    "QuantFuncGenerateVideo": "QuantFunc Generate Video (LTX-2 +Audio)",
+    "QuantFuncGenerateVideo": "QuantFunc Generate Video (Wan / LTX · t2v + i2v)",
+    "QuantFuncVideoPreview": "QuantFunc Video Preview (A/V)",
     "QuantFuncLatentPreview": "QuantFunc Latent Preview",
     "QuantFuncImageList": "QuantFunc Image List",
     "QuantFuncMaskConfig": "QuantFunc Mask Config",
