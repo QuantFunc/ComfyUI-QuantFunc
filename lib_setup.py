@@ -398,20 +398,23 @@ def _detect_default_device_sm() -> int:
     no CUDA / no torch.
 
     This is what the transformer GPU-match filter keys on (`_target_gpu_sm`): torch
-    device 0 is the SAME device index BuildPipeline runs the transformer on by
-    default, so a weight offered/auto-picked against it is guaranteed runnable on
-    the actual default run-device — no `CUDA_VISIBLE_DEVICES` mask or
-    `CUDA_DEVICE_ORDER` can make them disagree (both are "CUDA device 0"). Under
-    the default FASTEST_FIRST ordering device 0 is the BEST GPU, so on a 3060+4090
-    box device 0 is the 4090 (SM89) → the 40x/FP8 tier shows + auto-picks (the
-    user's reported ask). Deliberately TORCH, not nvidia-smi: nvidia-smi is
-    CVD-UNAWARE and PCI-bus-ordered, so its "device 0" can be a hidden or different
-    physical GPU than CUDA device 0 — keying on it could offer a tier the actual
-    run-device can't run (→ __trap). CPU-only / no CUDA → 0 (caller does NOT
-    filter). (History: keying the filter on max/min OVER ALL GPUs was unsafe —
-    min over-hid the user's 40x; max over the physical set could over-offer a tier
-    the CVD-visible or PCI-slot-0 run-device couldn't run. Keying on the actual
-    default run-device — CUDA device 0 — is safe under every CVD/ordering.)"""
+    device 0 is the SAME device index BuildPipeline runs the transformer on BY
+    DEFAULT (the worker inherits the identical CVD/order env), so a weight
+    offered/auto-picked against it is runnable on the actual DEFAULT run-device —
+    no `CUDA_VISIBLE_DEVICES` mask or `CUDA_DEVICE_ORDER` makes them disagree (both
+    are "CUDA device 0"). Under the default FASTEST_FIRST ordering device 0 is the
+    BEST GPU, so on a 3060+4090 box device 0 is the 4090 (SM89) → the 40x/FP8 tier
+    shows + auto-picks (the user's reported ask). Deliberately TORCH, not
+    nvidia-smi: nvidia-smi is CVD-UNAWARE and PCI-bus-ordered, so its "device 0"
+    can be a hidden or different physical GPU than CUDA device 0 — keying on it
+    could offer a tier the actual run-device can't run (→ __trap). CPU-only / no
+    CUDA → 0 (caller does NOT filter). NOTE: the guarantee holds for the DEFAULT
+    device; if the user manually routes BuildPipeline to a non-default WEAKER GPU
+    the auto-picked tier could still exceed it (a known, accepted limitation — see
+    `model_auto_loader._target_gpu_sm`). (History: keying on max/min OVER ALL GPUs
+    was worse — min over-hid the user's 40x on every config; max over the physical
+    set could over-offer a tier the CVD-visible / PCI-slot-0 DEFAULT run-device
+    couldn't run. Keying on CUDA device 0 removes that common-path __trap.)"""
     try:
         import torch
         if torch.cuda.is_available() and torch.cuda.device_count() > 0:

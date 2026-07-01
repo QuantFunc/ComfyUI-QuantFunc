@@ -342,17 +342,26 @@ def _target_gpu_sm():
     (torch device 0) — the GPU BuildPipeline runs the transformer on by default.
 
     Keying on the ACTUAL default run-device (NOT max/min over the whole GPU set)
-    means a weight offered / auto-picked here is guaranteed runnable on that
-    device under ANY `CUDA_VISIBLE_DEVICES` mask or `CUDA_DEVICE_ORDER` — torch's
-    "device 0" is the same index BuildPipeline defaults to, so the keyed GPU and
-    the run-device can never disagree → it can never __trap. Under the default
-    FASTEST_FIRST ordering device 0 IS the best GPU, so on a 3060+4090 box device
-    0 is the 4090 (SM89) → the 40x/FP8 tier shows + auto-picks (the user's
+    means a weight offered / auto-picked here is runnable on that device under ANY
+    `CUDA_VISIBLE_DEVICES` mask or `CUDA_DEVICE_ORDER` — torch's "device 0" is the
+    same index BuildPipeline defaults to (and the worker inherits the identical
+    CVD/order env), so the keyed GPU and the run-device agree and it will not
+    __trap — WHEN BuildPipeline's `device` is left at its default (0). Under the
+    default FASTEST_FIRST ordering device 0 IS the best GPU, so on a 3060+4090 box
+    device 0 is the 4090 (SM89) → the 40x/FP8 tier shows + auto-picks (the user's
     reported ask). Undetectable (CPU-only / no torch) → _SM_UNKNOWN (0), and the
-    caller then does NOT filter. (Earlier keyings were unsafe: MIN over all GPUs
-    over-hid the user's 40x; MAX over the physical set could offer a tier the
-    CVD-visible / PCI-slot-0 run-device couldn't run — a __trap. Keying on the
-    real default run-device is safe under every CVD/ordering.)"""
+    caller then does NOT filter.
+
+    KNOWN LIMITATION (accepted trade-off — the orchestrator chose device-0 keying
+    OVER a build()-time SM-vs-device guardrail): this node has no wiring to
+    BuildPipeline's `device` selector, so if the user MANUALLY routes the pipeline
+    to a NON-DEFAULT, WEAKER GPU (e.g. device 1 = the 3060 while device 0 = the
+    4090), an auto-picked tier keyed to device 0 could exceed the chosen device's
+    SM and __trap at run time. In that case pick a matching lower-tier weight
+    explicitly. (Earlier keyings were WORSE, not merely limited: MIN over all GPUs
+    over-hid the user's 40x on EVERY config; MAX over the physical set could offer
+    a tier the CVD-visible / PCI-slot-0 DEFAULT run-device couldn't run — a __trap
+    on the common no-override path, which device-0 keying eliminates.)"""
     return _default_device_sm()
 
 
