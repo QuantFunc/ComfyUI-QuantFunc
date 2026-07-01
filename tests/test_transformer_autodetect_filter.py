@@ -127,6 +127,23 @@ def test_autodetect_unknown_gpu_picks_safest_lowest_tier():
         assert (s, n) == (KLEIN, KLEIN_30X), (s, n)
 
 
+def test_autodetect_unknown_gpu_prefers_known_tier_over_unrecognized():
+    # SM undetectable + catalog has an UNRECOGNIZED-token file (min-SM 0) next to
+    # a real 30x (min-SM 75): the known-safe 30x wins — an unknown token means
+    # "unknown compatibility", not "runs everywhere", so it must NOT be preferred.
+    cache = {KLEIN: {"transformer": ["klein-4b-mystery.safetensors", KLEIN_30X]}}
+    with _Env(cache=cache, all_sms=[]):
+        s, n = mal.resolve_transformer_selection(mal.AUTO_DETECT, KLEIN)
+        assert (s, n) == (KLEIN, KLEIN_30X), (s, n)
+
+
+def test_autodetect_unknown_gpu_all_unrecognized_still_picks_one():
+    cache = {KLEIN: {"transformer": ["klein-4b-aaa.safetensors", "klein-4b-bbb.safetensors"]}}
+    with _Env(cache=cache, all_sms=[]):
+        s, n = mal.resolve_transformer_selection(mal.AUTO_DETECT, KLEIN)
+        assert (s, n) == (KLEIN, "klein-4b-aaa.safetensors"), (s, n)
+
+
 def test_autodetect_no_transformers_returns_none():
     # a series shipping no separate transformer weights → base model's default
     with _Env(cache={KLEIN: {"transformer": []}}, all_sms=[120]):

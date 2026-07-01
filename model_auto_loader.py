@@ -354,8 +354,8 @@ def _pick_best_transformer(names, sm):
     candidate is compatible (all min-SM > sm). Returning a known-incompatible
     weight would reproduce the exact __trap() this feature prevents, so we must
     NOT fall through to 'lowest tier' in that case. Only when the GPU is UNKNOWN
-    (sm == 0, cannot filter) do we best-effort the LOWEST tier (runs on the most
-    GPUs). 'Highest-tier compatible' = the largest min-SM ≤ sm (a LOWER-tier
+    (sm == 0, cannot filter) do we best-effort the LOWEST KNOWN tier (runs on the
+    most GPUs). 'Highest-tier compatible' = the largest min-SM ≤ sm (a LOWER-tier
     weight on a HIGHER GPU is fine — INT4 runs on Blackwell). Ties break by name
     (deterministic)."""
     scored = [(n, _transformer_min_sm(n)) for n in names]
@@ -367,9 +367,14 @@ def _pick_best_transformer(names, sm):
             return None  # nothing runs on this GPU → base model's default transformer
         top = max(ms for (_n, ms) in compat)
         return sorted(n for (n, ms) in compat if ms == top)[0]
-    # GPU SM unknown → safest best-effort: the lowest tier (runs on the most GPUs)
-    low = min(ms for (_n, ms) in scored)
-    return sorted(n for (n, ms) in scored if ms == low)[0]
+    # GPU SM unknown → best-effort the lowest KNOWN tier (runs on the most GPUs).
+    # An unrecognized token scores _SM_UNKNOWN (0) = "unknown compatibility", NOT
+    # "runs everywhere", so prefer a recognized tier over it; only fall back to an
+    # unknown-token name when EVERY candidate is unrecognized.
+    known = [(n, ms) for (n, ms) in scored if ms > _SM_UNKNOWN]
+    pool = known if known else scored
+    low = min(ms for (_n, ms) in pool)
+    return sorted(n for (n, ms) in pool if ms == low)[0]
 
 
 def get_transformer_options():
