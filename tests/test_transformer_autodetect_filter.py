@@ -134,6 +134,25 @@ def test_autodetect_datacenter_sm_mapping():
     assert mal._transformer_min_sm(KLEIN_50X) > 100, "FP4 tier must stay > SM100"
 
 
+def test_autodetect_known_gpu_ignores_unrecognized_token():
+    # On a KNOWN GPU, an unrecognized-token weight (min-SM 0 = "unknown
+    # compatibility") must NOT be auto-picked when NO recognized tier is
+    # compatible — it might need a higher SM (→ __trap). Auto-detect defers to
+    # the base model (None); the dropdown still SHOWS it for a manual pick.
+    unk = "klein-4b-nextgen-mystery.safetensors"   # no tier token → min-SM 0
+    cache = {KLEIN: {"transformer": [KLEIN_50X, unk]}}  # 50x needs SM120 (incompat on 86)
+    with _Env(cache=cache, all_sms=[86]):
+        assert mal.resolve_transformer_selection(mal.AUTO_DETECT, KLEIN) == (None, None)
+    # a RECOGNIZED-compatible tier still wins over the unrecognized one:
+    cache2 = {KLEIN: {"transformer": [KLEIN_30X, unk]}}
+    with _Env(cache=cache2, all_sms=[86]):
+        s, n = mal.resolve_transformer_selection(mal.AUTO_DETECT, KLEIN)
+        assert (s, n) == (KLEIN, KLEIN_30X), (s, n)
+    # and the unrecognized weight is NOT filtered from the dropdown (manual pick):
+    with _Env(cache=cache, all_sms=[86]):
+        assert _opt(KLEIN, unk) in mal.get_transformer_options()
+
+
 def test_autodetect_unknown_gpu_picks_safest_lowest_tier():
     # SM undetectable (no GPUs) → safest = lowest tier (INT4/30x)
     with _Env(cache=_klein_cache(), all_sms=[]):

@@ -372,26 +372,34 @@ def _pick_best_transformer(names, sm):
 
     Returns None (→ caller defers to the base model's own transformer) when
     `names` is empty OR — critically — when the GPU is KNOWN (sm > 0) but NO
-    candidate is compatible (all min-SM > sm). Returning a known-incompatible
-    weight would reproduce the exact __trap() this feature prevents, so we must
-    NOT fall through to 'lowest tier' in that case. Only when the GPU is UNKNOWN
+    RECOGNIZED tier is compatible. Returning a known-incompatible weight would
+    reproduce the exact __trap() this feature prevents, so we must NOT fall
+    through to 'lowest tier' in that case. Only when the GPU is UNKNOWN
     (sm == 0, cannot filter) do we best-effort the LOWEST KNOWN tier (runs on the
     most GPUs). 'Highest-tier compatible' = the largest min-SM ≤ sm (a LOWER-tier
     weight on a HIGHER GPU is fine — INT4 runs on Blackwell). Ties break by name
-    (deterministic)."""
+    (deterministic).
+
+    An UNRECOGNIZED token scores _SM_UNKNOWN (0) = "unknown compatibility", which
+    is NOT "runs on any GPU" — auto-detect must never PICK it (it may need a
+    higher SM → __trap). So BOTH branches exclude ms == _SM_UNKNOWN from the
+    auto-pick pool (sm>0: from `compat`; sm==0: prefer `known`), falling back to
+    None / an unknown name only when there is nothing recognized to choose. The
+    dropdown still SHOWS unrecognized weights (get_transformer_options never
+    hides ms==0) for a deliberate MANUAL pick — auto-detect is known-safe-only."""
     scored = [(n, _transformer_min_sm(n)) for n in names]
     if not scored:
         return None
     if sm > 0:
-        compat = [(n, ms) for (n, ms) in scored if ms <= sm]
+        # RECOGNIZED (_SM_UNKNOWN < ms) AND runnable (ms <= sm). ms==0 is excluded:
+        # it means "unknown", not "runs everywhere" — mirrors the sm==0 branch.
+        compat = [(n, ms) for (n, ms) in scored if _SM_UNKNOWN < ms <= sm]
         if not compat:
-            return None  # nothing runs on this GPU → base model's default transformer
+            return None  # no recognized-compatible weight → base model's default transformer
         top = max(ms for (_n, ms) in compat)
         return sorted(n for (n, ms) in compat if ms == top)[0]
-    # GPU SM unknown → best-effort the lowest KNOWN tier (runs on the most GPUs).
-    # An unrecognized token scores _SM_UNKNOWN (0) = "unknown compatibility", NOT
-    # "runs everywhere", so prefer a recognized tier over it; only fall back to an
-    # unknown-token name when EVERY candidate is unrecognized.
+    # GPU SM unknown → best-effort the lowest KNOWN tier (runs on the most GPUs);
+    # only fall back to an unknown-token name when EVERY candidate is unrecognized.
     known = [(n, ms) for (n, ms) in scored if ms > _SM_UNKNOWN]
     pool = known if known else scored
     low = min(ms for (_n, ms) in pool)
