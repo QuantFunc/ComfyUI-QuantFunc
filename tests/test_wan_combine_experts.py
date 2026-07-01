@@ -218,8 +218,7 @@ def test_stage_two_expert_dequant():
     shared = _make_shared_dir(base_dim=96)
     out = tempfile.mkdtemp(prefix="qfwan_out_") + "/stage"
 
-    model_dir = W.stage_two_expert(high, low, shared, out, boundary_ratio=0.9,
-                                   dequant_fp8=True)
+    model_dir = W.stage_two_expert(high, low, shared, out, boundary_ratio=0.9)
     assert model_dir == os.path.abspath(out)
 
     # transformer config: t2v channels + depth from the expert
@@ -263,35 +262,8 @@ def test_stage_two_expert_dequant():
 
 
 @pytest.mark.skipif(not _HAS_TORCH, reason="needs torch")
-def test_stage_two_expert_raw_preserves_fp8():
-    src = tempfile.mkdtemp(prefix="qfwan_raw_")
-    high = os.path.join(src, "high.safetensors")
-    low = os.path.join(src, "low.safetensors")
-    _write_expert(high, fp8=True)
-    _write_expert(low, fp8=True)
-    shared = _make_shared_dir()
-    out = tempfile.mkdtemp(prefix="qfwan_rawout_") + "/stage"
-    W.stage_two_expert(high, low, shared, out, dequant_fp8=False)
-    wpath = os.path.join(out, "transformer", "diffusion_pytorch_model.safetensors")
-    hdr = _hdr(wpath)
-    # keys remapped, fp8 preserved, scale/marker dropped
-    assert "blocks.0.attn1.to_q.weight" in hdr
-    assert hdr["blocks.0.attn1.to_q.weight"]["dtype"] == "F8_E4M3"
-    assert not any(k.endswith(".scale_weight") for k in hdr)
-    assert "scaled_fp8" not in hdr
-    # CRITICAL: the file must be a VALID safetensors after dropping keys — load via
-    # the REAL consumer (repacked data_offsets must partition [0,N) with no gaps).
-    from safetensors import safe_open
-    with safe_open(wpath, framework="pt") as f:  # raises InvalidOffset if corrupt
-        keys = set(f.keys())
-        assert "blocks.0.attn1.to_q.weight" in keys
-        assert f.get_tensor("blocks.0.attn1.to_q.weight").dtype == torch.float8_e4m3fn
-        assert f.get_tensor("proj_out.weight").shape[0] > 0   # tail tensor readable (head.head→proj_out)
-
-
-@pytest.mark.skipif(not _HAS_TORCH, reason="needs torch")
 def test_dequant_on_non_fp8_expert_passthrough():
-    """dequant_fp8=True on fully-fp16 (non-fp8) experts: non-fp8 tensors pass through,
+    """Dequant staging on fully-fp16 (non-fp8) experts: non-fp8 tensors pass through,
     keys still remapped, output loads clean."""
     src = tempfile.mkdtemp(prefix="qfwan_nofp8_")
     high = os.path.join(src, "high.safetensors")
@@ -300,7 +272,7 @@ def test_dequant_on_non_fp8_expert_passthrough():
     _write_expert(low, fp8=False)
     shared = _make_shared_dir()
     out = tempfile.mkdtemp(prefix="qfwan_nofp8out_") + "/stage"
-    W.stage_two_expert(high, low, shared, out, dequant_fp8=True)
+    W.stage_two_expert(high, low, shared, out)
     wpath = os.path.join(out, "transformer", "diffusion_pytorch_model.safetensors")
     sd = load_file(wpath)
     assert "blocks.0.attn1.to_q.weight" in sd
@@ -340,9 +312,10 @@ def test_foreign_nonempty_out_dir_refused():
     assert os.path.isfile(os.path.join(out, "my_important_file.txt"))  # untouched
 
 
-def test_remap_file_raw_rejects_out_of_range_offsets():
+@pytest.mark.skipif(not _HAS_TORCH, reason="needs torch")
+def test_remap_dequant_rejects_out_of_range_offsets():
     """An adversarial/corrupt header (data_offsets beyond the data region) must fail
-    LOUD, not emit a silently-truncated file."""
+    LOUD at plan time, not emit a silently-truncated file."""
     src = tempfile.mkdtemp(prefix="qfwan_bad_") + "/bad.safetensors"
     hdr = {"blocks.0.self_attn.q.weight": {"dtype": "F16", "shape": [2, 2],
                                            "data_offsets": [0, 999999]},  # far past EOF
@@ -354,16 +327,17 @@ def test_remap_file_raw_rejects_out_of_range_offsets():
         f.write(nh)
         f.write(b"\x00" * 8)   # only 8 bytes of data region
     with pytest.raises(RuntimeError, match="out of range"):
-        W.remap_file_raw(src, src + ".out")
+        W.remap_dequant_file(src, src + ".out")
 
 
-def test_remap_file_raw_rejects_implausible_header_len():
+@pytest.mark.skipif(not _HAS_TORCH, reason="needs torch")
+def test_remap_dequant_rejects_implausible_header_len():
     src = tempfile.mkdtemp(prefix="qfwan_bighdr_") + "/big.safetensors"
     with open(src, "wb") as f:
         f.write(struct.pack("<Q", 1 << 40))   # 1 TiB header on a tiny file
         f.write(b"{}")
     with pytest.raises(RuntimeError, match="implausible"):
-        W.remap_file_raw(src, src + ".out")
+        W.remap_dequant_file(src, src + ".out")
 
 
 def test_symlink_replace_never_deletes_real_dir():
@@ -441,6 +415,182 @@ def test_i2v_experts_stage_engine_loadable_class_with_i2v_channels():
         cfg = json.load(open(os.path.join(out, sub, "config.json")))
         assert cfg["in_channels"] == 36 and cfg["out_channels"] == 16
         assert cfg["_class_name"] == "WanTransformer3DModel"
+
+
+# --------------------------- fixup-round guards (S1-S4, C1-C3, G1) ---------------------------
+@pytest.mark.skipif(not _HAS_TORCH, reason="needs torch")
+def test_same_file_both_experts_refused():
+    """S1 — the same file staged as both experts = silent quality loss -> raise."""
+    src = tempfile.mkdtemp(prefix="qfwan_same_")
+    one = os.path.join(src, "wan_high_and_low.safetensors")
+    _write_expert(one)
+    shared = _make_shared_dir()
+    out = tempfile.mkdtemp(prefix="qfwan_sameout_") + "/stage"
+    with pytest.raises(RuntimeError, match="SAME file"):
+        W.stage_two_expert(one, one, shared, out)
+
+
+@pytest.mark.skipif(not _HAS_TORCH, reason="needs torch")
+def test_swapped_high_low_filenames_refused():
+    """C3 — both filename hints present but REVERSED -> raise (silent quality loss)."""
+    src = tempfile.mkdtemp(prefix="qfwan_swap_")
+    a = os.path.join(src, "wan2.2_t2v_low_noise_14B.safetensors")
+    b = os.path.join(src, "wan2.2_t2v_high_noise_14B.safetensors")
+    _write_expert(a)
+    _write_expert(b)
+    shared = _make_shared_dir()
+    out = tempfile.mkdtemp(prefix="qfwan_swapout_") + "/stage"
+    with pytest.raises(RuntimeError, match="SWAPPED"):
+        W.stage_two_expert(a, b, shared, out)   # 'low' passed as high + vice versa
+
+
+@pytest.mark.skipif(not _HAS_TORCH, reason="needs torch")
+def test_fp8_marker_with_missing_scale_sibling_refused():
+    """S2 — 'scaled_fp8' marker present but a .scale_weight sibling MISSING -> raise
+    (a bare fp8->fp16 cast would be ~20x numerically wrong)."""
+    d = tempfile.mkdtemp(prefix="qfwan_noscale_")
+    src = os.path.join(d, "bad.safetensors")
+    f8 = torch.float8_e4m3fn
+    sd = {"patch_embedding.weight": torch.randn(8, 16, 1, 2, 2).half(),
+          "blocks.0.self_attn.q.weight": (torch.randn(8, 8) * 0.1).to(f8),
+          # NOTE: no blocks.0.self_attn.q.scale_weight sibling
+          "blocks.0.ffn.0.weight": (torch.randn(8, 8) * 0.1).to(f8),
+          "blocks.0.ffn.0.scale_weight": torch.tensor(0.05),
+          "scaled_fp8": torch.tensor(0.0, dtype=f8)}
+    save_file(sd, src)
+    with pytest.raises(RuntimeError, match="scale_weight"):
+        W.remap_dequant_file(src, src + ".out")
+
+
+@pytest.mark.skipif(not _HAS_TORCH, reason="needs torch")
+def test_stage_atomic_no_tmp_leftover_and_stale_tmp_cleaned():
+    """S3 — staging is tmp+rename: after success no `<out>.tmp-*` sibling remains,
+    and a stale sentinel-carrying tmp dir from an aborted run is cleaned up."""
+    src = tempfile.mkdtemp(prefix="qfwan_atomic_")
+    high = os.path.join(src, "high.safetensors")
+    low = os.path.join(src, "low.safetensors")
+    _write_expert(high)
+    _write_expert(low)
+    shared = _make_shared_dir()
+    parent = tempfile.mkdtemp(prefix="qfwan_atomicout_")
+    out = os.path.join(parent, "stage")
+    # plant a stale aborted-run tmp dir (with our sentinel) + a foreign lookalike
+    stale = out + ".tmp-99999"
+    os.makedirs(stale)
+    open(os.path.join(stale, W._TMP_SENTINEL), "w").write("x")
+    foreign = out + ".tmp-alien"
+    os.makedirs(foreign)
+    open(os.path.join(foreign, "users_own.txt"), "w").write("keep")
+    W.stage_two_expert(high, low, shared, out)
+    assert os.path.isfile(os.path.join(out, ".qf_stage_complete"))
+    assert not os.path.exists(stale)                       # ours -> cleaned
+    assert os.path.isfile(os.path.join(foreign, "users_own.txt"))  # foreign -> kept
+    leftovers = [n for n in os.listdir(parent)
+                 if n.startswith("stage.tmp-") and n != os.path.basename(foreign)]
+    assert leftovers == []                                 # no tmp residue
+    assert not os.path.exists(os.path.join(out, W._TMP_SENTINEL))  # sentinel gone
+
+
+@pytest.mark.skipif(not _HAS_TORCH, reason="needs torch")
+def test_estimator_matches_actual_output_bytes():
+    """S4 — the free-disk estimator returns EXACTLY the data bytes the dequant writes
+    (verified against the real staged file: file size == 8 + header + estimate)."""
+    d = tempfile.mkdtemp(prefix="qfwan_est_")
+    src = os.path.join(d, "e.safetensors")
+    _write_expert(src, fp8=True)
+    est = W.estimate_dequant_output_bytes(src)
+    dst = os.path.join(d, "out.safetensors")
+    W.remap_dequant_file(src, dst)
+    with open(dst, "rb") as f:
+        hlen = struct.unpack("<Q", f.read(8))[0]
+    assert os.path.getsize(dst) == 8 + hlen + est
+
+
+@pytest.mark.skipif(not _HAS_TORCH, reason="needs torch")
+def test_stage_refuses_when_disk_too_small(monkeypatch):
+    """S4 — a too-small free-disk report -> actionable raise BEFORE any write."""
+    import shutil as _sh
+    src = tempfile.mkdtemp(prefix="qfwan_disk_")
+    high = os.path.join(src, "high.safetensors")
+    low = os.path.join(src, "low.safetensors")
+    _write_expert(high)
+    _write_expert(low)
+    shared = _make_shared_dir()
+    out = tempfile.mkdtemp(prefix="qfwan_diskout_") + "/stage"
+    Usage = type(_sh.disk_usage("/"))
+    monkeypatch.setattr(W.shutil, "disk_usage",
+                        lambda p: Usage(total=10**9, used=10**9 - 1024, free=1024))
+    with pytest.raises(RuntimeError, match="free disk"):
+        W.stage_two_expert(high, low, shared, out)
+    assert not os.path.exists(out)                          # nothing written
+
+
+def test_resolve_boundary_ratio_precedence():
+    """C1/C2 — explicit override > shared model_index value > published default;
+    explicit 0/out-of-range -> raise."""
+    # explicit override wins
+    v, srcl = W.resolve_boundary_ratio(0.8, {"boundary_ratio": 0.875}, 16, 16)
+    assert v == 0.8 and "override" in srcl
+    # inherit the published value from the shared model_index
+    v, srcl = W.resolve_boundary_ratio(None, {"boundary_ratio": 0.875}, 16, 16)
+    assert v == 0.875 and "inherited" in srcl
+    # published per-modality defaults when the base carries none
+    v, srcl = W.resolve_boundary_ratio(None, {}, 16, 16)
+    assert v == W._PUBLISHED_BOUNDARY_T2V and "t2v" in srcl
+    v, srcl = W.resolve_boundary_ratio(None, {}, 36, 16)
+    assert v == W._PUBLISHED_BOUNDARY_I2V and "i2v" in srcl
+    # explicit 0 / out-of-range -> raise (the engine would silently drop the low expert)
+    with pytest.raises(RuntimeError, match="invalid"):
+        W.resolve_boundary_ratio(0.0, None, 16, 16)
+    with pytest.raises(RuntimeError, match="invalid"):
+        W.resolve_boundary_ratio(1.5, None, 16, 16)
+
+
+@pytest.mark.skipif(not _HAS_TORCH, reason="needs torch")
+def test_stage_inherits_published_boundary_from_shared_model_index():
+    """C1 — auto (boundary_ratio=None) inherits the shared model_index's published
+    value instead of silently overriding it."""
+    src = tempfile.mkdtemp(prefix="qfwan_inh_")
+    high = os.path.join(src, "high.safetensors")
+    low = os.path.join(src, "low.safetensors")
+    _write_expert(high)
+    _write_expert(low)
+    shared = _make_shared_dir()
+    json.dump({"_class_name": "WanPipeline", "boundary_ratio": 0.875},
+              open(os.path.join(shared, "model_index.json"), "w"))
+    out = tempfile.mkdtemp(prefix="qfwan_inhout_") + "/stage"
+    W.stage_two_expert(high, low, shared, out)              # auto
+    mi = json.load(open(os.path.join(out, "model_index.json")))
+    assert mi["boundary_ratio"] == 0.875
+
+
+@pytest.mark.skipif(not _HAS_TORCH, reason="needs torch")
+def test_missing_shared_components_refused():
+    """G1 — shared dir without vae/ or text_encoder/ -> actionable stage-time error."""
+    src = tempfile.mkdtemp(prefix="qfwan_g1_")
+    high = os.path.join(src, "high.safetensors")
+    low = os.path.join(src, "low.safetensors")
+    _write_expert(high)
+    _write_expert(low)
+    shared = tempfile.mkdtemp(prefix="qfwan_g1shared_")   # empty: no vae/text_encoder
+    out = tempfile.mkdtemp(prefix="qfwan_g1out_") + "/stage"
+    with pytest.raises(RuntimeError, match="missing"):
+        W.stage_two_expert(high, low, shared, out)
+
+
+def test_stage_root_never_plugin_tree(monkeypatch):
+    """S5 — without QUANTFUNC_CACHE_DIR and without ComfyUI folder_paths, the staging
+    root falls back to the SYSTEM temp dir, never the plugin tree."""
+    for _n in ("comfy", "comfy.model_management", "comfy.utils", "folder_paths"):
+        sys.modules.setdefault(_n, types.ModuleType(_n))
+    sys.modules.setdefault("torch", types.ModuleType("torch"))
+    nodes = importlib.import_module(f"{_PKG}.nodes")
+    monkeypatch.delenv("QUANTFUNC_CACHE_DIR", raising=False)
+    # the stubbed folder_paths has no get_temp_directory -> Exception branch
+    root = nodes._wan_combine_stage_root()
+    plugin_root = os.path.dirname(os.path.abspath(nodes.__file__))
+    assert not root.startswith(plugin_root)
+    assert os.path.basename(root) == "qf_wan_combined"
 
 
 # --------------------------- node registration ---------------------------

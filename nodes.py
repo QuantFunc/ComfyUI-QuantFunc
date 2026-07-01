@@ -2136,11 +2136,13 @@ class QuantFuncModelLoader:
 
 def _wan_combine_stage_root() -> str:
     """Root for staged two-expert Wan dirs. Honors $QUANTFUNC_CACHE_DIR (the same
-    override the rest of the adapter layer respects), else ComfyUI temp (large,
-    already outside the repo), else a plugin-local cache dir. Unlike the format-
-    adapter build path this node symlinks (not hardlinks) its large components, so a
-    same-volume-as-source root is not required. NOTE: a staged A14B (14B×2 dequant→
-    fp16) is ~56 GB — point `output_dir` at a roomy disk if the default temp is small."""
+    override the rest of the adapter layer respects), else ComfyUI temp, else the
+    system temp dir — NEVER the plugin tree (forbidden staging ground; the ~56 GB
+    output would bloat/pollute the install). The dominant-size outputs are freshly
+    REWRITTEN (dequant), not hardlinked, so a same-volume-as-source root is not
+    required. NOTE: ComfyUI wipes its temp dir on every restart — set
+    QUANTFUNC_CACHE_DIR (or the node's output_dir) to PERSIST the ~56 GB stage
+    across restarts instead of re-dequantizing each time."""
     env = os.environ.get("QUANTFUNC_CACHE_DIR")
     if env:
         return os.path.join(env, "qf_wan_combined")
@@ -2148,8 +2150,8 @@ def _wan_combine_stage_root() -> str:
         import folder_paths
         return os.path.join(folder_paths.get_temp_directory(), "qf_wan_combined")
     except Exception:
-        return os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                            "cache", "wan_combined")
+        import tempfile
+        return os.path.join(tempfile.gettempdir(), "qf_wan_combined")
 
 
 class QuantFuncWanCombineExperts:
@@ -2176,7 +2178,11 @@ class QuantFuncWanCombineExperts:
     ComfyUI/original-Wan single-file keys are remapped to diffusers keys; fp8
     `*_scaled` experts are dequantized to fp16 (the engine's Wan transformer
     factory does not yet consume fp8 inline); the Wan2.1 16-ch VAE config is
-    absent-key-fixed. Staging is cached (idempotent on identical sources).
+    absent-key-fixed. `boundary_ratio` defaults to AUTO (inherit the shared
+    model_index's published value, else t2v 0.875 / i2v 0.9 — the official
+    Wan-AI release values). Staging is cached (idempotent on identical sources),
+    atomic (tmp+rename — a concurrent/aborted run can never leave a partial dir
+    that looks complete), and pre-checks free disk against the exact output size.
     """
 
     @classmethod
@@ -2190,15 +2196,20 @@ class QuantFuncWanCombineExperts:
                 "shared_components": ("STRING", {"default": "", "tooltip":
                     "Path to a Wan diffusers dir supplying the shared vae / "
                     "text_encoder / tokenizer / scheduler (+ transformer config base)"}),
-                "boundary_ratio": ("FLOAT", {"default": 0.9, "min": 0.0, "max": 1.0,
-                    "step": 0.01, "tooltip":
-                    "Denoise fraction at which the high→low expert switch happens "
-                    "(Wan2.2-A14B default 0.9)"}),
+                "boundary_ratio": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0,
+                    "step": 0.005, "tooltip":
+                    "Denoise fraction of the high→low expert switch. 0 = AUTO: "
+                    "inherit the shared model_index's published value when present, "
+                    "else the modality's published default (t2v 0.875 / i2v 0.9 — "
+                    "verified from the official Wan-AI A14B releases). Set >0 only "
+                    "to override the published value explicitly."}),
             },
             "optional": {
                 "output_dir": ("STRING", {"default": "", "tooltip":
-                    "Staging output dir (empty = ComfyUI temp / plugin cache). "
-                    "Point at a roomy disk — a staged A14B is ~56 GB."}),
+                    "Staging output dir (empty = $QUANTFUNC_CACHE_DIR, else ComfyUI "
+                    "temp — which ComfyUI WIPES on every restart, forcing a "
+                    "re-dequant). Point at a roomy PERSISTENT disk — a staged A14B "
+                    "is ~56 GB."}),
             },
         }
 
@@ -2219,21 +2230,24 @@ class QuantFuncWanCombineExperts:
                 "QuantFunc Wan Combine Experts: high_noise_expert, "
                 "low_noise_expert and shared_components are all required.")
 
+        # Widget sentinel: 0 = AUTO (inherit the shared model_index's published
+        # boundary_ratio, else the modality's published default) — the module
+        # resolves it; an explicit >0 value is an override. 0 never reaches the
+        # engine (whose boundary_ratio>0 gate would silently drop the low expert).
+        boundary = float(boundary_ratio) if boundary_ratio and boundary_ratio > 0 \
+            else None
+
         out = (output_dir or "").strip()
         if not out:
             fp = _fingerprint([os.path.abspath(high), os.path.abspath(low),
                                os.path.abspath(shared)],
-                              extra="{}".format(boundary_ratio))
+                              extra="{}".format(boundary))
             out = os.path.join(_wan_combine_stage_root(), fp)
 
-        # The engine's Wan transformer factory does not consume fp8 inline, so the
-        # node always dequantizes to fp16 (the loadable path). The module retains a
-        # fp8-preserving mode for a future engine that wires DequantFP8 — not exposed
-        # as a node option so a user can't pick a currently-unloadable output.
-        model_dir = stage_two_expert(
-            high, low, shared, out,
-            boundary_ratio=float(boundary_ratio),
-            dequant_fp8=True)
+        # The engine's Wan transformer factory does not consume fp8 inline, so
+        # staging always dequantizes to fp16 (the only engine-loadable form today).
+        model_dir = stage_two_expert(high, low, shared, out,
+                                     boundary_ratio=boundary)
         logging.info("[QuantFunc] Wan two-expert staged → %s", model_dir)
         return (model_dir,)
 

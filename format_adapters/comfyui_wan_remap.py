@@ -24,10 +24,10 @@ them unchanged. Three concerns are handled:
      linears as F8_E4M3 with per-tensor `.scale_weight`. The engine's Wan video
      transformer factory does not (yet) wire the shared DequantFP8Provider, so
      fp8 weights would load into fp16 slots (size mismatch). Until that 1-line
-     engine wrap lands, we dequant to fp16 on the plugin side (`dequant_fp8=True`,
-     the default). Once the engine wires DequantFP8 + a KeyAliasingProvider for
-     the Wan factory, `dequant_fp8=False` enables the zero-copy `key_remap.json`
-     manifest path (`build_wan_xfm_manifest`) — no data copy, fp8 preserved.
+     engine wrap lands, we dequant to fp16 on the plugin side (the ONLY staging
+     mode). Once the engine wires DequantFP8 + a KeyAliasingProvider for the Wan
+     factory, the zero-copy `key_remap.json` manifest (`build_wan_xfm_manifest`)
+     becomes usable — no data copy, fp8 preserved.
 
   3. VAE ABSENT-KEY FIX — the Wan2.1 16-ch VAE (used by the whole Wan-14B family)
      ships a diffusers `config.json` that OMITS `decoder_base_dim` / `is_residual`
@@ -47,6 +47,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import struct
 from pathlib import Path
 
@@ -159,23 +160,17 @@ def detect_wan_modality(path: str | Path) -> tuple[int, int]:
                    (t2v: in == out). i2v A14B is in>out (channel-concat).
     """
     hdr = _read_header(path)
-    in_ch = 0
+    # ONE pass over the header: in_channels + patch volume (kt*kh*kw) both come
+    # from the same patch_embedding.weight Conv3d shape [out,in,kt,kh,kw].
+    in_ch, pt, ph, pw = 0, 1, 1, 1
     for k, info in hdr.items():
         if k.startswith("patch_embedding") and k.endswith(".weight"):
             shp = info["shape"]
             if len(shp) == 5:
-                in_ch = shp[1]
+                in_ch, pt, ph, pw = shp[1], shp[2], shp[3], shp[4]
             break
     if not in_ch:
         raise RuntimeError(f"{path}: no patch_embedding.weight — not a Wan expert?")
-    # Derive the patch volume from the patch_embedding kernel (kt*kh*kw).
-    pt = ph = pw = 1
-    for k, info in hdr.items():
-        if k.startswith("patch_embedding") and k.endswith(".weight"):
-            shp = info["shape"]
-            if len(shp) == 5:
-                pt, ph, pw = shp[2], shp[3], shp[4]
-            break
     out_ch = in_ch
     for k in ("head.head.weight", "proj_out.weight"):
         if k in hdr:
@@ -220,76 +215,6 @@ def build_wan_xfm_manifest(src_path: str | Path) -> dict:
 # ============================================================================
 # Physical rewrites
 # ============================================================================
-
-def remap_file_raw(src: str | Path, dst: str | Path) -> tuple[int, list[str]]:
-    """Rename keys and REPACK the data region, preserving each kept tensor's dtype
-    (fp8 preserved, no torch). Dropped keys (fp8 `.scale_weight`/`.scale_input` + the
-    `scaled_fp8` marker) are excised and the surviving tensors' `data_offsets` are
-    renumbered to a gap-free `[0, N)` partition — a valid safetensors file (dropping a
-    header entry while copying the blob verbatim would corrupt the offset table).
-
-    Fastest path (byte copy, no dequant) but only LOADABLE by an engine that consumes
-    fp8 for the Wan transformer factory — not the current one. Kept for the future
-    zero-copy engine path + CPU structure checks; the node's default is the dequant path.
-    """
-    src, dst = str(src), str(dst)
-    data_len = os.path.getsize(src)
-    with open(src, "rb") as fh:
-        hlen = struct.unpack("<Q", fh.read(8))[0]
-        if hlen > _MAX_HEADER_BYTES or hlen > data_len - 8:
-            raise RuntimeError(
-                f"{src}: safetensors header length {hlen} is implausible "
-                f"(cap {_MAX_HEADER_BYTES}, file {data_len}) — refusing to parse")
-        hdr = json.loads(fh.read(hlen))
-        meta = hdr.pop("__metadata__", None)
-        data_start = 8 + hlen
-        data_region = data_len - data_start      # bytes available for tensor data
-        new: dict = {}
-        copies: list[tuple[int, int]] = []   # (old_start, old_end) in header order
-        dropped: list[str] = []
-        cursor = 0
-        for k, info in hdr.items():
-            if _is_droppable(k):
-                dropped.append(k)
-                continue
-            off = info.get("data_offsets")
-            if (not isinstance(off, (list, tuple)) or len(off) != 2):
-                raise RuntimeError(f"{src}: tensor {k!r} has malformed data_offsets {off!r}")
-            old_s, old_e = off
-            # Validate the declared slice lies within the data region + is ordered
-            # (an adversarial / corrupt header must fail LOUD, never silently emit a
-            # truncated/corrupt output file).
-            if not (isinstance(old_s, int) and isinstance(old_e, int)
-                    and 0 <= old_s <= old_e <= data_region):
-                raise RuntimeError(
-                    f"{src}: tensor {k!r} data_offsets {off!r} out of range "
-                    f"[0, {data_region}] — refusing to repack a corrupt file")
-            size = old_e - old_s
-            new[remap_key(k)] = {"dtype": info["dtype"], "shape": info["shape"],
-                                 "data_offsets": [cursor, cursor + size]}
-            copies.append((old_s, old_e))
-            cursor += size
-        n_keys = len(new)
-        if meta is not None:
-            new = {"__metadata__": meta, **new}
-        nh = json.dumps(new, separators=(",", ":")).encode("utf-8")
-        pad = (8 - (len(nh) % 8)) % 8
-        nh += b" " * pad
-        os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
-        with open(dst, "wb") as out:
-            out.write(struct.pack("<Q", len(nh)))
-            out.write(nh)
-            for old_s, old_e in copies:
-                fh.seek(data_start + old_s)
-                remaining = old_e - old_s
-                while remaining > 0:
-                    buf = fh.read(min(remaining, 64 * 1024 * 1024))
-                    if not buf:
-                        break
-                    out.write(buf)
-                    remaining -= len(buf)
-    return n_keys, dropped
-
 
 # safetensors dtype → element byte width (for planning the streamed output header).
 _ST_DTYPE_BYTES = {"F64": 8, "F32": 4, "F16": 2, "BF16": 2, "F8_E4M3": 1, "F8_E5M2": 1,
@@ -344,6 +269,10 @@ def remap_dequant_file(src: str | Path, dst: str | Path) -> int:
     # Plan the output header + per-tensor read plan (source order → kept, fp8→F16).
     scale_slices = {k: (_slice(k, v), v["dtype"])
                     for k, v in raw.items() if k.endswith(".scale_weight")}
+    # ComfyUI's fp8-scaled marker: when present, EVERY fp8 .weight must carry a
+    # .scale_weight sibling — a missing one means the checkpoint is malformed and a
+    # bare fp8→fp16 cast would be ~20× wrong. Fail LOUD at plan time (before any write).
+    has_scaled_marker = "scaled_fp8" in raw
     out_hdr: dict = {}
     plan: list = []   # (out_key, is_fp8, src_dt, (s,e), scale_key_or_None, out_bytes)
     cursor = 0
@@ -364,6 +293,11 @@ def remap_dequant_file(src: str | Path, dst: str | Path) -> int:
         size = numel * _ST_DTYPE_BYTES[out_dt]
         sk = (k[: -len(".weight")] + ".scale_weight"
               if is_fp8 and k.endswith(".weight") else None)
+        if has_scaled_marker and sk is not None and sk not in scale_slices:
+            raise RuntimeError(
+                f"{src}: fp8 tensor {k!r} carries the 'scaled_fp8' marker but has NO "
+                f"'{sk}' sibling — a bare fp8→fp16 cast would be numerically wrong "
+                f"(unscaled). The checkpoint is malformed; refusing to dequantize.")
         out_key = remap_key(k)
         out_hdr[out_key] = {"dtype": out_dt, "shape": info["shape"],
                             "data_offsets": [cursor, cursor + size]}
@@ -388,8 +322,10 @@ def remap_dequant_file(src: str | Path, dst: str | Path) -> int:
             t = _read(fh, s, e, src_dt)
             if is_fp8:
                 w = t.to(torch.float32)
-                # Scale applied ONLY when the sibling is present (a real read error on
-                # it must surface, not silently emit unscaled garbage).
+                # The plan loop already REJECTED a marker-carrying file with a missing
+                # scale sibling (fail-loud); here a sibling absent from scale_slices can
+                # only mean a legitimately-unscaled fp8 file (no 'scaled_fp8' marker).
+                # A real READ error on an existing sibling still propagates.
                 if sk is not None and sk in scale_slices:
                     (ss, se), sdt = scale_slices[sk]
                     w = w * _read(fh, ss, se, sdt).to(torch.float32)
@@ -403,9 +339,41 @@ def remap_dequant_file(src: str | Path, dst: str | Path) -> int:
     return len(plan)
 
 
+def estimate_dequant_output_bytes(src: str | Path) -> int:
+    """Exact DATA bytes `remap_dequant_file` will write for `src` (kept tensors,
+    fp8→F16 widening applied) — the same plan math, header-only, no torch. Used for
+    the free-disk pre-check; the output json header (~100 KB) rides in the caller's
+    safety margin."""
+    hdr = _read_header(src)   # DoS-guarded
+    total = 0
+    for k, info in hdr.items():
+        if _is_droppable(k):
+            continue
+        src_dt = info["dtype"]
+        if src_dt not in _ST_DTYPE_BYTES:
+            raise RuntimeError(f"{src}: tensor {k!r} unsupported dtype {src_dt!r}")
+        out_dt = "F16" if src_dt in ("F8_E4M3", "F8_E5M2") else src_dt
+        numel = 1
+        for sh in info["shape"]:
+            if not isinstance(sh, int) or sh < 0:
+                raise RuntimeError(f"{src}: tensor {k!r} invalid shape entry {sh!r}")
+            numel *= sh
+        total += numel * _ST_DTYPE_BYTES[out_dt]
+    return total
+
+
 # ============================================================================
 # Config synthesis
 # ============================================================================
+
+# Published boundary_ratio defaults per modality — VERIFIED 2026-07-02 against the
+# OFFICIAL upstream model_index.json of both A14B releases (two independent sources,
+# huggingface.co + modelscope.cn, byte-identical):
+#   Wan-AI/Wan2.2-T2V-A14B-Diffusers → "boundary_ratio": 0.875
+#   Wan-AI/Wan2.2-I2V-A14B-Diffusers → "boundary_ratio": 0.9   (also the local ref)
+# Used ONLY when neither the user nor the shared model_index supplies a value.
+_PUBLISHED_BOUNDARY_T2V = 0.875
+_PUBLISHED_BOUNDARY_I2V = 0.9
 
 # The synthesized model_index ALWAYS carries _class_name="WanPipeline" — for BOTH
 # t2v and i2v experts. Rationale (engine-verified):
@@ -499,7 +467,6 @@ def _stage_shared_dir(src: str, dst: str) -> None:
     try:
         os.symlink(src, dst)
     except OSError:                   # e.g. Windows without Developer Mode
-        import shutil
         shutil.copytree(src, dst)
 
 
@@ -536,21 +503,103 @@ def _assert_safe_out_dir(out_dir: str, protected: list[str]) -> None:
             f"empty / dedicated output_dir.")
 
 
+def resolve_boundary_ratio(requested, base_model_index: dict | None,
+                           in_ch: int, out_ch: int) -> tuple[float, str]:
+    """Resolve the effective boundary_ratio + a provenance label.
+
+    Precedence (C1 — never silently override the model's published value):
+      1. explicit `requested` (user override) — must be in (0, 1]; 0/negative is
+         REJECTED (the engine's `boundary_ratio > 0` gate would silently drop the
+         28 GB low-noise expert — C2);
+      2. the shared model_index's own `boundary_ratio` (the published value);
+      3. the modality's published default (t2v 0.875 / i2v 0.9 — see constants).
+    """
+    if requested is not None:
+        r = float(requested)
+        if not (0.0 < r <= 1.0):
+            raise RuntimeError(
+                f"boundary_ratio={r} is invalid: must be in (0, 1]. A value of 0 would "
+                f"make the engine silently ignore the staged low-noise expert "
+                f"(single-expert gate). Use None/auto to inherit the published value.")
+        return r, "explicit override"
+    if base_model_index:
+        b = base_model_index.get("boundary_ratio")
+        if isinstance(b, (int, float)) and 0.0 < float(b) <= 1.0:
+            return float(b), "inherited from shared model_index"
+    if in_ch > out_ch:
+        return _PUBLISHED_BOUNDARY_I2V, "published i2v default"
+    return _PUBLISHED_BOUNDARY_T2V, "published t2v default"
+
+
+# Free-disk safety margin over the EXACT planned output bytes (covers the output
+# json headers ~100 KB each, configs, and filesystem overhead). 2 GiB.
+_FREE_SPACE_MARGIN_BYTES = 2 * 1024 ** 3
+
+# Sentinel written FIRST into a staging tmp dir so stale-tmp cleanup can prove the
+# dir is OURS before removing it (never delete by name-pattern alone).
+_TMP_SENTINEL = ".qf_stage_tmp"
+
+
+def _cleanup_stale_tmp_dirs(out_dir: str) -> None:
+    """Remove leftover `<out_dir>.tmp-<pid>` staging dirs from aborted runs — ONLY
+    those carrying our `_TMP_SENTINEL` (proof we created them; a name-collision dir
+    without the sentinel is left untouched)."""
+    parent = os.path.dirname(out_dir) or "."
+    prefix = os.path.basename(out_dir) + ".tmp-"
+    if not os.path.isdir(parent):
+        return
+    for name in os.listdir(parent):
+        cand = os.path.join(parent, name)
+        if (name.startswith(prefix) and os.path.isdir(cand)
+                and os.path.isfile(os.path.join(cand, _TMP_SENTINEL))):
+            logger.info("[comfyui_wan_remap] removing stale staging tmp %s", cand)
+            shutil.rmtree(cand)
+
+
+def _expert_basename_hint_check(high_expert: str, low_expert: str) -> None:
+    """C3 — swapped high/low detection. The checkpoints carry NO __metadata__ and the
+    two experts are structurally identical, so the only available signal is the
+    filename convention every official release uses (`*high*` / `*low*`). Both hints
+    present but REVERSED → raise (a swap silently degrades quality: the wrong expert
+    denoises the wrong noise regime). Hints absent → warn once and proceed."""
+    hi_name = os.path.basename(high_expert).lower()
+    lo_name = os.path.basename(low_expert).lower()
+    hi_says_low = "low" in hi_name and "high" not in hi_name
+    lo_says_high = "high" in lo_name and "low" not in lo_name
+    if hi_says_low and lo_says_high:
+        raise RuntimeError(
+            f"high/low experts look SWAPPED by filename: high_noise_expert={hi_name!r} "
+            f"(says 'low') and low_noise_expert={lo_name!r} (says 'high'). A swap "
+            f"silently degrades quality — pass the *high_noise* checkpoint as "
+            f"high_noise_expert and the *low_noise* one as low_noise_expert.")
+    if ("high" not in hi_name and "low" not in hi_name)             or ("high" not in lo_name and "low" not in lo_name):
+        logger.warning(
+            "[comfyui_wan_remap] expert filenames carry no high/low hint (%s / %s) — "
+            "cannot verify the order; make sure high_noise_expert really is the "
+            "HIGH-noise checkpoint (the checkpoints are structurally identical).",
+            hi_name, lo_name)
+
+
 def stage_two_expert(high_expert: str, low_expert: str, shared_dir: str,
-                     out_dir: str, *, boundary_ratio: float = 0.9,
-                     dequant_fp8: bool = True, force: bool = False) -> str:
+                     out_dir: str, *, boundary_ratio: float | None = None,
+                     force: bool = False) -> str:
     """Stage two single-file Wan experts into a two-expert diffusers model_dir.
 
     Layout produced:
         <out_dir>/transformer/{config.json, diffusion_pytorch_model.safetensors}
         <out_dir>/transformer_2/{config.json, diffusion_pytorch_model.safetensors}
-        <out_dir>/{text_encoder,tokenizer,scheduler}/   (symlink → shared_dir)
-        <out_dir>/vae/{*.safetensors (symlink), config.json (absent-key fixed)}
+        <out_dir>/{text_encoder,tokenizer,scheduler}/   (symlink -> shared_dir)
+        <out_dir>/vae/{*.safetensors (link), config.json (absent-key fixed)}
         <out_dir>/model_index.json  (_class_name + boundary_ratio)
 
     `shared_dir` is a Wan diffusers dir supplying vae/text_encoder/tokenizer/
-    scheduler (+ a transformer/config.json used as the config base). Returns the
-    staged model_dir path. Cache-aware: re-runs with identical sources skip.
+    scheduler (+ a transformer/config.json used as the config base).
+    `boundary_ratio=None` = auto (inherit the shared model_index's published value,
+    else the modality's published default); an explicit value must be in (0, 1].
+    Returns the staged model_dir path. Cache-aware (identical sources skip), and
+    ATOMIC: everything is staged into `<out_dir>.tmp-<pid>` then `os.replace`d into
+    place, so a concurrent second instance or an aborted run can never leave a
+    partial dir that carries a valid completion marker.
     """
     high_expert = os.path.abspath(high_expert)
     low_expert = os.path.abspath(low_expert)
@@ -567,6 +616,22 @@ def stage_two_expert(high_expert: str, low_expert: str, shared_dir: str,
                 f"transformer (no blocks.N.self_attn / ffn.0 / patch_embedding): {p}")
     if not os.path.isdir(shared_dir):
         raise RuntimeError(f"shared_components dir not found: {shared_dir}")
+    # S1 — the same file staged as BOTH experts silently degrades quality (the
+    # boundary switch becomes a no-op): fail loud.
+    if os.path.samefile(high_expert, low_expert):
+        raise RuntimeError(
+            f"high_noise_expert and low_noise_expert are the SAME file ({high_expert}) "
+            f"— the A14B two-expert model needs the two DIFFERENT checkpoints.")
+    # C3 — filename-convention swap detection (no structural signal exists).
+    _expert_basename_hint_check(high_expert, low_expert)
+    # G1 — fail at stage time (actionable) instead of fail-late at engine load.
+    missing_shared = [sub for sub in ("vae", "text_encoder")
+                      if not os.path.isdir(os.path.join(shared_dir, sub))]
+    if missing_shared:
+        raise RuntimeError(
+            f"shared_components dir {shared_dir!r} is missing {missing_shared} — point "
+            f"it at a Wan diffusers dir containing vae/ + text_encoder/ (+ tokenizer/, "
+            f"scheduler/).")
 
     in_ch, out_ch = detect_wan_modality(high_expert)
     lo_in, lo_out = detect_wan_modality(low_expert)
@@ -582,80 +647,116 @@ def stage_two_expert(high_expert: str, low_expert: str, shared_dir: str,
             f"the two experts must be the same Wan variant")
     class_name = _ENGINE_WAN_PIPELINE_CLASS   # loadable for BOTH modalities (see above)
 
+    # C1 — resolve the boundary BEFORE fingerprinting (it is baked into the stage).
+    shared_mi = os.path.join(shared_dir, "model_index.json")
+    base_mi = _load_json(shared_mi) if os.path.isfile(shared_mi) else None
+    eff_boundary, boundary_src = resolve_boundary_ratio(
+        boundary_ratio, base_mi, in_ch, out_ch)
+
     # Safety: never let a mis-pointed / workflow-supplied output_dir clobber the
     # experts, the shared model, or a directory holding the user's own content.
     _assert_safe_out_dir(out_dir, [high_expert, low_expert, shared_dir,
                                    os.path.dirname(high_expert),
                                    os.path.dirname(low_expert)])
 
-    mode = "dequant" if dequant_fp8 else "raw"
     # Fingerprint the experts + the shared config files that get baked into the stage
     # (so an edit to a shared config invalidates the cache, not just a new dir mtime).
+    # The literal "dequant" keeps the fingerprint format stable from when a raw mode
+    # existed (dequant is now the only staging mode).
     fp_inputs = [high_expert, low_expert, shared_dir]
     for rel in ("model_index.json", "vae/config.json", "transformer/config.json"):
         fp_inputs.append(os.path.join(shared_dir, rel))
-    fp = _fingerprint(fp_inputs, extra=f"{boundary_ratio}|{mode}|{in_ch}|{out_ch}")
-    marker = os.path.join(out_dir, ".qf_stage_complete")
+    fp = _fingerprint(fp_inputs, extra=f"{eff_boundary}|dequant|{in_ch}|{out_ch}")
+    marker_name = ".qf_stage_complete"
+    marker = os.path.join(out_dir, marker_name)
     if not force and os.path.isfile(marker):
         with open(marker, "r", encoding="utf-8") as f:
             if f.read().strip() == fp:
-                logger.info("[comfyui_wan_remap] staged dir cache hit → %s", out_dir)
+                logger.info("[comfyui_wan_remap] staged dir cache hit -> %s", out_dir)
                 return out_dir
 
-    os.makedirs(out_dir, exist_ok=True)
+    # S4 — free-disk pre-check with the EXACT planned output bytes (fail with an
+    # actionable message instead of ENOSPC halfway through a 56 GB write).
+    need = (estimate_dequant_output_bytes(high_expert)
+            + estimate_dequant_output_bytes(low_expert) + _FREE_SPACE_MARGIN_BYTES)
+    space_probe = out_dir
+    while not os.path.isdir(space_probe):
+        parent = os.path.dirname(space_probe)
+        if parent == space_probe:
+            break
+        space_probe = parent
+    free = shutil.disk_usage(space_probe).free
+    if free < need:
+        raise RuntimeError(
+            f"not enough free disk for the staged A14B: need ~{need / 1024**3:.1f} GiB "
+            f"(dequantized experts + margin) but only {free / 1024**3:.1f} GiB free at "
+            f"{space_probe!r}. Point output_dir (or QUANTFUNC_CACHE_DIR) at a roomier disk.")
 
-    # ── transformers ─────────────────────────────────────────────────────
+    # S3 — ATOMIC staging: build in <out_dir>.tmp-<pid>, then os.replace into place.
+    _cleanup_stale_tmp_dirs(out_dir)
+    tmp_dir = f"{out_dir}.tmp-{os.getpid()}"
+    if os.path.isdir(tmp_dir):
+        # same-pid leftover (previous exception in this process) — ours by sentinel.
+        if os.path.isfile(os.path.join(tmp_dir, _TMP_SENTINEL)):
+            shutil.rmtree(tmp_dir)
+        else:
+            raise RuntimeError(f"staging tmp path {tmp_dir!r} exists and is not ours")
+    os.makedirs(tmp_dir)
+    with open(os.path.join(tmp_dir, _TMP_SENTINEL), "w", encoding="utf-8") as f:
+        f.write(fp)
+
+    # -- transformers ------------------------------------------------------
     base_xfm_cfg = {}
     shared_xfm_cfg = os.path.join(shared_dir, "transformer", "config.json")
     if os.path.isfile(shared_xfm_cfg):
         base_xfm_cfg = _load_json(shared_xfm_cfg)
     for sub, src in (("transformer", high_expert), ("transformer_2", low_expert)):
-        d = os.path.join(out_dir, sub)
+        d = os.path.join(tmp_dir, sub)
         os.makedirs(d, exist_ok=True)
         n_layers = _count_layers(_read_header(src))
         cfg = synthesize_transformer_config(base_xfm_cfg, in_ch, out_ch, n_layers)
         _dump_json(cfg, os.path.join(d, "config.json"))
         weight_dst = os.path.join(d, "diffusion_pytorch_model.safetensors")
-        if dequant_fp8:
-            nk = remap_dequant_file(src, weight_dst)
-            logger.info("[comfyui_wan_remap] %s ← %s (remap+dequant, %d keys)",
-                        sub, os.path.basename(src), nk)
-        else:
-            nk, dropped = remap_file_raw(src, weight_dst)
-            logger.info("[comfyui_wan_remap] %s ← %s (raw remap fp8-preserved, "
-                        "%d keys, dropped %d scale/marker)",
-                        sub, os.path.basename(src), nk, len(dropped))
+        nk = remap_dequant_file(src, weight_dst)
+        logger.info("[comfyui_wan_remap] %s <- %s (remap+dequant, %d keys)",
+                    sub, os.path.basename(src), nk)
 
-    # ── shared components (dir symlink / copy) ───────────────────────────
+    # -- shared components (dir symlink / copy) ----------------------------
     for sub in _SHARED_SUBDIRS:
-        s = os.path.join(shared_dir, sub)
-        if os.path.isdir(s):
-            _stage_shared_dir(s, os.path.join(out_dir, sub))
+        s2 = os.path.join(shared_dir, sub)
+        if os.path.isdir(s2):
+            _stage_shared_dir(s2, os.path.join(tmp_dir, sub))
 
-    # ── vae (link weights via the shared Windows-safe helper + fixed cfg) ─
+    # -- vae (link weights via the shared Windows-safe helper + fixed cfg) --
     vae_src = os.path.join(shared_dir, "vae")
     if os.path.isdir(vae_src):
-        vae_dst = os.path.join(out_dir, "vae")
+        vae_dst = os.path.join(tmp_dir, "vae")
         os.makedirs(vae_dst, exist_ok=True)
         for wf in os.listdir(vae_src):
             if wf.endswith(".safetensors"):
-                # out_dir is guaranteed ours by _assert_safe_out_dir → link_or_copy
-                # (hardlink → symlink → copy) is safe and cross-platform.
                 link_or_copy(os.path.join(vae_src, wf), os.path.join(vae_dst, wf))
         vae_cfg_path = os.path.join(vae_src, "config.json")
         base_vae_cfg = _load_json(vae_cfg_path) if os.path.isfile(vae_cfg_path) else {}
         _dump_json(synthesize_vae_config(base_vae_cfg),
                    os.path.join(vae_dst, "config.json"))
 
-    # ── model_index ──────────────────────────────────────────────────────
-    shared_mi = os.path.join(shared_dir, "model_index.json")
-    base_mi = _load_json(shared_mi) if os.path.isfile(shared_mi) else None
-    _dump_json(synthesize_model_index(base_mi, class_name, boundary_ratio),
-               os.path.join(out_dir, "model_index.json"))
+    # -- model_index --------------------------------------------------------
+    _dump_json(synthesize_model_index(base_mi, class_name, eff_boundary),
+               os.path.join(tmp_dir, "model_index.json"))
 
-    with open(marker, "w", encoding="utf-8") as f:
+    # Completion marker goes into the tmp dir LAST, sentinel comes OFF, then the
+    # atomic swap — the final path can only ever appear complete-with-marker.
+    os.unlink(os.path.join(tmp_dir, _TMP_SENTINEL))
+    with open(os.path.join(tmp_dir, marker_name), "w", encoding="utf-8") as f:
         f.write(fp)
-    logger.info("[comfyui_wan_remap] staged two-expert %s dir (%s, boundary=%.3f) → %s",
-                class_name, "dequant-fp16" if dequant_fp8 else "raw-fp8",
-                boundary_ratio, out_dir)
+    if os.path.isdir(out_dir):
+        # The dir passed _assert_safe_out_dir (empty, or OURS with a marker): remove
+        # the stale marker FIRST so no observer ever sees old-marker + mid-swap state.
+        if os.path.isfile(marker):
+            os.unlink(marker)
+        shutil.rmtree(out_dir)
+    os.replace(tmp_dir, out_dir)
+    logger.info("[comfyui_wan_remap] staged two-expert %s dir (dequant-fp16, "
+                "boundary=%.3f [%s]) -> %s",
+                class_name, eff_boundary, boundary_src, out_dir)
     return out_dir

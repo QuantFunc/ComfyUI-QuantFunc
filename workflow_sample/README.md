@@ -53,6 +53,7 @@ Drag the canvas to the labelled group you need.
 | **Layer Viewer** | Preview each decomposed RGBA layer produced by a layered generation. |
 | **ControlNet Auto Loader** | One-click download + load of a ControlNet model (InstantX for QwenImage). |
 | **Control Image** | Preprocess / pass a control image (edges, depth, pose, …) into the pipeline. |
+| **Wan Combine Experts (A14B two-transformer)** | Combine the two single-file Wan2.2-A14B checkpoints (high-noise + low-noise experts) into one engine-loadable model dir (`model_dir` → *Model Loader*). |
 
 ## 4. Model Download
 

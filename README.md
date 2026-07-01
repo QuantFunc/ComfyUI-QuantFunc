@@ -41,6 +41,7 @@ ComfyUI plugin for **QuantFunc** — the fastest diffusion model inference engin
 - **ControlNet** — structure-guided generation (InstantX ControlNet for QwenImage) (`QuantFunc-ControlNet.json`).
 
 **🎛️ New nodes & controls**
+- **Wan Combine Experts (A14B two-transformer)** — combine the two single-file Wan2.2-A14B checkpoints (high-noise + low-noise experts) into one engine-loadable model dir: keys remapped to diffusers naming, fp8 dequantized to fp16, `boundary_ratio` inherited from the published model_index (t2v 0.875 / i2v 0.9). Wire its `model_dir` output into *Model Loader*. The ~56 GB stage caches per source set — set `QUANTFUNC_CACHE_DIR` (or the node's `output_dir`) to persist it across ComfyUI restarts.
 - **VRAM budget** dropdown on *Build Pipeline* — cap VRAM at create time; the engine then plans as if running on a smaller card.
 - **FBCache acceleration** with separate **cond / uncond** thresholds (`fbcache` / `fbcache_uncond`).
 - **Image-to-image** — `init_img` socket + `init_img_strength` on the *Generate* node.
