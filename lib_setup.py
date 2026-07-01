@@ -397,25 +397,25 @@ def _detect_all_gpu_sms() -> list:
     """Compute capabilities (SM) of EVERY visible CUDA GPU, e.g. [120, 86].
 
     Returns [] if none can be determined. Used for the multi-GPU-aware
-    transformer GPU-match: on a mixed-SM box with no pinned device the loader
-    keys on the MIN SM (the safest — a shown/auto-picked weight must run on
-    whichever GPU is used). `min()` is order-independent, so the PCI-vs-CUDA
-    ordering difference between nvidia-smi and torch does not matter here
-    (it WOULD matter for a per-index query, which is why the caller never pins
-    a single device index against this PCI-ordered list).
+    transformer GPU-match: on a mixed-SM box the caller (`_target_gpu_sm`) keys
+    on the MAX SM — the BEST card the machine has — so everything that best GPU
+    can run is offered (the user routes the model to it via BuildPipeline's
+    `device` input). `max()` is order-independent, so the PCI-vs-CUDA ordering
+    difference between nvidia-smi and torch does not matter here (it WOULD matter
+    for a per-index query, which is why the caller never pins a single device
+    index against this PCI-ordered list).
 
-    ENUMERATION SCOPE — INTENTIONAL + conservative invariant (not an accident):
-    the PRIMARY path (nvidia-smi) reports ALL PHYSICAL GPUs and is deliberately
-    CUDA_VISIBLE_DEVICES-UNAWARE. That is the SAFE choice for a download/UI
-    filter: a subset selected later by CUDA_VISIBLE_DEVICES is ⊆ the physical
-    set, so its MIN-SM is ≥ the physical MIN-SM — a weight whose min-SM ≤ the
-    physical MIN therefore also runs on any CVD-restricted subset (worst case we
-    OVER-hide a weight the actually-used GPU could run, never OFFER one it can't).
-    The torch FALLBACK (below) only fires when nvidia-smi is entirely
-    unavailable; torch.cuda DOES honor CUDA_VISIBLE_DEVICES, so it sees only the
-    visible subset — still safe by the same ⊆ argument (its MIN ≥ physical MIN),
-    just a last-resort best-effort. Do NOT "fix" the primary to be CVD-aware:
-    that would make the filter LESS conservative on a masked multi-GPU box.
+    ENUMERATION SCOPE: the PRIMARY path (nvidia-smi) reports ALL PHYSICAL GPUs.
+    Under MAX-keying this offers every tier the best PHYSICAL GPU runs. Caveat
+    (documented, accepted): a CUDA_VISIBLE_DEVICES mask that HIDES the best GPU
+    could then over-offer a tier the visible subset can't run — but in that case
+    BuildPipeline's device list (torch, CVD-aware) also can't route to the hidden
+    GPU, so this is an advanced-config corner, not the common path; the user's
+    reported box has both GPUs visible. The torch FALLBACK (below) only fires
+    when nvidia-smi is entirely unavailable and IS CVD-aware. (History: the
+    filter previously keyed on MIN-SM to be conservative under CVD, but that HID
+    a 40x/FP8 weight the user's RTX 4090 could run on a 3060+4090 box — the
+    user-reported regression this MAX change fixes.)
     """
     sms = []
     try:

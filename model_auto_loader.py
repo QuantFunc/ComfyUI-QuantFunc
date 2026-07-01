@@ -341,18 +341,24 @@ def _target_gpu_sm():
     """The SM to key transformer GPU-compatibility on.
 
     This node SELECTS/downloads the transformer weights; the GPU that actually
-    RUNS them is chosen later (BuildPipeline's own `device` input), so no single
-    device is pinned here. On a mixed-SM multi-GPU box the SAFEST choice is the
-    MIN SM across all visible GPUs — a weight offered / auto-picked must run on
-    whichever GPU ends up used. Nothing detectable → _SM_UNKNOWN (0), and the
-    caller then does NOT filter (conservative)."""
+    RUNS them is chosen later (BuildPipeline's own `device` input). On a mixed-SM
+    multi-GPU box we key on the MAX SM across all visible GPUs — the BEST card
+    the machine has. Rationale: the set of weights runnable on the best GPU is a
+    SUPERSET of what the weaker cards run, so keying on MAX hides NOTHING the
+    hardware can run anywhere; the user then routes the model to that capable GPU
+    via BuildPipeline's `device` input. (Keying on MIN — the earlier choice — was
+    too conservative: it HID a weight the best GPU could run, e.g. a 40x/FP8
+    weight on an RTX 3060 SM86 + RTX 4090 SM89 box, which the user reported as
+    "我有 40x 的模型却没展示". A weight is only ever HIDDEN when NO GPU can run it.)
+    Nothing detectable → _SM_UNKNOWN (0), and the caller then does NOT filter."""
     sms = _all_gpu_sms()
     if not sms:
         return _SM_UNKNOWN
-    chosen = min(sms)
+    chosen = max(sms)
     if len(set(sms)) > 1:
         logger.info("[QuantFunc] transformer GPU-match: mixed-SM machine %s -> "
-                    "using MIN SM%d (safest across all GPUs)", sms, chosen)
+                    "using MAX SM%d (best GPU; route the model to that GPU via "
+                    "BuildPipeline's device input)", sms, chosen)
     return chosen
 
 

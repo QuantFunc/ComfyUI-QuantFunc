@@ -210,19 +210,36 @@ def test_filter_unknown_sm_shows_all():
 
 
 # ----------------------------- multi-GPU -----------------------------
-def test_multigpu_mixed_sm_uses_min_for_filter():
-    # a 5090(120)+3060(86) box, no pinned device → key on MIN SM (86)
+def test_multigpu_mixed_sm_uses_max_for_filter():
+    # a 5090(120)+3060(86) box → key on MAX SM (120, the BEST GPU): everything the
+    # best card can run is offered; the user routes the model to it via BuildPipeline.
     with _Env(cache=_klein_cache(), all_sms=[120, 86]):
         opts = mal.get_transformer_options()
         s, n = mal.resolve_transformer_selection(mal.AUTO_DETECT, KLEIN)
-    assert _opt(KLEIN, KLEIN_50X) not in opts       # 50x can't run on the 3060
+    assert _opt(KLEIN, KLEIN_50X) in opts            # 50x runs on the 5090 → shown
+    assert _opt(KLEIN, KLEIN_40X) in opts
     assert _opt(KLEIN, KLEIN_30X) in opts
-    assert (s, n) == (KLEIN, KLEIN_30X), (s, n)      # auto-detect also uses MIN SM
+    assert (s, n) == (KLEIN, KLEIN_50X), (s, n)      # auto-detect picks the best-GPU tier
 
 
-def test_target_gpu_sm_min_across_mixed():
+def test_target_gpu_sm_max_across_mixed():
     with _Env(all_sms=[89, 120, 86]):
-        assert mal._target_gpu_sm() == 86
+        assert mal._target_gpu_sm() == 120
+
+
+def test_multigpu_user_scenario_3060_plus_4090_shows_40x():
+    # The user's REAL box: RTX 3060 (SM86) + RTX 4090 (SM89). The 4090 CAN run a
+    # 40x/FP8 weight (min-SM 89), so it MUST be shown + auto-picked; the old MIN-SM
+    # (86) wrongly hid it ("我有 40x 的模型却没展示"). 50x/FP4 (min-SM 120) stays hidden
+    # (no GPU on this box runs it).
+    with _Env(cache=_klein_cache(), all_sms=[86, 89]):
+        assert mal._target_gpu_sm() == 89
+        opts = mal.get_transformer_options()
+        assert _opt(KLEIN, KLEIN_40X) in opts        # 40x now SHOWS (the user's ask)
+        assert _opt(KLEIN, KLEIN_30X) in opts
+        assert _opt(KLEIN, KLEIN_50X) not in opts    # 50x FP4: no GPU here runs it → hidden
+        s, n = mal.resolve_transformer_selection(mal.AUTO_DETECT, KLEIN)
+        assert (s, n) == (KLEIN, KLEIN_40X), (s, n)  # auto-detect picks 40x (highest ≤ 89)
 
 
 # ---------------------- fail-safe: no compatible weight ----------------------
