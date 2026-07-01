@@ -403,6 +403,19 @@ def _detect_all_gpu_sms() -> list:
     ordering difference between nvidia-smi and torch does not matter here
     (it WOULD matter for a per-index query, which is why the caller never pins
     a single device index against this PCI-ordered list).
+
+    ENUMERATION SCOPE — INTENTIONAL + conservative invariant (not an accident):
+    the PRIMARY path (nvidia-smi) reports ALL PHYSICAL GPUs and is deliberately
+    CUDA_VISIBLE_DEVICES-UNAWARE. That is the SAFE choice for a download/UI
+    filter: a subset selected later by CUDA_VISIBLE_DEVICES is ⊆ the physical
+    set, so its MIN-SM is ≥ the physical MIN-SM — a weight whose min-SM ≤ the
+    physical MIN therefore also runs on any CVD-restricted subset (worst case we
+    OVER-hide a weight the actually-used GPU could run, never OFFER one it can't).
+    The torch FALLBACK (below) only fires when nvidia-smi is entirely
+    unavailable; torch.cuda DOES honor CUDA_VISIBLE_DEVICES, so it sees only the
+    visible subset — still safe by the same ⊆ argument (its MIN ≥ physical MIN),
+    just a last-resort best-effort. Do NOT "fix" the primary to be CVD-aware:
+    that would make the filter LESS conservative on a masked multi-GPU box.
     """
     sms = []
     try:
@@ -427,13 +440,19 @@ def _detect_all_gpu_sms() -> list:
     if sms:
         return sms
 
-    # Fallback: torch enumerates every device.
+    # Fallback (only when nvidia-smi is unavailable): torch enumerates every
+    # CUDA-visible device. Guard EACH device individually so one throwing
+    # get_device_capability(i) skips that device rather than dropping i+1..n
+    # (mirrors the nvidia-smi per-line isolation above).
     try:
         import torch
         if torch.cuda.is_available():
             for i in range(torch.cuda.device_count()):
-                cap = torch.cuda.get_device_capability(i)
-                sms.append(cap[0] * 10 + cap[1])
+                try:
+                    cap = torch.cuda.get_device_capability(i)
+                    sms.append(cap[0] * 10 + cap[1])
+                except Exception:
+                    continue
     except Exception:
         pass
     return sms

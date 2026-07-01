@@ -120,6 +120,20 @@ def test_autodetect_sm75_picks_int4():
         assert (s, n) == (KLEIN, KLEIN_30X), (s, n)
 
 
+def test_autodetect_datacenter_sm_mapping():
+    # DATACENTER GPUs are mapped purely by NUMERIC min-SM (the tokens are consumer
+    # names but the comparison is on SM values): A100(80)->INT4/30x, H100/H200(90)->
+    # FP8/40x, B200/GB200(100)->FP8/40x. Critically SM100 must pick 40x, NOT 50x —
+    # the engine's FP4 is sm_120a-only, so a B200 (sm_100a) has NO FP4 path and must
+    # fall to FP8. Locks against a future accidental FP4-on-SM100 regression.
+    for sm, expect in ((80, KLEIN_30X), (90, KLEIN_40X), (100, KLEIN_40X)):
+        with _Env(cache=_klein_cache(), all_sms=[sm]):
+            s, n = mal.resolve_transformer_selection(mal.AUTO_DETECT, KLEIN)
+            assert (s, n) == (KLEIN, expect), (sm, s, n)
+    # explicit proof B200 is NOT handed FP4:
+    assert mal._transformer_min_sm(KLEIN_50X) > 100, "FP4 tier must stay > SM100"
+
+
 def test_autodetect_unknown_gpu_picks_safest_lowest_tier():
     # SM undetectable (no GPUs) → safest = lowest tier (INT4/30x)
     with _Env(cache=_klein_cache(), all_sms=[]):
@@ -237,6 +251,17 @@ def test_explicit_selection_still_resolves():
 def test_explicit_none_still_resolves_to_none():
     with _Env(cache=_klein_cache(), all_sms=[120]):
         assert mal.resolve_transformer_selection("None", KLEIN) == (None, None)
+
+
+def test_explicit_incompatible_selection_still_resolves():
+    # An explicit pick the FILTER would HIDE (a 40x weight on an SM86 box) must
+    # STILL resolve — a saved-workflow explicit value stays backward-compatible
+    # even when the dropdown no longer offers it. Filtering hides; it never blocks
+    # an explicit resolve (the __trap protection is at selection/auto-detect time,
+    # and an explicit incompatible pick is the user's deliberate override).
+    with _Env(cache=_klein_cache(), all_sms=[86]):
+        s, n = mal.resolve_transformer_selection(_opt(KLEIN, KLEIN_40X), KLEIN)
+        assert (s, n) == (KLEIN, KLEIN_40X), (s, n)
 
 
 def test_explicit_wrong_series_still_raises():

@@ -275,21 +275,42 @@ def _has_tier_token(name, token):
     return re.search(r"(?:^|[-_.])" + re.escape(token) + r"(?=$|[-_.])", name) is not None
 
 
+# Ordered (tier-token → minimum-SM) table. ORDER MATTERS and is the whole point
+# of the ordered list: '50x-below' / '30x-below' (the INT4 tier — they merely NAME
+# the GPUs they run *below*) must be matched BEFORE the bare '50x' FP4 token, else
+# '50x-below' would be misread as FP4. First delimiter-anchored match wins.
+# Data-driven so a FUTURE tier is ONE new row here — no logic edit per tier.
+#
+# The tokens (30x/40x/50x) are CONSUMER-tier names, but the min-SM VALUES are what
+# the whole filter/auto-detect compares against — so DATACENTER GPUs are handled
+# purely by NUMERIC min-SM comparison, no consumer-name aliasing needed:
+#   A100 (SM80) → INT4 (30x tier); H100/H200 (SM90) → FP8 (40x tier);
+#   B200/GB200 (SM100) → FP8 (40x tier); RTX 50xx (SM120) → FP4 (50x tier).
+_TIER_TOKEN_MAP = [
+    ("50x-below", _SM_TURING),     # INT4 (Qwen/Z-Image variant that "runs below 50x")
+    ("30x",       _SM_TURING),     # INT4 + INT8 islands (30x-below); SM75 via BF16 fallback
+    ("40x",       _SM_ADA_FP8),    # INT4 + FP8 islands — FP8 tensor cores need SM89+
+    # FP4 = SM120 ONLY today. The engine's sage3 + W4A4 FP4 is built sm_120a-only
+    # (CUDA_ARCHITECTURES "120a"); SM100 (sm_100a datacenter Blackwell, e.g.
+    # B200/GB200) is a DIFFERENT arch with NO engine FP4 path, so an SM100 card
+    # correctly falls to FP8 (SM89+) via numeric comparison — NOT this FP4 tier.
+    # If the engine ever ships an sm_100a FP4 build, extend the FP4-eligible set
+    # to include SM100 (e.g. a second FP4 row / an SM-set) — do NOT lower this to 100.
+    ("50x",       _SM_BLACKWELL),  # 50x-above / bare 50x → FP4 W4A4, Blackwell SM120+
+]
+
+
 def _transformer_min_sm(filename):
     """Minimum CUDA SM the transformer weight `filename` can run on.
 
     Returns _SM_UNKNOWN (0) for a name with no recognized tier token, so an
-    unrecognized weight is never hidden. Token order matters: '50x-below' and
-    '30x-below' are the INT4 tier (they merely name the GPUs they run *below*),
-    NOT the FP4 '50x' tier — match the INT4 tokens BEFORE the bare-'50x' FP4
-    token, else '50x-below' would be misread as FP4."""
+    unrecognized weight is never hidden. Iterates _TIER_TOKEN_MAP in priority
+    order; the first delimiter-anchored token match wins (see the map's ordering
+    note for why '50x-below'/'30x' precede the bare '50x' FP4 token)."""
     n = (filename or "").lower()
-    if _has_tier_token(n, "50x-below") or _has_tier_token(n, "30x"):
-        return _SM_TURING       # INT4/INT8 — runs on every supported GPU
-    if _has_tier_token(n, "40x"):
-        return _SM_ADA_FP8      # INT4 + FP8 islands
-    if _has_tier_token(n, "50x"):   # 50x-above / bare 50x → FP4
-        return _SM_BLACKWELL
+    for token, min_sm in _TIER_TOKEN_MAP:
+        if _has_tier_token(n, token):
+            return min_sm
     return _SM_UNKNOWN
 
 
