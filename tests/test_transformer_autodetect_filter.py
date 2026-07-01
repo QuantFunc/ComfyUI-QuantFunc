@@ -411,6 +411,99 @@ def test_detect_default_device_sm_cpu_only_returns_zero():
     assert _with_fake_torch(ns, lambda ls: ls._detect_default_device_sm()) == 0
 
 
+# ---- build()-time device re-resolve glue (nodes_format_adapters, the real fix) ----
+nfa = importlib.import_module(f"{_PKG}.nodes_format_adapters")
+
+
+class _StubModel:
+    """Mimics the _QFPathStub the auto-loader hands to build(): carries the
+    [auto-detect] marker (series) so _reresolve keys on the SELECTED device."""
+    def __init__(self, series="", data_source="modelscope"):
+        self.qf_auto_transformer_series = series
+        self.qf_data_source = data_source
+
+
+class _ReEnv:
+    """Stub the pieces _reresolve_auto_transformer_for_device pulls in: per-index
+    device SM (dev_sm={idx: sm}), the series catalog, and download (returns the
+    resolved name's path OR raises to simulate a network/library failure)."""
+    def __init__(self, dev_sm=None, cache=None, dl_raises=None):
+        self.dev_sm = dev_sm or {}
+        self.cache = cache or {}
+        self.dl_raises = dl_raises   # an Exception instance to raise from download
+
+    def __enter__(self):
+        import importlib as _il
+        self.ls = _il.import_module(f"{_PKG}.lib_setup")
+        self._o = (mal._resource_cache, mal._device_sm_by_index,
+                   mal._list_local_resource_names, self.ls._detect_device_sm,
+                   mal.download_transformer)
+        mal._resource_cache = self.cache
+        mal._device_sm_by_index = lambda idx: self.dev_sm.get(idx, 0)
+        mal._list_local_resource_names = lambda short, rtype: []
+        self.ls._detect_device_sm = lambda idx: self.dev_sm.get(idx, 0)
+
+        def _dl(series, name, ds):
+            if self.dl_raises is not None:
+                raise self.dl_raises
+            return "/models/QuantFunc/{}/transformer/{}".format(series.split("/")[-1], name)
+        mal.download_transformer = _dl
+        return self
+
+    def __exit__(self, *exc):
+        (mal._resource_cache, mal._device_sm_by_index, mal._list_local_resource_names,
+         self.ls._detect_device_sm, mal.download_transformer) = self._o
+        return False
+
+
+_BAKED_40X = "/models/QuantFunc/Klein-4B-Series/transformer/" + KLEIN_40X
+
+
+def test_reresolve_no_marker_is_noop():
+    # a plain UNETLoader / explicit pick (no [auto-detect] marker) is NEVER overridden
+    with _ReEnv(dev_sm={1: 86}, cache=_klein_cache()):
+        assert nfa._reresolve_auto_transformer_for_device(_StubModel(), _BAKED_40X, 1) == _BAKED_40X
+
+
+def test_reresolve_device_switch_repicks():
+    # THE USER REPRO: auto-loader baked 40x (device 0 = 4090 SM89); the pipeline runs
+    # on the SELECTED device → re-pick for it. device1(3060 SM86) → 30x (NOT 40x).
+    with _ReEnv(dev_sm={0: 89, 1: 86}, cache=_klein_cache()):
+        r0 = nfa._reresolve_auto_transformer_for_device(_StubModel(KLEIN), _BAKED_40X, 0)
+        r1 = nfa._reresolve_auto_transformer_for_device(_StubModel(KLEIN), _BAKED_40X, 1)
+        r0b = nfa._reresolve_auto_transformer_for_device(_StubModel(KLEIN), _BAKED_40X, 0)
+    assert os.path.basename(r0) == KLEIN_40X, r0
+    assert os.path.basename(r1) == KLEIN_30X, r1     # the fix: 30x on the 3060, not 40x
+    assert os.path.basename(r0b) == KLEIN_40X, r0b
+
+
+def test_reresolve_backstop_raises_when_no_compatible_weight():
+    # series ships only 40x+50x; device1 (SM86) can run neither → clean backstop
+    # (_NoCompatibleWeightError, a RuntimeError) — NOT a device __trap.
+    cache = {KLEIN: {"transformer": [KLEIN_40X, KLEIN_50X]}}
+    with _ReEnv(dev_sm={1: 86}, cache=cache):
+        try:
+            nfa._reresolve_auto_transformer_for_device(_StubModel(KLEIN), _BAKED_40X, 1)
+        except RuntimeError:
+            return
+        raise AssertionError("expected _NoCompatibleWeightError backstop")
+
+
+def test_reresolve_download_failure_falls_back_not_crash():
+    # a genuine download error (network / hf-modelscope missing) must FALL BACK to
+    # the auto-loader's already-valid pick, NOT propagate out of build().
+    with _ReEnv(dev_sm={1: 86}, cache=_klein_cache(),
+                dl_raises=RuntimeError("Download failed: transient network")):
+        r = nfa._reresolve_auto_transformer_for_device(_StubModel(KLEIN), _BAKED_40X, 1)
+        assert r == _BAKED_40X, r   # fell back, did not raise
+
+
+def test_reresolve_no_separate_weights_keeps_base():
+    # a series shipping no transformer weights → keep the base default (no raise)
+    with _ReEnv(dev_sm={0: 120}, cache={KLEIN: {"transformer": []}}):
+        assert nfa._reresolve_auto_transformer_for_device(_StubModel(KLEIN), _BAKED_40X, 0) == _BAKED_40X
+
+
 if __name__ == "__main__":
     _fns = [v for k, v in sorted(globals().items())
             if k.startswith("test_") and callable(v)]

@@ -427,13 +427,11 @@ def _detect_default_device_sm() -> int:
     nvidia-smi: nvidia-smi is CVD-UNAWARE and PCI-bus-ordered, so its "device 0"
     can be a hidden or different physical GPU than CUDA device 0 — keying on it
     could offer a tier the actual run-device can't run (→ __trap). CPU-only / no
-    CUDA → 0 (caller does NOT filter). NOTE: the guarantee holds for the DEFAULT
-    device; if the user manually routes BuildPipeline to a non-default WEAKER GPU
-    the auto-picked tier could still exceed it (a known, accepted limitation — see
-    `model_auto_loader._target_gpu_sm`). (History: keying on max/min OVER ALL GPUs
-    was worse — min over-hid the user's 40x on every config; max over the physical
-    set could over-offer a tier the CVD-visible / PCI-slot-0 DEFAULT run-device
-    couldn't run. Keying on CUDA device 0 removes that common-path __trap.)"""
+    CUDA → 0 (caller does NOT filter). This device-0 value drives only the DROPDOWN
+    DISPLAY / pre-device fallback; the authoritative [auto-detect] weight PICK is
+    re-resolved for the user's SELECTED run-device at build time (via
+    `_detect_device_sm(selected_idx)` → `_reresolve_auto_transformer_for_device`),
+    so a non-default / weaker run-device gets a weight it can run — no __trap."""
     return _detect_device_sm(0)
 
 

@@ -351,30 +351,24 @@ def _device_sm_by_index(device_idx):
 
 
 def _target_gpu_sm():
-    """The SM to key transformer GPU-compatibility on: the DEFAULT CUDA device
-    (torch device 0) — the GPU BuildPipeline runs the transformer on by default.
+    """The SM to key transformer GPU-compatibility on WHEN THE RUN-DEVICE ISN'T YET
+    KNOWN: the DEFAULT CUDA device (torch device 0). Used for the DROPDOWN-populate
+    path (get_transformer_options, at INPUT_TYPES time, before any device is chosen)
+    and as the auto-loader's initial (fallback) [auto-detect] pick.
 
-    Keying on the ACTUAL default run-device (NOT max/min over the whole GPU set)
-    means a weight offered / auto-picked here is runnable on that device under ANY
-    `CUDA_VISIBLE_DEVICES` mask or `CUDA_DEVICE_ORDER` — torch's "device 0" is the
-    same index BuildPipeline defaults to (and the worker inherits the identical
-    CVD/order env), so the keyed GPU and the run-device agree and it will not
-    __trap — WHEN BuildPipeline's `device` is left at its default (0). Under the
-    default FASTEST_FIRST ordering device 0 IS the best GPU, so on a 3060+4090 box
-    device 0 is the 4090 (SM89) → the 40x/FP8 tier shows + auto-picks (the user's
-    reported ask). Undetectable (CPU-only / no torch) → _SM_UNKNOWN (0), and the
-    caller then does NOT filter.
+    The AUTHORITATIVE [auto-detect] weight pick is NOT this — it is RE-RESOLVED for
+    the user's SELECTED run-device at pipeline-build time (nodes_format_adapters.
+    _reresolve_auto_transformer_for_device, keyed on the chosen device_idx), so
+    switching the pipeline to a non-default / weaker GPU picks a weight that GPU can
+    run (no __trap). This function only sets the pre-device DISPLAY/fallback tier.
 
-    KNOWN LIMITATION (accepted trade-off — the orchestrator chose device-0 keying
-    OVER a build()-time SM-vs-device guardrail): this node has no wiring to
-    BuildPipeline's `device` selector, so if the user MANUALLY routes the pipeline
-    to a NON-DEFAULT, WEAKER GPU (e.g. device 1 = the 3060 while device 0 = the
-    4090), an auto-picked tier keyed to device 0 could exceed the chosen device's
-    SM and __trap at run time. In that case pick a matching lower-tier weight
-    explicitly. (Earlier keyings were WORSE, not merely limited: MIN over all GPUs
-    over-hid the user's 40x on EVERY config; MAX over the physical set could offer
-    a tier the CVD-visible / PCI-slot-0 DEFAULT run-device couldn't run — a __trap
-    on the common no-override path, which device-0 keying eliminates.)"""
+    Device 0 (via torch, CVD-aware — the worker inherits the same CVD/order env) is
+    the right default: under FASTEST_FIRST ordering it's the best GPU, so a 3060+4090
+    box shows the 40x tier by default. Undetectable (CPU-only / no torch) →
+    _SM_UNKNOWN (0) and the caller does NOT filter. (History: keying the PICK on
+    max/min over all GPUs was unsafe — min over-hid the 40x; max over the physical
+    set could offer a tier the selected run-device couldn't run. The current design
+    keys DISPLAY on device 0 and the PICK on the actual selected device.)"""
     return _default_device_sm()
 
 
