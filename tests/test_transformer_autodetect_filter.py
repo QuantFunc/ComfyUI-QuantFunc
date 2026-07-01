@@ -43,25 +43,23 @@ QWEN_30X = "qwen-image-30x-below.safetensors"        # INT4 → SM75
 class _Env:
     """Install test doubles for cache + GPU enumeration; restore on exit."""
 
-    def __init__(self, cache=None, all_sms=None, dev_sm=None, local=None):
+    def __init__(self, cache=None, all_sms=None, local=None):
         self.cache = cache or {}
         self.all_sms = all_sms if all_sms is not None else []
-        self.dev_sm = dev_sm or {}          # {index: sm}
         self.local = local or {}            # {(short, resource_type): [names]}
 
     def __enter__(self):
         self._orig = (mal._resource_cache, mal._all_gpu_sms,
-                      mal._device_sm_by_index, mal._list_local_resource_names)
+                      mal._list_local_resource_names)
         mal._resource_cache = self.cache
         mal._all_gpu_sms = lambda: list(self.all_sms)
-        mal._device_sm_by_index = lambda idx: self.dev_sm.get(idx, 0)
         mal._list_local_resource_names = \
             lambda short, rtype: list(self.local.get((short, rtype), []))
         return self
 
     def __exit__(self, *exc):
         (mal._resource_cache, mal._all_gpu_sms,
-         mal._device_sm_by_index, mal._list_local_resource_names) = self._orig
+         mal._list_local_resource_names) = self._orig
         return False
 
 
@@ -172,20 +170,43 @@ def test_multigpu_mixed_sm_uses_min_for_filter():
     assert (s, n) == (KLEIN, KLEIN_30X), (s, n)      # auto-detect also uses MIN SM
 
 
-def test_pinned_device_uses_that_device_sm():
-    # device 0 = 5090(120), device 1 = 3060(86); pin device 1 → SM86
-    with _Env(cache=_klein_cache(), all_sms=[120, 86], dev_sm={0: 120, 1: 86}):
-        s, n = mal.resolve_transformer_selection(
-            mal.AUTO_DETECT, KLEIN, device="1: NVIDIA GeForce RTX 3060")
-        assert (s, n) == (KLEIN, KLEIN_30X), (s, n)
-        # pinning device 0 (the Blackwell) instead → FP4
-        s0, n0 = mal.resolve_transformer_selection(mal.AUTO_DETECT, KLEIN, device=0)
-        assert (s0, n0) == (KLEIN, KLEIN_50X), (s0, n0)
-
-
 def test_target_gpu_sm_min_across_mixed():
     with _Env(all_sms=[89, 120, 86]):
         assert mal._target_gpu_sm() == 86
+
+
+# ---------------------- fail-safe: no compatible weight ----------------------
+def test_autodetect_all_incompatible_returns_none():
+    # a series shipping ONLY 40x+50x (no SM75/80 floor weight) on an SM75/SM86
+    # GPU: auto-detect must return (None, None) — defer to the base model's own
+    # (GPU-tier-matched) transformer — and NEVER silently pick an incompatible
+    # weight (which would reproduce the __trap() this feature prevents).
+    cache = {KLEIN: {"transformer": [KLEIN_40X, KLEIN_50X]}}
+    for sm in (75, 86):
+        with _Env(cache=cache, all_sms=[sm]):
+            assert mal.resolve_transformer_selection(mal.AUTO_DETECT, KLEIN) == (None, None), sm
+            opts = mal.get_transformer_options()
+            assert _opt(KLEIN, KLEIN_40X) not in opts, sm   # both hidden from dropdown
+            assert _opt(KLEIN, KLEIN_50X) not in opts, sm
+
+
+def test_autodetect_partial_incompatible_picks_compatible():
+    # only the incompatible tier is skipped; the compatible one is still picked
+    cache = {KLEIN: {"transformer": [KLEIN_50X, KLEIN_40X]}}
+    with _Env(cache=cache, all_sms=[89]):   # SM89 → 40x ok, 50x not
+        assert mal.resolve_transformer_selection(mal.AUTO_DETECT, KLEIN) == (KLEIN, KLEIN_40X)
+
+
+# ------------------- token boundary (no substring collision) -------------------
+def test_min_sm_token_boundary_no_collision():
+    # a resolution-tagged '1440x' must NOT be misread as the '40x' FP8 tier
+    assert mal._transformer_min_sm("qwen-image-1440x-fp4-50x-above.safetensors") == 120
+    assert mal._transformer_min_sm("model-1440x-preview.safetensors") == 0
+    assert mal._transformer_min_sm("foo-2540x-thing.safetensors") == 0
+    assert mal._transformer_min_sm("bar_1230x_baz.safetensors") == 0
+    # bare start/end delimited tokens still match
+    assert mal._transformer_min_sm("50x-lighting.safetensors") == 120
+    assert mal._transformer_min_sm("klein-4b-40x.safetensors") == 89
 
 
 # --------------------------- backward compat ---------------------------

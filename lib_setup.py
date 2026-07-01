@@ -385,31 +385,12 @@ def _download_dep_zip(cuda_major: int, dest_dir: str) -> bool:
 
 
 def _detect_gpu_sm() -> int:
-    """Detect GPU compute capability (SM version). Returns e.g. 120, 89, 86, or 0."""
-    try:
-        out = subprocess.check_output(
-            ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
-            timeout=5, stderr=subprocess.DEVNULL
-        ).decode().strip()
-        # Parse "12.0" → 120, "8.9" → 89
-        for line in out.split("\n"):
-            line = line.strip()
-            if "." in line:
-                major, minor = line.split(".")[:2]
-                return int(major) * 10 + int(minor)
-    except Exception:
-        pass
+    """Compute capability (SM) of the FIRST CUDA GPU, e.g. 120 / 89 / 86, or 0.
 
-    # Fallback: try torch
-    try:
-        import torch
-        if torch.cuda.is_available():
-            cap = torch.cuda.get_device_capability(0)
-            return cap[0] * 10 + cap[1]
-    except Exception:
-        pass
-
-    return 0
+    Thin front for `_detect_all_gpu_sms` (one detection implementation) — takes
+    the first entry. Used by `detect_gpu_variant` (base-model 50x split)."""
+    sms = _detect_all_gpu_sms()
+    return sms[0] if sms else 0
 
 
 def _detect_all_gpu_sms() -> list:
@@ -449,25 +430,6 @@ def _detect_all_gpu_sms() -> list:
     except Exception:
         pass
     return sms
-
-
-def _detect_gpu_sm_for_device(index) -> int:
-    """SM of a SPECIFIC CUDA device index, via torch (CUDA capability ordering).
-
-    Deliberately NOT nvidia-smi: nvidia-smi orders GPUs by PCI bus while CUDA
-    (and the ComfyUI device dropdown, built from torch.cuda) orders by
-    capability, so nvidia-smi's Nth line can be a DIFFERENT physical GPU than
-    CUDA device N — pinning a device by nvidia-smi index would read the wrong
-    card's SM (the 本地 4090/3060 trap). Returns 0 if it can't be determined.
-    """
-    try:
-        import torch
-        if torch.cuda.is_available() and 0 <= int(index) < torch.cuda.device_count():
-            cap = torch.cuda.get_device_capability(int(index))
-            return cap[0] * 10 + cap[1]
-    except Exception:
-        pass
-    return 0
 
 
 def resolve_library() -> str:

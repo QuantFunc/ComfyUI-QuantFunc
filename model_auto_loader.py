@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import platform
+import re
 import subprocess
 import sys
 import threading
@@ -266,6 +267,14 @@ _SM_TURING = 75       # lowest supported GPU; the INT4/INT8 tier BF16-fallbacks 
 _SM_UNKNOWN = 0       # SM could not be determined → do not filter
 
 
+def _has_tier_token(name, token):
+    """True if `token` appears in `name` as a whole '-'/'_'/'.'-delimited segment.
+
+    Anchored (not a raw substring) so an unrelated digit run can't collide — e.g.
+    a resolution-tagged '...1440x...' must NOT match the '40x' tier token."""
+    return re.search(r"(?:^|[-_.])" + re.escape(token) + r"(?=$|[-_.])", name) is not None
+
+
 def _transformer_min_sm(filename):
     """Minimum CUDA SM the transformer weight `filename` can run on.
 
@@ -275,67 +284,47 @@ def _transformer_min_sm(filename):
     NOT the FP4 '50x' tier — match the INT4 tokens BEFORE the bare-'50x' FP4
     token, else '50x-below' would be misread as FP4."""
     n = (filename or "").lower()
-    if "50x-below" in n or "30x" in n:
+    if _has_tier_token(n, "50x-below") or _has_tier_token(n, "30x"):
         return _SM_TURING       # INT4/INT8 — runs on every supported GPU
-    if "40x" in n:
+    if _has_tier_token(n, "40x"):
         return _SM_ADA_FP8      # INT4 + FP8 islands
-    if "50x" in n:              # 50x-above / bare 50x → FP4
+    if _has_tier_token(n, "50x"):   # 50x-above / bare 50x → FP4
         return _SM_BLACKWELL
     return _SM_UNKNOWN
 
 
-def _parse_device_index(device):
-    """Extract a CUDA device index from an int or a 'N: name' dropdown value.
-    Returns None if it isn't parseable."""
-    if isinstance(device, bool):
-        return None
-    if isinstance(device, int):
-        return device
-    if isinstance(device, str):
-        head = device.split(":", 1)[0].strip()
-        try:
-            return int(head)
-        except ValueError:
-            return None
-    return None
+# Memoized once — the visible GPU set is fixed for the process, and
+# get_transformer_options() runs on ComfyUI's INPUT_TYPES / /object_info hot
+# path, so we must NOT re-shell to nvidia-smi on every call. A failed/empty
+# probe is NOT cached, so a transient nvidia-smi hiccup simply retries next time.
+# (Kept a module-level function so tests can stub it without a real CUDA device.)
+_gpu_sms_cache = None
 
 
-# Thin, monkeypatchable indirections over lib_setup (kept module-level so tests
-# can stub the GPU enumeration without a real CUDA device).
 def _all_gpu_sms():
+    """All visible GPUs' compute capabilities (SM), memoized. [] if undetectable."""
+    global _gpu_sms_cache
+    if _gpu_sms_cache:
+        return list(_gpu_sms_cache)
     try:
         from .lib_setup import _detect_all_gpu_sms
-        return _detect_all_gpu_sms()
+        sms = list(_detect_all_gpu_sms())
     except Exception:
-        return []
+        sms = []
+    if sms:
+        _gpu_sms_cache = list(sms)
+    return sms
 
 
-def _device_sm_by_index(index):
-    try:
-        from .lib_setup import _detect_gpu_sm_for_device
-        return _detect_gpu_sm_for_device(index)
-    except Exception:
-        return _SM_UNKNOWN
-
-
-def _target_gpu_sm(device=None):
+def _target_gpu_sm():
     """The SM to key transformer GPU-compatibility on.
 
-    - `device` pinned (int or 'N: name') and resolvable → THAT device's SM (the
-      GPU that will run the transformer), via a CUDA-ordered per-index query.
-    - Not pinned (or unresolvable) + one or more GPUs → the MIN SM across all
-      visible GPUs. On a mixed-SM multi-GPU box that is the SAFEST choice: a
-      weight offered / auto-picked must run on whichever GPU ends up used.
-    - Nothing detectable → _SM_UNKNOWN (0); the caller then does NOT filter.
-    """
-    if device is not None:
-        idx = _parse_device_index(device)
-        if idx is not None:
-            sm = _device_sm_by_index(idx)
-            if sm > 0:
-                logger.info("[QuantFunc] transformer GPU-match: pinned device %d -> SM%d",
-                            idx, sm)
-                return sm
+    This node SELECTS/downloads the transformer weights; the GPU that actually
+    RUNS them is chosen later (BuildPipeline's own `device` input), so no single
+    device is pinned here. On a mixed-SM multi-GPU box the SAFEST choice is the
+    MIN SM across all visible GPUs — a weight offered / auto-picked must run on
+    whichever GPU ends up used. Nothing detectable → _SM_UNKNOWN (0), and the
+    caller then does NOT filter (conservative)."""
     sms = _all_gpu_sms()
     if not sms:
         return _SM_UNKNOWN
@@ -360,24 +349,30 @@ def _available_transformer_names(model_series):
 def _pick_best_transformer(names, sm):
     """From candidate filenames, pick the highest-tier one runnable at `sm`.
 
-    'Highest-tier compatible' = the largest min-SM ≤ `sm` (a LOWER-tier weight
-    on a HIGHER GPU is fine — INT4 runs on Blackwell). When the GPU is unknown
-    (sm == 0) or NOTHING is compatible, fall back to the LOWEST tier available
-    (the safest best-effort). Ties within a tier break by name (deterministic).
-    Returns None if `names` is empty."""
+    Returns None (→ caller defers to the base model's own transformer) when
+    `names` is empty OR — critically — when the GPU is KNOWN (sm > 0) but NO
+    candidate is compatible (all min-SM > sm). Returning a known-incompatible
+    weight would reproduce the exact __trap() this feature prevents, so we must
+    NOT fall through to 'lowest tier' in that case. Only when the GPU is UNKNOWN
+    (sm == 0, cannot filter) do we best-effort the LOWEST tier (runs on the most
+    GPUs). 'Highest-tier compatible' = the largest min-SM ≤ sm (a LOWER-tier
+    weight on a HIGHER GPU is fine — INT4 runs on Blackwell). Ties break by name
+    (deterministic)."""
     scored = [(n, _transformer_min_sm(n)) for n in names]
     if not scored:
         return None
     if sm > 0:
         compat = [(n, ms) for (n, ms) in scored if ms <= sm]
-        if compat:
-            top = max(ms for (_n, ms) in compat)
-            return sorted(n for (n, ms) in compat if ms == top)[0]
+        if not compat:
+            return None  # nothing runs on this GPU → base model's default transformer
+        top = max(ms for (_n, ms) in compat)
+        return sorted(n for (n, ms) in compat if ms == top)[0]
+    # GPU SM unknown → safest best-effort: the lowest tier (runs on the most GPUs)
     low = min(ms for (_n, ms) in scored)
     return sorted(n for (n, ms) in scored if ms == low)[0]
 
 
-def get_transformer_options(device=None):
+def get_transformer_options():
     """Transformer dropdown: ['[auto-detect]', 'None', <GPU-compatible weights>].
 
     '[auto-detect]' (the node default) resolves at load time to the highest-tier
@@ -387,7 +382,7 @@ def get_transformer_options(device=None):
     names and the on-disk-merged names (from `_build_dropdown`) are filtered.
     When the GPU SM is undetectable, nothing is filtered (conservative)."""
     base = _build_dropdown(_SUBDIR_TRANSFORMER)  # ['None', 'Short/name', ...]
-    sm = _target_gpu_sm(device)
+    sm = _target_gpu_sm()
     kept = []
     for opt in base:
         if opt == "None":
@@ -734,17 +729,18 @@ def resolve_selection_no_series(selection, resource_label):
         resource_label, short_name))
 
 
-def resolve_transformer_selection(selection, model_series, device=None):
+def resolve_transformer_selection(selection, model_series):
     """Resolve a transformer dropdown value to (series_full_name, name).
 
     '[auto-detect]' (the default) → the highest-tier weight the target GPU can
     run, chosen from `model_series`'s available weights; (None, None) when the
-    series ships no separate transformer weights (→ use the base model's own).
-    Any explicit 'SeriesShort/name' value still resolves exactly as before
-    (backward compatible)."""
+    series ships no separate transformer weights OR none are compatible with the
+    detected GPU (→ use the base model's own transformer, which is GPU-tier-matched
+    by detect_gpu_variant). Any explicit 'SeriesShort/name' value still resolves
+    exactly as before (backward compatible)."""
     if selection == AUTO_DETECT:
         names = _available_transformer_names(model_series)
-        best = _pick_best_transformer(names, _target_gpu_sm(device))
+        best = _pick_best_transformer(names, _target_gpu_sm())
         if not best:
             return None, None
         return model_series, best
