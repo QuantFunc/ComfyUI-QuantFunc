@@ -401,7 +401,8 @@ def _detect_all_gpu_sms() -> list:
     keys on the MIN SM (the safest — a shown/auto-picked weight must run on
     whichever GPU is used). `min()` is order-independent, so the PCI-vs-CUDA
     ordering difference between nvidia-smi and torch does not matter here
-    (unlike a per-INDEX query — see `_detect_gpu_sm_for_device`).
+    (it WOULD matter for a per-index query, which is why the caller never pins
+    a single device index against this PCI-ordered list).
     """
     sms = []
     try:
