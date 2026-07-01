@@ -2140,7 +2140,10 @@ def _get_auto_loader_dropdowns():
         from .model_auto_loader import get_transformer_options
         return get_transformer_options()
     except Exception:
-        return ["None"]
+        # Fallback must still contain the INPUT_TYPES default ([auto-detect]) so
+        # ComfyUI never flags the saved default as "value not in list".
+        from .model_auto_loader import AUTO_DETECT
+        return [AUTO_DETECT, "None"]
 
 
 def _get_prequant_dropdowns():
@@ -2182,7 +2185,7 @@ class QuantFuncModelAutoLoader:
 
     @classmethod
     def INPUT_TYPES(cls):
-        from .model_auto_loader import MODEL_SERIES_LIST, _DATA_SOURCES
+        from .model_auto_loader import MODEL_SERIES_LIST, _DATA_SOURCES, AUTO_DETECT
         transformer_opts = _get_auto_loader_dropdowns()
         return {
             "required": {
@@ -2190,7 +2193,7 @@ class QuantFuncModelAutoLoader:
                 "data_source": (_DATA_SOURCES, {"default": "modelscope", "tooltip": "Download source: modelscope (China) or huggingface"}),
             },
             "optional": {
-                "transformer": (transformer_opts, {"default": "None", "tooltip": "Transformer model variant. Format: Series/name. Select None to use base model's default transformer."}),
+                "transformer": (transformer_opts, {"default": AUTO_DETECT, "tooltip": "Transformer weight. [auto-detect] (default) picks the highest-tier weight your DEFAULT GPU (CUDA device 0) can run; weights that need a newer GPU are hidden. None = use the base model's default transformer. Or pick an explicit Series/name. NOTE: auto-detect targets device 0 — if you route the pipeline to a WEAKER non-default GPU via Build Pipeline's device input, pick a matching lower-tier weight explicitly."}),
             },
         }
 
