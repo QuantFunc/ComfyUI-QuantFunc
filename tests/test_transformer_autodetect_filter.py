@@ -44,26 +44,29 @@ QWEN_30X = "qwen-image-30x-below.safetensors"        # INT4 → SM75
 
 
 class _Env:
-    """Stub the resource cache + the DEFAULT CUDA device SM (torch device 0, the
-    device the transformer runs on) + on-disk listing; restore on exit."""
+    """Stub the resource cache + the DEFAULT CUDA device SM (torch device 0) +
+    optional per-index device SMs (dev_sm={idx: sm}, for the SELECTED-device
+    auto-pick path) + on-disk listing; restore on exit."""
 
-    def __init__(self, cache=None, device_sm=0, local=None):
+    def __init__(self, cache=None, device_sm=0, dev_sm=None, local=None):
         self.cache = cache or {}
         self.device_sm = device_sm          # SM of torch device 0 (the default run-device)
+        self.dev_sm = dev_sm or {}          # {device_idx: sm} for _device_sm_by_index
         self.local = local or {}            # {(short, resource_type): [names]}
 
     def __enter__(self):
         self._orig = (mal._resource_cache, mal._default_device_sm,
-                      mal._list_local_resource_names)
+                      mal._device_sm_by_index, mal._list_local_resource_names)
         mal._resource_cache = self.cache
         mal._default_device_sm = lambda: self.device_sm
+        mal._device_sm_by_index = lambda idx: self.dev_sm.get(idx, 0)
         mal._list_local_resource_names = \
             lambda short, rtype: list(self.local.get((short, rtype), []))
         return self
 
     def __exit__(self, *exc):
         (mal._resource_cache, mal._default_device_sm,
-         mal._list_local_resource_names) = self._orig
+         mal._device_sm_by_index, mal._list_local_resource_names) = self._orig
         return False
 
 
@@ -249,6 +252,47 @@ def test_user_scenario_3060_plus_4090_shows_40x():
         assert _opt(KLEIN, KLEIN_50X) not in opts    # 50x FP4: device 0 can't run it → hidden
         s, n = mal.resolve_transformer_selection(mal.AUTO_DETECT, KLEIN)
         assert (s, n) == (KLEIN, KLEIN_40X), (s, n)  # auto-detect picks 40x (highest ≤ 89)
+
+
+# -------- SELECTED-device keying (BuildPipeline device switch, the user's blocker) --------
+def test_resolve_keys_on_selected_device_idx():
+    # The user's REAL repro: device 0 = 4090 (SM89), device 1 = 3060 (SM86).
+    # resolve_transformer_selection with an explicit device_idx keys on THAT device
+    # (what BuildPipeline passes), NOT device 0. Switching device 0↔1 flips the pick.
+    with _Env(cache=_klein_cache(), device_sm=89, dev_sm={0: 89, 1: 86}):
+        # device 0 (4090) → 40x (highest ≤ 89)
+        assert mal.resolve_transformer_selection(mal.AUTO_DETECT, KLEIN, device_idx=0) == (KLEIN, KLEIN_40X)
+        # SWITCH to device 1 (3060, SM86) → 40x is NOT runnable → picks 30x
+        assert mal.resolve_transformer_selection(mal.AUTO_DETECT, KLEIN, device_idx=1) == (KLEIN, KLEIN_30X)
+        # switch BACK to device 0 → 40x again
+        assert mal.resolve_transformer_selection(mal.AUTO_DETECT, KLEIN, device_idx=0) == (KLEIN, KLEIN_40X)
+
+
+def test_resolve_device_idx_none_uses_default_device0():
+    # device_idx omitted (dropdown-populate path, device not yet known) → keys on
+    # the DEFAULT device (device 0) via _target_gpu_sm — backward compatible.
+    with _Env(cache=_klein_cache(), device_sm=86, dev_sm={0: 89, 1: 86}):
+        assert mal.resolve_transformer_selection(mal.AUTO_DETECT, KLEIN) == (KLEIN, KLEIN_30X)  # device0 stub=86
+
+
+def test_resolve_selected_device_no_compat_returns_none():
+    # series ships only 40x+50x; device 1 (SM86) can run neither → (None,None) so the
+    # build()-time backstop raises a clean error (never a device __trap).
+    cache = {KLEIN: {"transformer": [KLEIN_40X, KLEIN_50X]}}
+    with _Env(cache=cache, dev_sm={1: 86}):
+        assert mal.resolve_transformer_selection(mal.AUTO_DETECT, KLEIN, device_idx=1) == (None, None)
+
+
+def test_detect_device_sm_reads_torch_per_index():
+    # lib_setup._detect_device_sm(idx) reads torch device `idx` (CVD-aware); out-of-range → 0.
+    ns = types.SimpleNamespace(
+        is_available=lambda: True,
+        device_count=lambda: 2,
+        get_device_capability=lambda i: (8, 9) if i == 0 else (8, 6),
+    )
+    assert _with_fake_torch(ns, lambda ls: ls._detect_device_sm(0)) == 89
+    assert _with_fake_torch(ns, lambda ls: ls._detect_device_sm(1)) == 86
+    assert _with_fake_torch(ns, lambda ls: ls._detect_device_sm(5)) == 0   # out of range
 
 
 # ---------------------- fail-safe: no compatible weight ----------------------

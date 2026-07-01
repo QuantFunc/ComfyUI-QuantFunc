@@ -337,6 +337,19 @@ def _default_device_sm():
     return sm
 
 
+def _device_sm_by_index(device_idx):
+    """SM of a SPECIFIC CUDA device index (the pipeline's SELECTED run-device),
+    via torch (CVD-aware). Used to key the [auto-detect] weight pick on the device
+    BuildPipeline will actually run on — NOT always device 0 — so switching the
+    pipeline to a weaker non-default GPU picks a weight that GPU can run. NOT
+    memoized (device_idx varies per build). 0 if undetectable."""
+    try:
+        from .lib_setup import _detect_device_sm
+        return _detect_device_sm(device_idx)
+    except Exception:
+        return _SM_UNKNOWN
+
+
 def _target_gpu_sm():
     """The SM to key transformer GPU-compatibility on: the DEFAULT CUDA device
     (torch device 0) — the GPU BuildPipeline runs the transformer on by default.
@@ -772,18 +785,26 @@ def resolve_selection_no_series(selection, resource_label):
         resource_label, short_name))
 
 
-def resolve_transformer_selection(selection, model_series):
+def resolve_transformer_selection(selection, model_series, device_idx=None):
     """Resolve a transformer dropdown value to (series_full_name, name).
 
-    '[auto-detect]' (the default) → the highest-tier weight the target GPU can
+    '[auto-detect]' (the default) → the highest-tier weight the TARGET GPU can
     run, chosen from `model_series`'s available weights; (None, None) when the
     series ships no separate transformer weights OR none are compatible with the
-    detected GPU (→ use the base model's own transformer, which is GPU-tier-matched
+    target GPU (→ use the base model's own transformer, which is GPU-tier-matched
     by detect_gpu_variant). Any explicit 'SeriesShort/name' value still resolves
-    exactly as before (backward compatible)."""
+    exactly as before (backward compatible).
+
+    TARGET GPU: when `device_idx` is given (the pipeline's SELECTED run-device,
+    passed by BuildPipeline where the device is known), key on THAT device's SM —
+    so switching the run-device (e.g. 4090 device 0 → 3060 device 1) picks a
+    weight the selected GPU can run. When `device_idx` is None (the dropdown-
+    populate path, before the device is known), fall back to the default device
+    (device 0) via `_target_gpu_sm()`."""
     if selection == AUTO_DETECT:
+        sm = _device_sm_by_index(device_idx) if device_idx is not None else _target_gpu_sm()
         names = _available_transformer_names(model_series)
-        best = _pick_best_transformer(names, _target_gpu_sm())
+        best = _pick_best_transformer(names, sm)
         if not best:
             return None, None
         return model_series, best

@@ -393,9 +393,28 @@ def _detect_gpu_sm() -> int:
     return sms[0] if sms else 0
 
 
+def _detect_device_sm(index) -> int:
+    """SM of a SPECIFIC CUDA device `index` via torch (CVD-aware, capability-ordered),
+    e.g. 120 / 89 / 86; 0 if no CUDA / no torch / index out of range.
+
+    Used to key the transformer auto-pick on the device the pipeline will ACTUALLY
+    run on (BuildPipeline's SELECTED `device` index), so a user switching from
+    device 0 (e.g. a 4090 SM89) to device 1 (a 3060 SM86) gets a weight the 3060
+    can run — not the 4090's tier. Torch honors CUDA_VISIBLE_DEVICES and the engine
+    worker inherits the same env, so torch device N == the engine's device_idx N."""
+    try:
+        import torch
+        if torch.cuda.is_available() and 0 <= int(index) < torch.cuda.device_count():
+            cap = torch.cuda.get_device_capability(int(index))
+            return cap[0] * 10 + cap[1]
+    except Exception:
+        pass
+    return 0
+
+
 def _detect_default_device_sm() -> int:
     """SM of the DEFAULT CUDA device (index 0) via torch, e.g. 120 / 89 / 86; 0 if
-    no CUDA / no torch.
+    no CUDA / no torch. Thin front for `_detect_device_sm(0)`.
 
     This is what the transformer GPU-match filter keys on (`_target_gpu_sm`): torch
     device 0 is the SAME device index BuildPipeline runs the transformer on BY
@@ -415,14 +434,7 @@ def _detect_default_device_sm() -> int:
     was worse — min over-hid the user's 40x on every config; max over the physical
     set could over-offer a tier the CVD-visible / PCI-slot-0 DEFAULT run-device
     couldn't run. Keying on CUDA device 0 removes that common-path __trap.)"""
-    try:
-        import torch
-        if torch.cuda.is_available() and torch.cuda.device_count() > 0:
-            cap = torch.cuda.get_device_capability(0)
-            return cap[0] * 10 + cap[1]
-    except Exception:
-        pass
-    return 0
+    return _detect_device_sm(0)
 
 
 def _detect_all_gpu_sms() -> list:

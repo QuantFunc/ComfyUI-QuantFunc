@@ -2118,7 +2118,7 @@ class QuantFuncModelAutoLoader:
     def load_model(self, model_series, data_source,
                    transformer="None", **kwargs):
         from .model_auto_loader import (
-            detect_gpu_variant, download_base_model,
+            AUTO_DETECT, detect_gpu_variant, download_base_model,
             download_transformer, resolve_transformer_selection,
         )
 
@@ -2127,13 +2127,26 @@ class QuantFuncModelAutoLoader:
         model_dir = download_base_model(model_series, gpu_variant, data_source)
 
         # ── Transformer (download if selected, otherwise use base model's) ──
+        # This node runs BEFORE the pipeline's run-device is known (the `device`
+        # lives on the downstream Build Pipeline node), so an [auto-detect] pick
+        # HERE can only key on the DEFAULT device (0). We resolve a device-0 weight
+        # so the model stub is valid + non-BuildPipeline consumers get a sensible
+        # pick, but ALSO stash the auto-detect intent + series so Build Pipeline —
+        # where the SELECTED device_idx IS known — RE-RESOLVES the best weight for
+        # that device (a user switching to a weaker non-default GPU then gets a
+        # weight it can run, instead of the device-0 tier → __trap). See
+        # nodes_format_adapters._reresolve_auto_transformer_for_device.
         transformer_path = ""
         if transformer and transformer != "None":
             t_series, t_name = resolve_transformer_selection(transformer, model_series)
             if t_series and t_name:
                 transformer_path = download_transformer(t_series, t_name, data_source)
 
-        return _build_model_refs(model_dir, transformer_path)
+        model_stub, clip_stub, vae_stub = _build_model_refs(model_dir, transformer_path)
+        if transformer == AUTO_DETECT:
+            model_stub.qf_auto_transformer_series = model_series
+            model_stub.qf_data_source = data_source
+        return (model_stub, clip_stub, vae_stub)
 
 
 # ============================================================================
