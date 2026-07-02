@@ -856,6 +856,110 @@ def test_swap_failure_first_replace_leaves_old_intact(monkeypatch):
     assert os.path.isfile(os.path.join(out, ".qf_stage_complete"))   # old intact
 
 
+@pytest.mark.skipif(not _HAS_TORCH, reason="needs torch")
+def test_compound_fault_both_replaces_fail_loud_and_recoverable(monkeypatch, caplog):
+    """COMPOUND persistent fault: the swap-in AND the (retried) rollback both fail.
+    Accepted degraded behavior, locked in: exception propagates LOUD, an ERROR names
+    both recovery dirs, out_dir may be absent BUT both complete stages survive
+    marker-carrying, and a follow-up run (fault cleared) self-heals."""
+    import logging as _logging
+    src = tempfile.mkdtemp(prefix="qfwan_cmp_")
+    high = os.path.join(src, "high.safetensors")
+    low = os.path.join(src, "low.safetensors")
+    _write_expert(high)
+    _write_expert(low)
+    shared = _make_shared_dir()
+    parent = tempfile.mkdtemp(prefix="qfwan_cmpout_")
+    out = os.path.join(parent, "stage")
+    W.stage_two_expert(high, low, shared, out)                 # old stage in place
+
+    real_replace = os.replace
+    def persistent_failure(a, b):
+        if os.path.abspath(b) == os.path.abspath(out):          # swap-in AND rollback
+            raise OSError("simulated persistent fault touching out_dir")
+        return real_replace(a, b)
+    monkeypatch.setattr(W.os, "replace", persistent_failure)
+    with caplog.at_level(_logging.ERROR):
+        with pytest.raises(OSError, match="persistent fault"):
+            W.stage_two_expert(high, low, shared, out, force=True)
+    monkeypatch.setattr(W.os, "replace", real_replace)
+
+    # LOUD: the compound-fault error names both recovery dirs
+    assert any("COMPOUND fault" in r.message for r in caplog.records)
+    # both complete stages survive, marker-carrying (nothing lost)
+    leftovers = [n for n in os.listdir(parent) if ".tmp-" in n or ".trash-" in n]
+    assert len(leftovers) == 2, leftovers
+    for n in leftovers:
+        assert os.path.isfile(os.path.join(parent, n, ".qf_stage_complete"))
+    # follow-up run (fault cleared) self-heals: reaps both + stages successfully
+    W.stage_two_expert(high, low, shared, out, force=True)
+    assert os.path.isfile(os.path.join(out, ".qf_stage_complete"))
+    residue = [n for n in os.listdir(parent) if ".tmp-" in n or ".trash-" in n]
+    assert residue == [], residue
+
+
+class _FakeK32:
+    """Mock kernel32 for the nt branch of _pid_alive (no real Windows needed)."""
+    def __init__(self, handle, exit_code=259, last_error=0, gec_ok=True):
+        self._h, self._code, self._le, self._ok = handle, exit_code, last_error, gec_ok
+    def OpenProcess(self, access, inherit, pid):
+        return self._h
+    def GetLastError(self):
+        return self._le
+    def GetExitCodeProcess(self, h, code_ref):
+        if not self._ok:
+            return 0
+        code_ref._obj.value = self._code
+        return 1
+    def CloseHandle(self, h):
+        return 1
+
+
+def test_pid_alive_nt_branch_mocked(monkeypatch):
+    """Windows liveness probe, mock-exercised on Linux: OpenProcess denied => alive;
+    handle + STILL_ACTIVE => alive; handle + exited => dead; GetExitCodeProcess
+    failure => alive (leak-safe); never os.kill on nt."""
+    import ctypes, types as _types
+    monkeypatch.setattr(W.os, "name", "nt")
+    def probe(k32):
+        monkeypatch.setattr(ctypes, "windll",
+                            _types.SimpleNamespace(kernel32=k32), raising=False)
+        return W._pid_alive(4242)
+    STILL_ACTIVE, ERROR_ACCESS_DENIED = 259, 5
+    assert probe(_FakeK32(handle=0, last_error=ERROR_ACCESS_DENIED)) is True   # denied => alive
+    assert probe(_FakeK32(handle=0, last_error=87)) is False                   # invalid pid => dead
+    assert probe(_FakeK32(handle=123, exit_code=STILL_ACTIVE)) is True         # running
+    assert probe(_FakeK32(handle=123, exit_code=0)) is False                   # exited
+    assert probe(_FakeK32(handle=123, gec_ok=False)) is True                   # ambiguous => alive
+
+
+def test_stage_lock_msvcrt_retry_loop_mocked(monkeypatch):
+    """The Windows lock branch, mock-exercised on Linux: fcntl import blocked =>
+    msvcrt path; LK_LOCK raising OSError twice (the documented ~10s-retry timeout)
+    must be retried until it succeeds — the loop emulates flock's indefinite block."""
+    import sys as _sys, types as _types
+    calls = {"lock": 0, "unlock": 0}
+    fake = _types.ModuleType("msvcrt")
+    fake.LK_LOCK, fake.LK_UNLCK = 0, 2
+    def locking(fd, mode, n):
+        if mode == fake.LK_LOCK:
+            calls["lock"] += 1
+            if calls["lock"] < 3:
+                raise OSError("lock timeout (simulated msvcrt 10s retry expiry)")
+        else:
+            calls["unlock"] += 1
+    fake.locking = locking
+    monkeypatch.setitem(_sys.modules, "fcntl", None)     # import fcntl -> ImportError
+    monkeypatch.setitem(_sys.modules, "msvcrt", fake)
+    d = tempfile.mkdtemp(prefix="qfwan_ntlock_")
+    out = os.path.join(d, "stage")
+    with W._stage_lock(out):
+        pass
+    assert calls["lock"] == 3      # retried through 2 timeouts, then acquired
+    assert calls["unlock"] == 1    # released on exit
+    assert os.path.isfile(out + W._STAGE_LOCK_SUFFIX)
+
+
 def test_cleanup_reaps_marker_only_tmp():
     """The sentinel-off->marker-in crash WINDOW: a dead-pid tmp carrying the marker
     (sentinel already removed) must be recognized as OURS and reaped."""

@@ -49,6 +49,7 @@ import os
 import re
 import shutil
 import struct
+import time
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -564,6 +565,12 @@ _TMP_SENTINEL = ".qf_stage_tmp"
 # Suffix of the per-out_dir exclusive staging lockfile (SF1).
 _STAGE_LOCK_SUFFIX = ".lock"
 
+# Rollback-rename retry budget for a swap-in failure: covers TRANSIENT fault classes
+# (e.g. a Windows AV scanner briefly holding the dir) — a PERSISTENT fault (ro-remount,
+# EIO) cannot be retried away and degrades to the loud compound-fault error below.
+_ROLLBACK_RETRIES = 3
+_ROLLBACK_RETRY_DELAY_S = 0.1
+
 
 def _pid_alive(pid: int) -> bool:
     """Best-effort liveness, used only in the SAFE direction (a pid that looks alive
@@ -908,10 +915,13 @@ def stage_two_expert(high_expert: str, low_expert: str, shared_dir: str,
             #   old out_dir --atomic rename--> .trash-<pid>
             #   tmp         --atomic rename--> out_dir     (failure ⇒ ROLLBACK trash→out)
             #   rmtree(.trash)
-            # Invariant after ANY crash/exception: a COMPLETE marker-carrying stage
-            # exists — at out_dir (old rolled back, or new landed) or in a leftover
-            # tmp/trash that the next run's cleanup reaps (marker = ownership proof).
-            # Never a markerless partial, never "neither old nor new".
+            # Invariant after ANY crash/exception: at least one COMPLETE marker-carrying
+            # stage exists ON DISK — at out_dir (old rolled back, or new landed) or in a
+            # leftover tmp/trash that the next run's cleanup reaps (marker = ownership
+            # proof). Never a markerless partial. Residual (accepted + LOUD): a COMPOUND
+            # persistent fault that fails the swap-in AND the retried rollback leaves
+            # out_dir absent — both complete stages survive as recovery dirs, an ERROR
+            # names them, and the next run self-heals (reap + rebuild).
             os.unlink(os.path.join(tmp_dir, _TMP_SENTINEL))
             with open(os.path.join(tmp_dir, marker_name), "w", encoding="utf-8") as f:
                 f.write(fp)
@@ -924,11 +934,26 @@ def stage_two_expert(high_expert: str, low_expert: str, shared_dir: str,
             try:
                 os.replace(tmp_dir, out_dir)     # new stage live, atomically
             except BaseException:
-                # ROLLBACK: restore the old stage to the canonical path so out_dir
-                # is never left absent (the completed new build stays in tmp for the
-                # next run's cleanup/rebuild).
+                # ROLLBACK: restore the old stage to the canonical path (bounded
+                # retry — the rollback rename is the same syscall shape as the
+                # failed swap-in, so a PERSISTENT fault can hit it too; retries
+                # only rescue transient classes). The completed new build stays in
+                # tmp for the next run's cleanup/rebuild either way.
                 if old_moved and not os.path.isdir(out_dir):
-                    os.replace(trash_dir, out_dir)
+                    for _attempt in range(_ROLLBACK_RETRIES):
+                        try:
+                            os.replace(trash_dir, out_dir)
+                            break
+                        except OSError:
+                            time.sleep(_ROLLBACK_RETRY_DELAY_S)
+                    else:
+                        logger.error(
+                            "[comfyui_wan_remap] COMPOUND fault: the swap-in AND the "
+                            "rollback both failed — %s is ABSENT. Nothing is lost: the "
+                            "OLD complete stage is at %s and the NEW complete stage is "
+                            "at %s (both marker-carrying). Re-running the stage "
+                            "self-heals (reaps + rebuilds), or move either dir into "
+                            "place manually.", out_dir, trash_dir, tmp_dir)
                 raise
             if old_moved and os.path.isdir(trash_dir):
                 shutil.rmtree(trash_dir)
