@@ -922,9 +922,12 @@ def stage_two_expert(high_expert: str, low_expert: str, shared_dir: str,
             # persistent fault that fails the swap-in AND the retried rollback leaves
             # out_dir absent — both complete stages survive as recovery dirs, an ERROR
             # names them, and the next run self-heals (reap + rebuild).
-            os.unlink(os.path.join(tmp_dir, _TMP_SENTINEL))
+            # Marker FIRST, sentinel off SECOND — the tmp carries >=1 ownership
+            # proof at every instant, so even a SIGKILL between the two operations
+            # leaves a reapable dir (never a neither-proof unreapable orphan).
             with open(os.path.join(tmp_dir, marker_name), "w", encoding="utf-8") as f:
                 f.write(fp)
+            os.unlink(os.path.join(tmp_dir, _TMP_SENTINEL))
             trash_dir = f"{out_dir}.trash-{os.getpid()}"
             swap_started = True                  # from here on, NEVER reap tmp blindly
             old_moved = False
@@ -956,7 +959,10 @@ def stage_two_expert(high_expert: str, low_expert: str, shared_dir: str,
                             "place manually.", out_dir, trash_dir, tmp_dir)
                 raise
             if old_moved and os.path.isdir(trash_dir):
-                shutil.rmtree(trash_dir)
+                # Best-effort: the swap already SUCCEEDED (out_dir is the valid new
+                # stage) — a trash-cleanup failure must not raise over that success;
+                # a surviving dead-pid trash is reaped by the next run's cleanup.
+                shutil.rmtree(trash_dir, ignore_errors=True)
         finally:
             if not swap_started and os.path.isdir(tmp_dir):
                 # BUILD-phase exception only (success renamed tmp away; swap-phase

@@ -930,6 +930,33 @@ def test_swap_failure_rollback_retry_rescues_transient(monkeypatch):
     assert open(os.path.join(out, ".qf_stage_complete")).read() == old_marker
 
 
+@pytest.mark.skipif(not _HAS_TORCH, reason="needs torch")
+def test_marker_written_before_sentinel_removed(monkeypatch):
+    """N-a ordering invariant: at the instant the sentinel is unlinked, the
+    completion marker must ALREADY exist in the tmp dir — so a SIGKILL between the
+    two operations can never leave a neither-proof (unreapable) orphan."""
+    src = tempfile.mkdtemp(prefix="qfwan_ord_")
+    high = os.path.join(src, "high.safetensors")
+    low = os.path.join(src, "low.safetensors")
+    _write_expert(high)
+    _write_expert(low)
+    shared = _make_shared_dir()
+    out = tempfile.mkdtemp(prefix="qfwan_ordout_") + "/stage"
+    seen = {"checked": False}
+    real_unlink = os.unlink
+    def checking_unlink(path):
+        if os.path.basename(path) == W._TMP_SENTINEL:
+            # the marker must already be present in the same dir
+            assert os.path.isfile(os.path.join(os.path.dirname(path),
+                                               ".qf_stage_complete")),                 "sentinel removed BEFORE the marker was written (neither-proof window)"
+            seen["checked"] = True
+        return real_unlink(path)
+    monkeypatch.setattr(W.os, "unlink", checking_unlink)
+    W.stage_two_expert(high, low, shared, out)
+    assert seen["checked"], "sentinel unlink was never observed"
+    assert os.path.isfile(os.path.join(out, ".qf_stage_complete"))
+
+
 class _FakeK32:
     """Mock kernel32 for the nt branch of _pid_alive (no real Windows needed)."""
     def __init__(self, handle, exit_code=259, last_error=0, gec_ok=True):
