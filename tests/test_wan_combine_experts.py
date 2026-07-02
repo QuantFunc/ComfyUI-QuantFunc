@@ -1021,8 +1021,8 @@ def test_stage_lock_msvcrt_retry_loop_mocked(monkeypatch):
 
 
 def test_cleanup_reaps_marker_only_tmp():
-    """The sentinel-off->marker-in crash WINDOW: a dead-pid tmp carrying the marker
-    (sentinel already removed) must be recognized as OURS and reaped."""
+    """A marker-only dead-pid tmp (sentinel already removed — the post-unlink,
+    pre-swap crash window) must be recognized as OURS and reaped."""
     import subprocess
     parent = tempfile.mkdtemp(prefix="qfwan_mkonly_")
     out = os.path.join(parent, "stage")
