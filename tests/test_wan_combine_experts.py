@@ -944,18 +944,55 @@ def test_marker_written_before_sentinel_removed(monkeypatch):
     out = tempfile.mkdtemp(prefix="qfwan_ordout_") + "/stage"
     seen = {"checked": False}
     real_unlink = os.unlink
-    def checking_unlink(path):
-        if os.path.basename(path) == W._TMP_SENTINEL:
+    def checking_unlink(path, *args, **kwargs):
+        # *args/**kwargs: shutil.rmtree's fd-based walk calls os.unlink(name,
+        # dir_fd=fd) — the interposer must pass every call shape through.
+        if isinstance(path, str) and os.path.basename(path) == W._TMP_SENTINEL:
             # the marker must already be present in the same dir
             marker_here = os.path.join(os.path.dirname(path), ".qf_stage_complete")
             assert os.path.isfile(marker_here), (
                 "sentinel removed BEFORE the marker was written (neither-proof window)")
             seen["checked"] = True
-        return real_unlink(path)
+        return real_unlink(path, *args, **kwargs)
     monkeypatch.setattr(W.os, "unlink", checking_unlink)
     W.stage_two_expert(high, low, shared, out)
     assert seen["checked"], "sentinel unlink was never observed"
     assert os.path.isfile(os.path.join(out, ".qf_stage_complete"))
+
+
+@pytest.mark.skipif(not _HAS_TORCH, reason="needs torch")
+def test_sentinel_unlink_failure_never_discards_completed_build(monkeypatch, caplog):
+    """swap_started timing invariant: the completion MARKER is the 'completed build'
+    proof, so the finally-reap must be gated OFF from the instant the marker is
+    written — a transient OSError from the sentinel unlink must NOT let the finally
+    blind-reap the only completed build. The unlink is best-effort: the stage
+    COMPLETES (out_dir valid), a warning is logged, zero data loss."""
+    import logging as _logging
+    src = tempfile.mkdtemp(prefix="qfwan_sunl_")
+    high = os.path.join(src, "high.safetensors")
+    low = os.path.join(src, "low.safetensors")
+    _write_expert(high)
+    _write_expert(low)
+    shared = _make_shared_dir()
+    out = tempfile.mkdtemp(prefix="qfwan_sunlout_") + "/stage"
+    real_unlink = os.unlink
+    def failing_sentinel_unlink(path, *args, **kwargs):
+        if isinstance(path, str) and os.path.basename(path) == W._TMP_SENTINEL:
+            raise OSError("simulated transient lock on the sentinel")
+        return real_unlink(path, *args, **kwargs)
+    monkeypatch.setattr(W.os, "unlink", failing_sentinel_unlink)
+    with caplog.at_level(_logging.WARNING):
+        W.stage_two_expert(high, low, shared, out)   # must COMPLETE, not raise
+    monkeypatch.setattr(W.os, "unlink", real_unlink)
+    # the completed build landed at out_dir, marker-carrying (zero data loss)
+    assert os.path.isfile(os.path.join(out, ".qf_stage_complete"))
+    assert os.path.isdir(os.path.join(out, "transformer"))
+    assert any("could not remove the staging sentinel" in r.message
+               for r in caplog.records)
+    # no orphaned tmp/trash left behind
+    parent = os.path.dirname(out)
+    residue = [n for n in os.listdir(parent) if ".tmp-" in n or ".trash-" in n]
+    assert residue == [], residue
 
 
 class _FakeK32:

@@ -928,9 +928,23 @@ def stage_two_expert(high_expert: str, low_expert: str, shared_dir: str,
             # leaves a reapable dir (never a neither-proof unreapable orphan).
             with open(os.path.join(tmp_dir, marker_name), "w", encoding="utf-8") as f:
                 f.write(fp)
-            os.unlink(os.path.join(tmp_dir, _TMP_SENTINEL))
-            trash_dir = f"{out_dir}.trash-{os.getpid()}"
+            # The marker IS the "completed build" proof — gate the finally-reap OFF
+            # from this exact instant (NOT after the sentinel unlink: a transient
+            # unlink failure must never let the finally blind-reap the only
+            # completed build).
             swap_started = True                  # from here on, NEVER reap tmp blindly
+            try:
+                os.unlink(os.path.join(tmp_dir, _TMP_SENTINEL))
+            except OSError as exc:
+                # Best-effort: the build is complete and marker-carrying; a stray
+                # sentinel file riding along into the staged dir is harmless (no
+                # consumer reads it inside out_dir), whereas failing here would
+                # discard a multi-GB completed build over a transient fault.
+                logger.warning(
+                    "[comfyui_wan_remap] could not remove the staging sentinel "
+                    "(%s) — proceeding with the swap; a stray %s file may remain "
+                    "inside the staged dir (harmless).", exc, _TMP_SENTINEL)
+            trash_dir = f"{out_dir}.trash-{os.getpid()}"
             old_moved = False
             if os.path.isdir(out_dir):
                 os.replace(out_dir, trash_dir)   # old stage aside, atomically, marker intact
