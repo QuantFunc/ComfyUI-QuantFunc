@@ -31,21 +31,27 @@ for _n in ("comfy", "comfy.model_management", "comfy.utils", "folder_paths"):
 
 import numpy as np  # real
 
-# Prefer REAL torch when importable; install the pass-through stub ONLY when torch
-# is genuinely absent. The old unconditional `sys.modules["torch"] = _torch` leaked
-# a bare stub into the whole pytest session, silently SKIPPING (alphabetical order)
-# or FAILING (reversed order) every torch-gated test collected after this file —
-# order-fragile CI. With real torch the node paths under test work identically
-# (from_numpy returns tensors with .shape/slicing); the stub is now the no-torch
-# fallback only, so the session state is deterministic in ANY collection order.
+# Prefer REAL torch; install the pass-through stub ONLY when the ACTIVE torch is
+# INCAPABLE — a CAPABILITY gate (hasattr from_numpy), NOT an import-success gate.
+# Two failure modes this kills:
+#  * the old unconditional `sys.modules["torch"] = _torch` leaked a bare stub
+#    session-wide (alphabetical order silently SKIPPED / reversed order FAILED
+#    every torch-gated test collected later);
+#  * an import-success gate alone still bound a BARE foreign stub on torch-less
+#    boxes (an earlier-collected file's `sys.modules.setdefault("torch", ...)`
+#    satisfies `import torch` from the cache) — measured 9 AttributeError
+#    failures in default order. `hasattr(sys.modules.get("torch"), ...)` is
+#    deterministic in ANY collection order in BOTH environments.
 try:
-    import torch  # noqa: F401  (real torch preferred when available)
-except Exception:  # noqa: BLE001 — no torch on this box -> minimal stub
+    import torch  # noqa: F401  (may resolve to a bare foreign stub from the cache)
+except Exception:  # noqa: BLE001 — genuinely torch-less box
+    pass
+if not hasattr(sys.modules.get("torch"), "from_numpy"):
     _torch = types.ModuleType("torch")
     _torch.from_numpy = lambda a: a
     _torch.ones = lambda shape, dtype=None: np.ones(shape, dtype=np.float32)
     _torch.float32 = np.float32
-    sys.modules["torch"] = _torch
+    sys.modules["torch"] = _torch     # replaces an incapable bare stub too
 
 # Bind the ACTIVE torch module (real or the stub above) — tests that temporarily
 # swap `_torch.from_numpy` patch whichever module `nodes` actually resolves.
