@@ -36,7 +36,9 @@ W = importlib.import_module(f"{_PKG}.format_adapters.comfyui_wan_remap")
 try:
     import torch
     from safetensors.torch import save_file, load_file
-    _HAS_TORCH = True
+    # Capability probe (not just importability): a foreign sys.modules torch STUB
+    # (e.g. another test file's) lacks real dtypes — skip cleanly, never fail.
+    _HAS_TORCH = hasattr(torch, "float8_e4m3fn")
 except Exception:  # noqa: BLE001
     _HAS_TORCH = False
 
@@ -896,6 +898,36 @@ def test_compound_fault_both_replaces_fail_loud_and_recoverable(monkeypatch, cap
     assert os.path.isfile(os.path.join(out, ".qf_stage_complete"))
     residue = [n for n in os.listdir(parent) if ".tmp-" in n or ".trash-" in n]
     assert residue == [], residue
+
+
+@pytest.mark.skipif(not _HAS_TORCH, reason="needs torch")
+def test_swap_failure_rollback_retry_rescues_transient(monkeypatch):
+    """The retry loop's value proposition: swap-in fails, the FIRST rollback attempt
+    ALSO fails (transient), the SECOND rollback attempt succeeds -> old stage restored
+    at out_dir."""
+    src = tempfile.mkdtemp(prefix="qfwan_retry_")
+    high = os.path.join(src, "high.safetensors")
+    low = os.path.join(src, "low.safetensors")
+    _write_expert(high)
+    _write_expert(low)
+    shared = _make_shared_dir()
+    parent = tempfile.mkdtemp(prefix="qfwan_retryout_")
+    out = os.path.join(parent, "stage")
+    W.stage_two_expert(high, low, shared, out)
+    old_marker = open(os.path.join(out, ".qf_stage_complete")).read()
+    real_replace = os.replace
+    fails = {"n": 0}
+    def transient(a, b):
+        if os.path.abspath(b) == os.path.abspath(out) and fails["n"] < 2:
+            fails["n"] += 1          # fail the swap-in AND the 1st rollback attempt
+            raise OSError("transient fault")
+        return real_replace(a, b)
+    monkeypatch.setattr(W.os, "replace", transient)
+    with pytest.raises(OSError, match="transient"):
+        W.stage_two_expert(high, low, shared, out, force=True)
+    monkeypatch.setattr(W.os, "replace", real_replace)
+    # the 2nd rollback attempt succeeded -> old stage back at the canonical path
+    assert open(os.path.join(out, ".qf_stage_complete")).read() == old_marker
 
 
 class _FakeK32:
