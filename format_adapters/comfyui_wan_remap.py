@@ -566,9 +566,30 @@ _STAGE_LOCK_SUFFIX = ".lock"
 
 
 def _pid_alive(pid: int) -> bool:
-    """Best-effort liveness: signal-0 probe. EPERM ⇒ alive (owned by another user);
-    ESRCH ⇒ dead. Used only in the SAFE direction (a recycled pid that looks alive
-    just SKIPS a cleanup — a disk leak, never a deletion of live work)."""
+    """Best-effort liveness, used only in the SAFE direction (a pid that looks alive
+    just SKIPS a cleanup — a disk leak, never a deletion of live work).
+    POSIX: signal-0 probe (EPERM ⇒ alive, ESRCH ⇒ dead). Windows: OpenProcess query
+    — NEVER os.kill(pid, 0) there, which calls TerminateProcess(pid, exit_code=0)
+    and would KILL a live stager (the sig arg is the exit code on Windows)."""
+    if os.name == "nt":
+        try:
+            import ctypes
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259
+            k32 = ctypes.windll.kernel32
+            h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not h:
+                ERROR_ACCESS_DENIED = 5
+                return k32.GetLastError() == ERROR_ACCESS_DENIED  # denied ⇒ alive
+            try:
+                code = ctypes.c_ulong()
+                if k32.GetExitCodeProcess(h, ctypes.byref(code)):
+                    return code.value == STILL_ACTIVE
+                return True     # unknown → assume alive (never reap on ambiguity)
+            finally:
+                k32.CloseHandle(h)
+        except Exception:  # noqa: BLE001
+            return True         # unknown → assume alive (never reap on ambiguity)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -590,18 +611,31 @@ def _stage_lock(out_dir: str):
     flock (POSIX) / msvcrt.locking (Windows); the OS releases the lock automatically
     when the holder dies, so a crashed holder never wedges the next run. The tiny
     lockfile is left in place (unlinking it would race a waiter)."""
-    lock_path = out_dir + _STAGE_LOCK_SUFFIX
+    # realpath-normalize so two literal spellings of the same (possibly symlinked)
+    # out_dir contend on ONE lock; O_NOFOLLOW (where supported) refuses a pre-planted
+    # symlink at the predictable lock path (shared-tmp hardening).
+    lock_path = os.path.realpath(out_dir) + _STAGE_LOCK_SUFFIX
     parent = os.path.dirname(lock_path) or "."
     os.makedirs(parent, exist_ok=True)
-    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+    fd = os.open(lock_path,
+                 os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o644)
     locked_msvcrt = False
     try:
         try:
             import fcntl
-            fcntl.flock(fd, fcntl.LOCK_EX)
+            fcntl.flock(fd, fcntl.LOCK_EX)     # blocks indefinitely; freed on death
         except ImportError:                    # Windows
             import msvcrt
-            msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+            # msvcrt LK_LOCK is NOT indefinite (≈10 retries over ~10 s, then OSError)
+            # while a real stage holds the lock for MINUTES — loop to emulate flock's
+            # indefinite block (deadlock-free: the holder always releases or dies,
+            # and the OS drops a dead holder's region locks).
+            while True:
+                try:
+                    msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+                    break
+                except OSError:
+                    continue
             locked_msvcrt = True
         yield
     finally:
@@ -625,21 +659,25 @@ def _cleanup_stale_dirs(out_dir: str) -> None:
     live concurrent stager (which holds the lock for its whole tmp lifetime) can never
     be racing us; the pid-liveness gate is defense-in-depth for lock-less API callers
     + pid reuse (a live/ambiguous pid ⇒ SKIP: leak-safe, never deletes live work).
-      * `<out_dir>.tmp-<pid>`   — ownership proof: contains `_TMP_SENTINEL`.
-      * `<out_dir>.trash-<pid>` — ownership proof: contains our completion marker
+      * `<out_dir>.tmp-<pid>`   — ownership proof: `_TMP_SENTINEL` OR our completion
+        marker (the sentinel comes OFF and the marker goes IN just before the swap,
+        so a crash in that window leaves a marker-only tmp — still OURS, still reapable).
+      * `<out_dir>.trash-<pid>` — ownership proof: our completion marker
         (it IS a previous complete stage renamed aside mid-swap, SF2).
     A non-numeric suffix or a missing ownership proof ⇒ untouched (foreign dir)."""
     parent = os.path.dirname(out_dir) or "."
     base = os.path.basename(out_dir)
     if not os.path.isdir(parent):
         return
-    for kind, proof in ((".tmp-", _TMP_SENTINEL), (".trash-", ".qf_stage_complete")):
+    for kind, proofs in ((".tmp-", (_TMP_SENTINEL, ".qf_stage_complete")),
+                         (".trash-", (".qf_stage_complete",))):
         prefix = base + kind
         for name in os.listdir(parent):
             if not name.startswith(prefix):
                 continue
             cand = os.path.join(parent, name)
-            if not (os.path.isdir(cand) and os.path.isfile(os.path.join(cand, proof))):
+            if not (os.path.isdir(cand)
+                    and any(os.path.isfile(os.path.join(cand, pf)) for pf in proofs)):
                 continue
             try:
                 pid = int(name[len(prefix):])
@@ -824,8 +862,12 @@ def stage_two_expert(high_expert: str, low_expert: str, shared_dir: str,
         with open(os.path.join(tmp_dir, _TMP_SENTINEL), "w", encoding="utf-8") as f:
             f.write(fp)
 
-        # SF3 — this process's own tmp is reaped on ANY exception (no 56 GB orphan
-        # per crash); on success it has been renamed away and the guard is a no-op.
+        # SF3 — this process's own tmp is reaped on a BUILD-phase exception (no 56 GB
+        # orphan per crash). Once the SWAP starts, tmp may hold the ONLY completed
+        # build → the reap is gated OFF (swap_started) and swap failures roll back
+        # instead (a marker-carrying leftover tmp is reaped by the next run's
+        # cleanup — marker counts as ownership proof).
+        swap_started = False
         try:
             # -- transformers (base_xfm_cfg loaded early, before boundary resolution) --
             for sub, src in (("transformer", high_expert), ("transformer_2", low_expert)):
@@ -864,22 +906,36 @@ def stage_two_expert(high_expert: str, low_expert: str, shared_dir: str,
 
             # SF2 — CRASH-SAFE swap. Marker into tmp LAST (sentinel off), then:
             #   old out_dir --atomic rename--> .trash-<pid>
-            #   tmp         --atomic rename--> out_dir
+            #   tmp         --atomic rename--> out_dir     (failure ⇒ ROLLBACK trash→out)
             #   rmtree(.trash)
-            # A crash at ANY point leaves either the OLD complete dir or the NEW
-            # complete dir at some path with its marker — never a markerless partial
-            # (the leftover trash/tmp is pid-dead-reaped by the next run's cleanup).
+            # Invariant after ANY crash/exception: a COMPLETE marker-carrying stage
+            # exists — at out_dir (old rolled back, or new landed) or in a leftover
+            # tmp/trash that the next run's cleanup reaps (marker = ownership proof).
+            # Never a markerless partial, never "neither old nor new".
             os.unlink(os.path.join(tmp_dir, _TMP_SENTINEL))
             with open(os.path.join(tmp_dir, marker_name), "w", encoding="utf-8") as f:
                 f.write(fp)
             trash_dir = f"{out_dir}.trash-{os.getpid()}"
+            swap_started = True                  # from here on, NEVER reap tmp blindly
+            old_moved = False
             if os.path.isdir(out_dir):
                 os.replace(out_dir, trash_dir)   # old stage aside, atomically, marker intact
-            os.replace(tmp_dir, out_dir)         # new stage live, atomically
-            if os.path.isdir(trash_dir):
+                old_moved = True
+            try:
+                os.replace(tmp_dir, out_dir)     # new stage live, atomically
+            except BaseException:
+                # ROLLBACK: restore the old stage to the canonical path so out_dir
+                # is never left absent (the completed new build stays in tmp for the
+                # next run's cleanup/rebuild).
+                if old_moved and not os.path.isdir(out_dir):
+                    os.replace(trash_dir, out_dir)
+                raise
+            if old_moved and os.path.isdir(trash_dir):
                 shutil.rmtree(trash_dir)
         finally:
-            if os.path.isdir(tmp_dir):           # only on exception (success renamed it)
+            if not swap_started and os.path.isdir(tmp_dir):
+                # BUILD-phase exception only (success renamed tmp away; swap-phase
+                # failures keep tmp — it may be the only completed build).
                 shutil.rmtree(tmp_dir, ignore_errors=True)
 
     logger.info("[comfyui_wan_remap] staged two-expert %s dir (dequant-fp16, "

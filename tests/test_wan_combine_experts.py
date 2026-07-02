@@ -786,6 +786,90 @@ def test_own_tmp_reaped_on_exception():
     assert not os.path.exists(out)               # nothing half-staged at the final path
 
 
+@pytest.mark.skipif(not _HAS_TORCH, reason="needs torch")
+def test_swap_failure_second_replace_rolls_back_old_stage(monkeypatch):
+    """SF2 rollback: a failure of the SECOND os.replace (tmp->out) must restore the
+    OLD complete stage at out_dir (never leave it absent), keep the completed tmp
+    (marker inside — NOT reaped), and a follow-up run must recover + succeed."""
+    src = tempfile.mkdtemp(prefix="qfwan_swap2_")
+    high = os.path.join(src, "high.safetensors")
+    low = os.path.join(src, "low.safetensors")
+    _write_expert(high)
+    _write_expert(low)
+    shared = _make_shared_dir()
+    parent = tempfile.mkdtemp(prefix="qfwan_swap2out_")
+    out = os.path.join(parent, "stage")
+    W.stage_two_expert(high, low, shared, out)                 # old stage in place
+    old_marker = open(os.path.join(out, ".qf_stage_complete")).read()
+
+    real_replace = os.replace
+    failed = {"n": 0}
+    def failing_replace(a, b):
+        # fail ONLY the first dst==out call (the tmp->out swap-in); the ROLLBACK's
+        # trash->out rename (also dst==out) must be allowed through — it models a
+        # transient swap-in fault (ENOSPC/EIO class) vs the metadata-only rollback.
+        if os.path.abspath(b) == os.path.abspath(out) and failed["n"] == 0:
+            failed["n"] = 1
+            raise OSError("simulated failure of the second replace")
+        return real_replace(a, b)
+    monkeypatch.setattr(W.os, "replace", failing_replace)
+    with pytest.raises(OSError, match="second replace"):
+        W.stage_two_expert(high, low, shared, out, force=True)
+    monkeypatch.setattr(W.os, "replace", real_replace)
+
+    # OLD stage rolled back to the canonical path, marker intact
+    assert os.path.isfile(os.path.join(out, ".qf_stage_complete"))
+    assert open(os.path.join(out, ".qf_stage_complete")).read() == old_marker
+    # the completed tmp was NOT reaped (it held the only new build)
+    tmps = [n for n in os.listdir(parent) if ".tmp-" in n]
+    assert len(tmps) == 1
+    assert os.path.isfile(os.path.join(parent, tmps[0], ".qf_stage_complete"))
+    # follow-up run recovers: reaps the marker-carrying tmp + stages successfully
+    W.stage_two_expert(high, low, shared, out, force=True)
+    assert os.path.isfile(os.path.join(out, ".qf_stage_complete"))
+    residue = [n for n in os.listdir(parent) if ".tmp-" in n or ".trash-" in n]
+    assert residue == [], residue
+
+
+@pytest.mark.skipif(not _HAS_TORCH, reason="needs torch")
+def test_swap_failure_first_replace_leaves_old_intact(monkeypatch):
+    """SF2: a failure of the FIRST os.replace (out->trash) leaves the OLD stage
+    untouched at out_dir (rename is atomic: either moved or not)."""
+    src = tempfile.mkdtemp(prefix="qfwan_swap1_")
+    high = os.path.join(src, "high.safetensors")
+    low = os.path.join(src, "low.safetensors")
+    _write_expert(high)
+    _write_expert(low)
+    shared = _make_shared_dir()
+    parent = tempfile.mkdtemp(prefix="qfwan_swap1out_")
+    out = os.path.join(parent, "stage")
+    W.stage_two_expert(high, low, shared, out)
+    real_replace = os.replace
+    def failing_replace(a, b):
+        if ".trash-" in os.path.basename(b):                    # the out->trash aside
+            raise OSError("simulated failure of the first replace")
+        return real_replace(a, b)
+    monkeypatch.setattr(W.os, "replace", failing_replace)
+    with pytest.raises(OSError, match="first replace"):
+        W.stage_two_expert(high, low, shared, out, force=True)
+    monkeypatch.setattr(W.os, "replace", real_replace)
+    assert os.path.isfile(os.path.join(out, ".qf_stage_complete"))   # old intact
+
+
+def test_cleanup_reaps_marker_only_tmp():
+    """The sentinel-off->marker-in crash WINDOW: a dead-pid tmp carrying the marker
+    (sentinel already removed) must be recognized as OURS and reaped."""
+    import subprocess
+    parent = tempfile.mkdtemp(prefix="qfwan_mkonly_")
+    out = os.path.join(parent, "stage")
+    dead = subprocess.Popen(["true"]); dead.wait()
+    tmp = f"{out}.tmp-{dead.pid}"
+    os.makedirs(tmp)
+    open(os.path.join(tmp, ".qf_stage_complete"), "w").write("fp")   # marker, NO sentinel
+    W._cleanup_stale_dirs(out)
+    assert not os.path.exists(tmp)
+
+
 def test_published_boundary_values_pinned():
     """N1 — pin the published boundary VALUES (not just key presence): the module
     constants must equal the official releases' model_index values (t2v 0.875 /
