@@ -49,6 +49,7 @@ import os
 import re
 import shutil
 import struct
+from contextlib import contextmanager
 from pathlib import Path
 
 from .tools.fs_util import link_or_copy
@@ -108,7 +109,7 @@ def _is_droppable(k: str) -> bool:
 
 
 # ============================================================================
-# safetensors header IO  (stdlib only — no torch needed for detect/raw-remap)
+# safetensors header IO  (stdlib only — no torch needed for detect/manifest)
 # ============================================================================
 
 def _read_header(path: str | Path) -> dict:
@@ -560,20 +561,93 @@ _FREE_SPACE_MARGIN_BYTES = 2 * 1024 ** 3
 # dir is OURS before removing it (never delete by name-pattern alone).
 _TMP_SENTINEL = ".qf_stage_tmp"
 
+# Suffix of the per-out_dir exclusive staging lockfile (SF1).
+_STAGE_LOCK_SUFFIX = ".lock"
 
-def _cleanup_stale_tmp_dirs(out_dir: str) -> None:
-    """Remove leftover `<out_dir>.tmp-<pid>` staging dirs from aborted runs — ONLY
-    those carrying our `_TMP_SENTINEL` (proof we created them; a name-collision dir
-    without the sentinel is left untouched)."""
+
+def _pid_alive(pid: int) -> bool:
+    """Best-effort liveness: signal-0 probe. EPERM ⇒ alive (owned by another user);
+    ESRCH ⇒ dead. Used only in the SAFE direction (a recycled pid that looks alive
+    just SKIPS a cleanup — a disk leak, never a deletion of live work)."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return True    # unknown → assume alive (never reap on ambiguity)
+    return True
+
+
+@contextmanager
+def _stage_lock(out_dir: str):
+    """SF1 — EXCLUSIVE whole-stage lock on `<out_dir>.lock`, serializing every
+    concurrent stager of the SAME out_dir (the unit of contention: the node derives
+    out_dir from the source fingerprint, and an explicit output_dir is one shared
+    target). Instance B BLOCKS until A finishes, then sees A's completed marker →
+    cache-hit — B can never reap A's live tmp nor read a half-swapped dir. Uses
+    flock (POSIX) / msvcrt.locking (Windows); the OS releases the lock automatically
+    when the holder dies, so a crashed holder never wedges the next run. The tiny
+    lockfile is left in place (unlinking it would race a waiter)."""
+    lock_path = out_dir + _STAGE_LOCK_SUFFIX
+    parent = os.path.dirname(lock_path) or "."
+    os.makedirs(parent, exist_ok=True)
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+    locked_msvcrt = False
+    try:
+        try:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except ImportError:                    # Windows
+            import msvcrt
+            msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+            locked_msvcrt = True
+        yield
+    finally:
+        try:
+            if locked_msvcrt:
+                import msvcrt
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            else:
+                try:
+                    import fcntl
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                except ImportError:
+                    pass
+        finally:
+            os.close(fd)
+
+
+def _cleanup_stale_dirs(out_dir: str) -> None:
+    """Reap leftovers of CRASHED runs — called ONLY while holding `_stage_lock`, so a
+    live concurrent stager (which holds the lock for its whole tmp lifetime) can never
+    be racing us; the pid-liveness gate is defense-in-depth for lock-less API callers
+    + pid reuse (a live/ambiguous pid ⇒ SKIP: leak-safe, never deletes live work).
+      * `<out_dir>.tmp-<pid>`   — ownership proof: contains `_TMP_SENTINEL`.
+      * `<out_dir>.trash-<pid>` — ownership proof: contains our completion marker
+        (it IS a previous complete stage renamed aside mid-swap, SF2).
+    A non-numeric suffix or a missing ownership proof ⇒ untouched (foreign dir)."""
     parent = os.path.dirname(out_dir) or "."
-    prefix = os.path.basename(out_dir) + ".tmp-"
+    base = os.path.basename(out_dir)
     if not os.path.isdir(parent):
         return
-    for name in os.listdir(parent):
-        cand = os.path.join(parent, name)
-        if (name.startswith(prefix) and os.path.isdir(cand)
-                and os.path.isfile(os.path.join(cand, _TMP_SENTINEL))):
-            logger.info("[comfyui_wan_remap] removing stale staging tmp %s", cand)
+    for kind, proof in ((".tmp-", _TMP_SENTINEL), (".trash-", ".qf_stage_complete")):
+        prefix = base + kind
+        for name in os.listdir(parent):
+            if not name.startswith(prefix):
+                continue
+            cand = os.path.join(parent, name)
+            if not (os.path.isdir(cand) and os.path.isfile(os.path.join(cand, proof))):
+                continue
+            try:
+                pid = int(name[len(prefix):])
+            except ValueError:
+                continue                        # not our naming — never touch
+            if pid != os.getpid() and _pid_alive(pid):
+                continue                        # possibly live → skip (leak-safe)
+            logger.info("[comfyui_wan_remap] removing stale staging dir %s", cand)
             shutil.rmtree(cand)
 
 
@@ -583,10 +657,15 @@ def _expert_basename_hint_check(high_expert: str, low_expert: str) -> None:
     filename convention every official release uses (`*high*` / `*low*`). Both hints
     present but REVERSED → raise (a swap silently degrades quality: the wrong expert
     denoises the wrong noise regime). Hints absent → warn once and proceed."""
+    def _hint_tokens(path):
+        # word-ish tokens (split on _ - . and spaces) so "flow"/"highway" can never
+        # false-match "low"/"high" — only a genuine high/low token counts (N3).
+        return set(re.split(r"[^a-z0-9]+", os.path.basename(path).lower()))
     hi_name = os.path.basename(high_expert).lower()
     lo_name = os.path.basename(low_expert).lower()
-    hi_says_low = "low" in hi_name and "high" not in hi_name
-    lo_says_high = "high" in lo_name and "low" not in lo_name
+    hi_toks, lo_toks = _hint_tokens(high_expert), _hint_tokens(low_expert)
+    hi_says_low = "low" in hi_toks and "high" not in hi_toks
+    lo_says_high = "high" in lo_toks and "low" not in lo_toks
     if hi_says_low and lo_says_high:
         raise RuntimeError(
             f"high/low experts look SWAPPED by filename: high_noise_expert={hi_name!r} "
@@ -692,97 +771,117 @@ def stage_two_expert(high_expert: str, low_expert: str, shared_dir: str,
 
     # Fingerprint the experts + the shared config files that get baked into the stage
     # (so an edit to a shared config invalidates the cache, not just a new dir mtime).
-    # The literal "dequant" keeps the fingerprint format stable from when a raw mode
-    # existed (dequant is now the only staging mode).
+    # "dequant" = a FIXED literal identifying the staging format in the fingerprint
+    # (kept stable across releases so existing staged caches keep hitting).
     fp_inputs = [high_expert, low_expert, shared_dir]
     for rel in ("model_index.json", "vae/config.json", "transformer/config.json"):
         fp_inputs.append(os.path.join(shared_dir, rel))
     fp = _fingerprint(fp_inputs, extra=f"{eff_boundary}|dequant|{in_ch}|{out_ch}")
     marker_name = ".qf_stage_complete"
     marker = os.path.join(out_dir, marker_name)
-    if not force and os.path.isfile(marker):
-        with open(marker, "r", encoding="utf-8") as f:
-            if f.read().strip() == fp:
-                logger.info("[comfyui_wan_remap] staged dir cache hit -> %s", out_dir)
-                return out_dir
 
-    # S4 — free-disk pre-check with the EXACT planned output bytes (fail with an
-    # actionable message instead of ENOSPC halfway through a 56 GB write).
-    need = (estimate_dequant_output_bytes(high_expert)
-            + estimate_dequant_output_bytes(low_expert) + _FREE_SPACE_MARGIN_BYTES)
-    space_probe = out_dir
-    while not os.path.isdir(space_probe):
-        parent = os.path.dirname(space_probe)
-        if parent == space_probe:
-            break
-        space_probe = parent
-    free = shutil.disk_usage(space_probe).free
-    if free < need:
-        raise RuntimeError(
-            f"not enough free disk for the staged A14B: need ~{need / 1024**3:.1f} GiB "
-            f"(dequantized experts + margin) but only {free / 1024**3:.1f} GiB free at "
-            f"{space_probe!r}. Point output_dir (or QUANTFUNC_CACHE_DIR) at a roomier disk.")
+    # SF1 — EXCLUSIVE whole-stage lock: everything from the cache-hit check to the
+    # final swap runs under `<out_dir>.lock`. A concurrent instance staging the same
+    # out_dir BLOCKS here until the holder finishes, then sees the completed marker
+    # and cache-hits — it can never reap the holder's live tmp (the old defect) nor
+    # observe a half-swapped dir. The lock dies with a crashed holder (flock).
+    with _stage_lock(out_dir):
+        if not force and os.path.isfile(marker):
+            with open(marker, "r", encoding="utf-8") as f:
+                if f.read().strip() == fp:
+                    logger.info("[comfyui_wan_remap] staged dir cache hit -> %s", out_dir)
+                    return out_dir
 
-    # S3 — ATOMIC staging: build in <out_dir>.tmp-<pid>, then os.replace into place.
-    _cleanup_stale_tmp_dirs(out_dir)
-    tmp_dir = f"{out_dir}.tmp-{os.getpid()}"
-    if os.path.isdir(tmp_dir):
-        # same-pid leftover (previous exception in this process) — ours by sentinel.
-        if os.path.isfile(os.path.join(tmp_dir, _TMP_SENTINEL)):
-            shutil.rmtree(tmp_dir)
-        else:
-            raise RuntimeError(f"staging tmp path {tmp_dir!r} exists and is not ours")
-    os.makedirs(tmp_dir)
-    with open(os.path.join(tmp_dir, _TMP_SENTINEL), "w", encoding="utf-8") as f:
-        f.write(fp)
+        # S4 — free-disk pre-check with the EXACT planned output bytes (fail with an
+        # actionable message instead of ENOSPC halfway through a 56 GB write).
+        need = (estimate_dequant_output_bytes(high_expert)
+                + estimate_dequant_output_bytes(low_expert) + _FREE_SPACE_MARGIN_BYTES)
+        space_probe = out_dir
+        while not os.path.isdir(space_probe):
+            parent = os.path.dirname(space_probe)
+            if parent == space_probe:
+                break
+            space_probe = parent
+        free = shutil.disk_usage(space_probe).free
+        if free < need:
+            raise RuntimeError(
+                f"not enough free disk for the staged A14B: need ~{need / 1024**3:.1f} GiB "
+                f"(dequantized experts + margin) but only {free / 1024**3:.1f} GiB free at "
+                f"{space_probe!r}. Point output_dir (or QUANTFUNC_CACHE_DIR) at a roomier disk.")
 
-    # -- transformers (base_xfm_cfg loaded early, before boundary resolution) --
-    for sub, src in (("transformer", high_expert), ("transformer_2", low_expert)):
-        d = os.path.join(tmp_dir, sub)
-        os.makedirs(d, exist_ok=True)
-        n_layers = _count_layers(_read_header(src))
-        cfg = synthesize_transformer_config(base_xfm_cfg, in_ch, out_ch, n_layers)
-        _dump_json(cfg, os.path.join(d, "config.json"))
-        weight_dst = os.path.join(d, "diffusion_pytorch_model.safetensors")
-        nk = remap_dequant_file(src, weight_dst)
-        logger.info("[comfyui_wan_remap] %s <- %s (remap+dequant, %d keys)",
-                    sub, os.path.basename(src), nk)
+        # S3 — ATOMIC staging: build in <out_dir>.tmp-<pid>, then swap into place.
+        # Under the lock, any leftover tmp/trash is from a CRASHED run (a live stager
+        # holds the lock for its tmp's whole lifetime) — reap the dead ones.
+        _cleanup_stale_dirs(out_dir)
+        tmp_dir = f"{out_dir}.tmp-{os.getpid()}"
+        if os.path.isdir(tmp_dir):
+            # same-pid leftover (previous exception in this process) — ours by sentinel.
+            if os.path.isfile(os.path.join(tmp_dir, _TMP_SENTINEL)):
+                shutil.rmtree(tmp_dir)
+            else:
+                raise RuntimeError(f"staging tmp path {tmp_dir!r} exists and is not ours")
+        os.makedirs(tmp_dir)
+        with open(os.path.join(tmp_dir, _TMP_SENTINEL), "w", encoding="utf-8") as f:
+            f.write(fp)
 
-    # -- shared components (dir symlink / copy) ----------------------------
-    for sub in _SHARED_SUBDIRS:
-        s2 = os.path.join(shared_dir, sub)
-        if os.path.isdir(s2):
-            _stage_shared_dir(s2, os.path.join(tmp_dir, sub))
+        # SF3 — this process's own tmp is reaped on ANY exception (no 56 GB orphan
+        # per crash); on success it has been renamed away and the guard is a no-op.
+        try:
+            # -- transformers (base_xfm_cfg loaded early, before boundary resolution) --
+            for sub, src in (("transformer", high_expert), ("transformer_2", low_expert)):
+                d = os.path.join(tmp_dir, sub)
+                os.makedirs(d, exist_ok=True)
+                n_layers = _count_layers(_read_header(src))
+                cfg = synthesize_transformer_config(base_xfm_cfg, in_ch, out_ch, n_layers)
+                _dump_json(cfg, os.path.join(d, "config.json"))
+                weight_dst = os.path.join(d, "diffusion_pytorch_model.safetensors")
+                nk = remap_dequant_file(src, weight_dst)
+                logger.info("[comfyui_wan_remap] %s <- %s (remap+dequant, %d keys)",
+                            sub, os.path.basename(src), nk)
 
-    # -- vae (link weights via the shared Windows-safe helper + fixed cfg) --
-    vae_src = os.path.join(shared_dir, "vae")
-    if os.path.isdir(vae_src):
-        vae_dst = os.path.join(tmp_dir, "vae")
-        os.makedirs(vae_dst, exist_ok=True)
-        for wf in os.listdir(vae_src):
-            if wf.endswith(".safetensors"):
-                link_or_copy(os.path.join(vae_src, wf), os.path.join(vae_dst, wf))
-        vae_cfg_path = os.path.join(vae_src, "config.json")
-        base_vae_cfg = _load_json(vae_cfg_path) if os.path.isfile(vae_cfg_path) else {}
-        _dump_json(synthesize_vae_config(base_vae_cfg),
-                   os.path.join(vae_dst, "config.json"))
+            # -- shared components (dir symlink / copy) ----------------------------
+            for sub in _SHARED_SUBDIRS:
+                s2 = os.path.join(shared_dir, sub)
+                if os.path.isdir(s2):
+                    _stage_shared_dir(s2, os.path.join(tmp_dir, sub))
 
-    # -- model_index --------------------------------------------------------
-    _dump_json(synthesize_model_index(base_mi, class_name, eff_boundary),
-               os.path.join(tmp_dir, "model_index.json"))
+            # -- vae (link weights via the shared Windows-safe helper + fixed cfg) --
+            vae_src = os.path.join(shared_dir, "vae")
+            if os.path.isdir(vae_src):
+                vae_dst = os.path.join(tmp_dir, "vae")
+                os.makedirs(vae_dst, exist_ok=True)
+                for wf in os.listdir(vae_src):
+                    if wf.endswith(".safetensors"):
+                        link_or_copy(os.path.join(vae_src, wf), os.path.join(vae_dst, wf))
+                vae_cfg_path = os.path.join(vae_src, "config.json")
+                base_vae_cfg = _load_json(vae_cfg_path) if os.path.isfile(vae_cfg_path) else {}
+                _dump_json(synthesize_vae_config(base_vae_cfg),
+                           os.path.join(vae_dst, "config.json"))
 
-    # Completion marker goes into the tmp dir LAST, sentinel comes OFF, then the
-    # atomic swap — the final path can only ever appear complete-with-marker.
-    os.unlink(os.path.join(tmp_dir, _TMP_SENTINEL))
-    with open(os.path.join(tmp_dir, marker_name), "w", encoding="utf-8") as f:
-        f.write(fp)
-    if os.path.isdir(out_dir):
-        # The dir passed _assert_safe_out_dir (empty, or OURS with a marker): remove
-        # the stale marker FIRST so no observer ever sees old-marker + mid-swap state.
-        if os.path.isfile(marker):
-            os.unlink(marker)
-        shutil.rmtree(out_dir)
-    os.replace(tmp_dir, out_dir)
+            # -- model_index --------------------------------------------------------
+            _dump_json(synthesize_model_index(base_mi, class_name, eff_boundary),
+                       os.path.join(tmp_dir, "model_index.json"))
+
+            # SF2 — CRASH-SAFE swap. Marker into tmp LAST (sentinel off), then:
+            #   old out_dir --atomic rename--> .trash-<pid>
+            #   tmp         --atomic rename--> out_dir
+            #   rmtree(.trash)
+            # A crash at ANY point leaves either the OLD complete dir or the NEW
+            # complete dir at some path with its marker — never a markerless partial
+            # (the leftover trash/tmp is pid-dead-reaped by the next run's cleanup).
+            os.unlink(os.path.join(tmp_dir, _TMP_SENTINEL))
+            with open(os.path.join(tmp_dir, marker_name), "w", encoding="utf-8") as f:
+                f.write(fp)
+            trash_dir = f"{out_dir}.trash-{os.getpid()}"
+            if os.path.isdir(out_dir):
+                os.replace(out_dir, trash_dir)   # old stage aside, atomically, marker intact
+            os.replace(tmp_dir, out_dir)         # new stage live, atomically
+            if os.path.isdir(trash_dir):
+                shutil.rmtree(trash_dir)
+        finally:
+            if os.path.isdir(tmp_dir):           # only on exception (success renamed it)
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+
     logger.info("[comfyui_wan_remap] staged two-expert %s dir (dequant-fp16, "
                 "boundary=%.3f [%s]) -> %s",
                 class_name, eff_boundary, boundary_src, out_dir)

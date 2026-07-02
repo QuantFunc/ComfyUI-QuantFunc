@@ -3,7 +3,7 @@
 Covers, CPU-only (no engine .so, no GPU):
   - remap_key(): original-Wan → diffusers key translation (spot checks).
   - is_comfyui_wan_single_file() / detect_wan_modality() on synthetic experts.
-  - stage_two_expert(): full staging (dequant + raw modes) into the two-expert
+  - stage_two_expert(): full staging (dequant; atomic lock+tmp+swap) into the two-expert
     diffusers layout — transformer/config channel+depth, remapped+dequant'd
     weights, transformer_2, shared symlinks, VAE absent-key fix, model_index
     with the engine-loadable _class_name ("WanPipeline" for BOTH modalities; the
@@ -474,8 +474,10 @@ def test_stage_atomic_no_tmp_leftover_and_stale_tmp_cleaned():
     shared = _make_shared_dir()
     parent = tempfile.mkdtemp(prefix="qfwan_atomicout_")
     out = os.path.join(parent, "stage")
-    # plant a stale aborted-run tmp dir (with our sentinel) + a foreign lookalike
-    stale = out + ".tmp-99999"
+    # plant a stale aborted-run tmp dir (with our sentinel, DEAD pid) + a foreign lookalike
+    import subprocess
+    _dead = subprocess.Popen(["true"]); _dead.wait()
+    stale = out + f".tmp-{_dead.pid}"
     os.makedirs(stale)
     open(os.path.join(stale, W._TMP_SENTINEL), "w").write("x")
     foreign = out + ".tmp-alien"
@@ -660,6 +662,152 @@ def test_stage_root_never_plugin_tree(monkeypatch):
     plugin_root = os.path.dirname(os.path.abspath(nodes.__file__))
     assert not root.startswith(plugin_root)
     assert os.path.basename(root) == "qf_wan_combined"
+
+
+# ------------------- SF1-SF3 concurrency + crash safety -------------------
+def _stage_in_child(high, low, shared, out, q):
+    """Child-process worker for the concurrency test (module-level for picklability)."""
+    try:
+        import importlib
+        Wm = importlib.import_module(f"{_PKG}.format_adapters.comfyui_wan_remap")
+        Wm.stage_two_expert(high, low, shared, out)
+        q.put("ok")
+    except Exception as e:  # noqa: BLE001
+        q.put(f"fail: {e}")
+
+
+@pytest.mark.skipif(not _HAS_TORCH, reason="needs torch")
+def test_concurrent_staging_same_out_dir_both_succeed():
+    """SF1 — THE defect: two PROCESSES staging the same out_dir concurrently. The
+    lock must serialize them (B waits, then cache-hits A's completed stage) — no
+    reap of a live tmp, no half-swapped dir, both succeed, no residue."""
+    import multiprocessing as mp
+    src = tempfile.mkdtemp(prefix="qfwan_conc_")
+    high = os.path.join(src, "high.safetensors")
+    low = os.path.join(src, "low.safetensors")
+    _write_expert(high)
+    _write_expert(low)
+    shared = _make_shared_dir()
+    parent = tempfile.mkdtemp(prefix="qfwan_concout_")
+    out = os.path.join(parent, "stage")
+    ctx = mp.get_context("fork")
+    q = ctx.Queue()
+    procs = [ctx.Process(target=_stage_in_child, args=(high, low, shared, out, q))
+             for _ in range(2)]
+    for pr in procs:
+        pr.start()
+    results = [q.get(timeout=120) for _ in procs]
+    for pr in procs:
+        pr.join(timeout=120)
+    assert results == ["ok", "ok"], results
+    # final dir intact + marker valid; zero tmp/trash/half-swap residue
+    assert os.path.isfile(os.path.join(out, ".qf_stage_complete"))
+    assert os.path.isfile(os.path.join(out, "transformer",
+                                       "diffusion_pytorch_model.safetensors"))
+    residue = [n for n in os.listdir(parent)
+               if ".tmp-" in n or ".trash-" in n]
+    assert residue == [], residue
+
+
+def test_cleanup_never_reaps_live_pid_tmp():
+    """SF1 defense-in-depth: a tmp dir owned by a LIVE pid is NEVER reaped by
+    `_cleanup_stale_dirs` (liveness gate), while a DEAD pid's tmp is."""
+    import subprocess, time as _t
+    parent = tempfile.mkdtemp(prefix="qfwan_live_")
+    out = os.path.join(parent, "stage")
+    live_proc = subprocess.Popen(["sleep", "30"])
+    try:
+        live_tmp = f"{out}.tmp-{live_proc.pid}"
+        os.makedirs(live_tmp)
+        open(os.path.join(live_tmp, W._TMP_SENTINEL), "w").write("x")
+        dead_proc = subprocess.Popen(["true"]); dead_proc.wait(); _t.sleep(0.05)
+        dead_tmp = f"{out}.tmp-{dead_proc.pid}"
+        os.makedirs(dead_tmp)
+        open(os.path.join(dead_tmp, W._TMP_SENTINEL), "w").write("x")
+        W._cleanup_stale_dirs(out)
+        assert os.path.isdir(live_tmp)          # live → skipped
+        assert not os.path.exists(dead_tmp)     # dead → reaped
+    finally:
+        live_proc.kill()
+
+
+@pytest.mark.skipif(not _HAS_TORCH, reason="needs torch")
+def test_crash_recovery_trash_and_tmp_reaped_then_stage_succeeds():
+    """SF2 — a crash mid-swap leaves `out.trash-<pid>` (old complete, marker inside)
+    and/or `out.tmp-<pid>` (sentinel inside) with NO out_dir. The next run must reap
+    both (dead pid) and stage successfully."""
+    import subprocess
+    src = tempfile.mkdtemp(prefix="qfwan_crash_")
+    high = os.path.join(src, "high.safetensors")
+    low = os.path.join(src, "low.safetensors")
+    _write_expert(high)
+    _write_expert(low)
+    shared = _make_shared_dir()
+    parent = tempfile.mkdtemp(prefix="qfwan_crashout_")
+    out = os.path.join(parent, "stage")
+    dead = subprocess.Popen(["true"]); dead.wait()
+    trash = f"{out}.trash-{dead.pid}"
+    os.makedirs(trash)
+    open(os.path.join(trash, ".qf_stage_complete"), "w").write("oldfp")
+    tmp = f"{out}.tmp-{dead.pid}"
+    os.makedirs(tmp)
+    open(os.path.join(tmp, W._TMP_SENTINEL), "w").write("x")
+    W.stage_two_expert(high, low, shared, out)
+    assert os.path.isfile(os.path.join(out, ".qf_stage_complete"))
+    assert not os.path.exists(trash)
+    assert not os.path.exists(tmp)
+
+
+@pytest.mark.skipif(not _HAS_TORCH, reason="needs torch")
+def test_own_tmp_reaped_on_exception():
+    """SF3 — an exception mid-build (disk full, simulated) leaves NO orphan tmp."""
+    import shutil as _sh
+    src = tempfile.mkdtemp(prefix="qfwan_sf3_")
+    high = os.path.join(src, "high.safetensors")
+    low = os.path.join(src, "low.safetensors")
+    _write_expert(high)
+    _write_expert(low)
+    shared = _make_shared_dir()
+    parent = tempfile.mkdtemp(prefix="qfwan_sf3out_")
+    out = os.path.join(parent, "stage")
+    # force a failure AFTER tmp creation: break remap by removing the low expert
+    # mid-flight is racy — instead patch _dump_json to raise on the model_index step.
+    orig = W.remap_dequant_file
+    def boom(*a, **k):
+        raise RuntimeError("simulated mid-build failure")
+    W.remap_dequant_file = boom
+    try:
+        with pytest.raises(RuntimeError, match="simulated"):
+            W.stage_two_expert(high, low, shared, out)
+    finally:
+        W.remap_dequant_file = orig
+    residue = [n for n in os.listdir(parent) if ".tmp-" in n]
+    assert residue == [], residue                # SF3: own tmp reaped
+    assert not os.path.exists(out)               # nothing half-staged at the final path
+
+
+def test_published_boundary_values_pinned():
+    """N1 — pin the published boundary VALUES (not just key presence): the module
+    constants must equal the official releases' model_index values (t2v 0.875 /
+    i2v 0.9); guarded cross-check against the REAL local i2v reference when present."""
+    assert W._PUBLISHED_BOUNDARY_T2V == 0.875
+    assert W._PUBLISHED_BOUNDARY_I2V == 0.9
+    ref = "/media/jonathan/Data/ComfyUI/models/diffusers/wan2.2-I2V-A14B-Diffusers/model_index.json"
+    if os.path.isfile(ref):
+        mi = json.load(open(ref))
+        assert mi["boundary_ratio"] == W._PUBLISHED_BOUNDARY_I2V
+
+
+def test_hint_check_tokenized_no_false_positive():
+    """N3 — 'flow'/'highway' substrings must NOT trigger the swap detector; genuine
+    reversed high/low tokens still raise."""
+    # no raise: hints are substrings of other words → treated as hint-less (warn only)
+    W._expert_basename_hint_check("/x/flow_expert.safetensors",
+                                  "/x/highway_expert.safetensors")
+    # genuine reversed tokens still raise
+    with pytest.raises(RuntimeError, match="SWAPPED"):
+        W._expert_basename_hint_check("/x/wan_low_noise.safetensors",
+                                      "/x/wan_high_noise.safetensors")
 
 
 # --------------------------- node registration ---------------------------
