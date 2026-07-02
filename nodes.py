@@ -2179,8 +2179,9 @@ class QuantFuncWanCombineExperts:
     `*_scaled` experts are dequantized to fp16 (the engine's Wan transformer
     factory does not yet consume fp8 inline); the Wan2.1 16-ch VAE config is
     absent-key-fixed. `boundary_ratio` defaults to AUTO (inherit the shared
-    model_index's published value, else t2v 0.875 / i2v 0.9 — the official
-    Wan-AI release values). Staging is cached (idempotent on identical sources),
+    model_index's published value when its modality matches the experts —
+    the boundary is modality-specific while the shared components are not —
+    else t2v 0.875 / i2v 0.9, the official Wan-AI release values). Staging is cached (idempotent on identical sources),
     atomic (tmp+rename — a concurrent/aborted run can never leave a partial dir
     that looks complete), and pre-checks free disk against the exact output size.
     """
@@ -2199,10 +2200,10 @@ class QuantFuncWanCombineExperts:
                 "boundary_ratio": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0,
                     "step": 0.005, "tooltip":
                     "Denoise fraction of the high→low expert switch. 0 = AUTO: "
-                    "inherit the shared model_index's published value when present, "
-                    "else the modality's published default (t2v 0.875 / i2v 0.9 — "
-                    "verified from the official Wan-AI A14B releases). Set >0 only "
-                    "to override the published value explicitly."}),
+                    "inherit the shared model_index's published value when its "
+                    "modality matches the experts (else the experts' published "
+                    "default: t2v 0.875 / i2v 0.9 — verified from the official "
+                    "Wan-AI A14B releases). Set >0 only to override explicitly."}),
             },
             "optional": {
                 "output_dir": ("STRING", {"default": "", "tooltip":

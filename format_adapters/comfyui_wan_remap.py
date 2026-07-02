@@ -504,15 +504,25 @@ def _assert_safe_out_dir(out_dir: str, protected: list[str]) -> None:
 
 
 def resolve_boundary_ratio(requested, base_model_index: dict | None,
-                           in_ch: int, out_ch: int) -> tuple[float, str]:
+                           in_ch: int, out_ch: int,
+                           shared_modality: tuple[int, int] | None = None
+                           ) -> tuple[float, str]:
     """Resolve the effective boundary_ratio + a provenance label.
 
     Precedence (C1 — never silently override the model's published value):
       1. explicit `requested` (user override) — must be in (0, 1]; 0/negative is
          REJECTED (the engine's `boundary_ratio > 0` gate would silently drop the
          28 GB low-noise expert — C2);
-      2. the shared model_index's own `boundary_ratio` (the published value);
-      3. the modality's published default (t2v 0.875 / i2v 0.9 — see constants).
+      2. the shared model_index's own `boundary_ratio` (the published value) —
+         inherited ONLY when the shared dir's modality matches the experts'
+         (`shared_modality` = the shared transformer config's (in,out) channels).
+         The boundary is MODALITY-SPECIFIC (t2v 0.875 vs i2v 0.9) while the shared
+         components (vae/TE/tokenizer/scheduler) are byte-identical across the two
+         A14B releases — so pairing t2v experts with the i2v diffusers dir is a
+         legitimate, common setup whose model_index carries the OTHER modality's
+         boundary. Inheriting it silently would be wrong → fall through to the
+         experts' own published default, with a loud warning;
+      3. the experts' modality's published default (t2v 0.875 / i2v 0.9).
     """
     if requested is not None:
         r = float(requested)
@@ -522,11 +532,22 @@ def resolve_boundary_ratio(requested, base_model_index: dict | None,
                 f"make the engine silently ignore the staged low-noise expert "
                 f"(single-expert gate). Use None/auto to inherit the published value.")
         return r, "explicit override"
+    experts_i2v = in_ch > out_ch
     if base_model_index:
         b = base_model_index.get("boundary_ratio")
         if isinstance(b, (int, float)) and 0.0 < float(b) <= 1.0:
-            return float(b), "inherited from shared model_index"
-    if in_ch > out_ch:
+            if (shared_modality is not None
+                    and (shared_modality[0] > shared_modality[1]) != experts_i2v):
+                logger.warning(
+                    "[comfyui_wan_remap] shared_components model_index carries "
+                    "boundary_ratio=%s but its transformer config is the OTHER "
+                    "modality (shared in/out=%s vs experts %s) — NOT inheriting; "
+                    "using the experts' published %s default instead.",
+                    b, shared_modality, (in_ch, out_ch),
+                    "i2v" if experts_i2v else "t2v")
+            else:
+                return float(b), "inherited from shared model_index"
+    if experts_i2v:
         return _PUBLISHED_BOUNDARY_I2V, "published i2v default"
     return _PUBLISHED_BOUNDARY_T2V, "published t2v default"
 
@@ -650,8 +671,18 @@ def stage_two_expert(high_expert: str, low_expert: str, shared_dir: str,
     # C1 — resolve the boundary BEFORE fingerprinting (it is baked into the stage).
     shared_mi = os.path.join(shared_dir, "model_index.json")
     base_mi = _load_json(shared_mi) if os.path.isfile(shared_mi) else None
+    # The shared dir's OWN modality (its transformer config channels) gates whether
+    # its published boundary_ratio may be inherited (modality-specific value).
+    base_xfm_cfg = {}
+    shared_xfm_cfg = os.path.join(shared_dir, "transformer", "config.json")
+    if os.path.isfile(shared_xfm_cfg):
+        base_xfm_cfg = _load_json(shared_xfm_cfg)
+    shared_modality = None
+    if isinstance(base_xfm_cfg.get("in_channels"), int) \
+            and isinstance(base_xfm_cfg.get("out_channels"), int):
+        shared_modality = (base_xfm_cfg["in_channels"], base_xfm_cfg["out_channels"])
     eff_boundary, boundary_src = resolve_boundary_ratio(
-        boundary_ratio, base_mi, in_ch, out_ch)
+        boundary_ratio, base_mi, in_ch, out_ch, shared_modality)
 
     # Safety: never let a mis-pointed / workflow-supplied output_dir clobber the
     # experts, the shared model, or a directory holding the user's own content.
@@ -705,11 +736,7 @@ def stage_two_expert(high_expert: str, low_expert: str, shared_dir: str,
     with open(os.path.join(tmp_dir, _TMP_SENTINEL), "w", encoding="utf-8") as f:
         f.write(fp)
 
-    # -- transformers ------------------------------------------------------
-    base_xfm_cfg = {}
-    shared_xfm_cfg = os.path.join(shared_dir, "transformer", "config.json")
-    if os.path.isfile(shared_xfm_cfg):
-        base_xfm_cfg = _load_json(shared_xfm_cfg)
+    # -- transformers (base_xfm_cfg loaded early, before boundary resolution) --
     for sub, src in (("transformer", high_expert), ("transformer_2", low_expert)):
         d = os.path.join(tmp_dir, sub)
         os.makedirs(d, exist_ok=True)

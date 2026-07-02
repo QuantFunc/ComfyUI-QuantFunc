@@ -544,24 +544,93 @@ def test_resolve_boundary_ratio_precedence():
         W.resolve_boundary_ratio(0.0, None, 16, 16)
     with pytest.raises(RuntimeError, match="invalid"):
         W.resolve_boundary_ratio(1.5, None, 16, 16)
+    # modality gate: a cross-modality shared dir's boundary is NOT inherited
+    v, srcl = W.resolve_boundary_ratio(None, {"boundary_ratio": 0.9}, 16, 16, (36, 16))
+    assert v == W._PUBLISHED_BOUNDARY_T2V and "t2v" in srcl
+    v, srcl = W.resolve_boundary_ratio(None, {"boundary_ratio": 0.875}, 36, 16, (16, 16))
+    assert v == W._PUBLISHED_BOUNDARY_I2V and "i2v" in srcl
+    # matching modality -> inherited; unknown shared modality -> inherited (trusted)
+    v, srcl = W.resolve_boundary_ratio(None, {"boundary_ratio": 0.85}, 16, 16, (16, 16))
+    assert v == 0.85 and "inherited" in srcl
+    v, srcl = W.resolve_boundary_ratio(None, {"boundary_ratio": 0.85}, 16, 16, None)
+    assert v == 0.85 and "inherited" in srcl
 
 
 @pytest.mark.skipif(not _HAS_TORCH, reason="needs torch")
 def test_stage_inherits_published_boundary_from_shared_model_index():
     """C1 — auto (boundary_ratio=None) inherits the shared model_index's published
-    value instead of silently overriding it."""
+    value when the shared dir's MODALITY MATCHES the experts'. Uses 0.85 (== no
+    published default) to prove genuine inheritance, and a t2v-shaped shared
+    transformer config matching the t2v synthetic experts."""
     src = tempfile.mkdtemp(prefix="qfwan_inh_")
     high = os.path.join(src, "high.safetensors")
     low = os.path.join(src, "low.safetensors")
     _write_expert(high)
     _write_expert(low)
     shared = _make_shared_dir()
-    json.dump({"_class_name": "WanPipeline", "boundary_ratio": 0.875},
+    json.dump({"_class_name": "WanTransformer3DModel", "in_channels": 16,
+               "out_channels": 16, "num_layers": 40},
+              open(os.path.join(shared, "transformer", "config.json"), "w"))
+    json.dump({"_class_name": "WanPipeline", "boundary_ratio": 0.85},
               open(os.path.join(shared, "model_index.json"), "w"))
     out = tempfile.mkdtemp(prefix="qfwan_inhout_") + "/stage"
     W.stage_two_expert(high, low, shared, out)              # auto
     mi = json.load(open(os.path.join(out, "model_index.json")))
-    assert mi["boundary_ratio"] == 0.875
+    assert mi["boundary_ratio"] == 0.85
+
+
+@pytest.mark.skipif(not _HAS_TORCH, reason="needs torch")
+def test_cross_modality_shared_dir_boundary_not_inherited():
+    """Generality NO-GO repro: t2v experts + an I2V-shaped shared dir (the common
+    real pairing — shared components are byte-identical across the A14B releases,
+    but its model_index carries the i2v boundary 0.9). AUTO must NOT inherit 0.9;
+    it must use the experts' published t2v default 0.875."""
+    src = tempfile.mkdtemp(prefix="qfwan_xmod_")
+    high = os.path.join(src, "high.safetensors")
+    low = os.path.join(src, "low.safetensors")
+    _write_expert(high, in_ch=16, out_ch=16)      # t2v experts
+    _write_expert(low, in_ch=16, out_ch=16)
+    shared = _make_shared_dir()                    # i2v-shaped (in=36,out=16)
+    json.dump({"_class_name": "WanImageToVideoPipeline", "boundary_ratio": 0.9},
+              open(os.path.join(shared, "model_index.json"), "w"))
+    out = tempfile.mkdtemp(prefix="qfwan_xmodout_") + "/stage"
+    W.stage_two_expert(high, low, shared, out)     # auto
+    mi = json.load(open(os.path.join(out, "model_index.json")))
+    assert mi["boundary_ratio"] == W._PUBLISHED_BOUNDARY_T2V   # 0.875, NOT 0.9
+    # and the reverse: i2v experts + a t2v-shaped shared dir carrying 0.875
+    src2 = tempfile.mkdtemp(prefix="qfwan_xmod2_")
+    h2 = os.path.join(src2, "high.safetensors")
+    l2 = os.path.join(src2, "low.safetensors")
+    _write_expert(h2, in_ch=36, out_ch=16)         # i2v experts
+    _write_expert(l2, in_ch=36, out_ch=16)
+    shared2 = _make_shared_dir()
+    json.dump({"_class_name": "WanTransformer3DModel", "in_channels": 16,
+               "out_channels": 16, "num_layers": 40},
+              open(os.path.join(shared2, "transformer", "config.json"), "w"))
+    json.dump({"_class_name": "WanPipeline", "boundary_ratio": 0.875},
+              open(os.path.join(shared2, "model_index.json"), "w"))
+    out2 = tempfile.mkdtemp(prefix="qfwan_xmod2out_") + "/stage"
+    W.stage_two_expert(h2, l2, shared2, out2)      # auto
+    mi2 = json.load(open(os.path.join(out2, "model_index.json")))
+    assert mi2["boundary_ratio"] == W._PUBLISHED_BOUNDARY_I2V  # 0.9, NOT 0.875
+
+
+@pytest.mark.skipif(not _HAS_TORCH, reason="needs torch")
+def test_unscaled_fp8_without_marker_dequants():
+    """A legitimately-unscaled fp8 file (no scaled_fp8 marker, no scale siblings)
+    still dequants via the bare fp8->fp16 cast (no scale requirement absent the
+    marker)."""
+    d = tempfile.mkdtemp(prefix="qfwan_unscaled_")
+    src = os.path.join(d, "u.safetensors")
+    f8 = torch.float8_e4m3fn
+    w8 = (torch.randn(8, 8) * 0.1).to(f8)
+    sd = {"patch_embedding.weight": torch.randn(8, 16, 1, 2, 2).half(),
+          "blocks.0.self_attn.q.weight": w8}     # no marker, no scale sibling
+    save_file(sd, src)
+    dst = os.path.join(d, "u.out.safetensors")
+    W.remap_dequant_file(src, dst)
+    out = load_file(dst)
+    assert torch.equal(out["blocks.0.attn1.to_q.weight"], w8.to(torch.float16))
 
 
 @pytest.mark.skipif(not _HAS_TORCH, reason="needs torch")
