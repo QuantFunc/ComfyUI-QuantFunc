@@ -667,8 +667,9 @@ def _cleanup_stale_dirs(out_dir: str) -> None:
     be racing us; the pid-liveness gate is defense-in-depth for lock-less API callers
     + pid reuse (a live/ambiguous pid ⇒ SKIP: leak-safe, never deletes live work).
       * `<out_dir>.tmp-<pid>`   — ownership proof: `_TMP_SENTINEL` OR our completion
-        marker (the sentinel comes OFF and the marker goes IN just before the swap,
-        so a crash in that window leaves a marker-only tmp — still OURS, still reapable).
+        marker (just before the swap the marker goes IN first, then the sentinel comes
+        OFF — the tmp carries >=1 proof at every instant; a crash mid-transition leaves
+        a marker-carrying — or briefly both-proof — tmp: still OURS, still reapable).
       * `<out_dir>.trash-<pid>` — ownership proof: our completion marker
         (it IS a previous complete stage renamed aside mid-swap, SF2).
     A non-numeric suffix or a missing ownership proof ⇒ untouched (foreign dir)."""
@@ -911,7 +912,7 @@ def stage_two_expert(high_expert: str, low_expert: str, shared_dir: str,
             _dump_json(synthesize_model_index(base_mi, class_name, eff_boundary),
                        os.path.join(tmp_dir, "model_index.json"))
 
-            # SF2 — CRASH-SAFE swap. Marker into tmp LAST (sentinel off), then:
+            # SF2 — CRASH-SAFE swap. Marker into tmp FIRST, sentinel off SECOND, then:
             #   old out_dir --atomic rename--> .trash-<pid>
             #   tmp         --atomic rename--> out_dir     (failure ⇒ ROLLBACK trash→out)
             #   rmtree(.trash)

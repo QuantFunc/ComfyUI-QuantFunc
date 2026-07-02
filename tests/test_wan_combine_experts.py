@@ -947,8 +947,9 @@ def test_marker_written_before_sentinel_removed(monkeypatch):
     def checking_unlink(path):
         if os.path.basename(path) == W._TMP_SENTINEL:
             # the marker must already be present in the same dir
-            assert os.path.isfile(os.path.join(os.path.dirname(path),
-                                               ".qf_stage_complete")),                 "sentinel removed BEFORE the marker was written (neither-proof window)"
+            marker_here = os.path.join(os.path.dirname(path), ".qf_stage_complete")
+            assert os.path.isfile(marker_here), (
+                "sentinel removed BEFORE the marker was written (neither-proof window)")
             seen["checked"] = True
         return real_unlink(path)
     monkeypatch.setattr(W.os, "unlink", checking_unlink)
