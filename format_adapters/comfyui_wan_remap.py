@@ -1001,33 +1001,35 @@ def stage_two_expert(high_expert: str, low_expert: str, shared_dir: str,
 # `is_comfyui_wan_single_file` / `detect_wan_modality` already perform.
 # ============================================================================
 
-# Wan2.2-A14B naming: a single-file expert set carries a `14b`/`a14b` size token
-# AND a `high`/`low` expert token; the standalone TI2V-5B (a single, non-A14B
-# model) carries `5b` and no high/low — excluded by requiring 14b + a high/low
-# hint and rejecting the 5b token.
-_A14B_SIZE_TOKENS = ("14b", "a14b")
+# Wan2.2-A14B naming: a single-file expert set carries a `high`/`low` expert token
+# (the real A14B signal — only A14B ships a high+low pair). The standalone TI2V-5B
+# (a single, non-A14B model) carries `5b` and no high/low — excluded both by the
+# high/low requirement and by rejecting the `5b` size token.
 _NON_A14B_SIZE_TOKENS = ("5b",)
 
 
 def _basename_tokens(path: str) -> set[str]:
     """Word-ish tokens of a basename (split on non-alphanumerics), lowercased —
     so `t2v`/`i2v`/`high`/`low`/`14b` match as whole tokens and e.g. `highway`
-    can never false-match `high` (mirrors `_expert_basename_hint_check`, N3)."""
+    can never false-match `high` (same tokenizer rule as `_expert_basename_hint_check`,
+    kept separate to leave that shipped function byte-unchanged, N3)."""
     return set(re.split(r"[^a-z0-9]+", os.path.basename(path).lower()))
 
 
 def _looks_like_a14b_single_file(path: str) -> bool:
-    """Filename PRE-FILTER (cheap, no header read): an A14B single-file expert
-    name carries a 14b/a14b size token + a high/low expert token, and NOT a 5b
-    token. Header confirmation (`is_comfyui_wan_single_file`) happens after."""
+    """Filename PRE-FILTER (cheap, no header read): a candidate A14B single-file
+    expert carries a high/low expert token (the real A14B signal — only A14B ships
+    a high+low pair; a single Wan2.1/TI2V-5B model has neither) and NOT a non-A14B
+    size token (`5b`). A `14b`/`a14b` size token is a bonus signal, NOT required, so
+    a RENAMED expert (e.g. `wan_high_noise.safetensors`) still detects. Header
+    confirmation (`is_comfyui_wan_single_file`) + weight-derived modality happen
+    after, and same-modality high+low pairing is what ultimately forms a set."""
     if not path.lower().endswith(".safetensors"):
         return False
     toks = _basename_tokens(path)
     if any(t in toks for t in _NON_A14B_SIZE_TOKENS):
         return False
-    has_size = any(t in toks for t in _A14B_SIZE_TOKENS)
-    has_expert = ("high" in toks) or ("low" in toks)
-    return has_size and has_expert
+    return ("high" in toks) or ("low" in toks)
 
 
 def _modality_str(in_ch: int, out_ch: int) -> str:
@@ -1052,15 +1054,23 @@ def _dir_has_shared_components(d: str) -> bool:
 
 
 def _diffusers_dir_is_loadable(model_index: dict | None) -> bool:
-    """A diffusers A14B dir is directly engine-loadable iff its model_index already
-    names the one class the engine's Wan family-detect accepts (`WanPipeline`) AND
-    carries a positive boundary_ratio (the engine's `boundary_ratio > 0` gate is
-    what enables the low-noise expert). Any other class (e.g. the published
-    `WanImageToVideoPipeline`) is NOT loadable as-is (PipelineLoader gates the
-    transformer_class fallback on an EMPTY pipeline_class) -> needs normalization."""
+    """A diffusers A14B dir is directly engine-loadable iff its model_index carries
+    (a) a `_class_name` in the Wan family AND (b) a positive `boundary_ratio`.
+
+    Matches the ENGINE'S ACTUAL gate (verified against live src/WanVideoPipeline.cpp
+    2026-07-02): `wan_detect` accepts ANY `Wan…`-prefixed pipeline class
+    (`in.pipeline_class.rfind("Wan", 0) == 0`) — not just `WanPipeline` — so the
+    published `WanImageToVideoPipeline` A14B checkpoint IS detected as Wan; and the
+    two-expert path engages purely on `boundary_ratio > 0` + a real
+    `transformer_2/config.json` (never re-reading `_class_name`). This dir's
+    transformer_2/ is already guaranteed by `_is_diffusers_a14b_dir`, so a real
+    downloaded A14B-Diffusers dir (Wan-prefixed class + published boundary) loads
+    AS-IS — no normalization. A dir with a non-Wan class OR a missing/zero
+    boundary_ratio is NOT loadable and is routed through `stage_a14b_diffusers`."""
     if not model_index:
         return False
-    if model_index.get("_class_name") != _ENGINE_WAN_PIPELINE_CLASS:
+    cls = model_index.get("_class_name")
+    if not isinstance(cls, str) or not cls.startswith("Wan"):
         return False
     br = model_index.get("boundary_ratio")
     return isinstance(br, (int, float)) and br > 0
@@ -1145,11 +1155,14 @@ def detect_wan_a14b_sets(roots: list[str]) -> list[dict]:
     #    diffusers dir (guarantees the 14B vae/text_encoder — a TI2V-5B dir has a
     #    DIFFERENT vae and would silently mis-decode a 14B expert). --
     def _pick_shared() -> str | None:
-        a14b = [c["dir"] for c in shared_candidates if c["is_a14b"]]
-        if a14b:
-            return sorted(a14b)[0]
-        any_shared = [c["dir"] for c in shared_candidates]
-        return sorted(any_shared)[0] if any_shared else None
+        a14b = sorted(c["dir"] for c in shared_candidates if c["is_a14b"])
+        pool = a14b or sorted(c["dir"] for c in shared_candidates)
+        if not pool:
+            return None
+        if len(pool) > 1:
+            logger.info("[comfyui_wan_remap] %d shared Wan diffusers dirs found; "
+                        "using %s (A14B-family preferred)", len(pool), pool[0])
+        return pool[0]
 
     shared_dir = _pick_shared()
 
@@ -1160,6 +1173,11 @@ def detect_wan_a14b_sets(roots: list[str]) -> list[dict]:
         by_mod.setdefault(sf["modality"], {"high": [], "low": []})[sf["expert"]].append(sf["path"])
     for mod in sorted(by_mod):
         highs, lows = sorted(by_mod[mod]["high"]), sorted(by_mod[mod]["low"])
+        if len(highs) > 1 or len(lows) > 1:
+            logger.info("[comfyui_wan_remap] %s A14B: multiple experts "
+                        "(high=%d low=%d) — pairing %s + %s", mod, len(highs),
+                        len(lows), os.path.basename(highs[0]) if highs else "-",
+                        os.path.basename(lows[0]) if lows else "-")
         if not highs or not lows:
             logger.info("[comfyui_wan_remap] %s A14B experts incomplete "
                         "(high=%d low=%d) — skipping", mod, len(highs), len(lows))
@@ -1193,13 +1211,17 @@ def stage_a14b_diffusers(src_dir: str, out_dir: str, *,
     A genuine diffusers A14B dir already carries the engine's native two-expert
     layout (transformer/ + transformer_2/ sharded diffusers weights + shared
     vae/text_encoder/tokenizer/scheduler), read directly via `ShardedSafeTensors`.
-    The ONLY blocker to a direct load is the published `model_index.json`
-    `_class_name` (e.g. `WanImageToVideoPipeline`) which the engine's Wan
-    family-detect rejects (it accepts only `WanPipeline`). This produces a staged
-    dir that SYMLINKS the source's expert + shared subdirs (weights byte-identical,
-    zero copy) and writes a corrected `model_index.json` (`_class_name=WanPipeline`
-    + a resolved positive `boundary_ratio`). NO weights are touched (no dequant/
-    remap) — it is a metadata + symlink normalization.
+    A real downloaded A14B-Diffusers dir (a `Wan…`-prefixed `_class_name` + a
+    published `boundary_ratio > 0`) is ALREADY loadable and is passed through
+    WITHOUT reaching here (`wan_detect` accepts any `Wan…` prefix; the two-expert
+    gate needs only `boundary_ratio > 0` + a real `transformer_2/`). This
+    normalization is the FALLBACK for a malformed dir — a NON-Wan `_class_name`, or
+    a missing/zero `boundary_ratio` — producing a staged dir that SYMLINKS the
+    source's expert + shared subdirs (weights byte-identical, zero copy) and writes
+    a corrected `model_index.json` (a Wan-prefixed `_class_name` — the source's own
+    when already Wan-prefixed, else `WanPipeline` — plus a resolved positive
+    `boundary_ratio`). NO weights are touched (no dequant/remap) — it is a metadata
+    + symlink normalization.
 
     Concurrency/crash-safe via the SAME primitives as `stage_two_expert`
     (`_stage_lock` / `_cleanup_stale_dirs` / marker+sentinel ownership), with the
@@ -1233,7 +1255,7 @@ def stage_a14b_diffusers(src_dir: str, out_dir: str, *,
     eff_boundary, boundary_src = resolve_boundary_ratio(
         boundary_ratio, base_mi, in_ch, out_ch, (in_ch, out_ch))
 
-    _assert_safe_out_dir(out_dir, [src_dir])
+    _assert_safe_out_dir(out_dir, [src_dir, os.path.dirname(src_dir)])
     fp_inputs = [src_dir]
     for rel in ("model_index.json", "transformer/config.json",
                 "transformer_2/config.json", "vae/config.json"):
@@ -1268,10 +1290,14 @@ def stage_a14b_diffusers(src_dir: str, out_dir: str, *,
                 s2 = os.path.join(src_dir, sub)
                 if os.path.isdir(s2):
                     _stage_shared_dir(s2, os.path.join(tmp_dir, sub))
-            # corrected model_index: engine-loadable class + resolved boundary,
-            # every other published key preserved.
+            # corrected model_index: a Wan-prefixed class (the engine detects any
+            # `Wan…` prefix — keep the source's own published class when it is
+            # already Wan-prefixed, else rewrite to the canonical WanPipeline) + a
+            # resolved positive boundary_ratio; every other published key preserved.
             mi = dict(base_mi) if base_mi else {}
-            mi["_class_name"] = _ENGINE_WAN_PIPELINE_CLASS
+            src_cls = mi.get("_class_name")
+            if not (isinstance(src_cls, str) and src_cls.startswith("Wan")):
+                mi["_class_name"] = _ENGINE_WAN_PIPELINE_CLASS
             mi["boundary_ratio"] = float(eff_boundary)
             _dump_json(mi, os.path.join(tmp_dir, "model_index.json"))
 

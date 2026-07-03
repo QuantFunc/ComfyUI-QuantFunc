@@ -137,16 +137,29 @@ def test_detect_skips_pair_without_shared_dir():
 
 
 def test_detect_diffusers_a14b_dir_and_loadable_flag():
-    not_loadable = _mk_diffusers_a14b(mi_class="WanImageToVideoPipeline", boundary=0.9)
-    sets = _by_name(W.detect_wan_a14b_sets([os.path.dirname(not_loadable)]))
-    nm = os.path.basename(not_loadable)
+    # a REAL download: a Wan…-prefixed class + a published boundary → loadable AS-IS
+    # (wan_detect accepts any "Wan" prefix; the two-expert gate needs only
+    # boundary_ratio>0 + transformer_2/ — verified against live WanVideoPipeline.cpp).
+    real = _mk_diffusers_a14b(mi_class="WanImageToVideoPipeline", boundary=0.9)
+    sets = _by_name(W.detect_wan_a14b_sets([os.path.dirname(real)]))
+    nm = os.path.basename(real)
     assert nm in sets and sets[nm]["kind"] == "diffusers_dir"
-    assert sets[nm]["loadable"] is False       # non-WanPipeline class → needs normalize
+    assert sets[nm]["loadable"] is True        # WanImageToVideoPipeline is a "Wan…" prefix
 
-    loadable = _mk_diffusers_a14b(name="wan-already-ok",
-                                  mi_class="WanPipeline", boundary=0.875)
-    sets2 = _by_name(W.detect_wan_a14b_sets([os.path.dirname(loadable)]))
-    assert sets2["wan-already-ok"]["loadable"] is True
+    # a plain WanPipeline is also loadable
+    ok = _mk_diffusers_a14b(name="wan-plain", mi_class="WanPipeline", boundary=0.875)
+    assert _by_name(W.detect_wan_a14b_sets([os.path.dirname(ok)]))["wan-plain"]["loadable"]
+
+    # missing boundary_ratio → the engine would load SINGLE-expert → NOT loadable
+    no_b = _mk_diffusers_a14b(name="wan-no-boundary",
+                              mi_class="WanImageToVideoPipeline", boundary=None)
+    assert _by_name(W.detect_wan_a14b_sets(
+        [os.path.dirname(no_b)]))["wan-no-boundary"]["loadable"] is False
+
+    # a non-Wan class → wan_detect's "Wan" prefix rejects → NOT loadable
+    bad = _mk_diffusers_a14b(name="mislabeled", mi_class="FooPipeline", boundary=0.9)
+    assert _by_name(W.detect_wan_a14b_sets(
+        [os.path.dirname(bad)]))["mislabeled"]["loadable"] is False
 
 
 def test_detect_5b_diffusers_not_flagged_a14b():
@@ -251,19 +264,20 @@ def test_auto_staged_model_dir_byte_identical_to_manual():
 # --------------------------------------------------------------------------- #
 # diffusers normalization + pass-through
 # --------------------------------------------------------------------------- #
-def test_normalize_diffusers_dir_rewrites_model_index_and_symlinks():
-    src = _mk_diffusers_a14b(mi_class="WanImageToVideoPipeline", boundary=0.9)
+def test_normalize_preserves_wan_prefix_class_and_adds_boundary():
+    # a Wan-prefixed dir MISSING boundary_ratio (not loadable) → normalize KEEPS the
+    # accurate published class and ADDS the resolved i2v boundary; weights symlinked.
+    src = _mk_diffusers_a14b(mi_class="WanImageToVideoPipeline", boundary=None)
     out = tempfile.mkdtemp(prefix="qfwan_norm_") + "/stage"
     model_dir = W.stage_a14b_diffusers(src, out, boundary_ratio=None)
 
     mi = json.load(open(os.path.join(model_dir, "model_index.json")))
-    assert mi["_class_name"] == "WanPipeline"      # normalized to the loadable class
-    assert mi["boundary_ratio"] == 0.9             # published i2v value inherited
+    assert mi["_class_name"] == "WanImageToVideoPipeline"   # Wan-prefix class preserved
+    assert mi["boundary_ratio"] == 0.9                      # published i2v default added
     # every engine-read subdir present; experts + shared symlinked to the source
     for sub in ("transformer", "transformer_2", "vae", "text_encoder",
                 "tokenizer", "scheduler"):
-        p = os.path.join(model_dir, sub)
-        assert os.path.isdir(p)
+        assert os.path.isdir(os.path.join(model_dir, sub))
     # weights byte-identical (symlink → same content as source)
     assert filecmp.cmp(
         os.path.join(model_dir, "transformer",
@@ -272,8 +286,20 @@ def test_normalize_diffusers_dir_rewrites_model_index_and_symlinks():
                      "diffusion_pytorch_model-00001-of-00001.safetensors"),
         shallow=False)
     # source model_index untouched (never mutate the user's model)
+    assert "boundary_ratio" not in json.load(open(os.path.join(src, "model_index.json")))
+
+
+def test_normalize_rewrites_non_wan_class_to_wanpipeline():
+    # a NON-Wan class (mislabeled) → normalize rewrites to the canonical WanPipeline.
+    src = _mk_diffusers_a14b(mi_class="FooPipeline", boundary=0.9)
+    out = tempfile.mkdtemp(prefix="qfwan_normc_") + "/stage"
+    model_dir = W.stage_a14b_diffusers(src, out, boundary_ratio=None)
+    mi = json.load(open(os.path.join(model_dir, "model_index.json")))
+    assert mi["_class_name"] == "WanPipeline"      # non-Wan → canonical loadable class
+    assert mi["boundary_ratio"] == 0.9
+    # source untouched
     assert json.load(open(os.path.join(src, "model_index.json")))["_class_name"] \
-        == "WanImageToVideoPipeline"
+        == "FooPipeline"
 
 
 def test_normalize_diffusers_dir_cache_hit():
@@ -287,8 +313,11 @@ def test_normalize_diffusers_dir_cache_hit():
 
 
 def test_resolve_loadable_diffusers_is_passthrough():
-    src = _mk_diffusers_a14b(name="wan-ready", mi_class="WanPipeline", boundary=0.875)
-    desc = _by_name(W.detect_wan_a14b_sets([os.path.dirname(src)]))["wan-ready"]
+    # the REAL download shape (WanImageToVideoPipeline + published boundary) is
+    # loadable AS-IS → resolve returns the dir itself, ZERO staging.
+    src = _mk_diffusers_a14b(name="wan-real-i2v",
+                             mi_class="WanImageToVideoPipeline", boundary=0.9)
+    desc = _by_name(W.detect_wan_a14b_sets([os.path.dirname(src)]))["wan-real-i2v"]
     assert desc["loadable"] is True
     out = tempfile.mkdtemp(prefix="qfwan_pt_") + "/stage"
     model_dir = W.resolve_wan_a14b_set(desc, out)
@@ -297,14 +326,15 @@ def test_resolve_loadable_diffusers_is_passthrough():
 
 
 def test_resolve_not_loadable_diffusers_normalizes():
-    src = _mk_diffusers_a14b(mi_class="WanImageToVideoPipeline", boundary=0.9)
+    # a not-loadable shape (missing boundary) → resolve normalizes it.
+    src = _mk_diffusers_a14b(mi_class="WanImageToVideoPipeline", boundary=None)
     desc = _by_name(W.detect_wan_a14b_sets([os.path.dirname(src)]))[os.path.basename(src)]
     assert desc["loadable"] is False
     out = tempfile.mkdtemp(prefix="qfwan_rn_") + "/stage"
     model_dir = W.resolve_wan_a14b_set(desc, out)
     assert model_dir == os.path.abspath(out)
-    assert json.load(open(os.path.join(model_dir, "model_index.json")))["_class_name"] \
-        == "WanPipeline"
+    mi = json.load(open(os.path.join(model_dir, "model_index.json")))
+    assert mi["_class_name"].startswith("Wan") and mi["boundary_ratio"] > 0
 
 
 def test_stage_a14b_diffusers_rejects_non_a14b():
@@ -374,3 +404,99 @@ def test_node_errors_on_stale_saved_value(monkeypatch):
     nodes.refresh_wan_a14b_sets()
     with pytest.raises(RuntimeError, match="no longer present"):
         nodes.QuantFuncWanCombineExpertsAuto().combine("wan2.2-t2v-A14B")
+
+
+# --------------------------------------------------------------------------- #
+# SHARED atomic-swap fault matrix — drives BOTH staging code paths
+# (stage_two_expert AND stage_a14b_diffusers) through the SAME crash points, so
+# the two copies of the hard-won marker-first / sentinel-off / swap_started
+# invariant can never silently diverge: a regression in either fails these.
+# --------------------------------------------------------------------------- #
+def _single_file_stage():
+    root = _mk_root(
+        ("wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors", 36, 16),
+        ("wan2.2_i2v_low_noise_14B_fp8_scaled.safetensors", 36, 16),
+    )
+    shared = _make_shared_dir()
+    desc = _by_name(W.detect_wan_a14b_sets([root, os.path.dirname(shared)]))["wan2.2-i2v-A14B"]
+    return lambda out, force=False: W.stage_two_expert(
+        desc["high"], desc["low"], desc["shared"], out, force=force)
+
+
+def _diffusers_stage():
+    src = _mk_diffusers_a14b(mi_class="WanImageToVideoPipeline", boundary=0.9)
+    return lambda out, force=False: W.stage_a14b_diffusers(src, out, force=force)
+
+
+_SWAP_PATHS = {"single_file": _single_file_stage, "diffusers": _diffusers_stage}
+
+
+@pytest.mark.skipif(not _HAS_TORCH, reason="needs torch")
+@pytest.mark.parametrize("path", sorted(_SWAP_PATHS))
+def test_swap_path_sentinel_unlink_failure_completes(path, monkeypatch, caplog):
+    """Both paths: a transient OSError on the sentinel unlink must NOT discard the
+    completed build (swap_started gates the reap OFF at the marker write) — the
+    stage COMPLETES, out_dir is valid + marker-carrying, a warning is logged."""
+    import logging as _logging
+    stage = _SWAP_PATHS[path]()
+    out = tempfile.mkdtemp(prefix=f"qfwan_fm_{path}_") + "/stage"
+    stage(out)                                    # baseline complete stage
+    real_unlink = os.unlink
+    def failing(p, *a, **k):
+        if isinstance(p, str) and os.path.basename(p) == W._TMP_SENTINEL:
+            raise OSError("simulated transient sentinel lock")
+        return real_unlink(p, *a, **k)
+    monkeypatch.setattr(W.os, "unlink", failing)
+    with caplog.at_level(_logging.WARNING):
+        stage(out, force=True)                    # must COMPLETE, not raise
+    monkeypatch.setattr(W.os, "unlink", real_unlink)
+    assert os.path.isfile(os.path.join(out, ".qf_stage_complete"))
+    assert any("staging sentinel" in r.message for r in caplog.records)
+    parent = os.path.dirname(out)
+    assert [n for n in os.listdir(parent) if ".tmp-" in n or ".trash-" in n] == []
+
+
+@pytest.mark.skipif(not _HAS_TORCH, reason="needs torch")
+@pytest.mark.parametrize("path", sorted(_SWAP_PATHS))
+def test_swap_path_marker_written_before_sentinel_removed(path, monkeypatch):
+    """Both paths: at the instant the tmp sentinel is unlinked, the completion
+    marker must ALREADY exist (>=1 ownership proof at every instant)."""
+    stage = _SWAP_PATHS[path]()
+    out = tempfile.mkdtemp(prefix=f"qfwan_ord_{path}_") + "/stage"
+    seen = {"checked": False}
+    real_unlink = os.unlink
+    def checking(p, *a, **k):
+        if isinstance(p, str) and os.path.basename(p) == W._TMP_SENTINEL:
+            assert os.path.isfile(os.path.join(os.path.dirname(p), ".qf_stage_complete")), \
+                "sentinel removed BEFORE the marker was written (neither-proof window)"
+            seen["checked"] = True
+        return real_unlink(p, *a, **k)
+    monkeypatch.setattr(W.os, "unlink", checking)
+    stage(out)
+    assert seen["checked"] and os.path.isfile(os.path.join(out, ".qf_stage_complete"))
+
+
+@pytest.mark.skipif(not _HAS_TORCH, reason="needs torch")
+@pytest.mark.parametrize("path", sorted(_SWAP_PATHS))
+def test_swap_path_swap_in_failure_rolls_back_old(path, monkeypatch):
+    """Both paths: a transient failure of the swap-in (tmp -> out_dir) rolls the
+    old stage back — out_dir is never left absent when a valid old stage existed."""
+    stage = _SWAP_PATHS[path]()
+    out = tempfile.mkdtemp(prefix=f"qfwan_swf_{path}_") + "/stage"
+    stage(out)                                    # old complete stage in place
+    old_marker = open(os.path.join(out, ".qf_stage_complete")).read()
+    real_replace = os.replace
+    failed = {"n": 0}
+    def transient(a, b):
+        # fail ONLY the swap-in (source is the .tmp- dir), and only once
+        if ".tmp-" in os.path.basename(a) and failed["n"] == 0:
+            failed["n"] = 1
+            raise OSError("simulated transient swap-in fault")
+        return real_replace(a, b)
+    monkeypatch.setattr(W.os, "replace", transient)
+    with pytest.raises(OSError, match="swap-in"):
+        stage(out, force=True)
+    monkeypatch.setattr(W.os, "replace", real_replace)
+    # rollback restored the OLD stage to the canonical path
+    assert os.path.isfile(os.path.join(out, ".qf_stage_complete"))
+    assert open(os.path.join(out, ".qf_stage_complete")).read() == old_marker
