@@ -282,3 +282,17 @@ def test_choices_recurses_into_subfolders():
     experts, shared = W.list_wan_a14b_choices([root])
     assert len(experts) == 2, f"nested experts missed: {list(experts)}"
     assert "wan2.2-I2V-A14B-Diffusers" in shared, f"nested shared dir missed: {list(shared)}"
+
+
+def test_choices_shared_only_dir_no_transformer():
+    # a STRIPPED Wan shared source — vae/ + text_encoder/ (+ tokenizer/scheduler) with
+    # a Wan vae config, but NO transformer/ and NO model_index.json — is still a valid
+    # shared choice (regression: an earlier os.walk gate wrongly dropped it).
+    root = tempfile.mkdtemp(prefix="qfsharedonly_")
+    d = os.path.join(root, "wan-shared-only")
+    for sub in ("vae", "text_encoder", "tokenizer", "scheduler"):
+        os.makedirs(os.path.join(d, sub))
+    json.dump({"_class_name": "AutoencoderKLWan"},
+              open(os.path.join(d, "vae", "config.json"), "w"))
+    _, shared = W.list_wan_a14b_choices([root])
+    assert "wan-shared-only" in shared, f"vae/te-only Wan shared dir dropped: {list(shared)}"

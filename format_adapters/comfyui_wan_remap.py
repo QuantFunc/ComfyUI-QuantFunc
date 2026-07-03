@@ -1121,20 +1121,27 @@ def list_wan_a14b_choices(roots: list[str]) -> tuple[dict, dict]:
         if not root or not os.path.isdir(root):
             continue
         for dirpath, subdirs, filenames in os.walk(root):
-            # A diffusers MODEL dir (has model_index.json, or a transformer/config.json)
-            # is a leaf for this scan: list it as a shared choice iff it's a Wan dir
-            # with vae/+text_encoder/, and PRUNE (don't recurse into model internals).
-            is_model_dir = ("model_index.json" in filenames
-                            or os.path.isfile(os.path.join(dirpath, "transformer",
-                                                           "config.json")))
-            if is_model_dir:
-                real_d = os.path.realpath(dirpath)
-                if real_d not in seen_d:
-                    seen_d.add(real_d)
-                    if _dir_has_shared_components(dirpath) and _is_wan_diffusers_dir(dirpath):
-                        (a14b_shared if _is_diffusers_a14b_dir(dirpath)
-                         else other_shared).append(dirpath)
-                subdirs[:] = []            # prune — never descend into a model dir
+            real_d = os.path.realpath(dirpath)
+            # A Wan diffusers dir that can supply the shared components (vae/ +
+            # text_encoder/) is a SHARED choice and a leaf — PRUNE. This is checked on
+            # EVERY visited dir, INDEPENDENT of whether it also looks like a full model
+            # dir: it covers both a full A14B dir AND a stripped vae/text_encoder-only
+            # shared source (which has neither transformer/ nor model_index.json but is
+            # still a valid Wan shared source per `_is_wan_diffusers_dir`'s vae signal).
+            if real_d not in seen_d and _dir_has_shared_components(dirpath) \
+                    and _is_wan_diffusers_dir(dirpath):
+                seen_d.add(real_d)
+                (a14b_shared if _is_diffusers_a14b_dir(dirpath)
+                 else other_shared).append(dirpath)
+                subdirs[:] = []            # a shared dir is a leaf — don't descend
+                continue
+            # A non-Wan diffusers MODEL dir (Qwen/ZImage/… — model_index.json, or a
+            # transformer/config.json) is a leaf too: PRUNE (don't descend into its
+            # internal sharded weights — they are diffusers-key, not single-file
+            # experts — and don't credit it as a Wan shared source).
+            if "model_index.json" in filenames \
+                    or os.path.isfile(os.path.join(dirpath, "transformer", "config.json")):
+                subdirs[:] = []
                 continue
             # Otherwise a plain dir: pick up any loose single-file Wan A14B experts.
             for name in sorted(filenames):
