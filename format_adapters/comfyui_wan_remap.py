@@ -988,3 +988,356 @@ def stage_two_expert(high_expert: str, low_expert: str, shared_dir: str,
                 "boundary=%.3f [%s]) -> %s",
                 class_name, eff_boundary, boundary_src, out_dir)
     return out_dir
+
+
+# ============================================================================
+# Auto-detection (frontend for the QuantFunc Wan Combine Experts (Auto) node)
+#
+# Pure filesystem scan that groups a machine's Wan2.2-A14B assets into named
+# "sets", each resolvable to an engine-loadable model_dir by DELEGATING to the
+# staging above (single-file pairs -> stage_two_expert; a diffusers A14B dir ->
+# pass-through when already loadable, else a minimal model_index normalization).
+# It writes NO weights and touches NO expert bytes beyond the cheap header reads
+# `is_comfyui_wan_single_file` / `detect_wan_modality` already perform.
+# ============================================================================
+
+# Wan2.2-A14B naming: a single-file expert set carries a `14b`/`a14b` size token
+# AND a `high`/`low` expert token; the standalone TI2V-5B (a single, non-A14B
+# model) carries `5b` and no high/low — excluded by requiring 14b + a high/low
+# hint and rejecting the 5b token.
+_A14B_SIZE_TOKENS = ("14b", "a14b")
+_NON_A14B_SIZE_TOKENS = ("5b",)
+
+
+def _basename_tokens(path: str) -> set[str]:
+    """Word-ish tokens of a basename (split on non-alphanumerics), lowercased —
+    so `t2v`/`i2v`/`high`/`low`/`14b` match as whole tokens and e.g. `highway`
+    can never false-match `high` (mirrors `_expert_basename_hint_check`, N3)."""
+    return set(re.split(r"[^a-z0-9]+", os.path.basename(path).lower()))
+
+
+def _looks_like_a14b_single_file(path: str) -> bool:
+    """Filename PRE-FILTER (cheap, no header read): an A14B single-file expert
+    name carries a 14b/a14b size token + a high/low expert token, and NOT a 5b
+    token. Header confirmation (`is_comfyui_wan_single_file`) happens after."""
+    if not path.lower().endswith(".safetensors"):
+        return False
+    toks = _basename_tokens(path)
+    if any(t in toks for t in _NON_A14B_SIZE_TOKENS):
+        return False
+    has_size = any(t in toks for t in _A14B_SIZE_TOKENS)
+    has_expert = ("high" in toks) or ("low" in toks)
+    return has_size and has_expert
+
+
+def _modality_str(in_ch: int, out_ch: int) -> str:
+    """Weight-derived modality label — the same signal the engine dispatches on
+    (i2v channel-concats the reference latents so in>out; t2v has in==out)."""
+    return "i2v" if in_ch > out_ch else "t2v"
+
+
+def _is_diffusers_a14b_dir(d: str) -> bool:
+    """A diffusers A14B dir is dual-expert: BOTH transformer/ and transformer_2/
+    carry a config.json. The TI2V-5B diffusers dir has a single transformer/ (no
+    transformer_2/) -> correctly excluded."""
+    return (os.path.isfile(os.path.join(d, "transformer", "config.json"))
+            and os.path.isfile(os.path.join(d, "transformer_2", "config.json")))
+
+
+def _dir_has_shared_components(d: str) -> bool:
+    """True if `d` can supply the shared vae/ + text_encoder/ a single-file pair
+    needs (the G1 minimum `stage_two_expert` enforces)."""
+    return (os.path.isdir(os.path.join(d, "vae"))
+            and os.path.isdir(os.path.join(d, "text_encoder")))
+
+
+def _diffusers_dir_is_loadable(model_index: dict | None) -> bool:
+    """A diffusers A14B dir is directly engine-loadable iff its model_index already
+    names the one class the engine's Wan family-detect accepts (`WanPipeline`) AND
+    carries a positive boundary_ratio (the engine's `boundary_ratio > 0` gate is
+    what enables the low-noise expert). Any other class (e.g. the published
+    `WanImageToVideoPipeline`) is NOT loadable as-is (PipelineLoader gates the
+    transformer_class fallback on an EMPTY pipeline_class) -> needs normalization."""
+    if not model_index:
+        return False
+    if model_index.get("_class_name") != _ENGINE_WAN_PIPELINE_CLASS:
+        return False
+    br = model_index.get("boundary_ratio")
+    return isinstance(br, (int, float)) and br > 0
+
+
+def detect_wan_a14b_sets(roots: list[str]) -> list[dict]:
+    """Scan `roots` (model dirs) for Wan2.2-A14B sets. Returns an ordered, unique
+    list of descriptors, each resolvable by `resolve_wan_a14b_set`:
+
+      single-file pair:
+        {"name","kind":"single_file_pair","modality","high","low","shared"}
+      diffusers A14B dir:
+        {"name","kind":"diffusers_dir","modality","dir","loadable"}
+
+    Detection is pure filesystem + cheap header reads. A single-file pair with no
+    resolvable shared Wan diffusers dir (no vae/text_encoder source) is DROPPED
+    with a log line (it can't be staged) rather than surfaced as unusable.
+    """
+    single_files: list[dict] = []      # {path, modality, expert('high'/'low')}
+    diffusers_dirs: list[dict] = []     # {name, dir, modality, loadable, shared}
+    shared_candidates: list[dict] = []  # {dir, is_a14b}
+    seen_files: set[str] = set()
+    seen_dirs: set[str] = set()
+
+    for root in roots:
+        if not root or not os.path.isdir(root):
+            continue
+        try:
+            entries = sorted(os.listdir(root))
+        except OSError as e:  # noqa: BLE001 — unreadable root, skip
+            logger.debug("detect_wan_a14b_sets: cannot list %s: %s", root, e)
+            continue
+        for name in entries:
+            full = os.path.join(root, name)
+            # -- single-file experts --
+            if os.path.isfile(full) and _looks_like_a14b_single_file(full):
+                real = os.path.realpath(full)
+                if real in seen_files:
+                    continue
+                try:
+                    if not is_comfyui_wan_single_file(full):
+                        continue
+                    in_ch, out_ch = detect_wan_modality(full)
+                except Exception as e:  # noqa: BLE001 — corrupt/partial, skip
+                    logger.debug("detect_wan_a14b_sets: header read failed %s: %s", full, e)
+                    continue
+                toks = _basename_tokens(full)
+                expert = "high" if "high" in toks and "low" not in toks else \
+                         "low" if "low" in toks and "high" not in toks else None
+                if expert is None:
+                    continue
+                seen_files.add(real)
+                single_files.append({"path": full, "modality": _modality_str(in_ch, out_ch),
+                                     "expert": expert})
+            # -- diffusers dirs (A14B set and/or shared source) --
+            elif os.path.isdir(full):
+                real = os.path.realpath(full)
+                if real in seen_dirs:
+                    continue
+                seen_dirs.add(real)
+                is_a14b = _is_diffusers_a14b_dir(full)
+                if _dir_has_shared_components(full):
+                    shared_candidates.append({"dir": full, "is_a14b": is_a14b})
+                if not is_a14b:
+                    continue
+                try:
+                    xcfg = _load_json(os.path.join(full, "transformer", "config.json"))
+                    in_ch = xcfg.get("in_channels"); out_ch = xcfg.get("out_channels")
+                    mod = _modality_str(in_ch, out_ch) if isinstance(in_ch, int) \
+                        and isinstance(out_ch, int) else "t2v"
+                    mi_path = os.path.join(full, "model_index.json")
+                    mi = _load_json(mi_path) if os.path.isfile(mi_path) else None
+                except Exception as e:  # noqa: BLE001
+                    logger.debug("detect_wan_a14b_sets: diffusers config read failed %s: %s", full, e)
+                    continue
+                diffusers_dirs.append({"name": os.path.basename(full.rstrip("/")),
+                                       "kind": "diffusers_dir", "modality": mod,
+                                       "dir": full,
+                                       "loadable": _diffusers_dir_is_loadable(mi)})
+
+    # -- resolve a shared dir for the single-file pairs: prefer an A14B-family
+    #    diffusers dir (guarantees the 14B vae/text_encoder — a TI2V-5B dir has a
+    #    DIFFERENT vae and would silently mis-decode a 14B expert). --
+    def _pick_shared() -> str | None:
+        a14b = [c["dir"] for c in shared_candidates if c["is_a14b"]]
+        if a14b:
+            return sorted(a14b)[0]
+        any_shared = [c["dir"] for c in shared_candidates]
+        return sorted(any_shared)[0] if any_shared else None
+
+    shared_dir = _pick_shared()
+
+    # -- pair single files by modality (one high + one low each) --
+    sets: list[dict] = []
+    by_mod: dict[str, dict[str, list[str]]] = {}
+    for sf in single_files:
+        by_mod.setdefault(sf["modality"], {"high": [], "low": []})[sf["expert"]].append(sf["path"])
+    for mod in sorted(by_mod):
+        highs, lows = sorted(by_mod[mod]["high"]), sorted(by_mod[mod]["low"])
+        if not highs or not lows:
+            logger.info("[comfyui_wan_remap] %s A14B experts incomplete "
+                        "(high=%d low=%d) — skipping", mod, len(highs), len(lows))
+            continue
+        if shared_dir is None:
+            logger.info("[comfyui_wan_remap] %s A14B single-file pair found but no "
+                        "shared Wan diffusers dir (vae/text_encoder) to stage it — "
+                        "skipping", mod)
+            continue
+        sets.append({"name": f"wan2.2-{mod}-A14B", "kind": "single_file_pair",
+                     "modality": mod, "high": highs[0], "low": lows[0],
+                     "shared": shared_dir})
+
+    # -- append diffusers A14B dirs (unique display names) --
+    used = {s["name"] for s in sets}
+    for d in diffusers_dirs:
+        nm = d["name"]
+        if nm in used:
+            nm = f"{nm} ({d['dir']})"
+        d = dict(d); d["name"] = nm
+        used.add(nm)
+        sets.append(d)
+    return sets
+
+
+def stage_a14b_diffusers(src_dir: str, out_dir: str, *,
+                         boundary_ratio: float | None = None,
+                         force: bool = False) -> str:
+    """Normalize a diffusers A14B dir into an engine-loadable model_dir.
+
+    A genuine diffusers A14B dir already carries the engine's native two-expert
+    layout (transformer/ + transformer_2/ sharded diffusers weights + shared
+    vae/text_encoder/tokenizer/scheduler), read directly via `ShardedSafeTensors`.
+    The ONLY blocker to a direct load is the published `model_index.json`
+    `_class_name` (e.g. `WanImageToVideoPipeline`) which the engine's Wan
+    family-detect rejects (it accepts only `WanPipeline`). This produces a staged
+    dir that SYMLINKS the source's expert + shared subdirs (weights byte-identical,
+    zero copy) and writes a corrected `model_index.json` (`_class_name=WanPipeline`
+    + a resolved positive `boundary_ratio`). NO weights are touched (no dequant/
+    remap) — it is a metadata + symlink normalization.
+
+    Concurrency/crash-safe via the SAME primitives as `stage_two_expert`
+    (`_stage_lock` / `_cleanup_stale_dirs` / marker+sentinel ownership), with the
+    same marker-first / sentinel-off / swap_started ordering — but WITHOUT the
+    heavy path's rollback-retry (there is no multi-GB build to protect: the source
+    is intact and a rebuild is millisecond-scale, so a swap-in failure just leaves
+    the old dir or an absent one that the next run instantly re-normalizes).
+    """
+    src_dir = os.path.abspath(src_dir)
+    out_dir = os.path.abspath(out_dir)
+    if not _is_diffusers_a14b_dir(src_dir):
+        raise RuntimeError(
+            f"not a diffusers A14B dir (need transformer/ + transformer_2/ with "
+            f"config.json): {src_dir}")
+    missing = [sub for sub in ("vae", "text_encoder")
+               if not os.path.isdir(os.path.join(src_dir, sub))]
+    if missing:
+        raise RuntimeError(
+            f"diffusers A14B dir {src_dir!r} is missing {missing} — it cannot "
+            f"supply the shared components the engine needs.")
+
+    base_mi_path = os.path.join(src_dir, "model_index.json")
+    base_mi = _load_json(base_mi_path) if os.path.isfile(base_mi_path) else None
+    xcfg = _load_json(os.path.join(src_dir, "transformer", "config.json"))
+    in_ch, out_ch = xcfg.get("in_channels"), xcfg.get("out_channels")
+    if not isinstance(in_ch, int) or not isinstance(out_ch, int):
+        raise RuntimeError(f"{src_dir}/transformer/config.json lacks integer "
+                           f"in_channels/out_channels")
+    # The dir's OWN modality IS the experts' modality here (single source), so the
+    # shared model_index's boundary is inherit-eligible (shared_modality matches).
+    eff_boundary, boundary_src = resolve_boundary_ratio(
+        boundary_ratio, base_mi, in_ch, out_ch, (in_ch, out_ch))
+
+    _assert_safe_out_dir(out_dir, [src_dir])
+    fp_inputs = [src_dir]
+    for rel in ("model_index.json", "transformer/config.json",
+                "transformer_2/config.json", "vae/config.json"):
+        fp_inputs.append(os.path.join(src_dir, rel))
+    fp = _fingerprint(fp_inputs, extra=f"{eff_boundary}|normalize|{in_ch}|{out_ch}")
+    marker_name = ".qf_stage_complete"
+    marker = os.path.join(out_dir, marker_name)
+
+    # Normalize the whole set of subdirs the engine reads (experts + shared).
+    _norm_subdirs = ("transformer", "transformer_2", "vae",
+                     "text_encoder", "tokenizer", "scheduler")
+
+    with _stage_lock(out_dir):
+        if not force and os.path.isfile(marker):
+            with open(marker, "r", encoding="utf-8") as f:
+                if f.read().strip() == fp:
+                    logger.info("[comfyui_wan_remap] normalized dir cache hit -> %s", out_dir)
+                    return out_dir
+        _cleanup_stale_dirs(out_dir)
+        tmp_dir = f"{out_dir}.tmp-{os.getpid()}"
+        if os.path.isdir(tmp_dir):
+            if os.path.isfile(os.path.join(tmp_dir, _TMP_SENTINEL)):
+                shutil.rmtree(tmp_dir)
+            else:
+                raise RuntimeError(f"staging tmp path {tmp_dir!r} exists and is not ours")
+        os.makedirs(tmp_dir)
+        with open(os.path.join(tmp_dir, _TMP_SENTINEL), "w", encoding="utf-8") as f:
+            f.write(fp)
+        swap_started = False
+        try:
+            for sub in _norm_subdirs:
+                s2 = os.path.join(src_dir, sub)
+                if os.path.isdir(s2):
+                    _stage_shared_dir(s2, os.path.join(tmp_dir, sub))
+            # corrected model_index: engine-loadable class + resolved boundary,
+            # every other published key preserved.
+            mi = dict(base_mi) if base_mi else {}
+            mi["_class_name"] = _ENGINE_WAN_PIPELINE_CLASS
+            mi["boundary_ratio"] = float(eff_boundary)
+            _dump_json(mi, os.path.join(tmp_dir, "model_index.json"))
+
+            # Marker FIRST, sentinel off SECOND, swap_started gated at the marker
+            # write (identical ownership-proof ordering to stage_two_expert's swap).
+            with open(os.path.join(tmp_dir, marker_name), "w", encoding="utf-8") as f:
+                f.write(fp)
+            swap_started = True
+            try:
+                os.unlink(os.path.join(tmp_dir, _TMP_SENTINEL))
+            except OSError as exc:
+                logger.warning(
+                    "[comfyui_wan_remap] could not remove the staging sentinel "
+                    "(%s) — proceeding; a stray %s file may remain (harmless).",
+                    exc, _TMP_SENTINEL)
+            trash_dir = f"{out_dir}.trash-{os.getpid()}"
+            old_moved = False
+            if os.path.isdir(out_dir):
+                os.replace(out_dir, trash_dir)
+                old_moved = True
+            try:
+                os.replace(tmp_dir, out_dir)
+            except BaseException:
+                # Single rollback attempt (metadata rename) — no retry loop: unlike
+                # the 56 GB dequant path there is nothing expensive to preserve, so
+                # a compound fault simply self-heals on the next (ms) re-normalize.
+                if old_moved and not os.path.isdir(out_dir):
+                    try:
+                        os.replace(trash_dir, out_dir)
+                    except OSError:
+                        logger.error(
+                            "[comfyui_wan_remap] normalize swap AND rollback failed "
+                            "— %s is absent; re-run to self-heal (the source %s is "
+                            "intact).", out_dir, src_dir)
+                raise
+            if old_moved and os.path.isdir(trash_dir):
+                shutil.rmtree(trash_dir, ignore_errors=True)
+        finally:
+            if not swap_started and os.path.isdir(tmp_dir):
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    logger.info("[comfyui_wan_remap] normalized diffusers A14B dir (%s, "
+                "boundary=%.3f [%s]) -> %s",
+                _ENGINE_WAN_PIPELINE_CLASS, eff_boundary, boundary_src, out_dir)
+    return out_dir
+
+
+def resolve_wan_a14b_set(descriptor: dict, out_dir: str, *,
+                         boundary_ratio: float | None = None,
+                         force: bool = False) -> str:
+    """Resolve a `detect_wan_a14b_sets` descriptor to an engine-loadable model_dir
+    by DELEGATING to the staging above — the auto node adds NO staging of its own.
+
+      single_file_pair -> stage_two_expert(high, low, shared, out_dir, ...)
+                          (byte-identical to the manual combine node's call)
+      diffusers_dir, already loadable -> the dir itself (zero staging)
+      diffusers_dir, not loadable    -> stage_a14b_diffusers(dir, out_dir, ...)
+    """
+    kind = descriptor.get("kind")
+    if kind == "single_file_pair":
+        return stage_two_expert(descriptor["high"], descriptor["low"],
+                                descriptor["shared"], out_dir,
+                                boundary_ratio=boundary_ratio, force=force)
+    if kind == "diffusers_dir":
+        if descriptor.get("loadable"):
+            return os.path.abspath(descriptor["dir"])
+        return stage_a14b_diffusers(descriptor["dir"], out_dir,
+                                    boundary_ratio=boundary_ratio, force=force)
+    raise RuntimeError(f"unknown Wan A14B set kind: {kind!r}")

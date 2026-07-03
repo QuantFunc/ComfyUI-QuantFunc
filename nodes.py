@@ -2254,6 +2254,178 @@ class QuantFuncWanCombineExperts:
 
 
 # ============================================================================
+# Node: QuantFunc Wan Combine Experts (Auto) — dropdown of scanned A14B sets
+# ============================================================================
+
+_WAN_A14B_NO_SETS = "[no Wan A14B sets found — scan roots empty]"
+_wan_a14b_sets_cache = None  # {display_name: descriptor} | None (unscanned)
+
+
+def _wan_a14b_scan_roots():
+    """Model dirs to scan for Wan A14B assets: the standard ComfyUI model folders
+    the experts/diffusers dirs live in (resolved via folder_paths so
+    extra_model_paths.yaml is honored) + the QuantFunc model_cache
+    ($QUANTFUNC_CACHE_DIR, else ~/model_cache). Deduped, existing dirs only."""
+    roots = []
+    try:
+        import folder_paths
+        for key in ("diffusion_models", "unet", "checkpoints", "diffusers"):
+            try:
+                roots.extend(folder_paths.get_folder_paths(key))
+            except Exception:  # noqa: BLE001 — a key not registered in this install
+                pass
+    except Exception:  # noqa: BLE001 — folder_paths unavailable (non-ComfyUI test)
+        pass
+    cache_env = os.environ.get("QUANTFUNC_CACHE_DIR") or \
+        os.path.join(os.path.expanduser("~"), "model_cache")
+    roots.append(cache_env)
+    seen, out = set(), []
+    for r in roots:
+        if not r:
+            continue
+        real = os.path.realpath(r)
+        if real in seen or not os.path.isdir(real):
+            continue
+        seen.add(real)
+        out.append(r)
+    return out
+
+
+def _get_wan_a14b_sets(force_rescan=False):
+    """Memoized {display_name: descriptor} of scanned Wan A14B sets. Pure
+    filesystem scan (delegates to comfyui_wan_remap.detect_wan_a14b_sets)."""
+    global _wan_a14b_sets_cache
+    if _wan_a14b_sets_cache is not None and not force_rescan:
+        return _wan_a14b_sets_cache
+    mapping = {}
+    try:
+        from .format_adapters.comfyui_wan_remap import detect_wan_a14b_sets
+        for desc in detect_wan_a14b_sets(_wan_a14b_scan_roots()):
+            mapping[desc["name"]] = desc
+    except Exception as e:  # noqa: BLE001 — never let a scan error break node load
+        logging.warning("[QuantFunc] Wan A14B auto-scan failed: %s", e)
+    _wan_a14b_sets_cache = mapping
+    return mapping
+
+
+def refresh_wan_a14b_sets():
+    """Drop the memo so the next INPUT_TYPES re-scans (dropdown refresh)."""
+    global _wan_a14b_sets_cache
+    _wan_a14b_sets_cache = None
+
+
+def _get_wan_a14b_dropdowns():
+    """Dropdown options for the Auto node. Never empty (ComfyUI would reject a
+    saved value not in the list) — a sentinel is offered when nothing is found."""
+    names = list(_get_wan_a14b_sets().keys())
+    return names if names else [_WAN_A14B_NO_SETS]
+
+
+class QuantFuncWanCombineExpertsAuto:
+    """Pick a scanned Wan2.2-A14B set from a dropdown → staged two-expert model_dir.
+
+    A zero-typing front-end for `QuantFunc Wan Combine Experts`: it scans the
+    ComfyUI model dirs + the QuantFunc model_cache, groups each detected A14B
+    asset into a named set, and offers them as a dropdown. On selection it
+    resolves the set to an engine-loadable `model_dir` (wire into `QuantFunc
+    Model Loader`) by DELEGATING to the exact same staging the manual node uses —
+    it adds NO staging/dequant/remap of its own:
+
+      * a single-file expert pair (high + low, same modality) + a same-family
+        shared Wan diffusers dir  ->  `stage_two_expert(...)` (byte-identical to
+        the manual node's call — the gen path is inherited unchanged);
+      * a diffusers A14B dir (transformer/ + transformer_2/): passed through
+        directly when already engine-loadable, else a metadata+symlink
+        `model_index` normalization (no weights touched).
+
+    Detection: single-file experts are paired by a `14b` + `high`/`low` filename
+    hint confirmed by the weights' own channels (t2v in==out, i2v in>out); the
+    TI2V-5B (no high/low, `5b`) is excluded; the shared dir prefers a 14B-family
+    (A14B) diffusers dir so a 5B VAE never mis-decodes a 14B expert. boundary_ratio
+    defaults to AUTO (t2v 0.875 / i2v 0.9, or the shared model_index's published
+    value when the modality matches). The manual node is unchanged and remains for
+    hand-entered paths / sets outside the scanned roots.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "wan_a14b_set": (_get_wan_a14b_dropdowns(), {"tooltip":
+                    "A Wan2.2-A14B set auto-detected under the ComfyUI model dirs "
+                    "+ QuantFunc model_cache. Selecting it stages (or passes "
+                    "through) an engine-loadable model_dir. Re-open the graph to "
+                    "rescan after adding files."}),
+            },
+            "optional": {
+                "boundary_ratio": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0,
+                    "step": 0.005, "tooltip":
+                    "High→low expert switch fraction. 0 = AUTO (inherit the shared "
+                    "model_index when its modality matches, else t2v 0.875 / i2v "
+                    "0.9). Set >0 only to override."}),
+                "output_dir": ("STRING", {"default": "", "tooltip":
+                    "Staging output dir (empty = $QUANTFUNC_CACHE_DIR, else ComfyUI "
+                    "temp — WIPED on restart → re-dequant). A staged A14B is ~56 GB; "
+                    "point at a roomy PERSISTENT disk. Unused for an already-loadable "
+                    "diffusers dir (passed through in place)."}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("model_dir",)
+    FUNCTION = "combine"
+    CATEGORY = "QuantFunc"
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, wan_a14b_set=None):
+        # The set list is scanned lazily and can differ from a saved workflow's
+        # value (files added/removed); resolve at run time with a clear error.
+        return True
+
+    def combine(self, wan_a14b_set, boundary_ratio=0.0, output_dir="", **kwargs):
+        from .format_adapters.comfyui_wan_remap import (
+            resolve_wan_a14b_set, _fingerprint)
+
+        if not wan_a14b_set or wan_a14b_set == _WAN_A14B_NO_SETS:
+            raise RuntimeError(
+                "QuantFunc Wan Combine Experts (Auto): no Wan A14B set selected / "
+                "none detected. Put the A14B experts (high+low single files) or a "
+                "diffusers A14B dir under the ComfyUI model dirs (diffusion_models/"
+                "unet/checkpoints/diffusers) or $QUANTFUNC_CACHE_DIR, then reopen "
+                "the graph — or use the manual 'QuantFunc Wan Combine Experts' node.")
+
+        # Re-scan at run time (a memo miss re-detects) so a set added since the
+        # graph opened still resolves; fail loud if the saved name is gone.
+        sets = _get_wan_a14b_sets(force_rescan=True)
+        desc = sets.get(wan_a14b_set)
+        if desc is None:
+            raise RuntimeError(
+                f"QuantFunc Wan Combine Experts (Auto): set {wan_a14b_set!r} is no "
+                f"longer present under the scan roots (available: "
+                f"{sorted(sets) or 'none'}). Reopen the graph to refresh the list.")
+
+        # 0 = AUTO (module resolves); an explicit >0 value is an override.
+        boundary = float(boundary_ratio) if boundary_ratio and boundary_ratio > 0 \
+            else None
+
+        out = (output_dir or "").strip()
+        if not out:
+            # Same persistent-cache default + fingerprint scheme as the manual node,
+            # keyed on the resolved sources so equivalent inputs share a staged dir.
+            if desc["kind"] == "single_file_pair":
+                key_paths = [os.path.abspath(desc["high"]), os.path.abspath(desc["low"]),
+                             os.path.abspath(desc["shared"])]
+            else:
+                key_paths = [os.path.abspath(desc["dir"])]
+            fp = _fingerprint(key_paths, extra="{}".format(boundary))
+            out = os.path.join(_wan_combine_stage_root(), fp)
+
+        model_dir = resolve_wan_a14b_set(desc, out, boundary_ratio=boundary)
+        logging.info("[QuantFunc] Wan A14B set %r -> %s", wan_a14b_set, model_dir)
+        return (model_dir,)
+
+
+# ============================================================================
 # Node: QuantFunc Model Auto Loader
 # ============================================================================
 
@@ -4889,6 +5061,7 @@ NODE_CLASS_MAPPINGS = {
     "QuantFuncPipelineConfig": QuantFuncPipelineConfig,
     "QuantFuncModelLoader": QuantFuncModelLoader,
     "QuantFuncWanCombineExperts": QuantFuncWanCombineExperts,
+    "QuantFuncWanCombineExpertsAuto": QuantFuncWanCombineExpertsAuto,
     "QuantFuncModelAutoLoader": QuantFuncModelAutoLoader,
     # QuantFuncBuildPipeline lives in nodes_format_adapters.py (one canonical
     # implementation; loaded after this map → __init__.py's update() lifts it
@@ -4918,6 +5091,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "QuantFuncPipelineConfig": "QuantFunc Pipeline Config",
     "QuantFuncModelLoader": "QuantFunc Model Loader",
     "QuantFuncWanCombineExperts": "QuantFunc Wan Combine Experts (A14B two-transformer)",
+    "QuantFuncWanCombineExpertsAuto": "QuantFunc Wan Combine Experts (Auto)",
     "QuantFuncModelAutoLoader": "QuantFunc Model Auto Loader",
     # QuantFuncBuildPipeline display name is set in nodes_format_adapters.py.
     "QuantFuncPrequantAutoLoader": "QuantFunc Prequant Auto Loader",
