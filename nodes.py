@@ -4679,12 +4679,11 @@ class QuantFuncGenerateVideo:
             "hidden": {"unique_id": "UNIQUE_ID"},
         }
 
-    # frames (IMAGE) — universal, for upscale/interpolate/preview; audio (AUDIO) —
-    # None for Wan, the vocoder track for LTX-2; video (VIDEO) — a native ComfyUI
-    # VIDEO so it plugs STRAIGHT into the core `Save Video` node in one wire (no
-    # `Create Video` bridge). `Video Combine` / `Preview Image` still take `frames`.
-    RETURN_TYPES = ("IMAGE", "AUDIO", "VIDEO")
-    RETURN_NAMES = ("frames", "audio", "video")
+    # SOLE output `video` (native ComfyUI VIDEO) → plugs STRAIGHT into the core
+    # `Save Video` node in one wire (frames + audio are packed inside it; extract
+    # them downstream with the native `Get Video Components` node if needed).
+    RETURN_TYPES = ("VIDEO",)
+    RETURN_NAMES = ("video",)
     FUNCTION = "generate_video"
     CATEGORY = "QuantFunc"
 
@@ -4764,25 +4763,27 @@ class QuantFuncGenerateVideo:
         if audio is not None:
             wav = torch.from_numpy(audio["waveform"]).unsqueeze(0)  # [1, C, N]
             audio_out = {"waveform": wav, "sample_rate": int(audio["sample_rate"])}
+        # frames + audio (computed above) are packed INTO the single VIDEO output.
         video_out = _frames_to_video(image, audio_out, fps)
-        return (image, audio_out, video_out)
+        return (video_out,)
 
 
 def _frames_to_video(image, audio_out, fps):
-    """Wrap the IMAGE frame batch (+ optional AUDIO) as a native ComfyUI VIDEO so the
-    node's `video` output plugs STRAIGHT into the core `Save Video` node (one wire,
-    no `Create Video`). Graceful: returns None on an older ComfyUI without the VIDEO
-    API — `frames`/`audio` are still emitted, so `Video Combine`/`Create Video` work."""
+    """Pack the frame batch (+ optional AUDIO) into a native ComfyUI VIDEO — the
+    node's SOLE output — so `video → Save Video` is one wire. Built exactly like the
+    core `Create Video` node. On a ComfyUI too old to have the VIDEO type this warns
+    and returns None (the output is then unusable — update ComfyUI); a genuine
+    VideoComponents/VideoFromComponents construction error is NOT swallowed."""
     try:
         from comfy_api.input_impl import VideoFromComponents
         from comfy_api.latest import VideoComponents
-        from fractions import Fraction
-        return VideoFromComponents(VideoComponents(
-            images=image, audio=audio_out, frame_rate=Fraction(float(fps) or 24.0)))
-    except Exception as e:  # noqa: BLE001 — ComfyUI without the native VIDEO type
-        logging.debug("[QuantFunc] native VIDEO output unavailable (%s); "
-                      "frames/audio still emitted", e)
+    except ImportError as e:
+        logging.warning("[QuantFunc] this ComfyUI lacks the native VIDEO type (%s) — "
+                        "update ComfyUI to use the Generate Video 'video' output.", e)
         return None
+    from fractions import Fraction
+    return VideoFromComponents(VideoComponents(
+        images=image, audio=audio_out, frame_rate=Fraction(float(fps) or 24.0)))
 
 
 def _encode_video_preview(frames_u8, fps, audio, out_path, container_fmt):

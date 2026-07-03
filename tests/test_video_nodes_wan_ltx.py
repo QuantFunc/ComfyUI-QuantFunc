@@ -157,17 +157,26 @@ def test_generate_video_t2v_no_first_frame():
     old = _patch_manager(mgr)
     try:
         node = nodes.QuantFuncGenerateVideo()
-        img, audio, _video = node.generate_video(
-            pipeline={"model_dir": d, "options": {}}, prompt="a cat",
-            width=64, height=64, length=5, fps=24.0, steps=4,
-            guidance_scale=4.0, seed=1)
+        cap = {}
+        old_f2v = nodes._frames_to_video
+        nodes._frames_to_video = lambda im, au, f: (cap.update(img=im, aud=au, fps=f)
+                                                    or "VIDEO")
+        try:
+            out = node.generate_video(
+                pipeline={"model_dir": d, "options": {}}, prompt="a cat",
+                width=64, height=64, length=5, fps=24.0, steps=4,
+                guidance_scale=4.0, seed=1)
+        finally:
+            nodes._frames_to_video = old_f2v
+        assert out == ("VIDEO",)                        # SOLE video output
         kinds = [c[0] for c in mgr.calls]
         assert "text_to_video" in kinds and "image_to_video" not in kinds
         call = dict(mgr.calls[[c[0] for c in mgr.calls].index("text_to_video")][1])
         assert call["num_frames"] == 5
         assert json.loads(call["options_json"])["fps"] == 24.0
-        assert audio is None
-        assert img.shape[0] == 5
+        # frames + audio are what get packed INTO the VIDEO
+        assert cap["aud"] is None                        # Wan → silent VIDEO
+        assert cap["img"].shape[0] == 5                  # 5 frames packed in
     finally:
         _patch_manager(old)
 
@@ -257,11 +266,19 @@ def test_generate_video_ltx_audio_passthrough():
     old = _patch_manager(mgr)
     try:
         node = nodes.QuantFuncGenerateVideo()
-        _img, audio_out, _video = node.generate_video(
-            pipeline={"model_dir": d, "options": {}}, prompt="x",
-            width=64, height=64, length=3, fps=24.0, steps=4,
-            guidance_scale=4.0, seed=1)
-        assert audio_out is not None and audio_out["sample_rate"] == 16000
+        cap = {}
+        old_f2v = nodes._frames_to_video
+        nodes._frames_to_video = lambda im, au, f: cap.update(aud=au) or "VIDEO"
+        try:
+            out = node.generate_video(
+                pipeline={"model_dir": d, "options": {}}, prompt="x",
+                width=64, height=64, length=3, fps=24.0, steps=4,
+                guidance_scale=4.0, seed=1)
+        finally:
+            nodes._frames_to_video = old_f2v
+        assert out == ("VIDEO",)
+        # the LTX audio track is what gets muxed into the VIDEO
+        assert cap["aud"] is not None and cap["aud"]["sample_rate"] == 16000
     finally:
         _patch_manager(old)
         _torch.from_numpy = old_from
@@ -322,7 +339,8 @@ def test_generate_video_input_types_have_i2v_and_fps():
     # fps is OPTIONAL (backward-compat: a pre-#344 saved prompt has no fps key and
     # ComfyUI validate_inputs would hard-fail a missing REQUIRED input).
     assert "fps" in it["optional"] and "fps" not in it["required"]
-    assert nodes.QuantFuncGenerateVideo.RETURN_TYPES == ("IMAGE", "AUDIO", "VIDEO")
+    assert nodes.QuantFuncGenerateVideo.RETURN_TYPES == ("VIDEO",)
+    assert nodes.QuantFuncGenerateVideo.RETURN_NAMES == ("video",)
 
 
 def test_generate_video_callable_without_fps():
@@ -640,3 +658,23 @@ if __name__ == "__main__":
             traceback.print_exc()
     print(f"\n{passed}/{len(fns)} passed")
     sys.exit(0 if passed == len(fns) else 1)
+
+
+def test_frames_to_video_builds_real_video_when_api_present():
+    # When the ComfyUI native VIDEO API is importable, _frames_to_video builds a real
+    # VIDEO (not the None fallback) carrying the frames + audio + fps. Skips in a bare
+    # test env without comfy_api (the fallback path is covered by the tests above).
+    try:
+        import comfy_api.input_impl  # noqa: F401
+        from comfy_api.latest import VideoComponents  # noqa: F401
+    except Exception:
+        import pytest as _pt; _pt.skip("comfy_api (native VIDEO type) not available")
+    import torch as _t
+    img = _t.zeros(3, 8, 8, 3)
+    aud = {"waveform": _t.zeros(1, 2, 100), "sample_rate": 16000}
+    v = nodes._frames_to_video(img, aud, 24.0)
+    assert v is not None
+    comp = v.get_components()
+    assert comp.images.shape[0] == 3                      # 3 frames packed in
+    assert int(comp.frame_rate) == 24
+    assert comp.audio is not None and comp.audio["sample_rate"] == 16000
