@@ -4610,6 +4610,14 @@ class QuantFuncLatentPreview:
         return {}
 
 
+# The Wan/LTX video denoise honors options_json["sampler"] via the engine's
+# makeConfiguredSampler → these are the names parseSamplerType (src/Sampler.cpp)
+# accepts, so every one is guaranteed loadable (an unknown name throws at the
+# C-API). Default "euler" matches the official Wan2.2 template.
+_WAN_VIDEO_SAMPLERS = ("euler", "dpmpp_2m", "dpmpp_2m_sde",
+                       "euler_ancestral", "heun", "ddim")
+
+
 class QuantFuncGenerateVideo:
     """Wan / LTX video generation (text-to-video, + image-to-video on capable
     checkpoints). Outputs the frame batch as ComfyUI IMAGE and, for AV models
@@ -4668,6 +4676,13 @@ class QuantFuncGenerateVideo:
                 # array never lands a value here (falls to the method default 24.0).
                 "fps": ("FLOAT", {"default": 24.0, "min": 1.0, "max": 60.0, "step": 1.0,
                     "tooltip": "Playback fps (rides in options_json; Wan + LTX both read it)."}),
+                # sampler APPENDED after fps (new slot) — old saved graphs keep their
+                # slots; cfg is `guidance_scale` above; shift defaults to the model's
+                # own flow_shift (Wan 5.0, same as the official ModelSamplingSD3).
+                "sampler": (list(_WAN_VIDEO_SAMPLERS), {"default": "euler",
+                    "tooltip": "Denoise sampler (rides in options_json; the engine's "
+                    "Wan/LTX video path honors it). euler = the official Wan default; "
+                    "dpmpp_2m / dpmpp_2m_sde are common alternatives."}),
                 # `start_image` = the first-frame condition (ComfyUI Wan i2v convention,
                 # cf. the core WanImageToVideo `start_image` input). IMAGE = a socket, not
                 # a widget → does not consume a widgets_values slot.
@@ -4688,7 +4703,7 @@ class QuantFuncGenerateVideo:
     CATEGORY = "QuantFunc"
 
     def generate_video(self, pipeline, prompt, width, height, length, steps,
-                       guidance_scale, seed, fps=24.0,
+                       guidance_scale, seed, fps=24.0, sampler="euler",
                        negative_prompt="", start_image=None, unique_id=None):
         import torch
         # `length` was renamed IN PLACE from the old required `num_frames` (same widget
@@ -4704,6 +4719,8 @@ class QuantFuncGenerateVideo:
         opts = {}
         if fps and float(fps) > 0.0:
             opts["fps"] = float(fps)
+        if sampler and sampler in _WAN_VIDEO_SAMPLERS:
+            opts["sampler"] = sampler        # engine reads options_json["sampler"]
         neg = negative_prompt if (isinstance(negative_prompt, str) and negative_prompt) else ""
         if neg:
             opts["negative_prompt"] = neg

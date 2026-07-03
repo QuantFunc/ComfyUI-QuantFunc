@@ -678,3 +678,26 @@ def test_frames_to_video_builds_real_video_when_api_present():
     assert comp.images.shape[0] == 3                      # 3 frames packed in
     assert int(comp.frame_rate) == 24
     assert comp.audio is not None and comp.audio["sample_rate"] == 16000
+
+
+def test_generate_video_sampler_rides_options_json():
+    # a picked sampler is forwarded into options_json (the engine reads it there);
+    # an unknown/default one is handled cleanly. Output is the sole VIDEO.
+    d = _make_model_dir(class_name="WanPipeline")
+    mgr = _FakeManager(n=5)
+    old = _patch_manager(mgr)
+    old_f2v = nodes._frames_to_video
+    nodes._frames_to_video = lambda im, au, f: "VIDEO"
+    try:
+        node = nodes.QuantFuncGenerateVideo()
+        out = node.generate_video(
+            pipeline={"model_dir": d, "options": {}}, prompt="a cat",
+            width=64, height=64, length=5, fps=24.0, steps=4,
+            guidance_scale=1.0, seed=1, sampler="dpmpp_2m")
+        assert out == ("VIDEO",)
+        call = dict(mgr.calls[[c[0] for c in mgr.calls].index("text_to_video")][1])
+        opts = json.loads(call["options_json"])
+        assert opts["sampler"] == "dpmpp_2m"           # rides in options_json
+    finally:
+        nodes._frames_to_video = old_f2v
+        _patch_manager(old)
