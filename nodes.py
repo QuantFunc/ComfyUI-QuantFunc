@@ -4679,8 +4679,12 @@ class QuantFuncGenerateVideo:
             "hidden": {"unique_id": "UNIQUE_ID"},
         }
 
-    RETURN_TYPES = ("IMAGE", "AUDIO")
-    RETURN_NAMES = ("frames", "audio")
+    # frames (IMAGE) — universal, for upscale/interpolate/preview; audio (AUDIO) —
+    # None for Wan, the vocoder track for LTX-2; video (VIDEO) — a native ComfyUI
+    # VIDEO so it plugs STRAIGHT into the core `Save Video` node in one wire (no
+    # `Create Video` bridge). `Video Combine` / `Preview Image` still take `frames`.
+    RETURN_TYPES = ("IMAGE", "AUDIO", "VIDEO")
+    RETURN_NAMES = ("frames", "audio", "video")
     FUNCTION = "generate_video"
     CATEGORY = "QuantFunc"
 
@@ -4760,7 +4764,25 @@ class QuantFuncGenerateVideo:
         if audio is not None:
             wav = torch.from_numpy(audio["waveform"]).unsqueeze(0)  # [1, C, N]
             audio_out = {"waveform": wav, "sample_rate": int(audio["sample_rate"])}
-        return (image, audio_out)
+        video_out = _frames_to_video(image, audio_out, fps)
+        return (image, audio_out, video_out)
+
+
+def _frames_to_video(image, audio_out, fps):
+    """Wrap the IMAGE frame batch (+ optional AUDIO) as a native ComfyUI VIDEO so the
+    node's `video` output plugs STRAIGHT into the core `Save Video` node (one wire,
+    no `Create Video`). Graceful: returns None on an older ComfyUI without the VIDEO
+    API — `frames`/`audio` are still emitted, so `Video Combine`/`Create Video` work."""
+    try:
+        from comfy_api.input_impl import VideoFromComponents
+        from comfy_api.latest import VideoComponents
+        from fractions import Fraction
+        return VideoFromComponents(VideoComponents(
+            images=image, audio=audio_out, frame_rate=Fraction(float(fps) or 24.0)))
+    except Exception as e:  # noqa: BLE001 — ComfyUI without the native VIDEO type
+        logging.debug("[QuantFunc] native VIDEO output unavailable (%s); "
+                      "frames/audio still emitted", e)
+        return None
 
 
 def _encode_video_preview(frames_u8, fps, audio, out_path, container_fmt):

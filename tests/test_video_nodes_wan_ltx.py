@@ -157,7 +157,7 @@ def test_generate_video_t2v_no_first_frame():
     old = _patch_manager(mgr)
     try:
         node = nodes.QuantFuncGenerateVideo()
-        img, audio = node.generate_video(
+        img, audio, _video = node.generate_video(
             pipeline={"model_dir": d, "options": {}}, prompt="a cat",
             width=64, height=64, length=5, fps=24.0, steps=4,
             guidance_scale=4.0, seed=1)
@@ -257,7 +257,7 @@ def test_generate_video_ltx_audio_passthrough():
     old = _patch_manager(mgr)
     try:
         node = nodes.QuantFuncGenerateVideo()
-        _img, audio_out = node.generate_video(
+        _img, audio_out, _video = node.generate_video(
             pipeline={"model_dir": d, "options": {}}, prompt="x",
             width=64, height=64, length=3, fps=24.0, steps=4,
             guidance_scale=4.0, seed=1)
@@ -322,7 +322,7 @@ def test_generate_video_input_types_have_i2v_and_fps():
     # fps is OPTIONAL (backward-compat: a pre-#344 saved prompt has no fps key and
     # ComfyUI validate_inputs would hard-fail a missing REQUIRED input).
     assert "fps" in it["optional"] and "fps" not in it["required"]
-    assert nodes.QuantFuncGenerateVideo.RETURN_TYPES == ("IMAGE", "AUDIO")
+    assert nodes.QuantFuncGenerateVideo.RETURN_TYPES == ("IMAGE", "AUDIO", "VIDEO")
 
 
 def test_generate_video_callable_without_fps():
