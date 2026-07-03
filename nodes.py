@@ -2258,12 +2258,13 @@ class QuantFuncWanCombineExperts:
 # Node: QuantFunc Wan Combine Experts (Auto) — dropdown of scanned A14B sets
 # ============================================================================
 
-_WAN_A14B_NO_SETS = "[no Wan A14B sets found — scan roots empty]"
-_wan_a14b_sets_cache = None  # {display_name: descriptor} | None (unscanned)
+_WAN_A14B_NO_EXPERTS = "[no Wan A14B experts found]"
+_WAN_A14B_NO_SHARED = "[no Wan diffusers dir found]"
+_wan_a14b_choice_cache = None  # (experts_map, shared_map) | None (unscanned)
 
 
 def _wan_a14b_scan_roots():
-    """Model dirs to scan for Wan A14B assets: the standard ComfyUI model folders
+    """Model dirs to scan for Wan A14B weights: the standard ComfyUI model folders
     the experts/diffusers dirs live in (resolved via folder_paths so
     extra_model_paths.yaml is honored) + the QuantFunc model_cache
     ($QUANTFUNC_CACHE_DIR, else ~/model_cache). Deduped, existing dirs only."""
@@ -2292,139 +2293,142 @@ def _wan_a14b_scan_roots():
     return out
 
 
-def _get_wan_a14b_sets(force_rescan=False):
-    """Memoized {display_name: descriptor} of scanned Wan A14B sets. Pure
-    filesystem scan (delegates to comfyui_wan_remap.detect_wan_a14b_sets)."""
-    global _wan_a14b_sets_cache
-    if _wan_a14b_sets_cache is not None and not force_rescan:
-        return _wan_a14b_sets_cache
-    mapping = {}
+def _get_wan_a14b_choices(force_rescan=False):
+    """Memoized (experts_map, shared_map) — each {display_label: abs_path} — of the
+    scanned Wan A14B expert files + Wan diffusers dirs. Pure filesystem scan
+    (delegates to comfyui_wan_remap.list_wan_a14b_choices)."""
+    global _wan_a14b_choice_cache
+    if _wan_a14b_choice_cache is not None and not force_rescan:
+        return _wan_a14b_choice_cache
+    experts, shared = {}, {}
     try:
-        from .format_adapters.comfyui_wan_remap import detect_wan_a14b_sets
-        for desc in detect_wan_a14b_sets(_wan_a14b_scan_roots()):
-            mapping[desc["name"]] = desc
+        from .format_adapters.comfyui_wan_remap import list_wan_a14b_choices
+        experts, shared = list_wan_a14b_choices(_wan_a14b_scan_roots())
     except Exception as e:  # noqa: BLE001 — never let a scan error break node load
-        logging.warning("[QuantFunc] Wan A14B auto-scan failed: %s", e)
-    _wan_a14b_sets_cache = mapping
-    return mapping
+        logging.warning("[QuantFunc] Wan A14B scan failed: %s", e)
+    _wan_a14b_choice_cache = (experts, shared)
+    return _wan_a14b_choice_cache
 
 
-def refresh_wan_a14b_sets():
+def refresh_wan_a14b_choices():
     """Drop the memo so the next INPUT_TYPES re-scans (dropdown refresh)."""
-    global _wan_a14b_sets_cache
-    _wan_a14b_sets_cache = None
+    global _wan_a14b_choice_cache
+    _wan_a14b_choice_cache = None
 
 
-def _get_wan_a14b_dropdowns():
-    """Dropdown options for the Auto node. Never empty (ComfyUI would reject a
-    saved value not in the list) — a sentinel is offered when nothing is found."""
-    names = list(_get_wan_a14b_sets().keys())
-    return names if names else [_WAN_A14B_NO_SETS]
+def _wan_a14b_expert_dropdown():
+    labels = list(_get_wan_a14b_choices()[0].keys())
+    return labels if labels else [_WAN_A14B_NO_EXPERTS]
+
+
+def _wan_a14b_shared_dropdown():
+    labels = list(_get_wan_a14b_choices()[1].keys())
+    return labels if labels else [_WAN_A14B_NO_SHARED]
 
 
 class QuantFuncWanCombineExpertsAuto:
-    """Pick a scanned Wan2.2-A14B set from a dropdown → staged two-expert model_dir.
+    """Load a Wan2.2-A14B two-expert model by picking the weights from dropdowns —
+    outputs MODEL / CLIP / VAE straight into `QuantFunc Build Pipeline`.
 
-    A zero-typing front-end for `QuantFunc Wan Combine Experts`: it scans the
-    ComfyUI model dirs + the QuantFunc model_cache, groups each detected A14B
-    asset into a named set, and offers them as a dropdown. On selection it
-    resolves the set to an engine-loadable `model_dir` (wire into `QuantFunc
-    Model Loader`) by DELEGATING to the exact same staging the manual node uses —
-    it adds NO staging/dequant/remap of its own:
+    Pick the HIGH-noise expert, the LOW-noise expert, and a shared Wan diffusers
+    dir (vae / text_encoder / tokenizer / scheduler) from dropdowns of your scanned
+    model files — no path typing. The two experts are combined into the engine's
+    two-transformer layout INTERNALLY (cached), and the node hands the three
+    standard MODEL / CLIP / VAE handles to Build Pipeline exactly like a native
+    loader — you never see or manage a staging dir.
 
-      * a single-file expert pair (high + low, same modality) + a same-family
-        shared Wan diffusers dir  ->  `stage_two_expert(...)` (byte-identical to
-        the manual node's call — the gen path is inherited unchanged);
-      * a diffusers A14B dir (transformer/ + transformer_2/): passed through
-        directly when already engine-loadable, else a metadata+symlink
-        `model_index` normalization (no weights touched).
-
-    Detection: single-file experts are paired by a `high`/`low` filename hint
-    confirmed by the weights' own channels (t2v in==out, i2v in>out) — a `14b` token
-    is a bonus, not required, so a renamed expert still detects; the TI2V-5B (no
-    high/low, `5b`) is excluded; the shared dir prefers a 14B-family (A14B) diffusers
-    dir so a 5B VAE never mis-decodes a 14B expert. boundary_ratio
-    defaults to AUTO (t2v 0.875 / i2v 0.9, or the shared model_index's published
-    value when the modality matches). The manual node is unchanged and remains for
-    hand-entered paths / sets outside the scanned roots.
+    Dropdowns: the expert lists show every Wan single-file transformer with a
+    high/low filename hint (header-confirmed; the single TI2V-5B is excluded); the
+    shared list shows Wan diffusers dirs with A14B (dual-transformer) dirs first so
+    a 5B dir's different VAE can't shadow the 14B shared components. boundary_ratio
+    defaults to AUTO (t2v 0.875 / i2v 0.9). The manual `QuantFunc Wan Combine
+    Experts` node (hand-typed paths) is unchanged and remains for paths outside the
+    scanned roots.
     """
 
     @classmethod
     def INPUT_TYPES(cls):
+        exp = _wan_a14b_expert_dropdown()
+        sh = _wan_a14b_shared_dropdown()
         return {
             "required": {
-                "wan_a14b_set": (_get_wan_a14b_dropdowns(), {"tooltip":
-                    "A Wan2.2-A14B set auto-detected under the ComfyUI model dirs "
-                    "+ QuantFunc model_cache. Selecting it stages (or passes "
-                    "through) an engine-loadable model_dir. Re-open the graph to "
-                    "rescan after adding files."}),
+                "high_noise_expert": (exp, {"tooltip":
+                    "The HIGH-noise A14B expert (drives the early/high-noise denoise "
+                    "steps). Pick the *high*-noise checkpoint here."}),
+                "low_noise_expert": (exp, {"tooltip":
+                    "The LOW-noise A14B expert (drives the later/low-noise steps). "
+                    "Pick the *low*-noise checkpoint here."}),
+                "shared_components": (sh, {"tooltip":
+                    "A Wan diffusers dir supplying the shared vae / text_encoder / "
+                    "tokenizer / scheduler. A14B-family dirs are listed first (a 5B "
+                    "dir's VAE differs — prefer the 14B one)."}),
             },
             "optional": {
                 "boundary_ratio": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0,
                     "step": 0.005, "tooltip":
-                    "High→low expert switch fraction. 0 = AUTO (inherit the shared "
-                    "model_index when its modality matches, else t2v 0.875 / i2v "
-                    "0.9). Set >0 only to override."}),
-                "output_dir": ("STRING", {"default": "", "tooltip":
-                    "Staging output dir (empty = $QUANTFUNC_CACHE_DIR, else ComfyUI "
-                    "temp — WIPED on restart → re-dequant). A staged A14B is ~56 GB; "
-                    "point at a roomy PERSISTENT disk. Unused for an already-loadable "
-                    "diffusers dir (passed through in place)."}),
+                    "High→low expert switch fraction. 0 = AUTO (t2v 0.875 / i2v 0.9, "
+                    "or the shared model_index's published value when the modality "
+                    "matches). Set >0 only to override."}),
             },
         }
 
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("model_dir",)
-    FUNCTION = "combine"
+    # Same MODEL / CLIP / VAE socket shape as the native loaders + the QuantFunc
+    # Pick* nodes → plugs straight into QuantFunc Build Pipeline.
+    RETURN_TYPES = ("MODEL", "CLIP", "VAE")
+    RETURN_NAMES = ("model", "clip", "vae")
+    FUNCTION = "load"
     CATEGORY = "QuantFunc"
 
     @classmethod
-    def VALIDATE_INPUTS(cls, wan_a14b_set=None):
-        # The set list is scanned lazily and can differ from a saved workflow's
-        # value (files added/removed); resolve at run time with a clear error.
+    def VALIDATE_INPUTS(cls, high_noise_expert=None, low_noise_expert=None,
+                        shared_components=None):
+        # Dropdown lists are scanned lazily and can differ from a saved workflow's
+        # values (files added/removed); resolve at run time with a clear error.
         return True
 
-    def combine(self, wan_a14b_set, boundary_ratio=0.0, output_dir="", **kwargs):
-        from .format_adapters.comfyui_wan_remap import (
-            resolve_wan_a14b_set, _fingerprint)
+    def load(self, high_noise_expert, low_noise_expert, shared_components,
+             boundary_ratio=0.0, **kwargs):
+        from .format_adapters.comfyui_wan_remap import stage_two_expert, _fingerprint
 
-        if not wan_a14b_set or wan_a14b_set == _WAN_A14B_NO_SETS:
+        # Re-scan at run time so a file added since the graph opened still resolves.
+        experts, shared = _get_wan_a14b_choices(force_rescan=True)
+        high = experts.get(high_noise_expert)
+        low = experts.get(low_noise_expert)
+        sh = shared.get(shared_components)
+        missing = []
+        if not high:
+            missing.append(f"high_noise_expert={high_noise_expert!r}")
+        if not low:
+            missing.append(f"low_noise_expert={low_noise_expert!r}")
+        if not sh:
+            missing.append(f"shared_components={shared_components!r}")
+        if missing:
             raise RuntimeError(
-                "QuantFunc Wan Combine Experts (Auto): no Wan A14B set selected / "
-                "none detected. Put the A14B experts (high+low single files) or a "
-                "diffusers A14B dir under the ComfyUI model dirs (diffusion_models/"
-                "unet/checkpoints/diffusers) or $QUANTFUNC_CACHE_DIR, then reopen "
-                "the graph — or use the manual 'QuantFunc Wan Combine Experts' node.")
+                "QuantFunc Wan Combine Experts (Auto): could not resolve "
+                + ", ".join(missing) + ". Put the A14B experts (high+low single "
+                "files) + a Wan diffusers dir under the ComfyUI model dirs "
+                "(diffusion_models/unet/checkpoints/diffusers) or "
+                "$QUANTFUNC_CACHE_DIR, then reopen the graph to rescan.")
 
-        # Re-scan at run time (a memo miss re-detects) so a set added since the
-        # graph opened still resolves; fail loud if the saved name is gone.
-        sets = _get_wan_a14b_sets(force_rescan=True)
-        desc = sets.get(wan_a14b_set)
-        if desc is None:
-            raise RuntimeError(
-                f"QuantFunc Wan Combine Experts (Auto): set {wan_a14b_set!r} is no "
-                f"longer present under the scan roots (available: "
-                f"{sorted(sets) or 'none'}). Reopen the graph to refresh the list.")
-
-        # 0 = AUTO (module resolves); an explicit >0 value is an override.
+        # 0 = AUTO (the module resolves the published boundary); >0 = explicit override.
         boundary = float(boundary_ratio) if boundary_ratio and boundary_ratio > 0 \
             else None
 
-        out = (output_dir or "").strip()
-        if not out:
-            # Same persistent-cache default + fingerprint scheme as the manual node,
-            # keyed on the resolved sources so equivalent inputs share a staged dir.
-            if desc["kind"] == "single_file_pair":
-                key_paths = [os.path.abspath(desc["high"]), os.path.abspath(desc["low"]),
-                             os.path.abspath(desc["shared"])]
-            else:
-                key_paths = [os.path.abspath(desc["dir"])]
-            fp = _fingerprint(key_paths, extra="{}".format(boundary))
-            out = os.path.join(_wan_combine_stage_root(), fp)
+        # INTERNAL, cached: combine the two experts into the engine's two-transformer
+        # model_dir (never surfaced to the user). Keyed on the resolved sources so
+        # identical picks share one staged dir. Same call the manual node makes.
+        fp = _fingerprint([os.path.abspath(high), os.path.abspath(low),
+                           os.path.abspath(sh)], extra="{}".format(boundary))
+        staged_dir = os.path.join(_wan_combine_stage_root(), fp)
+        model_dir = stage_two_expert(high, low, sh, staged_dir,
+                                     boundary_ratio=boundary)
+        logging.info("[QuantFunc] Wan A14B two-expert staged (internal) -> %s", model_dir)
 
-        model_dir = resolve_wan_a14b_set(desc, out, boundary_ratio=boundary)
-        logging.info("[QuantFunc] Wan A14B set %r -> %s", wan_a14b_set, model_dir)
-        return (model_dir,)
+        # Output the three standard handles → Build Pipeline. BuildPipeline's
+        # hf_native adapter walks the transformer file's parent chain to the
+        # model_index.json and loads the WHOLE staged dir, so transformer_2/ +
+        # boundary_ratio (the two-expert架构) are preserved.
+        return _build_model_refs(model_dir, "")
 
 
 # ============================================================================
