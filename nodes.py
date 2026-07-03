@@ -4129,24 +4129,15 @@ class QuantFuncGenerate:
                 if neg and true_cfg_scale > 1.0:
                     t2i_opts["negative_prompt"] = neg
                     t2i_opts["true_cfg_scale"] = true_cfg_scale
-                t2i_opts["sampler"] = sampler_name
-                if sampler_eta > 0.0:
-                    t2i_opts["eta"] = sampler_eta
-                # Sampler modifier params (#326 node param surface). Emit
-                # each only when non-default so the engine log stays clean.
-                if sampler_s_noise != 1.0:
-                    t2i_opts["s_noise"] = sampler_s_noise
-                if sampler_solver_order != 4:
-                    t2i_opts["solver_order"] = sampler_solver_order
-                if sampler_predictor_order != 3:
-                    t2i_opts["predictor_order"] = sampler_predictor_order
-                if sampler_corrector_order != 4:
-                    t2i_opts["corrector_order"] = sampler_corrector_order
-                # Scheduler TYPE (#334). Emit only when != "normal" so the
-                # default path stays byte-identical to legacy (no key → engine
-                # uses the native FlowMatchEuler flow curve = the `normal` anchor).
-                if scheduler and scheduler != "normal":
-                    t2i_opts["scheduler"] = scheduler
+                # Shared sampler/scheduler wiring (single source — the video node
+                # calls the same helper). Each modifier emitted only when non-default
+                # (#326/#334) so the default path stays byte-identical to legacy.
+                _qf_apply_sampling_opts(
+                    t2i_opts, sampler_name=sampler_name, scheduler=scheduler,
+                    sampler_eta=sampler_eta, sampler_s_noise=sampler_s_noise,
+                    sampler_solver_order=sampler_solver_order,
+                    sampler_predictor_order=sampler_predictor_order,
+                    sampler_corrector_order=sampler_corrector_order)
                 # #324 ControlNet (t2i only — the engine clears control on the
                 # edit/i2i path). control_image is a QUANTFUNC_CONTROL bundle
                 # from the 'QuantFunc Control Image' node: {image, control_type,
@@ -4610,12 +4601,77 @@ class QuantFuncLatentPreview:
         return {}
 
 
-# The Wan/LTX video denoise honors options_json["sampler"] via the engine's
-# makeConfiguredSampler → these are the names parseSamplerType (src/Sampler.cpp)
-# accepts, so every one is guaranteed loadable (an unknown name throws at the
-# C-API). Default "euler" matches the official Wan2.2 template.
-_WAN_VIDEO_SAMPLERS = ("euler", "dpmpp_2m", "dpmpp_2m_sde",
-                       "euler_ancestral", "heun", "ddim")
+# Shared sampling surface for the Generate nodes. The engine reads these keys from
+# options_json for BOTH t2i/i2i AND the Wan/LTX video denoise (parseSamplerType +
+# SCHEDULER_HANDLERS, via quantfunc_api.cpp / Sampler.cpp). Kept as module-level
+# helpers so the video node mirrors QuantFuncGenerate's sampler/scheduler controls
+# from a SINGLE source (the image node's t2i wiring calls the same _qf_apply helper).
+_QF_SAMPLER_NAMES = [
+    "euler", "heun", "heunpp2", "dpmpp_2m", "lms",
+    "dpmpp_2m_sde", "euler_ancestral", "ddim",
+    "dpm_2", "ipndm", "ipndm_v", "res_multistep", "gradient_estimation",
+    "dpm_2_ancestral", "dpmpp_2s_ancestral", "dpmpp_sde",
+    "dpmpp_3m_sde", "dpmpp_2m_sde_heun",
+    "lcm", "res_multistep_ancestral",
+    "sa_solver", "sa_solver_pece",
+]
+_QF_SCHEDULER_NAMES = [
+    "normal", "karras", "exponential", "sgm_uniform", "simple",
+    "ddim_uniform", "beta", "linear_quadratic", "kl_optimal",
+]
+
+
+def _qf_apply_sampling_opts(opts, *, sampler_name, scheduler, sampler_eta,
+                            sampler_s_noise, sampler_solver_order,
+                            sampler_predictor_order, sampler_corrector_order):
+    """Wire the shared sampler/scheduler knobs into an options_json dict — the SAME
+    keys QuantFuncGenerate emits for t2i (engine read sites: quantfunc_api.cpp /
+    Sampler.cpp). Every modifier is emitted only when non-default, so the default
+    euler/normal path stays byte-identical (no key -> engine legacy). Returns opts."""
+    opts["sampler"] = sampler_name
+    if sampler_eta > 0.0:
+        opts["eta"] = sampler_eta
+    if sampler_s_noise != 1.0:
+        opts["s_noise"] = sampler_s_noise
+    if sampler_solver_order != 4:
+        opts["solver_order"] = sampler_solver_order
+    if sampler_predictor_order != 3:
+        opts["predictor_order"] = sampler_predictor_order
+    if sampler_corrector_order != 4:
+        opts["corrector_order"] = sampler_corrector_order
+    if scheduler and scheduler != "normal":
+        opts["scheduler"] = scheduler
+    return opts
+
+
+def _qf_video_sampling_input_defs():
+    """Optional INPUT_TYPES widgets for the video node's sampling surface — mirrors
+    QuantFuncGenerate (sampler_name / scheduler / true_cfg_scale / eta / s_noise /
+    solver orders) with concise tooltips. cfg = the node's own guidance_scale."""
+    return {
+        "sampler_name": (list(_QF_SAMPLER_NAMES), {"default": "euler",
+            "tooltip": "Denoise sampler (rides in options_json; the Wan/LTX video "
+            "path honors it via the engine makeConfiguredSampler). euler = the "
+            "official Wan default."}),
+        "scheduler": (list(_QF_SCHEDULER_NAMES), {"default": "normal",
+            "tooltip": "Noise SCHEDULE - the sigma-curve shape (#334). normal = "
+            "native FlowMatchEuler flow curve (default). Orthogonal to the sampler."}),
+        "true_cfg_scale": ("FLOAT", {"default": 1.0, "min": 1.0, "max": 30.0,
+            "step": 0.1, "tooltip": "Classical CFG (needs a negative prompt). 1.0 = "
+            "OFF (default) - correct for distilled / few-step models. Raise only for "
+            "base models. (guidance_scale above = the distilled guidance.)"}),
+        "sampler_eta": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
+            "tooltip": "Noise scale (eta) for stochastic samplers. 0 = deterministic."}),
+        "sampler_s_noise": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0,
+            "step": 0.05, "tooltip": "SDE noise multiplier (s_noise). 1.0 = default; "
+            "only SDE/ancestral samplers use it."}),
+        "sampler_solver_order": ("INT", {"default": 4, "min": 1, "max": 4, "step": 1,
+            "tooltip": "Multistep order for lms (1-4)."}),
+        "sampler_predictor_order": ("INT", {"default": 3, "min": 1, "max": 4,
+            "step": 1, "tooltip": "SA-Solver predictor order (1-4)."}),
+        "sampler_corrector_order": ("INT", {"default": 4, "min": 1, "max": 4,
+            "step": 1, "tooltip": "SA-Solver corrector order (1-4)."}),
+    }
 
 
 class QuantFuncGenerateVideo:
@@ -4676,13 +4732,11 @@ class QuantFuncGenerateVideo:
                 # array never lands a value here (falls to the method default 24.0).
                 "fps": ("FLOAT", {"default": 24.0, "min": 1.0, "max": 60.0, "step": 1.0,
                     "tooltip": "Playback fps (rides in options_json; Wan + LTX both read it)."}),
-                # sampler APPENDED after fps (new slot) — old saved graphs keep their
-                # slots; cfg is `guidance_scale` above; shift defaults to the model's
-                # own flow_shift (Wan 5.0, same as the official ModelSamplingSD3).
-                "sampler": (list(_WAN_VIDEO_SAMPLERS), {"default": "euler",
-                    "tooltip": "Denoise sampler (rides in options_json; the engine's "
-                    "Wan/LTX video path honors it). euler = the official Wan default; "
-                    "dpmpp_2m / dpmpp_2m_sde are common alternatives."}),
+                # sampling surface — mirrors the image node (QuantFuncGenerate):
+                # sampler_name / scheduler / true_cfg_scale / eta / s_noise / orders.
+                # cfg = guidance_scale above; all APPENDED after fps (back-compat slots,
+                # old saved graphs keep their positions).
+                **_qf_video_sampling_input_defs(),
                 # `start_image` = the first-frame condition (ComfyUI Wan i2v convention,
                 # cf. the core WanImageToVideo `start_image` input). IMAGE = a socket, not
                 # a widget → does not consume a widgets_values slot.
@@ -4703,7 +4757,10 @@ class QuantFuncGenerateVideo:
     CATEGORY = "QuantFunc"
 
     def generate_video(self, pipeline, prompt, width, height, length, steps,
-                       guidance_scale, seed, fps=24.0, sampler="euler",
+                       guidance_scale, seed, fps=24.0,
+                       sampler_name="euler", scheduler="normal", true_cfg_scale=1.0,
+                       sampler_eta=0.0, sampler_s_noise=1.0, sampler_solver_order=4,
+                       sampler_predictor_order=3, sampler_corrector_order=4,
                        negative_prompt="", start_image=None, unique_id=None):
         import torch
         # `length` was renamed IN PLACE from the old required `num_frames` (same widget
@@ -4719,11 +4776,20 @@ class QuantFuncGenerateVideo:
         opts = {}
         if fps and float(fps) > 0.0:
             opts["fps"] = float(fps)
-        if sampler and sampler in _WAN_VIDEO_SAMPLERS:
-            opts["sampler"] = sampler        # engine reads options_json["sampler"]
+        # sampler / scheduler / eta / s_noise / solver orders — SAME wiring the image
+        # node uses (shared helper); each rides in options_json only when non-default,
+        # so the default euler/normal path is byte-identical.
+        _qf_apply_sampling_opts(
+            opts, sampler_name=sampler_name, scheduler=scheduler,
+            sampler_eta=sampler_eta, sampler_s_noise=sampler_s_noise,
+            sampler_solver_order=sampler_solver_order,
+            sampler_predictor_order=sampler_predictor_order,
+            sampler_corrector_order=sampler_corrector_order)
         neg = negative_prompt if (isinstance(negative_prompt, str) and negative_prompt) else ""
         if neg:
             opts["negative_prompt"] = neg
+        if true_cfg_scale and float(true_cfg_scale) > 1.0:
+            opts["true_cfg_scale"] = float(true_cfg_scale)   # classical CFG (needs a negative)
         opts_json = json.dumps(opts) if opts else None
         pbar = None
         try:

@@ -693,11 +693,27 @@ def test_generate_video_sampler_rides_options_json():
         out = node.generate_video(
             pipeline={"model_dir": d, "options": {}}, prompt="a cat",
             width=64, height=64, length=5, fps=24.0, steps=4,
-            guidance_scale=1.0, seed=1, sampler="dpmpp_2m")
+            guidance_scale=1.0, seed=1, sampler_name="dpmpp_2m",
+            scheduler="karras", true_cfg_scale=4.0, negative_prompt="ugly",
+            sampler_eta=0.5)
         assert out == ("VIDEO",)
         call = dict(mgr.calls[[c[0] for c in mgr.calls].index("text_to_video")][1])
         opts = json.loads(call["options_json"])
         assert opts["sampler"] == "dpmpp_2m"           # rides in options_json
+        assert opts["scheduler"] == "karras"           # non-default scheduler emitted
+        assert opts["eta"] == 0.5                       # eta emitted (>0)
+        assert opts["true_cfg_scale"] == 4.0            # classical CFG (with negative)
+        assert opts["negative_prompt"] == "ugly"
+        # defaults must NOT leak keys (byte-identical default path)
+        mgr.calls.clear()
+        out2 = node.generate_video(
+            pipeline={"model_dir": d, "options": {}}, prompt="a cat",
+            width=64, height=64, length=5, fps=24.0, steps=4,
+            guidance_scale=1.0, seed=1)
+        call2 = dict(mgr.calls[[c[0] for c in mgr.calls].index("text_to_video")][1])
+        o2 = json.loads(call2["options_json"])
+        assert o2["sampler"] == "euler" and "scheduler" not in o2 and "eta" not in o2
+        assert "true_cfg_scale" not in o2
     finally:
         nodes._frames_to_video = old_f2v
         _patch_manager(old)
