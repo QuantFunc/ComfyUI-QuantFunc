@@ -3044,11 +3044,28 @@ def _resolve_controlnet_model(model_path, arch):
         return model_path
 
 
+# Wan two-expert LoRA targeting → engine options key (the contract with the
+# engine's wan factory): "all" rides the existing flat options["lora"] (applies
+# to every transformer — on Wan A14B that is BOTH experts); "high"/"low" ride
+# the SEPARATE options["lora_high"]/["lora_low"] lists so the engine can merge
+# each set ONLY into transformer (high-noise) / transformer_2 (low-noise).
+# Separate keys (not a "path:scale:expert" suffix) keep the image pipelines'
+# existing "path:scale" parsing byte-unchanged.
+_WAN_LORA_TARGET_KEY = {"all": "lora", "high": "lora_high", "low": "lora_low"}
+
+
 class QuantFuncLoRAAutoLoader:
     """Auto-load LoRA weights from models/QuantFunc/lora/ directory.
 
     Scans the lora directory for .safetensors files and presents them
     as a dropdown. Appends the selected LoRA to the pipeline.
+
+    `transformer` targets Wan2.2 A14B two-expert models: `all` (default) applies
+    the LoRA to every transformer; `high`/`low` apply it ONLY to the high-noise /
+    low-noise expert — the official 4-step lightx2v LoRAs ship as a per-expert
+    PAIR (chain two of these nodes: the *_high_noise file -> high, the
+    *_low_noise file -> low). On a non-Wan pipeline `high`/`low` fall back to
+    `all` with a warning (there is only one transformer).
     """
 
     @classmethod
@@ -3060,6 +3077,14 @@ class QuantFuncLoRAAutoLoader:
                 "lora_file": (lora_opts, {"tooltip": "LoRA weights from models/loras/"}),
                 "scale": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05,
                            "tooltip": "LoRA weight scale (1.0 = full strength)"}),
+                # APPENDED after scale (old saved graphs keep their widget slots).
+                "transformer": (["all", "high", "low"], {"default": "all",
+                    "tooltip": "Which transformer to mount this LoRA on.\n"
+                    "all (default): every transformer (single-transformer models, "
+                    "or BOTH Wan A14B experts).\n"
+                    "high / low: ONLY the Wan2.2 A14B high-noise / low-noise "
+                    "expert - use for the per-expert 4-step lightx2v LoRA pair "
+                    "(high_noise file -> high, low_noise file -> low)."}),
             },
         }
 
@@ -3068,7 +3093,7 @@ class QuantFuncLoRAAutoLoader:
     FUNCTION = "add_lora"
     CATEGORY = "QuantFunc"
 
-    def add_lora(self, pipeline, lora_file, scale):
+    def add_lora(self, pipeline, lora_file, scale, transformer="all"):
         cfg = dict(pipeline)
         cfg["options"] = dict(cfg.get("options", {}))
 
@@ -3076,12 +3101,20 @@ class QuantFuncLoRAAutoLoader:
             lora_path = os.path.join(_get_comfyui_dir(), "models", "loras", lora_file)
             if not os.path.exists(lora_path):
                 raise RuntimeError("LoRA file not found: {}".format(lora_path))
-            loras = list(cfg["options"].get("lora", []))
+            target = transformer if transformer in _WAN_LORA_TARGET_KEY else "all"
+            if target != "all" and _pipeline_video_family(cfg) != "wan":
+                logging.warning(
+                    "[QuantFunc] LoRA transformer=%s targets a Wan two-expert "
+                    "model, but this pipeline is not Wan — applying to the "
+                    "single transformer (all) instead: %s", target, lora_file)
+                target = "all"
+            key = _WAN_LORA_TARGET_KEY[target]
+            loras = list(cfg["options"].get(key, []))
             if scale != 1.0:
                 loras.append("{}:{}".format(lora_path, scale))
             else:
                 loras.append(lora_path)
-            cfg["options"]["lora"] = loras
+            cfg["options"][key] = loras
 
         return (cfg,)
 
