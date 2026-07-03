@@ -1,11 +1,12 @@
 """Tests for the QuantFunc LoRA Auto Loader `transformer` targeting dropdown
 (Wan2.2 A14B two-expert per-LoRA routing — high/low/all, default all).
 
-Contract under test (plugin side of the engine wan-LoRA work):
-  all  -> options["lora"]        (flat list, byte-identical to the old behavior)
-  high -> options["lora_high"]   (engine merges ONLY into transformer)
-  low  -> options["lora_low"]    (engine merges ONLY into transformer_2)
-  high/low on a NON-Wan pipeline -> warning + fall back to the flat list.
+ENGINE CONTRACT under test (orchestrator-confirmed): ONE options["lora"] list;
+  all  -> legacy "path[:scale]" STRING entry (byte-identical default)
+  high -> OBJECT entry {"path","scale","target":"high"}  (engine -> transformer only)
+  low  -> OBJECT entry {"path","scale","target":"low"}   (engine -> transformer_2 only,
+                                                          fail-loud on single-transformer)
+The dropdown value passes LITERALLY; no plugin-side family sniffing.
 
 Run:  python3 -m pytest tests/test_lora_auto_loader.py -q
 """
@@ -58,50 +59,54 @@ def test_widget_has_transformer_dropdown_appended_after_scale():
     assert keys.index("transformer") > keys.index("scale")
 
 
-def test_default_all_is_byte_identical_flat_list():
+def test_default_all_is_byte_identical_legacy_string():
     def run(tmp):
         rel = _fake_lora(tmp, "wan2.2_t2v_lightx2v_4steps_lora_v1.1_high_noise.safetensors")
         d = _make_model_dir(class_name="WanPipeline")
         node = nodes.QuantFuncLoRAAutoLoader()
         (cfg,) = node.add_lora({"model_dir": d, "options": {}}, rel, 1.0)
-        assert list(cfg["options"].keys()) == ["lora"]          # flat key only
-        assert cfg["options"]["lora"][0].endswith("_high_noise.safetensors")
-        assert ":" not in os.path.basename(cfg["options"]["lora"][0])  # no scale suffix at 1.0
+        entries = cfg["options"]["lora"]
+        assert len(entries) == 1 and isinstance(entries[0], str)   # legacy STRING
+        assert entries[0].endswith("_high_noise.safetensors")
+        # scale=1.0 -> bare path (no ":1.0" suffix), exactly the old behavior
+        assert ":" not in os.path.basename(entries[0])
+        # scale != 1.0 -> "path:scale" string, still legacy shape
+        (cfg2,) = node.add_lora({"model_dir": d, "options": {}}, rel, 0.8)
+        assert isinstance(cfg2["options"]["lora"][0], str)
+        assert cfg2["options"]["lora"][0].endswith(":0.8")
     _with_fake_comfyui_dir(run)
 
 
-def test_high_low_route_to_separate_keys_on_wan():
+def test_high_low_emit_target_object_entries():
     def run(tmp):
         hi = _fake_lora(tmp, "wan2.2_t2v_lightx2v_4steps_lora_v1.1_high_noise.safetensors")
         lo = _fake_lora(tmp, "wan2.2_t2v_lightx2v_4steps_lora_v1.1_low_noise.safetensors")
         d = _make_model_dir(class_name="WanPipeline")
         node = nodes.QuantFuncLoRAAutoLoader()
-        # chain: high then low (the official pair wiring)
+        # chain: high then low (the official pair wiring) — ONE shared list
         (cfg,) = node.add_lora({"model_dir": d, "options": {}}, hi, 1.0, transformer="high")
         (cfg,) = node.add_lora(cfg, lo, 0.8, transformer="low")
-        assert cfg["options"]["lora_high"][0].endswith("_high_noise.safetensors")
-        assert cfg["options"]["lora_low"][0].endswith("_low_noise.safetensors:0.8")
-        assert "lora" not in cfg["options"]                     # nothing leaked to flat
+        entries = cfg["options"]["lora"]
+        assert len(entries) == 2
+        assert entries[0] == {"path": entries[0]["path"], "scale": 1.0, "target": "high"}
+        assert entries[0]["path"].endswith("_high_noise.safetensors")
+        assert entries[1]["target"] == "low" and entries[1]["scale"] == 0.8
+        assert entries[1]["path"].endswith("_low_noise.safetensors")
+        # entries are JSON-serializable (they ride options into the engine create)
+        json.dumps(entries)
     _with_fake_comfyui_dir(run)
 
 
-def test_high_on_non_wan_falls_back_to_flat_with_warning():
+def test_mixed_chain_string_and_object_coexist():
     def run(tmp):
-        rel = _fake_lora(tmp, "some_style_lora.safetensors")
-        d = _make_model_dir(class_name="QwenImagePipeline")
+        style = _fake_lora(tmp, "some_style_lora.safetensors")
+        hi = _fake_lora(tmp, "wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise.safetensors")
+        d = _make_model_dir(class_name="WanPipeline")
         node = nodes.QuantFuncLoRAAutoLoader()
-        import logging
-        recs = []
-        h = logging.Handler(); h.emit = lambda r: recs.append(r.getMessage())
-        logging.getLogger().addHandler(h)
-        try:
-            (cfg,) = node.add_lora({"model_dir": d, "options": {}}, rel, 1.0,
-                                   transformer="high")
-        finally:
-            logging.getLogger().removeHandler(h)
-        assert "lora_high" not in cfg["options"]
-        assert cfg["options"]["lora"][0].endswith("some_style_lora.safetensors")
-        assert any("not Wan" in m for m in recs), recs
+        (cfg,) = node.add_lora({"model_dir": d, "options": {}}, style, 1.0)          # all
+        (cfg,) = node.add_lora(cfg, hi, 1.0, transformer="high")                     # targeted
+        entries = cfg["options"]["lora"]
+        assert isinstance(entries[0], str) and isinstance(entries[1], dict)
     _with_fake_comfyui_dir(run)
 
 

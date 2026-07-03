@@ -3044,16 +3044,6 @@ def _resolve_controlnet_model(model_path, arch):
         return model_path
 
 
-# Wan two-expert LoRA targeting → engine options key (the contract with the
-# engine's wan factory): "all" rides the existing flat options["lora"] (applies
-# to every transformer — on Wan A14B that is BOTH experts); "high"/"low" ride
-# the SEPARATE options["lora_high"]/["lora_low"] lists so the engine can merge
-# each set ONLY into transformer (high-noise) / transformer_2 (low-noise).
-# Separate keys (not a "path:scale:expert" suffix) keep the image pipelines'
-# existing "path:scale" parsing byte-unchanged.
-_WAN_LORA_TARGET_KEY = {"all": "lora", "high": "lora_high", "low": "lora_low"}
-
-
 class QuantFuncLoRAAutoLoader:
     """Auto-load LoRA weights from models/QuantFunc/lora/ directory.
 
@@ -3064,8 +3054,16 @@ class QuantFuncLoRAAutoLoader:
     the LoRA to every transformer; `high`/`low` apply it ONLY to the high-noise /
     low-noise expert — the official 4-step lightx2v LoRAs ship as a per-expert
     PAIR (chain two of these nodes: the *_high_noise file -> high, the
-    *_low_noise file -> low). On a non-Wan pipeline `high`/`low` fall back to
-    `all` with a warning (there is only one transformer).
+    *_low_noise file -> low).
+
+    ENGINE CONTRACT (orchestrator-confirmed): the dropdown value is passed
+    LITERALLY as the lora entry's "target" field — `all` keeps the legacy
+    "path:scale" STRING entry (byte-identical default), `high`/`low` emit an
+    OBJECT entry {"path","scale","target"}. The ENGINE routes by registered
+    component: all -> transformer (+transformer_2 if present); high -> only
+    transformer; low -> only transformer_2, FAIL-LOUD on a single-transformer
+    pipeline ("target=low requires a two-expert pipeline"). No plugin-side
+    family sniffing — semantics live in one place (the engine).
     """
 
     @classmethod
@@ -3101,20 +3099,18 @@ class QuantFuncLoRAAutoLoader:
             lora_path = os.path.join(_get_comfyui_dir(), "models", "loras", lora_file)
             if not os.path.exists(lora_path):
                 raise RuntimeError("LoRA file not found: {}".format(lora_path))
-            target = transformer if transformer in _WAN_LORA_TARGET_KEY else "all"
-            if target != "all" and _pipeline_video_family(cfg) != "wan":
-                logging.warning(
-                    "[QuantFunc] LoRA transformer=%s targets a Wan two-expert "
-                    "model, but this pipeline is not Wan — applying to the "
-                    "single transformer (all) instead: %s", target, lora_file)
-                target = "all"
-            key = _WAN_LORA_TARGET_KEY[target]
-            loras = list(cfg["options"].get(key, []))
-            if scale != 1.0:
+            loras = list(cfg["options"].get("lora", []))
+            if transformer in ("high", "low"):
+                # Expert-targeted entry: OBJECT with the literal "target" field
+                # (engine routes: high -> transformer, low -> transformer_2,
+                # fail-loud on single-transformer pipelines).
+                loras.append({"path": lora_path, "scale": float(scale),
+                              "target": transformer})
+            elif scale != 1.0:
                 loras.append("{}:{}".format(lora_path, scale))
             else:
                 loras.append(lora_path)
-            cfg["options"][key] = loras
+            cfg["options"]["lora"] = loras
 
         return (cfg,)
 
