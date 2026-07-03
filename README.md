@@ -42,6 +42,7 @@ ComfyUI plugin for **QuantFunc** — the fastest diffusion model inference engin
 
 **🎛️ New nodes & controls**
 - **Wan Combine Experts (A14B two-transformer)** — combine the two single-file Wan2.2-A14B checkpoints (high-noise + low-noise experts) into one engine-loadable model dir: keys remapped to diffusers naming, fp8 dequantized to fp16, `boundary_ratio` inherited from the published model_index (t2v 0.875 / i2v 0.9). Wire its `model_dir` output into *Model Loader*. The ~56 GB stage caches per source set — set `QUANTFUNC_CACHE_DIR` (or the node's `output_dir`) to persist it across ComfyUI restarts.
+- **Wan Combine Experts (Auto)** — a zero-typing front-end for the above: scans the ComfyUI model dirs (`diffusion_models`/`unet`/`checkpoints`/`diffusers`) + the QuantFunc model_cache, groups each detected A14B asset (single-file high+low pair, or a diffusers A14B dir) into a **dropdown**, and on selection resolves an engine-loadable `model_dir` by delegating to the same staging — a real diffusers A14B download is passed through as-is; a single-file pair is staged identically to the manual node. Reopen the graph to rescan after adding files.
 - **VRAM budget** dropdown on *Build Pipeline* — cap VRAM at create time; the engine then plans as if running on a smaller card.
 - **FBCache acceleration** with separate **cond / uncond** thresholds (`fbcache` / `fbcache_uncond`).
 - **Image-to-image** — `init_img` socket + `init_img_strength` on the *Generate* node.

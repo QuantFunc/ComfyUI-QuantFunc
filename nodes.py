@@ -380,19 +380,19 @@ def _pipeline_video_family(cfg):
     `_class_name` first, then transformer/config.json `_class_name` (only when the
     former is empty).
 
-    The MATCH here is a deliberate SUPERSET of the engine's exact-match registrars,
-    NOT a mirror of them: it treats any `_class_name` starting with "Wan"/"LTX"
-    (plus the transformer classes WanTransformer3DModel / LTX2VideoTransformer3DModel)
-    as that family. The engine's own detectors are NARROWER — wan_detect
-    (WanVideoPipeline.cpp) exact-matches pipeline_class=="WanPipeline" OR
-    transformer_class=="WanTransformer3DModel"; ltx2_pipeline_detect
-    (LTX2VideoPipeline.cpp) exact-matches pipeline_class=="LTX2Pipeline" only (no
-    transformer-class fallback). So a match HERE is NOT a guarantee the engine can
-    load the model (e.g. a Wan I2V-A14B dir whose _class_name is
-    "WanImageToVideoPipeline" is classified "wan" here but the current engine's
-    wan_detect would reject it). That is intentional + safe: the superset routes
-    anything Wan/LTX-shaped to the video path so the user gets a clear LOUD video/
-    load error (the engine throws at create time, and generate_video throws on a
+    The MATCH here is a deliberate SUPERSET of the engine's registrars, NOT a strict
+    mirror: it treats any `_class_name` starting with "Wan"/"LTX" (plus the
+    transformer classes WanTransformer3DModel / LTX2VideoTransformer3DModel) as that
+    family. wan_detect (WanVideoPipeline.cpp, widened 2026-07-02) now ALSO prefix-
+    matches any `Wan…` pipeline_class OR transformer_class=="WanTransformer3DModel",
+    so a Wan I2V-A14B dir whose _class_name is "WanImageToVideoPipeline" IS both
+    classified "wan" here AND loaded by the engine; ltx2_pipeline_detect
+    (LTX2VideoPipeline.cpp) still exact-matches pipeline_class=="LTX2Pipeline" only
+    (no transformer-class fallback), so this superset is still broader on the LTX
+    side. A match HERE is not a hard guarantee the engine can load the model, but for
+    the Wan family it now aligns; anything Wan/LTX-shaped is routed to the video path
+    so a genuinely unloadable dir surfaces a clear LOUD video/load error (the engine
+    throws at create time, and generate_video throws on a
     non-video pipeline) rather than the wrong image-node behavior — never a silent
     misroute. Returns None for every image pipeline (QwenImage/ZImage/Klein/
     Ideogram/Flux), keeping the image node's video branch guarded (byte-unchanged)."""
@@ -2169,11 +2169,12 @@ class QuantFuncWanCombineExperts:
 
     The expert modality is auto-detected from the weights (t2v: in==out channels;
     A14B channel-concat i2v: in>out) and written into the synthesized transformer
-    configs. The model_index always carries `_class_name="WanPipeline"` — the one
-    value the engine's family detect accepts — because the engine dispatches
-    t2v-vs-i2v by the transformer's CHANNELS, not the pipeline class string.
-    (t2v is the path exercised end-to-end here; i2v staging emits the same loadable
-    class + i2v channels, relying on the engine's channel-driven i2v dispatch.)
+    configs. The model_index always carries `_class_name="WanPipeline"` — a value
+    the engine's family detect accepts (it accepts any `Wan…`-prefixed class) —
+    because the engine dispatches t2v-vs-i2v by the transformer's CHANNELS, not the
+    pipeline class string. (t2v is the path exercised end-to-end here; i2v staging
+    emits the same loadable class + i2v channels, relying on the engine's
+    channel-driven i2v dispatch.)
 
     ComfyUI/original-Wan single-file keys are remapped to diffusers keys; fp8
     `*_scaled` experts are dequantized to fp16 (the engine's Wan transformer
@@ -2338,10 +2339,11 @@ class QuantFuncWanCombineExpertsAuto:
         directly when already engine-loadable, else a metadata+symlink
         `model_index` normalization (no weights touched).
 
-    Detection: single-file experts are paired by a `14b` + `high`/`low` filename
-    hint confirmed by the weights' own channels (t2v in==out, i2v in>out); the
-    TI2V-5B (no high/low, `5b`) is excluded; the shared dir prefers a 14B-family
-    (A14B) diffusers dir so a 5B VAE never mis-decodes a 14B expert. boundary_ratio
+    Detection: single-file experts are paired by a `high`/`low` filename hint
+    confirmed by the weights' own channels (t2v in==out, i2v in>out) — a `14b` token
+    is a bonus, not required, so a renamed expert still detects; the TI2V-5B (no
+    high/low, `5b`) is excluded; the shared dir prefers a 14B-family (A14B) diffusers
+    dir so a 5B VAE never mis-decodes a 14B expert. boundary_ratio
     defaults to AUTO (t2v 0.875 / i2v 0.9, or the shared model_index's published
     value when the modality matches). The manual node is unchanged and remains for
     hand-entered paths / sets outside the scanned roots.

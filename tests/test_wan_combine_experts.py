@@ -72,10 +72,10 @@ def test_remap_key_top_level():
 
 
 def test_model_index_class_name_always_engine_loadable():
-    """The synthesized model_index must carry the ONE class the engine's family
-    detect exact-matches ("WanPipeline") — for BOTH modalities. The engine has no
-    "WanImageToVideoPipeline" registration; writing it would throw at load
-    (t2v-vs-i2v is channel-driven in the engine, not class-string-driven)."""
+    """The synthesized model_index must carry a class the engine's family detect
+    accepts — the canonical "WanPipeline" — for BOTH modalities. The engine accepts
+    any `Wan…`-prefixed class; we synthesize from scratch so we write the canonical
+    one (t2v-vs-i2v is channel-driven in the engine, not class-string-driven)."""
     assert W._ENGINE_WAN_PIPELINE_CLASS == "WanPipeline"
     mi = W.synthesize_model_index(None, W._ENGINE_WAN_PIPELINE_CLASS, 0.9)
     assert mi["_class_name"] == "WanPipeline"
@@ -395,10 +395,11 @@ def test_expert_depth_mismatch_raises():
 
 
 def test_i2v_experts_stage_engine_loadable_class_with_i2v_channels():
-    """Two i2v experts (in>out): the staged model_index carries the ENGINE-LOADABLE
-    "WanPipeline" (NOT "WanImageToVideoPipeline", which no engine pipeline matches —
-    it would throw at load); i2v-ness is carried by the transformer config channels,
-    which is what the engine's is_i2v/vae-encoder gates actually read."""
+    """Two i2v experts (in>out): the staged model_index carries the canonical
+    ENGINE-LOADABLE "WanPipeline" (the engine accepts any `Wan…`-prefixed class; we
+    synthesize from scratch so we write the canonical one). i2v-ness is carried by
+    the transformer config channels, which is what the engine's is_i2v/vae-encoder
+    gates actually read — not the pipeline class string."""
     if not _HAS_TORCH:
         pytest.skip("needs torch")
     src = tempfile.mkdtemp(prefix="qfwan_i2v_")

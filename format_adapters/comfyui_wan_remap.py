@@ -378,16 +378,17 @@ _PUBLISHED_BOUNDARY_T2V = 0.875
 _PUBLISHED_BOUNDARY_I2V = 0.9
 
 # The synthesized model_index ALWAYS carries _class_name="WanPipeline" — for BOTH
-# t2v and i2v experts. Rationale (engine-verified):
-#   * The engine's family detect (wan_detect, WanVideoPipeline.cpp) EXACT-matches
-#     pipeline_class=="WanPipeline"; its transformer_class fallback only fires when
-#     model_index has NO _class_name. "WanImageToVideoPipeline" is registered NOWHERE
-#     in the engine — writing it would make the staged dir throw at load.
+# t2v and i2v experts. Rationale (engine-verified 2026-07-02):
+#   * The engine's family detect (wan_detect, WanVideoPipeline.cpp) accepts ANY
+#     `Wan…`-prefixed pipeline class (`in.pipeline_class.rfind("Wan",0)==0`), so
+#     "WanPipeline" is loadable everywhere (as is the published
+#     "WanImageToVideoPipeline"). We synthesize from scratch and have no published
+#     class to preserve, so we write the canonical "WanPipeline".
 #   * t2v-vs-i2v behavior is CHANNEL-driven in the engine (is_i2v = in_channels >
 #     latent channels; the VAE encoder loads when xfm_in > xfm_out), so the modality
 #     information lives in the transformer config's in/out_channels we synthesize —
 #     the pipeline-level class string plays no role in it.
-# We own this synthesized file, so we write the value that is loadable everywhere.
+# We own this synthesized file, so we write the canonical loadable value.
 _ENGINE_WAN_PIPELINE_CLASS = "WanPipeline"
 
 
@@ -1066,7 +1067,11 @@ def _diffusers_dir_is_loadable(model_index: dict | None) -> bool:
     transformer_2/ is already guaranteed by `_is_diffusers_a14b_dir`, so a real
     downloaded A14B-Diffusers dir (Wan-prefixed class + published boundary) loads
     AS-IS — no normalization. A dir with a non-Wan class OR a missing/zero
-    boundary_ratio is NOT loadable and is routed through `stage_a14b_diffusers`."""
+    boundary_ratio is NOT loadable and is routed through `stage_a14b_diffusers`.
+    (Edge: `wan_detect`'s OTHER arm accepts a model_index with an EMPTY `_class_name`
+    when transformer_class=="WanTransformer3DModel"; a real HF diffusers model_index
+    always carries a non-empty `_class_name`, so this returns False for the empty case
+    → routed through the — still correct — normalization rather than pass-through.)"""
     if not model_index:
         return False
     cls = model_index.get("_class_name")
@@ -1255,7 +1260,12 @@ def stage_a14b_diffusers(src_dir: str, out_dir: str, *,
     eff_boundary, boundary_src = resolve_boundary_ratio(
         boundary_ratio, base_mi, in_ch, out_ch, (in_ch, out_ch))
 
-    _assert_safe_out_dir(out_dir, [src_dir, os.path.dirname(src_dir)])
+    # Protect the SOURCE model dir only (not its parent): unlike single-file experts
+    # — which sit as loose files in a shared pool dir whose parent is worth guarding —
+    # a diffusers `src_dir` IS a self-contained model dir, and its parent is typically
+    # a models-root of INDEPENDENT model dirs; guarding that whole root would foreclose
+    # a legitimate "stage as a sibling of the source" out_dir.
+    _assert_safe_out_dir(out_dir, [src_dir])
     fp_inputs = [src_dir]
     for rel in ("model_index.json", "transformer/config.json",
                 "transformer_2/config.json", "vae/config.json"):
