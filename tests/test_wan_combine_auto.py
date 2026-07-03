@@ -38,7 +38,6 @@ W = importlib.import_module(f"{_PKG}.format_adapters.comfyui_wan_remap")
 twe = importlib.import_module("test_wan_combine_experts")   # DRY: reuse builders
 _HAS_TORCH = twe._HAS_TORCH
 _write_expert = twe._write_expert
-_make_shared_dir = twe._make_shared_dir
 
 
 # --------------------------------------------------------------------------- #
@@ -261,3 +260,25 @@ def test_node_errors_on_unresolvable_selection(monkeypatch):
         nodes.QuantFuncWanCombineExpertsAuto().load(
             nodes._WAN_A14B_NO_EXPERTS, nodes._WAN_A14B_NO_EXPERTS,
             nodes._WAN_A14B_NO_SHARED)
+
+
+@pytest.mark.skipif(not _HAS_TORCH, reason="needs torch")
+def test_choices_recurses_into_subfolders():
+    # experts + a diffusers dir nested one level under the root (per-model subfolder
+    # layout) must be found — matches the plugin's other os.walk dropdown scanners.
+    root = tempfile.mkdtemp(prefix="qfnest_")
+    sub = os.path.join(root, "wan2.2-a14b"); os.makedirs(sub)
+    _write_expert(os.path.join(sub, "wan_high_noise_14B.safetensors"), in_ch=36, out_ch=16)
+    _write_expert(os.path.join(sub, "wan_low_noise_14B.safetensors"), in_ch=36, out_ch=16)
+    # a REAL nested Wan diffusers dir two levels down (os.walk, like the sibling
+    # scanners, does not follow symlinked dirs — so build it as a real tree).
+    dd = os.path.join(root, "diffusers_sub", "wan2.2-I2V-A14B-Diffusers")
+    for sub in ("transformer", "transformer_2", "vae", "text_encoder"):
+        os.makedirs(os.path.join(dd, sub))
+    json.dump({"_class_name": "WanTransformer3DModel", "in_channels": 36,
+               "out_channels": 16}, open(os.path.join(dd, "transformer", "config.json"), "w"))
+    json.dump({"_class_name": "AutoencoderKLWan"}, open(os.path.join(dd, "vae", "config.json"), "w"))
+    json.dump({"_class_name": "WanImageToVideoPipeline"}, open(os.path.join(dd, "model_index.json"), "w"))
+    experts, shared = W.list_wan_a14b_choices([root])
+    assert len(experts) == 2, f"nested experts missed: {list(experts)}"
+    assert "wan2.2-I2V-A14B-Diffusers" in shared, f"nested shared dir missed: {list(shared)}"

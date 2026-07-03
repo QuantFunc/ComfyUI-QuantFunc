@@ -2344,6 +2344,12 @@ class QuantFuncWanCombineExpertsAuto:
     defaults to AUTO (t2v 0.875 / i2v 0.9). The manual `QuantFunc Wan Combine
     Experts` node (hand-typed paths) is unchanged and remains for paths outside the
     scanned roots.
+
+    Verification note (验证契约): the node → staged-dir → MODEL/CLIP/VAE → Build
+    Pipeline handoff is verified (the whole staged two-expert dir, incl.
+    transformer_2/ + boundary, reaches the engine). The end-to-end two-expert
+    Wan VIDEO GENERATION on real GPU is the user's local ComfyUI run — not yet
+    machine-verified here.
     """
 
     @classmethod

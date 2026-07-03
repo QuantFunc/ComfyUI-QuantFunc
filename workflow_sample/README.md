@@ -54,7 +54,7 @@ Drag the canvas to the labelled group you need.
 | **ControlNet Auto Loader** | One-click download + load of a ControlNet model (InstantX for QwenImage). |
 | **Control Image** | Preprocess / pass a control image (edges, depth, pose, …) into the pipeline. |
 | **Wan Combine Experts (A14B two-transformer)** | Combine the two single-file Wan2.2-A14B checkpoints (high-noise + low-noise experts) into one engine-loadable model dir (`model_dir` → *Model Loader*). |
-| **Wan Combine Experts (Auto)** | Zero-typing front-end for the above: pick a scanned Wan2.2-A14B set (single-file pair or diffusers A14B dir) from a dropdown → engine-loadable `model_dir` (delegates to the same staging). |
+| **Wan Combine Experts (Auto)** | Zero-typing front-end for the above: pick the high / low experts + a Wan shared dir from three dropdowns of your scanned files → outputs **MODEL / CLIP / VAE** straight into *Build Pipeline* (the two-expert combine is done internally + cached; no user-facing `model_dir`). |
 
 ## 4. Model Download
 

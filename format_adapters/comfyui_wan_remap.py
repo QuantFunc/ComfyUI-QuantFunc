@@ -992,14 +992,14 @@ def stage_two_expert(high_expert: str, low_expert: str, shared_dir: str,
 
 
 # ============================================================================
-# Auto-detection (frontend for the QuantFunc Wan Combine Experts (Auto) node)
+# Scan (frontend for the QuantFunc Wan Combine Experts (Auto) node's dropdowns)
 #
-# Pure filesystem scan that groups a machine's Wan2.2-A14B assets into named
-# "sets", each resolvable to an engine-loadable model_dir by DELEGATING to the
-# staging above (single-file pairs -> stage_two_expert; a diffusers A14B dir ->
-# pass-through when already loadable, else a minimal model_index normalization).
-# It writes NO weights and touches NO expert bytes beyond the cheap header reads
-# `is_comfyui_wan_single_file` / `detect_wan_modality` already perform.
+# Pure filesystem scan that lists a machine's Wan2.2-A14B single-file experts +
+# Wan diffusers dirs (vae/text_encoder source) as {label: abs_path} maps for the
+# node's high/low/shared dropdowns. The node then delegates the picked triple to
+# `stage_two_expert` (above). This scan writes NO weights and touches NO expert
+# bytes beyond the cheap header reads `is_comfyui_wan_single_file` /
+# `detect_wan_modality` already perform.
 # ============================================================================
 
 # Wan2.2-A14B naming: a single-file expert set carries a `high`/`low` expert token
@@ -1104,7 +1104,13 @@ def list_wan_a14b_choices(roots: list[str]) -> tuple[dict, dict]:
                      transformer_2/) listed FIRST so a 5B dir's different VAE
                      can't shadow the correct 14B shared components.
 
-    Pure filesystem + cheap header reads. NO staging, NO weights touched.
+    RECURSIVE (`os.walk`, matching the plugin's other dropdown scanners
+    `_get_diffusers_model_options` / `_get_local_transformer_file_options`) so
+    per-model subfolders (`models/diffusion_models/wan2.2-a14b/high.safetensors`,
+    `models/diffusers/wan/Wan2.2-T2V-A14B-Diffusers/`) are found. A diffusers model
+    dir is PRUNED once identified — added as a shared choice if it's a Wan dir, and
+    never descended into (its internal sharded transformer weights are diffusers-key,
+    not single-file experts). Pure filesystem + cheap header reads. NO staging.
     """
     expert_paths: list[str] = []
     a14b_shared: list[str] = []
@@ -1114,14 +1120,27 @@ def list_wan_a14b_choices(roots: list[str]) -> tuple[dict, dict]:
     for root in roots:
         if not root or not os.path.isdir(root):
             continue
-        try:
-            entries = sorted(os.listdir(root))
-        except OSError as e:  # noqa: BLE001 — unreadable root, skip
-            logger.debug("list_wan_a14b_choices: cannot list %s: %s", root, e)
-            continue
-        for name in entries:
-            full = os.path.join(root, name)
-            if os.path.isfile(full) and _looks_like_a14b_single_file(full):
+        for dirpath, subdirs, filenames in os.walk(root):
+            # A diffusers MODEL dir (has model_index.json, or a transformer/config.json)
+            # is a leaf for this scan: list it as a shared choice iff it's a Wan dir
+            # with vae/+text_encoder/, and PRUNE (don't recurse into model internals).
+            is_model_dir = ("model_index.json" in filenames
+                            or os.path.isfile(os.path.join(dirpath, "transformer",
+                                                           "config.json")))
+            if is_model_dir:
+                real_d = os.path.realpath(dirpath)
+                if real_d not in seen_d:
+                    seen_d.add(real_d)
+                    if _dir_has_shared_components(dirpath) and _is_wan_diffusers_dir(dirpath):
+                        (a14b_shared if _is_diffusers_a14b_dir(dirpath)
+                         else other_shared).append(dirpath)
+                subdirs[:] = []            # prune — never descend into a model dir
+                continue
+            # Otherwise a plain dir: pick up any loose single-file Wan A14B experts.
+            for name in sorted(filenames):
+                full = os.path.join(dirpath, name)
+                if not _looks_like_a14b_single_file(full):
+                    continue
                 real = os.path.realpath(full)
                 if real in seen_f:
                     continue
@@ -1133,12 +1152,4 @@ def list_wan_a14b_choices(roots: list[str]) -> tuple[dict, dict]:
                     continue
                 seen_f.add(real)
                 expert_paths.append(full)
-            elif os.path.isdir(full):
-                real = os.path.realpath(full)
-                if real in seen_d:
-                    continue
-                seen_d.add(real)
-                if _dir_has_shared_components(full) and _is_wan_diffusers_dir(full):
-                    (a14b_shared if _is_diffusers_a14b_dir(full)
-                     else other_shared).append(full)
     return _labeled(expert_paths), _labeled(a14b_shared + other_shared)
