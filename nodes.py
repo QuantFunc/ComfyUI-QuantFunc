@@ -3443,6 +3443,86 @@ def _reinhard_color_match(target_hwc, reference_hwc, strength):
     return np.clip(out, 0.0, 1.0, out=out)
 
 
+# ============================================================================
+# Shared: sparse-attention (稀疏注意力) 算法 + 比例 控件 —— QuantFuncGenerate 与
+# QuantFuncGenerateVideo 共用同一套「可选择的稀疏策略」下拉框（不再写死 sage 一种）。
+# ============================================================================
+
+def _parse_sparse_cdf_percent(val):
+    """把稀疏「比例」控件值（"off"/"90%"/... 或裸 float / 0-100 数）解析成 0.0-1.0 的 cdf。
+    off/空/0 → 0.0（dense）。容错 API 调用方或旧存档里的裸数值。"""
+    try:
+        if isinstance(val, str):
+            s = val.strip().lower()
+            if s in ("", "off", "0", "0%", "none", "dense"):
+                return 0.0
+            v = float(s.rstrip("%").strip()) / 100.0
+        else:
+            v = float(val)
+            if v > 1.0:            # 0-100 的数按百分比处理
+                v = v / 100.0
+    except (ValueError, TypeError):
+        return 0.0
+    return max(0.0, min(1.0, v))
+
+
+def _qf_sparse_input_defs():
+    """两个共享控件：稀疏注意力「算法」+「比例」。两个 Generate 节点共用，保证定义一致。
+    默认 algorithm=off → dense，逐位一致、零开销、零行为变化。"""
+    return {
+        "sparse_algorithm": (
+            ["off", "sage", "meansim", "svg2"],
+            {"default": "off",
+             "tooltip": (
+                 "稀疏注意力算法（用训练无关的预测器跳过对输出几乎无贡献的 key-block，\n"
+                 "减少 O(N^2) 注意力计算 —— 分辨率/帧数越高越省）：\n"
+                 "  off     = 关闭，走原始 dense 注意力（逐位一致，无预测器开销）。\n"
+                 "  sage    = SpargeAttn，per-generation（不重建 pipeline）；作用于 SM89+\n"
+                 "            的 sage f8 注意力（krea2 / Wan 等 lighting int8-qk/fp8-v 路径）。\n"
+                 "  meansim = SVG2 block-mean top-p 预测器（LTX2 / BSA flash 路径，已落地）；\n"
+                 "            create-time —— 改动会重建 pipeline。\n"
+                 "  svg2    = SVG2 语义 k-means selector（phase-2，尚未实现）。\n"
+                 "非对应路径的模型会忽略该值。稀疏程度由下面的 sparse_ratio 控制。")}),
+        "sparse_ratio": (
+            ["off", "50%", "60%", "70%", "75%", "80%", "85%", "90%", "95%", "100%"],
+            {"default": "90%",
+             "tooltip": (
+                 "稀疏「比例」= 每个 query-block 保留的、按预测质量排序的最小 key-block 集合\n"
+                 "覆盖的质量比例（top-CDF 百分比）。仅当 sparse_algorithm != off 时生效：\n"
+                 "  100%    = 保留全部 block → 与 dense 逐位一致（仅预测器开销、无提速，用于验证）。\n"
+                 "  70%-95% = 越低越稀疏 = 越快但逐步有损（细节/连贯性下降）。\n"
+                 "  off     = 不稀疏（等同 dense）。\n"
+                 "建议从 100%（验证一致）往下调，权衡 速度 vs 画质。")}),
+    }
+
+
+def _apply_sparse_config(cfg, sparse_algorithm="off", sparse_ratio="off", legacy_sage_cdf="off"):
+    """把「算法 + 比例」两个控件路由到引擎对应的 key。返回 sage 路径的 per-gen cdf
+    （非 sage 时为 0.0），由调用方注入到 per-gen options_json。
+      sage           → per-gen options_json 'sage_sparse_cdf'（SpargeAttn，sage-f8 路径）
+      meansim / svg2 → create-time cfg['options'] 'sparse_selector' + 'sparse_cdf'
+                       （SVG2 selector，LTX2/BSA flash；改动会重建 pipeline）
+      off / 比例 off → 不注入任何 key（dense，逐位一致）
+    向后兼容：旧存档工作流里独立的 'sage_sparse_cdf'（legacy_sage_cdf），在新算法下拉为
+    'off' 时按 algorithm='sage' 兜住，行为不变。engine 不认识的 key 会被忽略（dense 回退），
+    所以旧 .so 上选 meansim/svg2/sage 是安全的（forward-prep）。"""
+    algo = str(sparse_algorithm or "off").strip().lower()
+    cdf = _parse_sparse_cdf_percent(sparse_ratio)
+    if algo == "off":
+        legacy = _parse_sparse_cdf_percent(legacy_sage_cdf)
+        if legacy > 0.0:
+            algo, cdf = "sage", legacy
+    if algo == "off" or cdf <= 0.0:
+        return 0.0                                   # dense —— 不动 cfg / opts
+    if algo == "sage":
+        return cdf                                   # 调用方注入到 per-gen options_json
+    if algo in ("meansim", "svg2"):                  # create-time comp_opt（config_json）
+        cfg.setdefault("options", {})
+        cfg["options"]["sparse_selector"] = algo
+        cfg["options"]["sparse_cdf"] = cdf
+    return 0.0
+
+
 class QuantFuncGenerate:
     """Generate an image. Creates/reuses a cached pipeline from the config.
     Edit mode is auto-detected when ref_image is connected.
@@ -3639,6 +3719,10 @@ class QuantFuncGenerate:
                         "recreates the pipeline."
                     ),
                 }),
+                # 稀疏注意力：可选择算法（off/sage/meansim/svg2）+ 比例，取代原先写死
+                # 的 sage_sparse_cdf 单控件。旧存档的 sage_sparse_cdf 仍由 generate() 的
+                # 同名 kwarg 兜住（见 _apply_sparse_config 的 legacy_sage_cdf）。
+                **_qf_sparse_input_defs(),
                 "vram_budget": (
                     ["off", "10%", "20%", "30%", "40%", "50%",
                      "60%", "70%", "80%", "90%", "100%"],
@@ -3783,6 +3867,8 @@ class QuantFuncGenerate:
                  sampler_predictor_order=3, sampler_corrector_order=4,
                  scheduler="normal",
                  control_image=None,
+                 sparse_algorithm="off", sparse_ratio="90%",
+                 sage_sparse_cdf="off",
                  vram_budget="100%",
                  activate_unload=False, unload_mode=None, unload_every_time=None,
                  fbcache=0.0, fbcache_uncond=0.0,
@@ -3895,6 +3981,17 @@ class QuantFuncGenerate:
         if fbc_uncond > 0.0:
             cfg["options"]["fbcache_uncond"] = fbc_uncond     # generic uncond (Ideogram4 + QwenImage-Layered)
             cfg["options"]["ideogram4_fbcache"] = fbc_uncond  # Ideogram4 legacy uncond fallback
+        # 稀疏注意力（算法 + 比例）：把两个下拉框路由到引擎对应 key。
+        #   sage           → 返回 per-gen cdf，下面注入到 t2i_opts["sage_sparse_cdf"]
+        #                    （SpargeAttn sage-f8 路径；os.environ 不行——引擎在常驻
+        #                     worker.py 子进程里，走 options_json 这条通道）。
+        #   meansim / svg2 → 直接写进 cfg["options"]（create-time comp_opt → config_json →
+        #                    引擎 makeSvg2Config，SVG2 selector / LTX2·BSA flash 路径），
+        #                    必须在 ensure_pipeline 之前完成（此处即在其前）；改动会重建 pipeline。
+        #   off / 比例 off → 不注入任何 key，dense 逐位一致。
+        # 旧存档独立的 sage_sparse_cdf 由 legacy_sage_cdf 兜底（新算法为 off 时按 sage 处理）。
+        sage_cdf = _apply_sparse_config(
+            cfg, sparse_algorithm, sparse_ratio, legacy_sage_cdf=sage_sparse_cdf)
         # Unpack ImageList dict format
         ref_img_resize = "720"
         ref_img_resize_others = "720"
@@ -4198,6 +4295,10 @@ class QuantFuncGenerate:
                             control_image.get("control_guidance_end", 1.0))
                 if lp_cfg:
                     t2i_opts["latent_preview"] = lp_cfg
+                # Experimental SpargeAttn block-sparse threshold (per-gen). >0 only,
+                # so off/0 leaves the options byte-identical.
+                if sage_cdf > 0.0:
+                    t2i_opts["sage_sparse_cdf"] = sage_cdf
                 opts_json = json.dumps(t2i_opts) if t2i_opts else None
                 logging.info(
                     "[QuantFunc] t2i sampler=%s scheduler=%s eta=%.2f s_noise=%.2f "
@@ -4779,6 +4880,10 @@ class QuantFuncGenerateVideo:
                 # cfg = guidance_scale above; all APPENDED after fps (back-compat slots,
                 # old saved graphs keep their positions).
                 **_qf_video_sampling_input_defs(),
+                # 稀疏注意力：可选择算法（off/sage/meansim/svg2）+ 比例。作为新 WIDGET
+                # 追加在采样控件之后（旧存档的短 widgets_values 数组不会触达它们 → 落到默认
+                # off = dense）。svg2 meansim 正是为高 token 视频（LTX2/Wan）设计。
+                **_qf_sparse_input_defs(),
                 # `start_image` = the first-frame condition (ComfyUI Wan i2v convention,
                 # cf. the core WanImageToVideo `start_image` input). IMAGE = a socket, not
                 # a widget → does not consume a widgets_values slot.
@@ -4803,7 +4908,8 @@ class QuantFuncGenerateVideo:
                        sampler_name="euler", scheduler="normal", true_cfg_scale=1.0,
                        sampler_eta=0.0, sampler_s_noise=1.0, sampler_solver_order=4,
                        sampler_predictor_order=3, sampler_corrector_order=4,
-                       negative_prompt="", start_image=None, unique_id=None):
+                       negative_prompt="", start_image=None,
+                       sparse_algorithm="off", sparse_ratio="90%", unique_id=None):
         import torch
         # `length` was renamed IN PLACE from the old required `num_frames` (same widget
         # slot — see the INPUT_TYPES widget-order note), so an old graph-format saved
@@ -4812,10 +4918,17 @@ class QuantFuncGenerateVideo:
         cfg = dict(pipeline)
         cfg["options"] = dict(cfg.get("options", {}))
         family = _pipeline_video_family(cfg)  # 'wan' | 'ltx' | None (advisory/logging)
+        # 稀疏注意力（算法 + 比例）：meansim/svg2 → cfg["options"]（create-time comp_opt，
+        # 必须在 ensure_pipeline 之前，改动会重建 pipeline）；sage → 返回 per-gen cdf，下面
+        # 注入 options_json。off/比例 off → 不注入，dense 逐位一致。SVG2 meansim 正是为
+        # 高 token 视频（LTX2/Wan）设计，视频节点是它的主战场。
+        _sage_cdf = _apply_sparse_config(cfg, sparse_algorithm, sparse_ratio)
         cache_key = _manager.ensure_pipeline(cfg, node_id=unique_id)
         # length (frame count) rides in the manager call; fps + negative_prompt ride
         # in options_json (the C-API t2v/i2v contract).
         opts = {}
+        if _sage_cdf > 0.0:
+            opts["sage_sparse_cdf"] = _sage_cdf   # SpargeAttn per-gen 旋钮（sage-f8 路径）
         if fps and float(fps) > 0.0:
             opts["fps"] = float(fps)
         # sampler / scheduler / eta / s_noise / solver orders — SAME wiring the image
