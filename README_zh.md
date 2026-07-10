@@ -42,6 +42,8 @@
 - **ControlNet** —— 结构引导生成（QwenImage InstantX ControlNet）（`QuantFunc-ControlNet.json`）。
 
 **🎛️ 新增节点与控制**
+- **Wan 单文件 TI2V-5B（三件套）** —— 直接加载 ComfyUI 单文件版 Wan2.2 TI2V-5B：把 **UNETLoader**（`wan2.2_ti2v_5B_*.safetensors`）+ **CLIPLoader**（`umt5_xxl_*.safetensors`，fp16 或 fp8-scaled）+ **VAELoader**（`wan2.2_vae.safetensors`）接进 `QuantFunc Build Pipeline` 即可 —— 键名自动重映射为 diffusers 命名、fp8 自动反量化（与 Combine Experts 同一套机制），暂存在 ComfyUI 临时目录的会话缓存中。16 通道的单文件（A14B 专家）会被明确拒绝并给出指引 —— A14B 成对模型请用 *Wan Combine Experts*。
+- **`tiny_vae` 快速预览开关**（*Build Pipeline*，仅 Wan 视频，**默认关闭**）—— 将完整 Wan VAE 解码器替换为轻量 TAEHV 解码器：视频解码大幅加速（实测 Wan2.1/A14B @384×384 约 5×，Wan2.2-5B 最高约 28×），画面保持连贯但**偏软** —— 适合草稿/预览，最终出片请关闭。taew 变体自动选择（Wan2.1/A14B → `taew2_1`，Wan2.2-5B → `taew2_2`）；权重放置于 `<ComfyUI>/models/QuantFunc/taew/<variant>.safetensors`（权重缺失 / 非 Wan 模型 / 引擎库版本过旧均会明确报错，绝不静默回退）。
 - **显存预算**下拉（*Build Pipeline*）—— 在创建时限制显存上限，引擎据此按更小的显卡来规划运行。
 - **FBCache 加速** —— 支持独立的 **cond / uncond** 阈值（`fbcache` / `fbcache_uncond`）。
 - **图生图** —— *Generate* 节点新增 `init_img` 接口与 `init_img_strength`。
