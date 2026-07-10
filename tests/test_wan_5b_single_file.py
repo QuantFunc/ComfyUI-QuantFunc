@@ -217,6 +217,27 @@ def test_missing_clip_or_vae_socket_refused():
                  tempfile.mkdtemp(prefix="qf5b_stg_"), None)
 
 
+def test_taew_file_in_vaeloader_gets_actionable_hint():
+    # User mistake seen in the field: taew2_2.safetensors wired into VAELoader.
+    # The refusal must tell them exactly what to do (EN+ZH), keyed off either
+    # the TinyVAEDecoder key layout or the taew basename.
+    xfm = _mk_tiny_5b_xfm(_tmpf("wan5b.safetensors"))
+    te = _mk_tiny_umt5(_tmpf("umt5.safetensors"))
+    taew = _write_safetensors(_tmpf("taew2_2.safetensors"), {
+        "decoder.1.weight": ((4, 4, 3, 3), "F16", _f16(16 * 9)),
+        "decoder.22.weight": ((3, 4, 3, 3), "F16", _f16(12 * 9)),
+    })
+    with pytest.raises(RuntimeError) as ei:
+        W.stage_ti2v_5b_trio(xfm, te, taew, _tmpf("out"))
+    msg = str(ei.value)
+    assert "tiny_vae" in msg and "wan2.2_vae.safetensors" in msg
+    assert "tiny_vae 开关" in msg  # zh guidance reaches the user too
+    # key-layout arm alone (non-taew filename) also detects
+    assert W._looks_like_taew_tiny_vae(taew) is True
+    plain = _mk_tiny_wan_vae(_tmpf("wanvae.safetensors"))
+    assert W._looks_like_taew_tiny_vae(plain) is False
+
+
 def test_wrong_family_clip_and_vae_refused():
     xfm = _mk_tiny_5b_xfm(_tmpf("wan5b.safetensors"))
     vae = _mk_tiny_wan_vae(_tmpf("wanvae.safetensors"))

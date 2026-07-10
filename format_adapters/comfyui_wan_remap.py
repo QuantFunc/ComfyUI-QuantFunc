@@ -1302,6 +1302,21 @@ def _looks_like_wan_vae_single_file(path: str | Path) -> bool:
                for k in hdr)
 
 
+def _looks_like_taew_tiny_vae(path: str | Path) -> bool:
+    """taehv TINY-VAE acceleration files (taew2_1/taew2_2): TinyVAEDecoder layout
+    keys `decoder.<idx>.*` (e.g. decoder.1.weight ... decoder.22.weight — a bare
+    numeric segment right after `decoder.`, unlike full-VAE namings), or a
+    'taew' basename. Used ONLY to make the trio's VAE-signature refusal
+    actionable when a user wires the tiny-VAE file into VAELoader by mistake."""
+    if "taew" in os.path.basename(str(path)).lower():
+        return True
+    try:
+        hdr = _read_header(path)
+    except Exception:  # noqa: BLE001
+        return False
+    return any(re.match(r"^decoder\.\d+\.", k) for k in hdr)
+
+
 def default_wan_5b_stage_dir() -> str:
     """VOLATILE staging root for the 5B trio (ComfyUI temp — cleared on restart;
     tempfile.gettempdir() outside ComfyUI). Deliberately NEVER a persistent
@@ -1356,9 +1371,20 @@ def stage_ti2v_5b_trio(xfm_path: str | Path, te_path: str | Path,
             f"the wired CLIP file does not look like the Wan umt5_xxl text "
             f"encoder (no encoder.block.* keys): {te_path}")
     if not _looks_like_wan_vae_single_file(vae_path):
+        hint = ""
+        if _looks_like_taew_tiny_vae(vae_path):
+            hint = (
+                " This is a taew TINY-VAE acceleration file, NOT the full Wan "
+                "VAE. In VAELoader pick wan2.2_vae.safetensors; for tiny-VAE "
+                "acceleration enable the `tiny_vae` toggle on Build Pipeline "
+                "instead (its weights already live under "
+                "models/QuantFunc/taew/ — no manual selection needed). "
+                "你接入的是 taew tiny-VAE 加速文件，不是完整 VAE。VAELoader 请选 "
+                "wan2.2_vae.safetensors；tiny-VAE 加速请打开 Build Pipeline 的 "
+                "tiny_vae 开关（权重已在 models/QuantFunc/taew/，无需手选）。")
         raise RuntimeError(
             f"the wired VAE file does not look like a Wan VAE (no decoder.head"
-            f".2/decoder.conv_out keys): {vae_path}")
+            f".2/decoder.conv_out keys): {vae_path}." + hint)
 
     # Resolve every bundled asset UP FRONT (fail-loud before any GB write).
     xfm_cfg_asset = _wan_bundled_asset(_WAN_ASSET_TRANSFORMER_CFG)
