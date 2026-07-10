@@ -587,6 +587,96 @@ def _reresolve_auto_transformer_for_device(model, xfm_path, device_idx):
         return xfm_path
 
 
+# tiny-VAE (TAEHV) opt-in fast-preview decoder — Wan video only. The engine's
+# TinyVAEDecoder is a per-variant TRUSTED decoder that validates the incoming
+# latent channel count z against the variant (ComponentImpl.cpp: taew2_1 = 16,
+# taew2_2 = 48). We pick the variant from that SAME value — the staged Wan
+# transformer's `out_channels` (= the latent channel count) — instead of a new
+# parallel arch heuristic, so the plugin's choice can never disagree with the
+# engine's own check.
+_TAEW_LATENT_TO_VARIANT = {16: "taew2_1", 48: "taew2_2"}  # latent z_dim → taehv variant
+_TAEW_WEIGHTS_SUBDIR = "taew"  # <ComfyUI>/models/QuantFunc/<subdir>/<variant>.safetensors
+
+
+def _resolve_tiny_vae_decoder(staging_model_dir: str,
+                              taew_dir: Optional[str] = None) -> tuple[str, str]:
+    """Resolve the taew (variant, weights_path) for a staged Wan video model.
+
+    Reads the SAME staged configs the engine loads from (`model_index.json`
+    `_class_name` for the Wan-family gate, `transformer/config.json`
+    `out_channels` for the latent channel count) — no new parallel arch
+    detection. Fails LOUD (RuntimeError) if the model is not Wan video, the
+    latent channel count is unsupported, or the weight file is absent; never
+    silently degrades to a wrong-variant / full-VAE decode.
+
+    `taew_dir` defaults to `<ComfyUI>/models/QuantFunc/taew` (dependency-
+    injected so the unit test can point it at a fixture dir).
+    """
+    import json as _json
+    # (1) Wan-video gate — reuse the engine's own family predicate
+    #     (WanVideoPipeline wan_detect: the pipeline class starts with "Wan").
+    mi_path = os.path.join(staging_model_dir, "model_index.json")
+    try:
+        with open(mi_path, "r", encoding="utf-8") as _f:
+            cls_name = str(_json.load(_f).get("_class_name", ""))
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(
+            f"tiny_vae: cannot read {mi_path} to confirm this is a Wan video "
+            f"model ({e}). tiny_vae is only supported for Wan video models.")
+    if not cls_name.startswith("Wan"):
+        raise RuntimeError(
+            f"tiny_vae is only supported for Wan video models (Wan2.1/A14B or "
+            f"Wan2.2-5B); this pipeline is '{cls_name or 'unknown'}'. Disable "
+            f"tiny_vae for this model.")
+    # (2) Variant by latent channel count = staged transformer out_channels,
+    #     the exact value the engine's TinyVAEDecoder validates z against.
+    xfm_cfg_path = os.path.join(staging_model_dir, "transformer", "config.json")
+    try:
+        with open(xfm_cfg_path, "r", encoding="utf-8") as _f:
+            latent_ch = int(_json.load(_f).get("out_channels"))
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(
+            f"tiny_vae: cannot read out_channels from {xfm_cfg_path} ({e}) — "
+            f"needed to pick the taew variant.")
+    variant = _TAEW_LATENT_TO_VARIANT.get(latent_ch)
+    if variant is None:
+        raise RuntimeError(
+            f"tiny_vae: unsupported Wan latent channel count "
+            f"out_channels={latent_ch}; the tiny VAE supports Wan2.1/A14B "
+            f"(16-ch → taew2_1) and Wan2.2-5B (48-ch → taew2_2) only.")
+    # (3) Weight path — <ComfyUI>/models/QuantFunc/taew/<variant>.safetensors.
+    if taew_dir is None:
+        from .model_auto_loader import get_models_dir
+        taew_dir = os.path.join(get_models_dir(), _TAEW_WEIGHTS_SUBDIR)
+    weights_path = os.path.join(taew_dir, f"{variant}.safetensors")
+    if not os.path.isfile(weights_path):
+        raise RuntimeError(
+            f"tiny_vae: {variant} weights not found at {weights_path}. Place "
+            f"the taehv {variant} weights file there (create the folder if "
+            f"needed): <ComfyUI>/models/QuantFunc/{_TAEW_WEIGHTS_SUBDIR}/"
+            f"{variant}.safetensors")
+    return variant, weights_path
+
+
+def _apply_tiny_vae(options: dict, tiny_vae: bool, staging_model_dir: str,
+                    taew_dir: Optional[str] = None) -> None:
+    """Inject the tiny-VAE comp_opts keys when `tiny_vae` is ON.
+
+    OFF (the default) is a strict no-op — NO key is added or touched, so the
+    engine comp_opts stay byte-identical to the full-VAE path. ON resolves the
+    taew variant + weights via `_resolve_tiny_vae_decoder` (fail-LOUD) and
+    injects `vae_decoder` + `vae_decoder_weights`.
+    """
+    if not tiny_vae:
+        return
+    variant, weights_path = _resolve_tiny_vae_decoder(staging_model_dir, taew_dir)
+    options["vae_decoder"] = variant
+    options["vae_decoder_weights"] = weights_path
+    logger.info(
+        "[BuildPipeline] tiny_vae ON → %s (%s) — lossy fast preview",
+        variant, weights_path)
+
+
 class QuantFuncBuildPipeline:
     """Assemble a QuantFunc pipeline from official ComfyUI loaders.
 
@@ -651,6 +741,17 @@ class QuantFuncBuildPipeline:
                                "Empty = falls back to api_key in config.json next to "
                                "libquantfunc.so. Explicit value here overrides that.",
                 }),
+                "tiny_vae": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Lossy FAST-preview VAE (Wan video only). Swaps the "
+                               "full Wan VAE decoder for the tiny TAEHV decoder "
+                               "(~4.7x faster VAE decode). Output stays coherent but "
+                               "is SOFTER — use for draft/preview, DISABLE for final "
+                               "quality. The taew variant is auto-selected by model "
+                               "(Wan2.1/A14B = taew2_1, Wan2.2-5B = taew2_2); the "
+                               "weights must sit at "
+                               "<ComfyUI>/models/QuantFunc/taew/<variant>.safetensors.",
+                }),
             },
         }
 
@@ -661,7 +762,8 @@ class QuantFuncBuildPipeline:
 
     @classmethod
     def IS_CHANGED(cls, model=None, clip=None, vae=None, device=None,
-                    precision_config=None, pipeline_config=None, api_key=""):
+                    precision_config=None, pipeline_config=None, api_key="",
+                    tiny_vae=False):
         # Force re-execution every prompt: this node creates a fresh tmp
         # staging dir on each call, so caching the previous prompt's
         # output (which references a now-deleted staging dir) would crash
@@ -670,7 +772,7 @@ class QuantFuncBuildPipeline:
         return f"build@{time.time_ns()}"
 
     def build(self, model, clip, vae, device, precision_config,
-              pipeline_config=None, api_key=""):
+              pipeline_config=None, api_key="", tiny_vae=False):
         # P0 diagnostic — surface the exact `precision_config` arg ComfyUI
         # delivered. User reported wiring `Precision Config Loader` →
         # converted-to-input `precision_config` socket but generation came
@@ -906,6 +1008,14 @@ class QuantFuncBuildPipeline:
         # Explicit "absmax" / "mse" matches the QuantFuncModelAutoLoader knob.
         if act_quant_mode in ("absmax", "mse"):
             options["act_quant_mode"] = act_quant_mode
+
+        # tiny-VAE (TAEHV) fast-preview opt-in — Wan video only, default OFF.
+        # OFF injects NOTHING (comp_opts byte-identical to the full-VAE path);
+        # ON resolves the taew variant from the SAME latent channel count the
+        # engine's TinyVAEDecoder validates z against, so a non-Wan model /
+        # unsupported variant / missing weight file all fail LOUD here rather
+        # than silently mis-decoding. See _apply_tiny_vae/_resolve_tiny_vae_decoder.
+        _apply_tiny_vae(options, tiny_vae, staging.model_dir)
 
         # Pick up QuantFunc-loader-only hints stashed on the `_QFPathStub`
         # by QuantFunc Model Loader / Auto Loader (no equivalent on stock
