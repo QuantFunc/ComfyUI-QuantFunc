@@ -616,12 +616,14 @@ def _resolve_tiny_vae_decoder(staging_model_dir: str,
     injected so the unit test can point it at a fixture dir).
     """
     import json as _json
-    # (1) Wan-video gate — REUSE the plugin's single Wan-family predicate
-    #     (`_is_wan_diffusers_dir`, comfyui_wan_remap.py: mirrors the engine's
-    #     wan_detect INCLUDING the transformer/vae _class_name fallback arms the
-    #     bare model_index check misses), instead of a third parallel copy of
-    #     the heuristic. Predicate is fail-open (False on unreadable configs);
-    #     the REFUSAL here is the fail-loud part.
+    # (1) Wan-video FAMILY gate — REUSE the plugin's single Wan-family
+    #     predicate (`_is_wan_diffusers_dir`, comfyui_wan_remap.py). Its
+    #     model_index + transformer arms exactly mirror the engine's wan_detect
+    #     (WanVideoPipeline.cpp @ b13721da: pipeline_class starts "Wan" OR
+    #     transformer_class=="WanTransformer3DModel"); its A14B-layout and
+    #     vae-substring arms are PERMISSIVE family signals only — the strict
+    #     consumer-side check is step (1b) below. Predicate is fail-open
+    #     (False on unreadable configs); the REFUSAL here is the fail-loud part.
     from .format_adapters.comfyui_wan_remap import _is_wan_diffusers_dir
     if not _is_wan_diffusers_dir(staging_model_dir):
         # Best-effort class name, purely for the error message.
@@ -637,6 +639,31 @@ def _resolve_tiny_vae_decoder(staging_model_dir: str,
             f"Wan2.2-5B); no Wan signal in {staging_model_dir!r} "
             f"(model_index.json/transformer/vae _class_name; pipeline is "
             f"'{cls_name or 'unknown'}'). Disable tiny_vae for this model.")
+    # (1b) CONSUMER-exact check: the injected keys are consumed by the engine's
+    #     Wan VAE factory, whose registry dispatch is wan_vae_match =
+    #     vaeClassOf(config) == "AutoencoderKLWan" EXACT equality
+    #     (ComponentImpl.cpp:6466 @ b13721da) — STRICTER than the family
+    #     predicate's permissive vae-substring arm. A "Wan-ish" but non-exact
+    #     VAE class would dispatch a DIFFERENT VAE backend that ignores
+    #     vae_decoder/vae_decoder_weights → silent full-VAE fallback. Refuse
+    #     loud instead. An ABSENT vae config / class stays permitted (the
+    #     family gate + the engine's own fail-loud load carry those).
+    vae_cfg_path = os.path.join(staging_model_dir, "vae", "config.json")
+    if os.path.isfile(vae_cfg_path):
+        try:
+            with open(vae_cfg_path, "r", encoding="utf-8") as _f:
+                vae_cls = str(_json.load(_f).get("_class_name", "") or "")
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(
+                f"tiny_vae: cannot read {vae_cfg_path} ({e}) — needed to "
+                f"confirm the Wan VAE class before injecting tiny-VAE keys.")
+        if vae_cls and vae_cls != "AutoencoderKLWan":
+            raise RuntimeError(
+                f"tiny_vae: the staged VAE class '{vae_cls}' is not the exact "
+                f"'AutoencoderKLWan' the engine's Wan VAE factory dispatches "
+                f"on — the tiny-VAE keys would be silently ignored by the "
+                f"selected VAE backend. Disable tiny_vae for this model.")
+
     # (2) Variant by latent channel count = staged transformer out_channels,
     #     the exact value the engine's TinyVAEDecoder validates z against.
     xfm_cfg_path = os.path.join(staging_model_dir, "transformer", "config.json")

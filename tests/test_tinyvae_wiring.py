@@ -54,9 +54,10 @@ nfa = importlib.import_module(f"{_PKG}.nodes_format_adapters")
 # --------------------------------------------------------------------------- #
 def _mk_staged_dir(mi_class="WanPipeline", out_channels=16,
                    write_mi=True, write_xfm_cfg=True,
-                   xfm_class="WanTransformer3DModel"):
+                   xfm_class="WanTransformer3DModel",
+                   vae_class=None):
     """A minimal staged model dir: model_index.json + transformer/config.json
-    (the files the Wan gate + variant resolver read)."""
+    (+ optional vae/config.json) — the files the Wan gates + variant resolver read."""
     d = tempfile.mkdtemp(prefix="qftaew_staged_")
     if write_mi:
         json.dump({"_class_name": mi_class},
@@ -66,6 +67,10 @@ def _mk_staged_dir(mi_class="WanPipeline", out_channels=16,
         json.dump({"_class_name": xfm_class,
                    "out_channels": out_channels},
                   open(os.path.join(d, "transformer", "config.json"), "w"))
+    if vae_class is not None:
+        os.makedirs(os.path.join(d, "vae"), exist_ok=True)
+        json.dump({"_class_name": vae_class},
+                  open(os.path.join(d, "vae", "config.json"), "w"))
     return d
 
 
@@ -171,6 +176,25 @@ def test_missing_model_index_wan_transformer_still_resolves():
     taew = _mk_taew_dir("taew2_1")
     variant, _ = nfa._resolve_tiny_vae_decoder(staged, taew_dir=taew)
     assert variant == "taew2_1"
+
+
+def test_wanish_but_not_exact_vae_class_rejected():
+    # CONSUMER-exact gate: the engine's Wan VAE factory dispatch is
+    # vaeClassOf(config) == "AutoencoderKLWan" EXACT (wan_vae_match,
+    # ComponentImpl.cpp:6466 @ b13721da). A "Wan-ish" non-exact class passes
+    # the permissive FAMILY predicate but would route to a different VAE
+    # backend that silently IGNORES the tiny-VAE keys — must refuse loud.
+    staged = _mk_staged_dir(out_channels=16, vae_class="AutoencoderKLWanFuture")
+    taew = _mk_taew_dir("taew2_1")
+    with pytest.raises(RuntimeError, match="not the exact 'AutoencoderKLWan'"):
+        nfa._resolve_tiny_vae_decoder(staged, taew_dir=taew)
+
+
+def test_exact_wan_vae_class_resolves():
+    staged = _mk_staged_dir(out_channels=48, vae_class="AutoencoderKLWan")
+    taew = _mk_taew_dir("taew2_2")
+    variant, _ = nfa._resolve_tiny_vae_decoder(staged, taew_dir=taew)
+    assert variant == "taew2_2"
 
 
 def test_no_wan_signal_at_all_rejected():
