@@ -616,21 +616,27 @@ def _resolve_tiny_vae_decoder(staging_model_dir: str,
     injected so the unit test can point it at a fixture dir).
     """
     import json as _json
-    # (1) Wan-video gate — reuse the engine's own family predicate
-    #     (WanVideoPipeline wan_detect: the pipeline class starts with "Wan").
-    mi_path = os.path.join(staging_model_dir, "model_index.json")
-    try:
-        with open(mi_path, "r", encoding="utf-8") as _f:
-            cls_name = str(_json.load(_f).get("_class_name", ""))
-    except Exception as e:  # noqa: BLE001
-        raise RuntimeError(
-            f"tiny_vae: cannot read {mi_path} to confirm this is a Wan video "
-            f"model ({e}). tiny_vae is only supported for Wan video models.")
-    if not cls_name.startswith("Wan"):
+    # (1) Wan-video gate — REUSE the plugin's single Wan-family predicate
+    #     (`_is_wan_diffusers_dir`, comfyui_wan_remap.py: mirrors the engine's
+    #     wan_detect INCLUDING the transformer/vae _class_name fallback arms the
+    #     bare model_index check misses), instead of a third parallel copy of
+    #     the heuristic. Predicate is fail-open (False on unreadable configs);
+    #     the REFUSAL here is the fail-loud part.
+    from .format_adapters.comfyui_wan_remap import _is_wan_diffusers_dir
+    if not _is_wan_diffusers_dir(staging_model_dir):
+        # Best-effort class name, purely for the error message.
+        cls_name = ""
+        try:
+            with open(os.path.join(staging_model_dir, "model_index.json"),
+                      "r", encoding="utf-8") as _f:
+                cls_name = str(_json.load(_f).get("_class_name", ""))
+        except Exception:  # noqa: BLE001 — message detail only
+            pass
         raise RuntimeError(
             f"tiny_vae is only supported for Wan video models (Wan2.1/A14B or "
-            f"Wan2.2-5B); this pipeline is '{cls_name or 'unknown'}'. Disable "
-            f"tiny_vae for this model.")
+            f"Wan2.2-5B); no Wan signal in {staging_model_dir!r} "
+            f"(model_index.json/transformer/vae _class_name; pipeline is "
+            f"'{cls_name or 'unknown'}'). Disable tiny_vae for this model.")
     # (2) Variant by latent channel count = staged transformer out_channels,
     #     the exact value the engine's TinyVAEDecoder validates z against.
     xfm_cfg_path = os.path.join(staging_model_dir, "transformer", "config.json")
@@ -664,12 +670,22 @@ def _resolve_tiny_vae_decoder(staging_model_dir: str,
 # Engine-capability probe cache: lib identity (path, mtime, size) → set of the
 # taew variant tokens found in the lib binary. The engine's factory gates on the
 # LITERAL variant strings ("taew2_1"/"taew2_2" in ComponentImpl.cpp), so a
-# supporting .so necessarily carries them in .rodata — their absence means the
-# installed engine PREDATES tiny-VAE support and would SILENTLY IGNORE the
-# injected comp_opts (unknown create-time keys are not rejected), i.e. a silent
-# full-VAE fallback. Probing turns that version skew into a fail-LOUD error.
-# Transition-window belt-and-braces: releases pair plugin+engine, but a manual
-# `git pull` of the plugin alone would otherwise silently no-op.
+# supporting .so necessarily carries them in .rodata (string LITERALS survive
+# symbol stripping — `strip` removes symbol tables, not constants) — their
+# absence means the installed engine PREDATES tiny-VAE support and would
+# SILENTLY IGNORE the injected comp_opts (unknown create-time keys are not
+# rejected), i.e. a silent full-VAE fallback. Probing turns that version skew
+# into a fail-LOUD error. Transition-window belt-and-braces: releases pair
+# plugin+engine, but a manual `git pull` of the plugin alone would otherwise
+# silently no-op.
+# WHY NOT auto_update._read_lib_version() + _ver_cmp (simplicity-CR question):
+# MEASURED — QUANTFUNC_VERSION_STRING bumps only at SHIP time, not per commit:
+# it is "0.0.12" (engine CMakeLists.txt:242) at BOTH 81ddedc9 (pre-taew2_1) AND
+# b13721da (has taew2_1). So the shipped 0.0.12 lib (probe: no "taew2_1" token)
+# and a self-built lib from b13721da (has it) report the IDENTICAL version —
+# a version floor cannot distinguish them, on either side of the skew. The
+# capability token IS the discriminating signal (same signal used to diagnose
+# the live lib's skew in the first place).
 _ENGINE_TAEW_PROBE_CACHE: dict[tuple, frozenset] = {}
 _TAEW_PROBE_CHUNK_BYTES = 8 * 1024 * 1024  # streaming scan chunk (avoid loading a ~300MB .so at once)
 
@@ -821,7 +837,7 @@ class QuantFuncBuildPipeline:
                     "tooltip": "Lossy FAST-preview VAE (Wan video only). Swaps the "
                                "full Wan VAE decoder for the tiny TAEHV decoder — "
                                "measured decode speedups range from ~5x (Wan2.1/A14B "
-                               "@384p) to ~28x (Wan2.2-5B), varying with model and "
+                               "@384x384) to ~28x (Wan2.2-5B), varying with model and "
                                "resolution. Output stays coherent but is SOFTER — "
                                "use for draft/preview, DISABLE for final quality. "
                                "The taew variant is auto-selected by model "

@@ -53,16 +53,17 @@ nfa = importlib.import_module(f"{_PKG}.nodes_format_adapters")
 # fixtures
 # --------------------------------------------------------------------------- #
 def _mk_staged_dir(mi_class="WanPipeline", out_channels=16,
-                   write_mi=True, write_xfm_cfg=True):
+                   write_mi=True, write_xfm_cfg=True,
+                   xfm_class="WanTransformer3DModel"):
     """A minimal staged model dir: model_index.json + transformer/config.json
-    (the two files _resolve_tiny_vae_decoder reads)."""
+    (the files the Wan gate + variant resolver read)."""
     d = tempfile.mkdtemp(prefix="qftaew_staged_")
     if write_mi:
         json.dump({"_class_name": mi_class},
                   open(os.path.join(d, "model_index.json"), "w"))
     if write_xfm_cfg:
         os.makedirs(os.path.join(d, "transformer"), exist_ok=True)
-        json.dump({"_class_name": "WanTransformer3DModel",
+        json.dump({"_class_name": xfm_class,
                    "out_channels": out_channels},
                   open(os.path.join(d, "transformer", "config.json"), "w"))
     return d
@@ -146,7 +147,9 @@ def test_missing_weights_message_names_exact_path_and_convention():
 
 
 def test_non_wan_model_rejected():
-    staged = _mk_staged_dir(mi_class="QwenImagePipeline", out_channels=16)
+    # NO Wan signal anywhere (mi/transformer both non-Wan) → refuse.
+    staged = _mk_staged_dir(mi_class="QwenImagePipeline", out_channels=16,
+                            xfm_class="QwenImageTransformer2DModel")
     taew = _mk_taew_dir("taew2_1")
     with pytest.raises(RuntimeError, match="only supported for Wan video"):
         nfa._resolve_tiny_vae_decoder(staged, taew_dir=taew)
@@ -159,9 +162,21 @@ def test_unsupported_latent_channels_rejected():
         nfa._resolve_tiny_vae_decoder(staged, taew_dir=taew)
 
 
-def test_missing_model_index_rejected():
-    staged = _mk_staged_dir(write_mi=False)
-    with pytest.raises(RuntimeError, match="model_index.json"):
+def test_missing_model_index_wan_transformer_still_resolves():
+    # The Wan gate reuses the shared `_is_wan_diffusers_dir` predicate, which
+    # ALSO accepts the transformer-config _class_name arm (mirrors the engine
+    # wan_detect fallback) — a dir lacking model_index.json but carrying a Wan
+    # transformer config is still detectably Wan.
+    staged = _mk_staged_dir(write_mi=False, out_channels=16)
+    taew = _mk_taew_dir("taew2_1")
+    variant, _ = nfa._resolve_tiny_vae_decoder(staged, taew_dir=taew)
+    assert variant == "taew2_1"
+
+
+def test_no_wan_signal_at_all_rejected():
+    # Neither model_index nor a Wan transformer config → no Wan signal → refuse.
+    staged = _mk_staged_dir(write_mi=False, xfm_class="SomethingElse")
+    with pytest.raises(RuntimeError, match="only supported for Wan video"):
         nfa._resolve_tiny_vae_decoder(staged, taew_dir=_mk_taew_dir("taew2_1"))
 
 
