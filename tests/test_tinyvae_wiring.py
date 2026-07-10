@@ -86,6 +86,17 @@ def test_off_injects_nothing():
     assert "vae_decoder_weights" not in options
 
 
+def _mk_engine_lib(*tokens, pad_mb=1):
+    """A fake engine .so: binary blob optionally embedding the taew tokens
+    (mirrors the real gate's string literals living in .rodata)."""
+    fd, p = tempfile.mkstemp(prefix="qftaew_lib_", suffix=".so")
+    with os.fdopen(fd, "wb") as f:
+        f.write(b"\x7fELF" + b"\0" * (pad_mb * 1024 * 1024))
+        for t in tokens:
+            f.write(t.encode("ascii") + b"\0" * 64)
+    return p
+
+
 # --------------------------------------------------------------------------- #
 # 2. ON → correct variant + exact keys
 # --------------------------------------------------------------------------- #
@@ -93,9 +104,10 @@ def test_off_injects_nothing():
 def test_on_injects_variant_by_latent_channels(out_ch, variant):
     staged = _mk_staged_dir(out_channels=out_ch)
     taew = _mk_taew_dir("taew2_1", "taew2_2")
+    lib = _mk_engine_lib("taew2_1", "taew2_2")  # engine supports both
     options = {"auto_optimize": True}
     before = copy.deepcopy(options)
-    nfa._apply_tiny_vae(options, True, staged, taew_dir=taew)
+    nfa._apply_tiny_vae(options, True, staged, taew_dir=taew, lib_path=lib)
     added = {k: v for k, v in options.items() if k not in before}
     assert added == {
         "vae_decoder": variant,
@@ -152,6 +164,41 @@ def test_missing_transformer_config_rejected():
     staged = _mk_staged_dir(write_xfm_cfg=False)
     with pytest.raises(RuntimeError, match="out_channels"):
         nfa._resolve_tiny_vae_decoder(staged, taew_dir=_mk_taew_dir("taew2_1"))
+
+
+# --------------------------------------------------------------------------- #
+# 3b. engine version-skew guard (an old .so would SILENTLY ignore the keys)
+# --------------------------------------------------------------------------- #
+def test_old_engine_lib_without_variant_rejected():
+    staged = _mk_staged_dir(out_channels=16)
+    taew = _mk_taew_dir("taew2_1")
+    old_lib = _mk_engine_lib("taew2_2")  # pre-taew2_1 engine (or none at all)
+    options = {}
+    with pytest.raises(RuntimeError, match="predates"):
+        nfa._apply_tiny_vae(options, True, staged, taew_dir=taew,
+                            lib_path=old_lib)
+    assert "vae_decoder" not in options, "must refuse BEFORE injecting"
+
+
+def test_engine_probe_finds_token_across_chunk_boundary():
+    # Token straddling the streaming-scan chunk boundary must still be found.
+    fd, p = tempfile.mkstemp(prefix="qftaew_lib_", suffix=".so")
+    tok = b"taew2_1"
+    split = 3  # bytes of the token before the boundary
+    with os.fdopen(fd, "wb") as f:
+        f.write(b"\0" * (nfa._TAEW_PROBE_CHUNK_BYTES - split))
+        f.write(tok)
+    assert nfa._engine_lib_supports_taew("taew2_1", lib_path=p) is True
+
+
+def test_unresolvable_lib_warns_but_proceeds():
+    # Non-ComfyUI context (no lib on disk): cannot verify → proceed (log-only).
+    staged = _mk_staged_dir(out_channels=48)
+    taew = _mk_taew_dir("taew2_2")
+    options = {}
+    nfa._apply_tiny_vae(options, True, staged, taew_dir=taew,
+                        lib_path="/nonexistent/libquantfunc.so")
+    assert options.get("vae_decoder") == "taew2_2"
 
 
 # --------------------------------------------------------------------------- #

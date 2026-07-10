@@ -658,18 +658,90 @@ def _resolve_tiny_vae_decoder(staging_model_dir: str,
     return variant, weights_path
 
 
+# Engine-capability probe cache: lib identity (path, mtime, size) → set of the
+# taew variant tokens found in the lib binary. The engine's factory gates on the
+# LITERAL variant strings ("taew2_1"/"taew2_2" in ComponentImpl.cpp), so a
+# supporting .so necessarily carries them in .rodata — their absence means the
+# installed engine PREDATES tiny-VAE support and would SILENTLY IGNORE the
+# injected comp_opts (unknown create-time keys are not rejected), i.e. a silent
+# full-VAE fallback. Probing turns that version skew into a fail-LOUD error.
+# Transition-window belt-and-braces: releases pair plugin+engine, but a manual
+# `git pull` of the plugin alone would otherwise silently no-op.
+_ENGINE_TAEW_PROBE_CACHE: dict[tuple, frozenset] = {}
+_TAEW_PROBE_CHUNK_BYTES = 8 * 1024 * 1024  # streaming scan chunk (avoid loading a ~300MB .so at once)
+
+
+def _engine_lib_supports_taew(variant: str,
+                              lib_path: Optional[str] = None) -> Optional[bool]:
+    """Best-effort: does the installed engine lib support this taew variant?
+
+    Returns True/False when the lib file is resolvable (scan for the variant's
+    literal token), or None when no lib path can be resolved (non-ComfyUI test
+    context) — callers treat None as "cannot verify" (log, don't block).
+    """
+    if lib_path is None:
+        try:
+            from .nodes import _LIB_PATH
+            lib_path = _LIB_PATH
+        except Exception:  # noqa: BLE001 — nodes not importable outside ComfyUI
+            return None
+    if not lib_path or not os.path.isfile(lib_path):
+        return None
+    try:
+        st = os.stat(lib_path)
+        cache_key = (lib_path, st.st_mtime_ns, st.st_size)
+        found = _ENGINE_TAEW_PROBE_CACHE.get(cache_key)
+        if found is None:
+            tokens = {v.encode("ascii") for v in _TAEW_LATENT_TO_VARIANT.values()}
+            hits = set()
+            overlap = max(len(t) for t in tokens) - 1
+            tail = b""
+            with open(lib_path, "rb") as f:
+                while tokens - hits:
+                    chunk = f.read(_TAEW_PROBE_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    window = tail + chunk
+                    for t in tokens - hits:
+                        if t in window:
+                            hits.add(t)
+                    tail = chunk[-overlap:]
+            found = frozenset(h.decode("ascii") for h in hits)
+            _ENGINE_TAEW_PROBE_CACHE[cache_key] = found
+        return variant in found
+    except Exception as e:  # noqa: BLE001 — unreadable lib: cannot verify
+        logger.warning("[BuildPipeline] tiny_vae engine probe failed on %s: %s",
+                       lib_path, e)
+        return None
+
+
 def _apply_tiny_vae(options: dict, tiny_vae: bool, staging_model_dir: str,
-                    taew_dir: Optional[str] = None) -> None:
+                    taew_dir: Optional[str] = None,
+                    lib_path: Optional[str] = None) -> None:
     """Inject the tiny-VAE comp_opts keys when `tiny_vae` is ON.
 
     OFF (the default) is a strict no-op — NO key is added or touched, so the
     engine comp_opts stay byte-identical to the full-VAE path. ON resolves the
-    taew variant + weights via `_resolve_tiny_vae_decoder` (fail-LOUD) and
-    injects `vae_decoder` + `vae_decoder_weights`.
+    taew variant + weights via `_resolve_tiny_vae_decoder` (fail-LOUD), verifies
+    the INSTALLED engine lib actually supports the variant (an engine that
+    predates tiny-VAE support would silently ignore the keys = silent full-VAE
+    fallback — refuse instead), and injects `vae_decoder` + `vae_decoder_weights`.
     """
     if not tiny_vae:
         return
     variant, weights_path = _resolve_tiny_vae_decoder(staging_model_dir, taew_dir)
+    supported = _engine_lib_supports_taew(variant, lib_path)
+    if supported is False:
+        raise RuntimeError(
+            f"tiny_vae: the installed QuantFunc engine library predates "
+            f"tiny-VAE ({variant}) support and would silently ignore it "
+            f"(falling back to the full VAE). Update the engine library "
+            f"(plugin auto-update / matching release), or disable tiny_vae.")
+    if supported is None:
+        logger.warning(
+            "[BuildPipeline] tiny_vae: could not verify engine support for %s "
+            "(engine lib not resolvable in this context) — proceeding; an "
+            "unsupported engine would fall back to the full VAE.", variant)
     options["vae_decoder"] = variant
     options["vae_decoder_weights"] = weights_path
     logger.info(
@@ -744,10 +816,12 @@ class QuantFuncBuildPipeline:
                 "tiny_vae": ("BOOLEAN", {
                     "default": False,
                     "tooltip": "Lossy FAST-preview VAE (Wan video only). Swaps the "
-                               "full Wan VAE decoder for the tiny TAEHV decoder "
-                               "(~4.7x faster VAE decode). Output stays coherent but "
-                               "is SOFTER — use for draft/preview, DISABLE for final "
-                               "quality. The taew variant is auto-selected by model "
+                               "full Wan VAE decoder for the tiny TAEHV decoder — "
+                               "measured decode speedups range from ~5x (Wan2.1/A14B "
+                               "@384p) to ~28x (Wan2.2-5B), varying with model and "
+                               "resolution. Output stays coherent but is SOFTER — "
+                               "use for draft/preview, DISABLE for final quality. "
+                               "The taew variant is auto-selected by model "
                                "(Wan2.1/A14B = taew2_1, Wan2.2-5B = taew2_2); the "
                                "weights must sit at "
                                "<ComfyUI>/models/QuantFunc/taew/<variant>.safetensors.",
