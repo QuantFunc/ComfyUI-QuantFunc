@@ -888,6 +888,19 @@ class QuantFuncBuildPipeline:
         # so adding a knob to PipelineConfig automatically propagates here.
         options.update(cfg_dict)
         options.setdefault("vision_quant", "int8")
+        # #516: runtime int4/fp4 TE (Qwen3) MUST use Hadamard rotation. The engine
+        # qwen3_te_factory defaults use_rotation=false for the RUNTIME (raw/online-
+        # quant) TE, so without this the outlier-heavy Qwen3 hidden-state activations
+        # collapse under int4/fp4 W4A4 ACTIVATION quant → the conditioning embedding
+        # goes to ~0 → solid-gray t2i (edit survives via image-token conditioning).
+        # The transformer already rotates (rotation_block_size=256 above + engine
+        # default use_rotation=true); forward the same to the TE. rotation_block_size
+        # is already 256 here so the paired H256 rotation is available. setdefault →
+        # an explicit user use_rotation still wins; 8-bit/fp16 TE tolerate outliers
+        # and are left untouched. Mirrors what the pre-quantized Model-Auto-Loader
+        # path bakes in (its int4/fp4 TE ships already-rotated).
+        if str(text_precision).lower() in ("int4", "i4", "4", "fp4", "f4"):
+            options.setdefault("use_rotation", True)
         # `act_quant_mode="auto"` ⇒ leave key unset so engine auto-enables
         # MSE search when rotation_block_size > 0 (best INT4 quality).
         # Explicit "absmax" / "mse" matches the QuantFuncModelAutoLoader knob.
@@ -1009,6 +1022,11 @@ class QuantFuncBuildPipeline:
             options.pop("rotation_block_size", None)
             options.pop("quant_method", None)
             options.pop("fused_mod", None)
+            # #516: the SVDQ obfuscated TE is prequant INT4+rotation (baked), so
+            # the runtime TE use_rotation default set above is a Lighting-only knob
+            # here — drop it for parity (the prequant restore path applies the
+            # baked rotation regardless).
+            options.pop("use_rotation", None)
         else:
             backend = "lighting"
             transformer_path = ""
