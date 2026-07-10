@@ -1,9 +1,14 @@
 """Tests for the Build Pipeline tiny-VAE (TAEHV fast-preview) wiring.
 
-The engine (merged main) supports an opt-in tiny Wan video VAE decoder via
-comp_opts `vae_decoder` ("taew2_1" = Wan2.1/A14B 16-ch | "taew2_2" = Wan2.2-5B
-48-ch) + `vae_decoder_weights` (operator-provided .safetensors). This suite
-covers the plugin-side wiring added to QuantFuncBuildPipeline:
+Engine contract baseline: QuantFunc engine origin/main `b13721da`
+(verify: `git show b13721da:src/ComponentImpl.cpp` — the wan_vae_factory gate
+`vd == "taew2_2" || vd == "taew2_1"`; NOTE a stale local engine checkout may
+still show the older taew2_2-only gate). That engine supports an opt-in tiny
+Wan video VAE decoder via comp_opts `vae_decoder` ("taew2_1" = Wan2.1/A14B
+16-ch | "taew2_2" = Wan2.2-5B 48-ch) + `vae_decoder_weights`
+(operator-provided .safetensors). An OLDER installed engine lib silently
+ignores the keys — the wiring probes the lib and refuses (tested below).
+This suite covers the plugin-side wiring added to QuantFuncBuildPipeline:
 
   1. OFF (default) is a strict byte-no-op — the options dict gains NO key.
   2. ON auto-selects the variant from the staged transformer's `out_channels`

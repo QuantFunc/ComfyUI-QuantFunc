@@ -589,11 +589,14 @@ def _reresolve_auto_transformer_for_device(model, xfm_path, device_idx):
 
 # tiny-VAE (TAEHV) opt-in fast-preview decoder — Wan video only. The engine's
 # TinyVAEDecoder is a per-variant TRUSTED decoder that validates the incoming
-# latent channel count z against the variant (ComponentImpl.cpp: taew2_1 = 16,
-# taew2_2 = 48). We pick the variant from that SAME value — the staged Wan
-# transformer's `out_channels` (= the latent channel count) — instead of a new
-# parallel arch heuristic, so the plugin's choice can never disagree with the
-# engine's own check.
+# latent channel count z against the variant (engine origin/main b13721da
+# ComponentImpl.cpp wan_vae_factory: `vd=="taew2_2"||vd=="taew2_1"`, taew2_1 =
+# 16-ch, taew2_2 = 48-ch — verify via `git show b13721da:src/ComponentImpl.cpp`;
+# a stale engine checkout/lib may predate the taew2_1 arm, which is exactly what
+# _engine_lib_supports_taew guards against). We pick the variant from that SAME
+# value — the staged Wan transformer's `out_channels` (= the latent channel
+# count) — instead of a new parallel arch heuristic, so the plugin's choice can
+# never disagree with the engine's own check.
 _TAEW_LATENT_TO_VARIANT = {16: "taew2_1", 48: "taew2_2"}  # latent z_dim → taehv variant
 _TAEW_WEIGHTS_SUBDIR = "taew"  # <ComfyUI>/models/QuantFunc/<subdir>/<variant>.safetensors
 
