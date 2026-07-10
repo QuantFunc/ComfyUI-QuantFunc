@@ -334,3 +334,49 @@ def test_real_vae_and_te_signatures():
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))
+
+
+# --------------------------------------------------------------------------- #
+# 7. real REFERENCE-dir key-exactness (CI-locks the '825/825' / '242' claims;
+#    mirrors test_wan_combine_experts.test_real_single_file_key_exact_vs_diffusers)
+# --------------------------------------------------------------------------- #
+_REAL_REF_DIR = "/media/jonathan/Data/ComfyUI/models/diffusers/wan2.2-TI2V-5B-Diffusers"
+
+
+def _shard_keys(dirpath):
+    keys = set()
+    for f in sorted(os.listdir(dirpath)):
+        if f.endswith(".safetensors"):
+            keys.update(W._read_header(os.path.join(dirpath, f)))
+    return keys
+
+
+@pytest.mark.skipif(not (os.path.isfile(_REAL_5B) and
+                         os.path.isdir(os.path.join(_REAL_REF_DIR, "transformer"))),
+                    reason="real 5B single-file / diffusers reference not present")
+def test_real_transformer_remap_key_exact_vs_diffusers():
+    # remap_key over EVERY key of the real single-file must be key-EXACT onto
+    # the official diffusers release (825/825, 0 missing / 0 extra) — the
+    # docstring's transformer verification, locked as a regression test.
+    src = W._read_header(_REAL_5B)
+    mapped = {W.remap_key(k) for k in src
+              if not W._is_droppable(k)}
+    ref = _shard_keys(os.path.join(_REAL_REF_DIR, "transformer"))
+    assert mapped == ref, (
+        f"missing={sorted(ref - mapped)[:5]} extra={sorted(mapped - ref)[:5]}")
+
+
+@pytest.mark.skipif(not (os.path.isfile(_REAL_TE) and
+                         os.path.isdir(os.path.join(_REAL_REF_DIR, "text_encoder"))),
+                    reason="real umt5 single-file / diffusers reference not present")
+def test_real_te_clean_keys_exact_vs_diffusers():
+    # The umt5 single-file minus the fp8 scale siblings/marker + the embedded
+    # spiece_model blob must equal the official release's key set EXACTLY
+    # (242/242, pass-through naming — no remap needed) — the docstring's TE
+    # verification, locked as a regression test.
+    src = W._read_header(_REAL_TE)
+    clean = {k for k in src
+             if not W._is_droppable(k) and k not in W._UMT5_EXTRA_DROP}
+    ref = _shard_keys(os.path.join(_REAL_REF_DIR, "text_encoder"))
+    assert clean == ref, (
+        f"missing={sorted(ref - clean)[:5]} extra={sorted(clean - ref)[:5]}")

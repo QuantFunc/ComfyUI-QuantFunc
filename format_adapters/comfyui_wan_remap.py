@@ -811,7 +811,10 @@ def _expert_basename_hint_check(high_expert: str, low_expert: str) -> None:
 def _run_staged_build(out_dir: str, fp: str, need_bytes: int, build_fn,
                       label: str, force: bool = False) -> str:
     """Cache-aware, locked, CRASH-SAFE staged build — the shared core extracted
-    from `stage_two_expert` (byte-identical behaviour): under `<out_dir>.lock`,
+    from `stage_two_expert` (behaviour-identical OUTCOMES; the one ordering
+    delta is that callers now compute need_bytes BEFORE the lock, so a
+    cache-hit pays a few extra header reads — read-only, side-effect-free):
+    under `<out_dir>.lock`,
     (1) fingerprint cache-hit check, (2) free-disk pre-check with the caller's
     exact planned bytes, (3) build into `<out_dir>.tmp-<pid>` via `build_fn(tmp)`,
     (4) marker-first atomic swap with rollback (SF1/SF2/SF3/S3/S4 semantics
