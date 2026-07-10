@@ -85,12 +85,30 @@ BUNDLE_SCHEMES = [
         # #135/#140/#134/#25-recurrence map::at INTERNAL signature.
         "te":          "text_encoders.qwen25_7b.transformer.model.",
         "vae":         "vae.",
+        # Vision tower lives at `text_encoders.qwen25_7b.transformer.visual.*`
+        # (NOT under `.model.`, the LLM sub-tree). The engine's AIO vision path
+        # uses Qwen25VLVisionTensorsProvider(add_visual_prefix=true) → it queries
+        # `visual.blocks.N…` and its presence probe checks
+        # `visual.blocks.0.attn.qkv.weight` (ComponentImpl.cpp:7400), so the
+        # PrefixFilter prepend (ComponentImpl.cpp:1306-1310) must strip ONLY to
+        # `transformer.` and KEEP the `visual.` segment. WITHOUT this key,
+        # adapt() falls back to ve_prefix = te (`…transformer.model.`, the LLM
+        # sub-tree) → the filter matches ZERO vision weights → engine warns
+        # "no weights found in safetensors — skipping" (ComponentImpl.cpp:7404)
+        # → null vision encoder → generate_edit null-deref / worker kill.
+        "vision":      "text_encoders.qwen25_7b.transformer.",
     },
     {   # Qwen variants with qwen2vl naming
         "name": "qwen2vl_bundle",
         "transformer": "model.diffusion_model.",
         "te":          "text_encoders.qwen2vl.transformer.",
         "vae":         "vae.",
+        # Same visual-subtree rule as qwen25_bundle: KEEP `visual.`, strip only
+        # to `transformer.`. Here `te` already stops at `transformer.` so the
+        # default ve_prefix would coincidentally resolve correctly, but declare
+        # `vision` EXPLICITLY so a future `te` change (e.g. adding a `.model.`
+        # segment to mirror qwen25) cannot silently re-break the vision tower.
+        "vision":      "text_encoders.qwen2vl.transformer.",
     },
     {   # SD legacy bundles (out of MVP scope but detect for graceful error)
         "name": "sd_legacy_bundle",
