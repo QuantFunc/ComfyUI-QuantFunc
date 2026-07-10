@@ -7,6 +7,12 @@ __pycache__/
 *.so
 *.dylib
 
+# Versioned/renamed libraries: `*.so` misses `libfmt.so.8` and the
+# `libquantfunc.so.bak-<tag>` engine backups (hundreds of MB each).
+*.so.*
+*.dll.*
+*.dylib.*
+
 # Static libraries (all platforms)
 *.lib
 *.a
@@ -22,3 +28,21 @@ bin/windows/resource_cache.json
 # SHA-256 integrity verify: runtime cache + heal-state (per-version manifest cache + marker)
 bin/*/verify-*.json
 bin/*/verify.state
+
+# Dev-lib lock: local marker that disables auto-update so a self-built engine
+# .so is not clobbered. Never publish — its presence is a per-machine choice.
+bin/*/.dev_lib_lock
+
+# Ad-hoc file/dir backups from deploy + rollback scripts
+*.bak-*
+.deploy-backups/
+.qf_deploy_backup/
+.autoloader-bak-*/
+.comfyui-deploy-bak-*/
+.deviceselect-bak-*/
+
+# Local editor / code-intel tooling
+.cursor/
+.codegraph/
+.codegraph-init.log
+.codegraph-init.lock
