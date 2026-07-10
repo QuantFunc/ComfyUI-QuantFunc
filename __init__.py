@@ -1,6 +1,6 @@
 """ComfyUI-QuantFunc: GPU-accelerated quantized diffusion inference via QuantFunc C API."""
 
-import os as _os, logging
+import os as _os, platform as _platform, logging
 _plugin_dir = _os.path.dirname(_os.path.abspath(__file__))
 
 # Plugin updates are EXPLICIT, never silent. By default this plugin does NOT
@@ -61,12 +61,24 @@ try:
 except Exception:
     pass
 
-# Auto-update check on startup (background, non-blocking)
-try:
-    from .auto_update import check_for_updates
-    check_for_updates()
-except Exception as e:
-    logging.getLogger("QuantFunc").debug("Auto-update check skipped: %s", e)
+# Auto-update check on startup (background, non-blocking).
+# Skipped when a dev-lib lock marker exists (a locally-built engine .so installed
+# for testing — its SHA won't match the release manifest, so the integrity check
+# would otherwise re-download and CLOBBER the dev build). Delete
+# bin/<platform>/.dev_lib_lock to re-enable auto-update + restore the release .so.
+_dev_lib_lock = _os.path.join(_plugin_dir, "bin",
+                              "windows" if _platform.system() == "Windows" else "linux",
+                              ".dev_lib_lock")
+if _os.path.exists(_dev_lib_lock):
+    logging.getLogger("QuantFunc").warning(
+        "QuantFunc: dev-lib lock present (%s) — skipping auto-update/integrity check "
+        "so the locally-built engine .so is preserved.", _dev_lib_lock)
+else:
+    try:
+        from .auto_update import check_for_updates
+        check_for_updates()
+    except Exception as e:
+        logging.getLogger("QuantFunc").debug("Auto-update check skipped: %s", e)
 
 # Refresh resource cache for ModelAutoLoader dropdowns (background)
 try:

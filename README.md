@@ -179,6 +179,11 @@ pip install modelscope
 If `modelscope` is not installed, auto-update is silently skipped. You can manually download binaries from:
 - https://www.modelscope.cn/models/QuantFunc/Plugin
 
+To keep a locally-built engine library, create an empty `bin/<platform>/.dev_lib_lock`.
+Auto-update then skips its integrity check, which would otherwise see the SHA
+mismatch and re-download the release library over your build. Delete the marker to
+restore normal updating.
+
 ### 2.6 Verify Installation
 
 After starting ComfyUI, check the console for:
