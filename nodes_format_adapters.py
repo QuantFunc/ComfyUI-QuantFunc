@@ -94,7 +94,11 @@ class _QFPathStub:
     """
     __slots__ = ("qf_source_path", "qf_is_checkpoint", "qf_lora_chain",
                  "qf_kind", "qf_model_dir", "qf_backend_hint",
-                 "qf_prequant_weights")
+                 "qf_prequant_weights",
+                 # [auto-detect] intent stashed by QuantFuncModelAutoLoader so
+                 # build() can RE-RESOLVE the transformer weight for the SELECTED
+                 # run-device (device_idx), not the auto-loader's device-0 pick.
+                 "qf_auto_transformer_series", "qf_data_source")
 
     def __init__(self, path: str, kind: str = ""):
         self.qf_source_path = path
@@ -104,6 +108,8 @@ class _QFPathStub:
         self.qf_model_dir = ""
         self.qf_backend_hint = ""
         self.qf_prequant_weights = ""
+        self.qf_auto_transformer_series = ""   # non-empty ⇒ [auto-detect] re-resolve at build()
+        self.qf_data_source = ""
 
 
 def _scan_files(*folder_keys: str) -> list[str]:
@@ -374,21 +380,22 @@ _ARCH_TO_SERIES = {
 
 def _device_sm(device_idx: int) -> int:
     """Compute capability (e.g. 120, 89, 86) of the user-selected CUDA device.
-    Returns 0 if it can't be determined."""
+    Returns 0 if it can't be determined.
+
+    Thin convenience wrapper — delegates to the canonical per-index detector
+    `lib_setup._detect_device_sm` (torch `get_device_capability(idx)`, CVD-aware,
+    bounds-checked), which is the single source of truth for per-index SM (callers
+    may also import `_detect_device_sm` directly). We deliberately do NOT probe a
+    first GPU / nvidia-smi here:
+    nvidia-smi orders by PCI bus while CUDA orders by capability, so it can return
+    the WRONG device's SM and wrongly pick FP4 on a non-Blackwell card (the 本地
+    4090/3060 trap — FP4 __trap()s below SM120). 0 → the caller falls back to INT4
+    (50x-below), the conservative choice that runs on EVERY GPU."""
     try:
-        import torch
-        if torch.cuda.is_available():
-            cap = torch.cuda.get_device_capability(int(device_idx))
-            return cap[0] * 10 + cap[1]
+        from .lib_setup import _detect_device_sm
+        return _detect_device_sm(device_idx)
     except Exception:
-        pass
-    # No reliable per-device query → 0. 0 < 120, so the caller falls back to INT4
-    # (50x-below) — the conservative choice that runs on EVERY GPU. We deliberately
-    # do NOT probe a first GPU here (nvidia-smi / device 0): nvidia-smi orders by
-    # PCI bus while CUDA orders by capability, so it can return the WRONG device's
-    # SM and wrongly pick FP4 on a non-Blackwell card (the 本地 4090/3060 trap —
-    # FP4 __trap()s below SM120, a far worse failure than INT4 on a Blackwell card).
-    return 0
+        return 0
 
 
 # POSITIVE allowlist of kinds that get a config injected — only genuine
@@ -508,6 +515,76 @@ def _autopick_precision_for_full_model(precision_map_xfm, xfm_ref, device_idx,
         logger.warning("[BuildPipeline] precision auto-pick failed (%s); "
                         "falling back to engine [auto-derive]", e)
         return precision_map_xfm
+
+
+class _NoCompatibleWeightError(RuntimeError):
+    """The [auto-detect] BACKSTOP: the SELECTED run-device can run NO weight in the
+    series. A clean, user-actionable pipeline-build error (choose a higher-capability
+    device or pick a weight explicitly) — NOT a device __trap. A dedicated subclass
+    so `_reresolve_auto_transformer_for_device` can re-raise ONLY this and let a
+    generic download RuntimeError fall back to the auto-loader's pick."""
+
+
+def _reresolve_auto_transformer_for_device(model, xfm_path, device_idx):
+    """Device-aware [auto-detect] transformer re-resolution at pipeline-build time.
+
+    QuantFuncModelAutoLoader resolves the transformer weight BEFORE the run-device
+    is known (its node has no `device`; the device lives on THIS Build Pipeline
+    node), so it keys on the DEFAULT GPU (device 0). Here `device_idx` — the device
+    the pipeline will ACTUALLY run on — IS known, so re-pick the best weight for it,
+    overriding the auto-loader's device-0 pick. This makes a device switch (e.g. a
+    4090 on device 0 → a 3060 on device 1) load a weight the SELECTED GPU can run
+    instead of the device-0 tier (which would `__trap` on the weaker card).
+
+    - No-op (returns `xfm_path` unchanged) when `model` carries no [auto-detect]
+      marker — i.e. an explicit user pick or a non-auto-loader source (plain
+      UNETLoader). So it never overrides a deliberate selection.
+    - BACKSTOP: raises a clean `_NoCompatibleWeightError` (never a device `__trap`)
+      when the series HAS weights but NONE runs on the selected device — telling the
+      user to choose a higher-capability device or pick a compatible weight explicitly.
+    - Undetectable device SM (no CUDA/torch) → the resolver best-efforts the lowest
+      tier (safe); a genuine resolve/download error (network, hf/modelscope missing)
+      FALLS BACK to the auto-loader's already-valid pick (never crashes build()).
+    """
+    series = getattr(model, "qf_auto_transformer_series", "") or ""
+    if not series:
+        return xfm_path  # not an [auto-detect] auto-loader selection → leave as-is
+    data_source = getattr(model, "qf_data_source", "") or "modelscope"
+    try:
+        from .model_auto_loader import (
+            resolve_transformer_selection, download_transformer, AUTO_DETECT,
+            _available_transformer_names,
+        )
+        from .lib_setup import _detect_device_sm
+        sm = _detect_device_sm(device_idx)
+        t_series, t_name = resolve_transformer_selection(AUTO_DETECT, series, device_idx)
+        if not t_name:
+            if _available_transformer_names(series):
+                # DISTINCT subclass (not a bare RuntimeError) so the except below can
+                # tell THIS intentional backstop from a generic download failure —
+                # download_transformer raises plain RuntimeError on hf/modelscope
+                # missing or a transient network error, which must FALL BACK, not crash.
+                raise _NoCompatibleWeightError(
+                    "[QuantFunc] No transformer weight in {} runs on the selected "
+                    "device (CUDA device {}, SM{}). Choose a device with a higher "
+                    "compute capability, or pick a compatible weight explicitly in "
+                    "the QuantFunc Model Auto Loader.".format(series, device_idx, sm))
+            return xfm_path  # series ships no separate weights → keep base default
+        new_path = download_transformer(t_series, t_name, data_source)
+        if os.path.abspath(new_path or "") != os.path.abspath(xfm_path or ""):
+            logger.info("[BuildPipeline] [auto-detect] re-resolved transformer for "
+                        "device %d (SM%d): %s -> %s", device_idx, sm,
+                        os.path.basename(xfm_path or "?"), os.path.basename(new_path))
+        return new_path
+    except _NoCompatibleWeightError:
+        raise  # the clean, user-actionable backstop — surface it (never a __trap)
+    except Exception as e:
+        # ANY other failure (download/network/library-missing/resolve bug) → degrade
+        # gracefully to the auto-loader's already-valid pick rather than crash build().
+        logger.warning("[BuildPipeline] [auto-detect] device re-resolve failed (%s); "
+                        "keeping the auto-loader's pick %s",
+                        e, os.path.basename(xfm_path or "?"))
+        return xfm_path
 
 
 class QuantFuncBuildPipeline:
@@ -664,6 +741,17 @@ class QuantFuncBuildPipeline:
             return FileRef(path=path, arch=arch, kind=kind, mtime=mtime)
 
         xfm_path = extract_qf_source_path(model, "diffusion model (UNETLoader)")
+        # [auto-detect] DEVICE-AWARE re-resolution: QuantFuncModelAutoLoader picked
+        # xfm_path for the DEFAULT GPU (device 0), but THIS pipeline runs on the
+        # user-SELECTED `device`. Re-pick the best weight for the selected device so
+        # switching devices (e.g. 4090 device 0 → 3060 device 1) never loads a tier
+        # the selected GPU can't run (→ __trap). No-op unless the auto-loader stashed
+        # its [auto-detect] marker on `model`. Done BEFORE the is_ckpt probe/staging
+        # so they operate on the weight actually used.
+        # SELECTED run-device index (also reused below by the precision-config
+        # auto-pick — computed once here, the earliest point it's needed).
+        device_idx = int(device.split(":")[0]) if isinstance(device, str) else int(device)
+        xfm_path = _reresolve_auto_transformer_for_device(model, xfm_path, device_idx)
         is_ckpt = bool(getattr(model, "qf_is_checkpoint", False))
         # CheckpointLoaderSimple sets qf_is_checkpoint, but UNETLoader doesn't —
         # users may also wire a bundled-checkpoint file
@@ -723,7 +811,7 @@ class QuantFuncBuildPipeline:
             scheduler_config=scheduler_config,
         )
 
-        device_idx = int(device.split(":")[0]) if isinstance(device, str) else int(device)
+        # device_idx already computed above (right after xfm_path extraction).
         # Full-precision auto-pick: a full-precision diffusers base / all-in-one
         # checkpoint with no quant metadata + no explicit precision_config would
         # stay at full precision under [auto-derive]. Identify the model (via the

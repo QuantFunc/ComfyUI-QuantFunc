@@ -3,12 +3,15 @@
 The transformer dropdown must (a) default to '[auto-detect]', which resolves to
 the HIGHEST-tier weight the target GPU can run, and (b) HIDE weights whose
 minimum SM exceeds the target GPU (a 50x FP4 weight must not be offered on an
-SM86 card — it __trap()s at runtime). The TARGET GPU is the DEFAULT CUDA device
-(torch device 0) — the device BuildPipeline runs the transformer on by default —
-so a weight offered/auto-picked is ALWAYS runnable on the actual run-device under
-any CUDA_VISIBLE_DEVICES mask or CUDA_DEVICE_ORDER (torch "device 0" == the index
-BuildPipeline defaults to). Under the default FASTEST_FIRST ordering device 0 is
-the best GPU (e.g. the 4090 on a 3060+4090 box → the 40x/FP8 tier shows).
+SM86 card — it __trap()s at runtime). TWO-STAGE design: the dropdown DISPLAY is
+filtered for the DEFAULT CUDA device (torch device 0), but the authoritative
+[auto-detect] PICK is RE-RESOLVED for the device the user SELECTS in Build
+Pipeline at build() time (_reresolve_auto_transformer_for_device) — so switching
+to a weaker non-default GPU (e.g. device 1 = a 3060 SM86 on a 3060+4090 box)
+re-picks a compatible weight instead of the device-0 40x/FP8 tier. torch
+per-index capability respects CUDA_VISIBLE_DEVICES / CUDA_DEVICE_ORDER, and the
+engine worker runs on the same index, so the re-resolved weight matches the
+run-device.
 
 Tier tokens (confirmed from real weight names — klein-9b-50x-lighting.safetensors,
 qwen 50x-above / 30x-below — and the engine precision rules):
@@ -44,26 +47,29 @@ QWEN_30X = "qwen-image-30x-below.safetensors"        # INT4 → SM75
 
 
 class _Env:
-    """Stub the resource cache + the DEFAULT CUDA device SM (torch device 0, the
-    device the transformer runs on) + on-disk listing; restore on exit."""
+    """Stub the resource cache + the DEFAULT CUDA device SM (torch device 0) +
+    optional per-index device SMs (dev_sm={idx: sm}, for the SELECTED-device
+    auto-pick path) + on-disk listing; restore on exit."""
 
-    def __init__(self, cache=None, device_sm=0, local=None):
+    def __init__(self, cache=None, device_sm=0, dev_sm=None, local=None):
         self.cache = cache or {}
         self.device_sm = device_sm          # SM of torch device 0 (the default run-device)
+        self.dev_sm = dev_sm or {}          # {device_idx: sm} for _device_sm_by_index
         self.local = local or {}            # {(short, resource_type): [names]}
 
     def __enter__(self):
         self._orig = (mal._resource_cache, mal._default_device_sm,
-                      mal._list_local_resource_names)
+                      mal._device_sm_by_index, mal._list_local_resource_names)
         mal._resource_cache = self.cache
         mal._default_device_sm = lambda: self.device_sm
+        mal._device_sm_by_index = lambda idx: self.dev_sm.get(idx, 0)
         mal._list_local_resource_names = \
             lambda short, rtype: list(self.local.get((short, rtype), []))
         return self
 
     def __exit__(self, *exc):
         (mal._resource_cache, mal._default_device_sm,
-         mal._list_local_resource_names) = self._orig
+         mal._device_sm_by_index, mal._list_local_resource_names) = self._orig
         return False
 
 
@@ -251,6 +257,47 @@ def test_user_scenario_3060_plus_4090_shows_40x():
         assert (s, n) == (KLEIN, KLEIN_40X), (s, n)  # auto-detect picks 40x (highest ≤ 89)
 
 
+# -------- SELECTED-device keying (BuildPipeline device switch, the user's blocker) --------
+def test_resolve_keys_on_selected_device_idx():
+    # The user's REAL repro: device 0 = 4090 (SM89), device 1 = 3060 (SM86).
+    # resolve_transformer_selection with an explicit device_idx keys on THAT device
+    # (what BuildPipeline passes), NOT device 0. Switching device 0↔1 flips the pick.
+    with _Env(cache=_klein_cache(), device_sm=89, dev_sm={0: 89, 1: 86}):
+        # device 0 (4090) → 40x (highest ≤ 89)
+        assert mal.resolve_transformer_selection(mal.AUTO_DETECT, KLEIN, device_idx=0) == (KLEIN, KLEIN_40X)
+        # SWITCH to device 1 (3060, SM86) → 40x is NOT runnable → picks 30x
+        assert mal.resolve_transformer_selection(mal.AUTO_DETECT, KLEIN, device_idx=1) == (KLEIN, KLEIN_30X)
+        # switch BACK to device 0 → 40x again
+        assert mal.resolve_transformer_selection(mal.AUTO_DETECT, KLEIN, device_idx=0) == (KLEIN, KLEIN_40X)
+
+
+def test_resolve_device_idx_none_uses_default_device0():
+    # device_idx omitted (dropdown-populate path, device not yet known) → keys on
+    # the DEFAULT device (device 0) via _target_gpu_sm — backward compatible.
+    with _Env(cache=_klein_cache(), device_sm=86, dev_sm={0: 89, 1: 86}):
+        assert mal.resolve_transformer_selection(mal.AUTO_DETECT, KLEIN) == (KLEIN, KLEIN_30X)  # device0 stub=86
+
+
+def test_resolve_selected_device_no_compat_returns_none():
+    # series ships only 40x+50x; device 1 (SM86) can run neither → (None,None) so the
+    # build()-time backstop raises a clean error (never a device __trap).
+    cache = {KLEIN: {"transformer": [KLEIN_40X, KLEIN_50X]}}
+    with _Env(cache=cache, dev_sm={1: 86}):
+        assert mal.resolve_transformer_selection(mal.AUTO_DETECT, KLEIN, device_idx=1) == (None, None)
+
+
+def test_detect_device_sm_reads_torch_per_index():
+    # lib_setup._detect_device_sm(idx) reads torch device `idx` (CVD-aware); out-of-range → 0.
+    ns = types.SimpleNamespace(
+        is_available=lambda: True,
+        device_count=lambda: 2,
+        get_device_capability=lambda i: (8, 9) if i == 0 else (8, 6),
+    )
+    assert _with_fake_torch(ns, lambda ls: ls._detect_device_sm(0)) == 89
+    assert _with_fake_torch(ns, lambda ls: ls._detect_device_sm(1)) == 86
+    assert _with_fake_torch(ns, lambda ls: ls._detect_device_sm(5)) == 0   # out of range
+
+
 # ---------------------- fail-safe: no compatible weight ----------------------
 def test_autodetect_all_incompatible_returns_none():
     # a series shipping ONLY 40x+50x (no SM75/80 floor weight) on an SM75/SM86
@@ -365,6 +412,99 @@ def test_detect_default_device_sm_cpu_only_returns_zero():
         get_device_capability=lambda i: (0, 0),
     )
     assert _with_fake_torch(ns, lambda ls: ls._detect_default_device_sm()) == 0
+
+
+# ---- build()-time device re-resolve glue (nodes_format_adapters, the real fix) ----
+nfa = importlib.import_module(f"{_PKG}.nodes_format_adapters")
+
+
+class _StubModel:
+    """Mimics the _QFPathStub the auto-loader hands to build(): carries the
+    [auto-detect] marker (series) so _reresolve keys on the SELECTED device."""
+    def __init__(self, series="", data_source="modelscope"):
+        self.qf_auto_transformer_series = series
+        self.qf_data_source = data_source
+
+
+class _ReEnv:
+    """Stub the pieces _reresolve_auto_transformer_for_device pulls in: per-index
+    device SM (dev_sm={idx: sm}), the series catalog, and download (returns the
+    resolved name's path OR raises to simulate a network/library failure)."""
+    def __init__(self, dev_sm=None, cache=None, dl_raises=None):
+        self.dev_sm = dev_sm or {}
+        self.cache = cache or {}
+        self.dl_raises = dl_raises   # an Exception instance to raise from download
+
+    def __enter__(self):
+        import importlib as _il
+        self.ls = _il.import_module(f"{_PKG}.lib_setup")
+        self._o = (mal._resource_cache, mal._device_sm_by_index,
+                   mal._list_local_resource_names, self.ls._detect_device_sm,
+                   mal.download_transformer)
+        mal._resource_cache = self.cache
+        mal._device_sm_by_index = lambda idx: self.dev_sm.get(idx, 0)
+        mal._list_local_resource_names = lambda short, rtype: []
+        self.ls._detect_device_sm = lambda idx: self.dev_sm.get(idx, 0)
+
+        def _dl(series, name, ds):
+            if self.dl_raises is not None:
+                raise self.dl_raises
+            return "/models/QuantFunc/{}/transformer/{}".format(series.split("/")[-1], name)
+        mal.download_transformer = _dl
+        return self
+
+    def __exit__(self, *exc):
+        (mal._resource_cache, mal._device_sm_by_index, mal._list_local_resource_names,
+         self.ls._detect_device_sm, mal.download_transformer) = self._o
+        return False
+
+
+_BAKED_40X = "/models/QuantFunc/Klein-4B-Series/transformer/" + KLEIN_40X
+
+
+def test_reresolve_no_marker_is_noop():
+    # a plain UNETLoader / explicit pick (no [auto-detect] marker) is NEVER overridden
+    with _ReEnv(dev_sm={1: 86}, cache=_klein_cache()):
+        assert nfa._reresolve_auto_transformer_for_device(_StubModel(), _BAKED_40X, 1) == _BAKED_40X
+
+
+def test_reresolve_device_switch_repicks():
+    # THE USER REPRO: auto-loader baked 40x (device 0 = 4090 SM89); the pipeline runs
+    # on the SELECTED device → re-pick for it. device1(3060 SM86) → 30x (NOT 40x).
+    with _ReEnv(dev_sm={0: 89, 1: 86}, cache=_klein_cache()):
+        r0 = nfa._reresolve_auto_transformer_for_device(_StubModel(KLEIN), _BAKED_40X, 0)
+        r1 = nfa._reresolve_auto_transformer_for_device(_StubModel(KLEIN), _BAKED_40X, 1)
+        r0b = nfa._reresolve_auto_transformer_for_device(_StubModel(KLEIN), _BAKED_40X, 0)
+    assert os.path.basename(r0) == KLEIN_40X, r0
+    assert os.path.basename(r1) == KLEIN_30X, r1     # the fix: 30x on the 3060, not 40x
+    assert os.path.basename(r0b) == KLEIN_40X, r0b
+
+
+def test_reresolve_backstop_raises_when_no_compatible_weight():
+    # series ships only 40x+50x; device1 (SM86) can run neither → clean backstop
+    # (_NoCompatibleWeightError, a RuntimeError) — NOT a device __trap.
+    cache = {KLEIN: {"transformer": [KLEIN_40X, KLEIN_50X]}}
+    with _ReEnv(dev_sm={1: 86}, cache=cache):
+        try:
+            nfa._reresolve_auto_transformer_for_device(_StubModel(KLEIN), _BAKED_40X, 1)
+        except RuntimeError:
+            return
+        raise AssertionError("expected _NoCompatibleWeightError backstop")
+
+
+def test_reresolve_download_failure_falls_back_not_crash():
+    # a genuine download error (network / hf-modelscope missing) must FALL BACK to
+    # the auto-loader's already-valid pick, NOT propagate out of build().
+    with _ReEnv(dev_sm={1: 86}, cache=_klein_cache(),
+                dl_raises=RuntimeError("Download failed: transient network")):
+        r = nfa._reresolve_auto_transformer_for_device(_StubModel(KLEIN), _BAKED_40X, 1)
+        assert r == _BAKED_40X, r   # fell back, did not raise
+
+
+def test_reresolve_no_separate_weights_keeps_base():
+    # a series shipping no transformer weights → keep the base default (no raise)
+    with _ReEnv(dev_sm={0: 120}, cache={KLEIN: {"transformer": []}}):
+        assert nfa._reresolve_auto_transformer_for_device(_StubModel(KLEIN), _BAKED_40X, 0) == _BAKED_40X
 
 
 if __name__ == "__main__":
