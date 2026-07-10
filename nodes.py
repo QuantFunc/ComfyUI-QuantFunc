@@ -362,6 +362,64 @@ def _detect_model_backend(transformer_path: str, model_dir: str) -> str:
     return "lighting"
 
 
+def _read_class_name(json_path):
+    """Best-effort read of `_class_name` from a diffusers config/model_index JSON.
+    Returns "" on any failure (missing file, bad JSON)."""
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            return str(json.load(f).get("_class_name", "") or "")
+    except Exception:
+        return ""
+
+
+def _pipeline_video_family(cfg):
+    """Return 'wan' | 'ltx' | None — a best-effort, ADVISORY classification of the
+    loaded pipeline's video family, used ONLY to pick the plugin's node behavior
+    (video path vs image path). It reads the same SOURCES in the same ORDER as the
+    engine's detectPipelineKind() (PipelineLoader.cpp): model_dir/model_index.json
+    `_class_name` first, then transformer/config.json `_class_name` (only when the
+    former is empty).
+
+    The MATCH here is a deliberate SUPERSET of the engine's registrars, NOT a strict
+    mirror: it treats any `_class_name` starting with "Wan"/"LTX" (plus the
+    transformer classes WanTransformer3DModel / LTX2VideoTransformer3DModel) as that
+    family. wan_detect (WanVideoPipeline.cpp, widened 2026-07-02) now ALSO prefix-
+    matches any `Wan…` pipeline_class OR transformer_class=="WanTransformer3DModel",
+    so a Wan I2V-A14B dir whose _class_name is "WanImageToVideoPipeline" IS both
+    classified "wan" here AND loaded by the engine; ltx2_pipeline_detect
+    (LTX2VideoPipeline.cpp) still exact-matches pipeline_class=="LTX2Pipeline" only
+    (no transformer-class fallback), so this superset is still broader on the LTX
+    side. A match HERE is not a hard guarantee the engine can load the model, but for
+    the Wan family it now aligns; anything Wan/LTX-shaped is routed to the video path
+    so a genuinely unloadable dir surfaces a clear LOUD video/load error (the engine
+    throws at create time, and generate_video throws on a
+    non-video pipeline) rather than the wrong image-node behavior — never a silent
+    misroute. Returns None for every image pipeline (QwenImage/ZImage/Klein/
+    Ideogram/Flux), keeping the image node's video branch guarded (byte-unchanged)."""
+    model_dir = str((cfg or {}).get("model_dir", "") or "")
+    pipeline_cls = ""
+    transformer_cls = ""
+    if model_dir:
+        pipeline_cls = _read_class_name(os.path.join(model_dir, "model_index.json"))
+        if not pipeline_cls:
+            transformer_cls = _read_class_name(
+                os.path.join(model_dir, "transformer", "config.json"))
+    # `_arch` hint the loader may have recorded is a cheap secondary signal.
+    arch = str((cfg or {}).get("_arch", "") or "")
+
+    def _is_wan(s):
+        return s.startswith("Wan")
+    def _is_ltx(s):
+        return s.startswith("LTX") or s.startswith("Ltx")
+
+    if _is_wan(pipeline_cls) or transformer_cls == "WanTransformer3DModel" or _is_wan(arch):
+        return "wan"
+    if (_is_ltx(pipeline_cls) or transformer_cls == "LTX2VideoTransformer3DModel"
+            or _is_ltx(arch)):
+        return "ltx"
+    return None
+
+
 def _load_lib_config():
     """Load config.json from the same directory as the quantfunc library binary.
     Returns dict with server_url and api_key (empty strings if not found).
@@ -1479,6 +1537,42 @@ class WorkerManager:
                       f"— dropping audio", file=sys.stderr)
         return frames, audio
 
+    def image_to_video(self, cache_key, prompt, ref_paths, height, width, steps, seed,
+                       guidance_scale, num_frames, negative_prompt="",
+                       options_json=None, pbar=None):
+        """#329/#330 — image-to-video via the generic quantfunc_image_to_video C-API.
+        The FIRST ref path is the first-frame condition. Whether the engine actually
+        honors it is the ENGINE's decision (Wan i2v-capable checkpoints do; a t2v-only
+        Wan checkpoint throws; LTX i2v is not yet engine-wired → the ref is ignored,
+        the node warns). Returns (frames, audio) like text_to_video — frames is a
+        [N, H, W, 3] float32 numpy array and audio is None or
+        {"waveform": np[C, N], "sample_rate": int}."""
+        with self._lock:
+            self._ensure_worker()
+            self._unload_others_locked(keep_key=cache_key)
+            on_progress, _ = _make_progress_preview_cbs(pbar, None)
+            # num_frames/fps ride in options_json (mirrors the C-API i2v contract).
+            opts = json.loads(options_json) if options_json else {}
+            opts["num_frames"] = int(num_frames)
+            cmd = {
+                "cmd": "image_to_video",
+                "req_id": self._next_req_id(),
+                "cache_key": cache_key,
+                "prompt": prompt,
+                "ref_image_paths": ref_paths,
+                "height": height,
+                "width": width,
+                "num_steps": steps,
+                # Video CFG rides in guidance_scale; the worker maps it onto the i2i
+                # struct's true_cfg_scale (the field the engine's i2v reads).
+                "guidance_scale": guidance_scale,
+                "negative_prompt": negative_prompt or "",
+                "seed": seed,
+                "options_json": json.dumps(opts),
+            }
+            resp = self._call(cmd, progress_cb=on_progress, timeout=1800)
+            return self._read_video(resp)
+
     def image_to_image(self, cache_key, prompt, ref_paths, height, width, steps, seed,
                        true_cfg_scale=1.0, negative_prompt="",
                        options_json=None, pbar=None,
@@ -2037,6 +2131,313 @@ class QuantFuncModelLoader:
 
 
 # ============================================================================
+# Node: QuantFunc Wan Combine Experts (A14B two-transformer combine-picker)
+# ============================================================================
+
+def _wan_combine_stage_root() -> str:
+    """Root for staged two-expert Wan dirs. Honors $QUANTFUNC_CACHE_DIR (the same
+    override the rest of the adapter layer respects), else ComfyUI temp, else the
+    system temp dir — NEVER the plugin tree (forbidden staging ground; the ~56 GB
+    output would bloat/pollute the install). The dominant-size outputs are freshly
+    REWRITTEN (dequant), not hardlinked, so a same-volume-as-source root is not
+    required. NOTE: ComfyUI wipes its temp dir on every restart — set
+    QUANTFUNC_CACHE_DIR (or the node's output_dir) to PERSIST the ~56 GB stage
+    across restarts instead of re-dequantizing each time."""
+    env = os.environ.get("QUANTFUNC_CACHE_DIR")
+    if env:
+        return os.path.join(env, "qf_wan_combined")
+    try:
+        import folder_paths
+        return os.path.join(folder_paths.get_temp_directory(), "qf_wan_combined")
+    except Exception:
+        import tempfile
+        return os.path.join(tempfile.gettempdir(), "qf_wan_combined")
+
+
+class QuantFuncWanCombineExperts:
+    """Combine two single-file Wan2.2-A14B experts (high-noise + low-noise) into a
+    single two-expert model_dir the QuantFunc engine loads.
+
+    Wan2.2-A14B is a DUAL-transformer model: a high-noise expert drives the early
+    (high-noise) denoise steps and a low-noise expert the later steps, switching at
+    `boundary_ratio`. It is distributed as TWO separate single-file checkpoints,
+    not a diffusers dir. This node stages them into the engine's expected layout
+    (`transformer/` = high, `transformer_2/` = low, shared `text_encoder`/`vae`/
+    `tokenizer`/`scheduler` from a Wan diffusers dir, and a synthesized
+    `model_index.json` carrying `boundary_ratio`), then outputs the staged
+    `model_dir` STRING — wire it into `QuantFunc Model Loader`.
+
+    The expert modality is auto-detected from the weights (t2v: in==out channels;
+    A14B channel-concat i2v: in>out) and written into the synthesized transformer
+    configs. The model_index always carries `_class_name="WanPipeline"` — a value
+    the engine's family detect accepts (it accepts any `Wan…`-prefixed class) —
+    because the engine dispatches t2v-vs-i2v by the transformer's CHANNELS, not the
+    pipeline class string. (t2v is the path exercised end-to-end here; i2v staging
+    emits the same loadable class + i2v channels, relying on the engine's
+    channel-driven i2v dispatch.)
+
+    ComfyUI/original-Wan single-file keys are remapped to diffusers keys; fp8
+    `*_scaled` experts are dequantized to fp16 (the engine's Wan transformer
+    factory does not yet consume fp8 inline); the Wan2.1 16-ch VAE config is
+    absent-key-fixed. `boundary_ratio` defaults to AUTO (inherit the shared
+    model_index's published value when its modality matches the experts —
+    the boundary is modality-specific while the shared components are not —
+    else t2v 0.875 / i2v 0.9, the official Wan-AI release values). Staging is cached (idempotent on identical sources),
+    atomic (tmp+rename — a concurrent/aborted run can never leave a partial dir
+    that looks complete), and pre-checks free disk against the exact output size.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "high_noise_expert": ("STRING", {"default": "", "tooltip":
+                    "Path to the HIGH-noise A14B expert (.safetensors single file)"}),
+                "low_noise_expert": ("STRING", {"default": "", "tooltip":
+                    "Path to the LOW-noise A14B expert (.safetensors single file)"}),
+                "shared_components": ("STRING", {"default": "", "tooltip":
+                    "Path to a Wan diffusers dir supplying the shared vae / "
+                    "text_encoder / tokenizer / scheduler (+ transformer config base)"}),
+                "boundary_ratio": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0,
+                    "step": 0.005, "tooltip":
+                    "Denoise fraction of the high→low expert switch. 0 = AUTO: "
+                    "inherit the shared model_index's published value when its "
+                    "modality matches the experts (else the experts' published "
+                    "default: t2v 0.875 / i2v 0.9 — verified from the official "
+                    "Wan-AI A14B releases). Set >0 only to override explicitly."}),
+            },
+            "optional": {
+                "output_dir": ("STRING", {"default": "", "tooltip":
+                    "Staging output dir (empty = $QUANTFUNC_CACHE_DIR, else ComfyUI "
+                    "temp — which ComfyUI WIPES on every restart, forcing a "
+                    "re-dequant). Point at a roomy PERSISTENT disk — a staged A14B "
+                    "is ~56 GB."}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("model_dir",)
+    FUNCTION = "combine"
+    CATEGORY = "QuantFunc"
+
+    def combine(self, high_noise_expert, low_noise_expert, shared_components,
+                boundary_ratio, output_dir="", **kwargs):
+        from .format_adapters.comfyui_wan_remap import stage_two_expert, _fingerprint
+
+        high = (high_noise_expert or "").strip()
+        low = (low_noise_expert or "").strip()
+        shared = (shared_components or "").strip()
+        if not high or not low or not shared:
+            raise RuntimeError(
+                "QuantFunc Wan Combine Experts: high_noise_expert, "
+                "low_noise_expert and shared_components are all required.")
+
+        # Widget sentinel: 0 = AUTO (inherit the shared model_index's published
+        # boundary_ratio, else the modality's published default) — the module
+        # resolves it; an explicit >0 value is an override. 0 never reaches the
+        # engine (whose boundary_ratio>0 gate would silently drop the low expert).
+        boundary = float(boundary_ratio) if boundary_ratio and boundary_ratio > 0 \
+            else None
+
+        out = (output_dir or "").strip()
+        if not out:
+            fp = _fingerprint([os.path.abspath(high), os.path.abspath(low),
+                               os.path.abspath(shared)],
+                              extra="{}".format(boundary))
+            out = os.path.join(_wan_combine_stage_root(), fp)
+
+        # The engine's Wan transformer factory does not consume fp8 inline, so
+        # staging always dequantizes to fp16 (the only engine-loadable form today).
+        model_dir = stage_two_expert(high, low, shared, out,
+                                     boundary_ratio=boundary)
+        logging.info("[QuantFunc] Wan two-expert staged → %s", model_dir)
+        return (model_dir,)
+
+
+# ============================================================================
+# Node: QuantFunc Wan Combine Experts (Auto) — dropdown of scanned A14B sets
+# ============================================================================
+
+_WAN_A14B_NO_EXPERTS = "[no Wan A14B experts found]"
+_WAN_A14B_NO_SHARED = "[no Wan diffusers dir found]"
+_wan_a14b_choice_cache = None  # (experts_map, shared_map) | None (unscanned)
+
+
+def _wan_a14b_scan_roots():
+    """Model dirs to scan for Wan A14B weights: the standard ComfyUI model folders
+    the experts/diffusers dirs live in (resolved via folder_paths so
+    extra_model_paths.yaml is honored) + the QuantFunc model_cache
+    ($QUANTFUNC_CACHE_DIR, else ~/model_cache). Deduped, existing dirs only."""
+    roots = []
+    try:
+        import folder_paths
+        for key in ("diffusion_models", "unet", "checkpoints", "diffusers"):
+            try:
+                roots.extend(folder_paths.get_folder_paths(key))
+            except Exception:  # noqa: BLE001 — a key not registered in this install
+                pass
+    except Exception:  # noqa: BLE001 — folder_paths unavailable (non-ComfyUI test)
+        pass
+    cache_env = os.environ.get("QUANTFUNC_CACHE_DIR") or \
+        os.path.join(os.path.expanduser("~"), "model_cache")
+    roots.append(cache_env)
+    seen, out = set(), []
+    for r in roots:
+        if not r:
+            continue
+        real = os.path.realpath(r)
+        if real in seen or not os.path.isdir(real):
+            continue
+        seen.add(real)
+        out.append(r)
+    return out
+
+
+def _get_wan_a14b_choices(force_rescan=False):
+    """Memoized (experts_map, shared_map) — each {display_label: abs_path} — of the
+    scanned Wan A14B expert files + Wan diffusers dirs. Pure filesystem scan
+    (delegates to comfyui_wan_remap.list_wan_a14b_choices)."""
+    global _wan_a14b_choice_cache
+    if _wan_a14b_choice_cache is not None and not force_rescan:
+        return _wan_a14b_choice_cache
+    experts, shared = {}, {}
+    try:
+        from .format_adapters.comfyui_wan_remap import list_wan_a14b_choices
+        experts, shared = list_wan_a14b_choices(_wan_a14b_scan_roots())
+    except Exception as e:  # noqa: BLE001 — never let a scan error break node load
+        logging.warning("[QuantFunc] Wan A14B scan failed: %s", e)
+    _wan_a14b_choice_cache = (experts, shared)
+    return _wan_a14b_choice_cache
+
+
+def refresh_wan_a14b_choices():
+    """Drop the memo so the next INPUT_TYPES re-scans (dropdown refresh)."""
+    global _wan_a14b_choice_cache
+    _wan_a14b_choice_cache = None
+
+
+def _wan_a14b_expert_dropdown():
+    labels = list(_get_wan_a14b_choices()[0].keys())
+    return labels if labels else [_WAN_A14B_NO_EXPERTS]
+
+
+def _wan_a14b_shared_dropdown():
+    labels = list(_get_wan_a14b_choices()[1].keys())
+    return labels if labels else [_WAN_A14B_NO_SHARED]
+
+
+class QuantFuncWanCombineExpertsAuto:
+    """Load a Wan2.2-A14B two-expert model by picking the weights from dropdowns —
+    outputs MODEL / CLIP / VAE straight into `QuantFunc Build Pipeline`.
+
+    Pick the HIGH-noise expert, the LOW-noise expert, and a shared Wan diffusers
+    dir (vae / text_encoder / tokenizer / scheduler) from dropdowns of your scanned
+    model files — no path typing. The two experts are combined into the engine's
+    two-transformer layout INTERNALLY (cached), and the node hands the three
+    standard MODEL / CLIP / VAE handles to Build Pipeline exactly like a native
+    loader — you never see or manage a staging dir.
+
+    Dropdowns: the expert lists show every Wan single-file transformer with a
+    high/low filename hint (header-confirmed; the single TI2V-5B is excluded); the
+    shared list shows Wan diffusers dirs with A14B (dual-transformer) dirs first so
+    a 5B dir's different VAE can't shadow the 14B shared components. boundary_ratio
+    defaults to AUTO (t2v 0.875 / i2v 0.9). The manual `QuantFunc Wan Combine
+    Experts` node (hand-typed paths) is unchanged and remains for paths outside the
+    scanned roots.
+
+    Verification note (验证契约): the node → staged-dir → MODEL/CLIP/VAE → Build
+    Pipeline handoff is verified (the whole staged two-expert dir, incl.
+    transformer_2/ + boundary, reaches the engine). The end-to-end two-expert
+    Wan VIDEO GENERATION on real GPU is the user's local ComfyUI run — not yet
+    machine-verified here.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        exp = _wan_a14b_expert_dropdown()
+        sh = _wan_a14b_shared_dropdown()
+        return {
+            "required": {
+                "high_noise_expert": (exp, {"tooltip":
+                    "The HIGH-noise A14B expert (drives the early/high-noise denoise "
+                    "steps). Pick the *high*-noise checkpoint here."}),
+                "low_noise_expert": (exp, {"tooltip":
+                    "The LOW-noise A14B expert (drives the later/low-noise steps). "
+                    "Pick the *low*-noise checkpoint here."}),
+                "shared_components": (sh, {"tooltip":
+                    "A Wan diffusers dir supplying the shared vae / text_encoder / "
+                    "tokenizer / scheduler. A14B-family dirs are listed first (a 5B "
+                    "dir's VAE differs — prefer the 14B one)."}),
+            },
+            "optional": {
+                "boundary_ratio": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0,
+                    "step": 0.005, "tooltip":
+                    "High→low expert switch fraction. 0 = AUTO (t2v 0.875 / i2v 0.9, "
+                    "or the shared model_index's published value when the modality "
+                    "matches). Set >0 only to override."}),
+            },
+        }
+
+    # Same MODEL / CLIP / VAE socket shape as the native loaders + the QuantFunc
+    # Pick* nodes → plugs straight into QuantFunc Build Pipeline.
+    RETURN_TYPES = ("MODEL", "CLIP", "VAE")
+    RETURN_NAMES = ("model", "clip", "vae")
+    FUNCTION = "load"
+    CATEGORY = "QuantFunc"
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, high_noise_expert=None, low_noise_expert=None,
+                        shared_components=None):
+        # Dropdown lists are scanned lazily and can differ from a saved workflow's
+        # values (files added/removed); resolve at run time with a clear error.
+        return True
+
+    def load(self, high_noise_expert, low_noise_expert, shared_components,
+             boundary_ratio=0.0, **kwargs):
+        from .format_adapters.comfyui_wan_remap import stage_two_expert, _fingerprint
+
+        # Re-scan at run time so a file added since the graph opened still resolves.
+        experts, shared = _get_wan_a14b_choices(force_rescan=True)
+        high = experts.get(high_noise_expert)
+        low = experts.get(low_noise_expert)
+        sh = shared.get(shared_components)
+        missing = []
+        if not high:
+            missing.append(f"high_noise_expert={high_noise_expert!r}")
+        if not low:
+            missing.append(f"low_noise_expert={low_noise_expert!r}")
+        if not sh:
+            missing.append(f"shared_components={shared_components!r}")
+        if missing:
+            raise RuntimeError(
+                "QuantFunc Wan Combine Experts (Auto): could not resolve "
+                + ", ".join(missing) + ". Put the A14B experts (high+low single "
+                "files) + a Wan diffusers dir under the ComfyUI model dirs "
+                "(diffusion_models/unet/checkpoints/diffusers) or "
+                "$QUANTFUNC_CACHE_DIR, then reopen the graph to rescan.")
+
+        # 0 = AUTO (the module resolves the published boundary); >0 = explicit override.
+        boundary = float(boundary_ratio) if boundary_ratio and boundary_ratio > 0 \
+            else None
+
+        # INTERNAL, cached: combine the two experts into the engine's two-transformer
+        # model_dir (never surfaced to the user). Keyed on the resolved sources so
+        # identical picks share one staged dir. Same call the manual node makes.
+        fp = _fingerprint([os.path.abspath(high), os.path.abspath(low),
+                           os.path.abspath(sh)], extra="{}".format(boundary))
+        staged_dir = os.path.join(_wan_combine_stage_root(), fp)
+        model_dir = stage_two_expert(high, low, sh, staged_dir,
+                                     boundary_ratio=boundary)
+        logging.info("[QuantFunc] Wan A14B two-expert staged (internal) -> %s", model_dir)
+
+        # Output the three standard handles → Build Pipeline. BuildPipeline's
+        # hf_native adapter walks the transformer file's parent chain to the
+        # model_index.json and loads the WHOLE staged dir, so transformer_2/ +
+        # boundary_ratio (the two-expert架构) are preserved.
+        return _build_model_refs(model_dir, "")
+
+
+# ============================================================================
 # Node: QuantFunc Model Auto Loader
 # ============================================================================
 
@@ -2046,7 +2447,10 @@ def _get_auto_loader_dropdowns():
         from .model_auto_loader import get_transformer_options
         return get_transformer_options()
     except Exception:
-        return ["None"]
+        # Fallback must still contain the INPUT_TYPES default ([auto-detect]) so
+        # ComfyUI never flags the saved default as "value not in list".
+        from .model_auto_loader import AUTO_DETECT
+        return [AUTO_DETECT, "None"]
 
 
 def _get_prequant_dropdowns():
@@ -2088,7 +2492,7 @@ class QuantFuncModelAutoLoader:
 
     @classmethod
     def INPUT_TYPES(cls):
-        from .model_auto_loader import MODEL_SERIES_LIST, _DATA_SOURCES
+        from .model_auto_loader import MODEL_SERIES_LIST, _DATA_SOURCES, AUTO_DETECT
         transformer_opts = _get_auto_loader_dropdowns()
         return {
             "required": {
@@ -2096,7 +2500,7 @@ class QuantFuncModelAutoLoader:
                 "data_source": (_DATA_SOURCES, {"default": "modelscope", "tooltip": "Download source: modelscope (China) or huggingface"}),
             },
             "optional": {
-                "transformer": (transformer_opts, {"default": "None", "tooltip": "Transformer model variant. Format: Series/name. Select None to use base model's default transformer."}),
+                "transformer": (transformer_opts, {"default": AUTO_DETECT, "tooltip": "Transformer weight. [auto-detect] (default) picks the highest-tier weight your DEFAULT GPU (CUDA device 0) can run; weights that need a newer GPU are hidden. None = use the base model's default transformer. Or pick an explicit Series/name. NOTE: auto-detect targets device 0 — if you route the pipeline to a WEAKER non-default GPU via Build Pipeline's device input, pick a matching lower-tier weight explicitly."}),
             },
         }
 
@@ -2645,6 +3049,21 @@ class QuantFuncLoRAAutoLoader:
 
     Scans the lora directory for .safetensors files and presents them
     as a dropdown. Appends the selected LoRA to the pipeline.
+
+    `transformer` targets Wan2.2 A14B two-expert models: `all` (default) applies
+    the LoRA to every transformer; `high`/`low` apply it ONLY to the high-noise /
+    low-noise expert — the official 4-step lightx2v LoRAs ship as a per-expert
+    PAIR (chain two of these nodes: the *_high_noise file -> high, the
+    *_low_noise file -> low).
+
+    ENGINE CONTRACT (orchestrator-confirmed): the dropdown value is passed
+    LITERALLY as the lora entry's "target" field — `all` keeps the legacy
+    "path:scale" STRING entry (byte-identical default), `high`/`low` emit an
+    OBJECT entry {"path","scale","target"}. The ENGINE routes by registered
+    component: all -> transformer (+transformer_2 if present); high -> only
+    transformer; low -> only transformer_2, FAIL-LOUD on a single-transformer
+    pipeline ("target=low requires a two-expert pipeline"). No plugin-side
+    family sniffing — semantics live in one place (the engine).
     """
 
     @classmethod
@@ -2656,6 +3075,14 @@ class QuantFuncLoRAAutoLoader:
                 "lora_file": (lora_opts, {"tooltip": "LoRA weights from models/loras/"}),
                 "scale": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05,
                            "tooltip": "LoRA weight scale (1.0 = full strength)"}),
+                # APPENDED after scale (old saved graphs keep their widget slots).
+                "transformer": (["all", "high", "low"], {"default": "all",
+                    "tooltip": "Which transformer to mount this LoRA on.\n"
+                    "all (default): every transformer (single-transformer models, "
+                    "or BOTH Wan A14B experts).\n"
+                    "high / low: ONLY the Wan2.2 A14B high-noise / low-noise "
+                    "expert - use for the per-expert 4-step lightx2v LoRA pair "
+                    "(high_noise file -> high, low_noise file -> low)."}),
             },
         }
 
@@ -2664,7 +3091,7 @@ class QuantFuncLoRAAutoLoader:
     FUNCTION = "add_lora"
     CATEGORY = "QuantFunc"
 
-    def add_lora(self, pipeline, lora_file, scale):
+    def add_lora(self, pipeline, lora_file, scale, transformer="all"):
         cfg = dict(pipeline)
         cfg["options"] = dict(cfg.get("options", {}))
 
@@ -2673,7 +3100,13 @@ class QuantFuncLoRAAutoLoader:
             if not os.path.exists(lora_path):
                 raise RuntimeError("LoRA file not found: {}".format(lora_path))
             loras = list(cfg["options"].get("lora", []))
-            if scale != 1.0:
+            if transformer in ("high", "low"):
+                # Expert-targeted entry: OBJECT with the literal "target" field
+                # (engine routes: high -> transformer, low -> transformer_2,
+                # fail-loud on single-transformer pipelines).
+                loras.append({"path": lora_path, "scale": float(scale),
+                              "target": transformer})
+            elif scale != 1.0:
                 loras.append("{}:{}".format(lora_path, scale))
             else:
                 loras.append(lora_path)
@@ -3299,6 +3732,36 @@ class QuantFuncGenerate:
                 "(%s) — running WITHOUT the cap (unlimited).", pct, device, e)
             return None
 
+    def _generate_video_single_frame(self, cfg, prompt, width, height, steps, seed,
+                                     guidance_scale, negative_prompt, unique_id, family):
+        """#329/#330 — render ONE image from a video (Wan / LTX) pipeline via a
+        1-frame text-to-video. Returns the image node's 3-tuple
+        (IMAGE, MASK, latent_preview) with the single frame as a [1,H,W,3] IMAGE +
+        an opaque mask. We request num_frames=1; the engine may still decode more
+        than one frame (a video VAE has a minimum temporal decode — Wan TI2V-5B
+        returns 4), so we slice frames[:1] to guarantee exactly one image."""
+        import torch
+        cache_key = _manager.ensure_pipeline(cfg, node_id=unique_id)
+        opts = {}
+        neg = negative_prompt if (isinstance(negative_prompt, str) and negative_prompt) else ""
+        if neg:
+            opts["negative_prompt"] = neg
+        pbar = None
+        try:
+            from comfy.utils import ProgressBar
+            pbar = ProgressBar(steps)
+        except Exception:
+            pass
+        logging.info("[QuantFunc] image node → video pipeline (%s): 1-frame t2v %dx%d",
+                     family, width, height)
+        frames, _audio = _manager.text_to_video(
+            cache_key, prompt, height, width, steps, seed, float(guidance_scale),
+            1, options_json=(json.dumps(opts) if opts else None), pbar=pbar)
+        # frames: [1, H, W, 3] float32 [0,1] — take the single frame as the IMAGE.
+        image = torch.from_numpy(frames[:1])                      # [1, H, W, 3]
+        mask = torch.ones(image.shape[:3], dtype=torch.float32)   # [1, H, W] opaque
+        return (image, mask, None)
+
     def generate(self, pipeline, prompt, width, height, steps, seed,
                  guidance_scale, ref_images=None,
                  negative_prompt="", true_cfg_scale=1.0,
@@ -3328,6 +3791,29 @@ class QuantFuncGenerate:
         # Auto-detect edit mode from ref_images
         cfg = dict(pipeline)
         cfg["options"] = dict(cfg.get("options", {}))
+        # #329/#330 — a VIDEO pipeline (Wan / LTX) loaded into the IMAGE Generate
+        # node produces a SINGLE image = a 1-frame text-to-video. Detect the video
+        # family and route to the video C-API (num_frames=1) instead of the image
+        # t2i/i2i path — the t2i C-API throws on a video pipeline (WanVideoPipeline /
+        # LTX2VideoPipeline have no image path). Guarded: None (every image pipeline)
+        # → the branch is skipped and the image path below is BYTE-UNCHANGED.
+        _video_family = _pipeline_video_family(cfg)
+        if _video_family is not None:
+            # The image node produces a 1-frame t2v for a video pipeline; a wired
+            # ref_images/edit input is NOT used on this path (i2v-via-image-node is
+            # out of scope — use the dedicated 'QuantFunc Generate Video' node's
+            # first_frame for image-to-video). Warn LOUDLY so it isn't silently
+            # dropped.
+            if ref_images is not None:
+                logging.warning(
+                    "[QuantFunc] %s is a VIDEO pipeline loaded into the image "
+                    "'QuantFunc Generate' node → producing a SINGLE frame (1-frame "
+                    "text-to-video); the wired ref_images are IGNORED here. For "
+                    "image-to-video, use the 'QuantFunc Generate Video' node's "
+                    "`first_frame` input.", _video_family)
+            return self._generate_video_single_frame(
+                cfg, prompt, width, height, steps, seed, guidance_scale,
+                negative_prompt, unique_id, _video_family)
         # Qwen-Image-Layered guidance — NON-intrusive: we NEVER override your widget
         # values (you control steps / true_cfg / negative_prompt / resolution). We only
         # warn when the current settings are likely to under-perform vs the official
@@ -3672,24 +4158,15 @@ class QuantFuncGenerate:
                 if neg and true_cfg_scale > 1.0:
                     t2i_opts["negative_prompt"] = neg
                     t2i_opts["true_cfg_scale"] = true_cfg_scale
-                t2i_opts["sampler"] = sampler_name
-                if sampler_eta > 0.0:
-                    t2i_opts["eta"] = sampler_eta
-                # Sampler modifier params (#326 node param surface). Emit
-                # each only when non-default so the engine log stays clean.
-                if sampler_s_noise != 1.0:
-                    t2i_opts["s_noise"] = sampler_s_noise
-                if sampler_solver_order != 4:
-                    t2i_opts["solver_order"] = sampler_solver_order
-                if sampler_predictor_order != 3:
-                    t2i_opts["predictor_order"] = sampler_predictor_order
-                if sampler_corrector_order != 4:
-                    t2i_opts["corrector_order"] = sampler_corrector_order
-                # Scheduler TYPE (#334). Emit only when != "normal" so the
-                # default path stays byte-identical to legacy (no key → engine
-                # uses the native FlowMatchEuler flow curve = the `normal` anchor).
-                if scheduler and scheduler != "normal":
-                    t2i_opts["scheduler"] = scheduler
+                # Shared sampler/scheduler wiring (single source — the video node
+                # calls the same helper). Each modifier emitted only when non-default
+                # (#326/#334) so the default path stays byte-identical to legacy.
+                _qf_apply_sampling_opts(
+                    t2i_opts, sampler_name=sampler_name, scheduler=scheduler,
+                    sampler_eta=sampler_eta, sampler_s_noise=sampler_s_noise,
+                    sampler_solver_order=sampler_solver_order,
+                    sampler_predictor_order=sampler_predictor_order,
+                    sampler_corrector_order=sampler_corrector_order)
                 # #324 ControlNet (t2i only — the engine clears control on the
                 # edit/i2i path). control_image is a QUANTFUNC_CONTROL bundle
                 # from the 'QuantFunc Control Image' node: {image, control_type,
@@ -4153,60 +4630,481 @@ class QuantFuncLatentPreview:
         return {}
 
 
+# Shared sampling surface for the Generate nodes. The engine reads these keys from
+# options_json for BOTH t2i/i2i AND the Wan/LTX video denoise (parseSamplerType +
+# SCHEDULER_HANDLERS, via quantfunc_api.cpp / Sampler.cpp). Kept as module-level
+# helpers so the video node mirrors QuantFuncGenerate's sampler/scheduler controls
+# from a SINGLE source (the image node's t2i wiring calls the same _qf_apply helper).
+_QF_SAMPLER_NAMES = [
+    "euler", "heun", "heunpp2", "dpmpp_2m", "lms",
+    "dpmpp_2m_sde", "euler_ancestral", "ddim",
+    "dpm_2", "ipndm", "ipndm_v", "res_multistep", "gradient_estimation",
+    "dpm_2_ancestral", "dpmpp_2s_ancestral", "dpmpp_sde",
+    "dpmpp_3m_sde", "dpmpp_2m_sde_heun",
+    "lcm", "res_multistep_ancestral",
+    "sa_solver", "sa_solver_pece",
+]
+_QF_SCHEDULER_NAMES = [
+    "normal", "karras", "exponential", "sgm_uniform", "simple",
+    "ddim_uniform", "beta", "linear_quadratic", "kl_optimal",
+]
+
+
+def _qf_apply_sampling_opts(opts, *, sampler_name, scheduler, sampler_eta,
+                            sampler_s_noise, sampler_solver_order,
+                            sampler_predictor_order, sampler_corrector_order):
+    """Wire the shared sampler/scheduler knobs into an options_json dict — the SAME
+    keys QuantFuncGenerate emits for t2i (engine read sites: quantfunc_api.cpp /
+    Sampler.cpp). Every modifier is emitted only when non-default, so the default
+    euler/normal path stays byte-identical (no key -> engine legacy). Returns opts."""
+    opts["sampler"] = sampler_name
+    if sampler_eta > 0.0:
+        opts["eta"] = sampler_eta
+    if sampler_s_noise != 1.0:
+        opts["s_noise"] = sampler_s_noise
+    if sampler_solver_order != 4:
+        opts["solver_order"] = sampler_solver_order
+    if sampler_predictor_order != 3:
+        opts["predictor_order"] = sampler_predictor_order
+    if sampler_corrector_order != 4:
+        opts["corrector_order"] = sampler_corrector_order
+    if scheduler and scheduler != "normal":
+        opts["scheduler"] = scheduler
+    return opts
+
+
+def _qf_video_sampling_input_defs():
+    """Optional INPUT_TYPES widgets for the video node's sampling surface — mirrors
+    QuantFuncGenerate (sampler_name / scheduler / true_cfg_scale / eta / s_noise /
+    solver orders) with concise tooltips. cfg = the node's own guidance_scale."""
+    return {
+        "sampler_name": (list(_QF_SAMPLER_NAMES), {"default": "euler",
+            "tooltip": "Denoise sampler (rides in options_json; the Wan/LTX video "
+            "path honors it via the engine makeConfiguredSampler). euler = the "
+            "official Wan default."}),
+        "scheduler": (list(_QF_SCHEDULER_NAMES), {"default": "normal",
+            "tooltip": "Noise SCHEDULE - the sigma-curve shape (#334). normal = "
+            "native FlowMatchEuler flow curve (default). Orthogonal to the sampler."}),
+        "true_cfg_scale": ("FLOAT", {"default": 1.0, "min": 1.0, "max": 30.0,
+            "step": 0.1, "tooltip": "Classical CFG (needs a negative prompt). 1.0 = "
+            "OFF (default) - correct for distilled / few-step models. Raise only for "
+            "base models. (guidance_scale above = the distilled guidance.)"}),
+        "sampler_eta": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
+            "tooltip": "Noise scale (eta) for stochastic samplers. 0 = deterministic."}),
+        "sampler_s_noise": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0,
+            "step": 0.05, "tooltip": "SDE noise multiplier (s_noise). 1.0 = default; "
+            "only SDE/ancestral samplers use it."}),
+        "sampler_solver_order": ("INT", {"default": 4, "min": 1, "max": 4, "step": 1,
+            "tooltip": "Multistep order for lms (1-4)."}),
+        "sampler_predictor_order": ("INT", {"default": 3, "min": 1, "max": 4,
+            "step": 1, "tooltip": "SA-Solver predictor order (1-4)."}),
+        "sampler_corrector_order": ("INT", {"default": 4, "min": 1, "max": 4,
+            "step": 1, "tooltip": "SA-Solver corrector order (1-4)."}),
+    }
+
+
 class QuantFuncGenerateVideo:
-    """#344 — LTX-2 text-to-video (+ audio). Outputs the frame batch as ComfyUI
-    IMAGE and the vocoder waveform as ComfyUI AUDIO. Requires an LTX-2 (lighting)
-    pipeline; non-AV / non-LTX pipelines return no audio (AUDIO output is None)."""
+    """Wan / LTX video generation (text-to-video, + image-to-video on capable
+    checkpoints). Outputs the frame batch as ComfyUI IMAGE and, for AV models
+    (LTX-2), the vocoder waveform as ComfyUI AUDIO.
+
+    Family-agnostic: works with any loaded video pipeline (Wan 2.2 TI2V-5B /
+    I2V-A14B, LTX-2). Wan produces no audio → the AUDIO output is None (silent
+    playback); LTX-2 emits an audio track. Wire an optional `start_image` IMAGE
+    (ComfyUI Wan convention) to condition the clip on a starting frame (image-to-
+    video) — absent → text-to-video. NOTE on i2v support: it is the ENGINE that
+    decides — a Wan i2v-capable checkpoint honors the start image (a t2v-only Wan
+    checkpoint throws a clear error); LTX i2v is not yet wired in the engine, so on
+    LTX the start_image is currently IGNORED (a loud warning is logged) and a t2v
+    clip is produced. Inputs use the ComfyUI Wan/LTX names (`length` = frame count,
+    `start_image` = first-frame condition). Feed `frames` (+ `audio`) into
+    'QuantFunc Video Preview' for in-graph A/V playback, or the core CreateVideo →
+    SaveVideo (or VHS) nodes."""
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
+            # WIDGET-ORDER BACK-COMPAT (graph-format .json workflows): ComfyUI restores
+            # a saved node's `widgets_values` by ARRAY POSITION for classic dict-
+            # INPUT_TYPES nodes, NOT by name. This node (#344) originally shipped the
+            # widget order [prompt, width, height, num_frames, steps, guidance_scale,
+            # seed, negative_prompt]. To keep an OLD saved graph from misaligning its
+            # steps/cfg/seed into the wrong slots, we preserve those positions exactly:
+            # the frame-count widget stays at slot 4 (just RENAMED num_frames→`length`,
+            # which is semantically the same value, so an old array maps correctly),
+            # steps/guidance_scale/seed keep their slots, negative_prompt stays the
+            # first optional widget (slot 8), and any NEW widget (fps) is APPENDED after
+            # it so a shorter old array never reaches it. `start_image` is an IMAGE
+            # SOCKET (not a positional widget), so it doesn't shift widget indices.
             "required": {
                 "pipeline": ("QUANTFUNC_PIPELINE",),
                 "prompt": ("STRING", {"multiline": True, "default": ""}),
                 "width": ("INT", {"default": 512, "min": 64, "max": 2048, "step": 8}),
                 "height": ("INT", {"default": 512, "min": 64, "max": 2048, "step": 8}),
-                "num_frames": ("INT", {"default": 49, "min": 1, "max": 257, "step": 1}),
+                # `length` = frame count (ComfyUI Wan/LTX convention, cf. the core
+                # WanImageToVideo/EmptyLTXVLatentVideo `length` input) — RENAMED IN PLACE
+                # from the old `num_frames` (SAME widget slot 4 → old saved values map
+                # correctly). Wan needs (length-1)%4==0 (e.g. 49=48+1, or the Wan-native
+                # 81); LTX needs (length-1)%8==0 (e.g. 49, or the LTX-native 97). 49 fits both.
+                "length": ("INT", {"default": 49, "min": 1, "max": 257, "step": 4,
+                    "tooltip": "Number of frames (ComfyUI Wan/LTX 'length'; formerly "
+                               "'num_frames'). Wan: (length-1)%4==0 (49, 81, …); "
+                               "LTX: (length-1)%8==0 (49, 97, …)."}),
                 "steps": ("INT", {"default": 30, "min": 1, "max": 100}),
                 "guidance_scale": ("FLOAT", {"default": 4.0, "min": 0.0, "max": 20.0, "step": 0.1}),
                 "seed": ("INT", {"default": 42, "min": 0, "max": 0xffffffffffffffff}),
             },
             "optional": {
+                # negative_prompt stays the FIRST optional widget (slot 8, as in #344).
                 "negative_prompt": ("STRING", {"multiline": True, "default": ""}),
+                # fps APPENDED after negative_prompt (new slot 9) so an old 8-slot saved
+                # array never lands a value here (falls to the method default 24.0).
+                "fps": ("FLOAT", {"default": 24.0, "min": 1.0, "max": 60.0, "step": 1.0,
+                    "tooltip": "Playback fps (rides in options_json; Wan + LTX both read it)."}),
+                # sampling surface — mirrors the image node (QuantFuncGenerate):
+                # sampler_name / scheduler / true_cfg_scale / eta / s_noise / orders.
+                # cfg = guidance_scale above; all APPENDED after fps (back-compat slots,
+                # old saved graphs keep their positions).
+                **_qf_video_sampling_input_defs(),
+                # `start_image` = the first-frame condition (ComfyUI Wan i2v convention,
+                # cf. the core WanImageToVideo `start_image` input). IMAGE = a socket, not
+                # a widget → does not consume a widgets_values slot.
+                "start_image": ("IMAGE", {"tooltip": "Optional first-frame condition "
+                    "(ComfyUI 'start_image') → image-to-video. Honored by Wan i2v-capable "
+                    "checkpoints; LTX i2v is not yet engine-wired (start_image ignored on "
+                    "LTX → t2v). Absent → text-to-video."}),
             },
             "hidden": {"unique_id": "UNIQUE_ID"},
         }
 
-    RETURN_TYPES = ("IMAGE", "AUDIO")
-    RETURN_NAMES = ("frames", "audio")
+    # SOLE output `video` (native ComfyUI VIDEO) → plugs STRAIGHT into the core
+    # `Save Video` node in one wire (frames + audio are packed inside it; extract
+    # them downstream with the native `Get Video Components` node if needed).
+    RETURN_TYPES = ("VIDEO",)
+    RETURN_NAMES = ("video",)
     FUNCTION = "generate_video"
     CATEGORY = "QuantFunc"
 
-    def generate_video(self, pipeline, prompt, width, height, num_frames, steps,
-                       guidance_scale, seed, negative_prompt="", unique_id=None):
+    def generate_video(self, pipeline, prompt, width, height, length, steps,
+                       guidance_scale, seed, fps=24.0,
+                       sampler_name="euler", scheduler="normal", true_cfg_scale=1.0,
+                       sampler_eta=0.0, sampler_s_noise=1.0, sampler_solver_order=4,
+                       sampler_predictor_order=3, sampler_corrector_order=4,
+                       negative_prompt="", start_image=None, unique_id=None):
         import torch
+        # `length` was renamed IN PLACE from the old required `num_frames` (same widget
+        # slot — see the INPUT_TYPES widget-order note), so an old graph-format saved
+        # workflow's slot-4 value maps here correctly.
+        length = int(length)
         cfg = dict(pipeline)
         cfg["options"] = dict(cfg.get("options", {}))
+        family = _pipeline_video_family(cfg)  # 'wan' | 'ltx' | None (advisory/logging)
         cache_key = _manager.ensure_pipeline(cfg, node_id=unique_id)
-        # negative_prompt rides in options_json (the C-API t2v contract).
+        # length (frame count) rides in the manager call; fps + negative_prompt ride
+        # in options_json (the C-API t2v/i2v contract).
         opts = {}
-        if isinstance(negative_prompt, str) and negative_prompt:
-            opts["negative_prompt"] = negative_prompt
+        if fps and float(fps) > 0.0:
+            opts["fps"] = float(fps)
+        # sampler / scheduler / eta / s_noise / solver orders — SAME wiring the image
+        # node uses (shared helper); each rides in options_json only when non-default,
+        # so the default euler/normal path is byte-identical.
+        _qf_apply_sampling_opts(
+            opts, sampler_name=sampler_name, scheduler=scheduler,
+            sampler_eta=sampler_eta, sampler_s_noise=sampler_s_noise,
+            sampler_solver_order=sampler_solver_order,
+            sampler_predictor_order=sampler_predictor_order,
+            sampler_corrector_order=sampler_corrector_order)
+        neg = negative_prompt if (isinstance(negative_prompt, str) and negative_prompt) else ""
+        if neg:
+            opts["negative_prompt"] = neg
+        if true_cfg_scale and float(true_cfg_scale) > 1.0:
+            opts["true_cfg_scale"] = float(true_cfg_scale)   # classical CFG (needs a negative)
+        opts_json = json.dumps(opts) if opts else None
         pbar = None
         try:
             from comfy.utils import ProgressBar
             pbar = ProgressBar(steps)
         except Exception:
             pass
-        frames, audio = _manager.text_to_video(
-            cache_key, prompt, height, width, steps, seed, float(guidance_scale),
-            num_frames, options_json=(json.dumps(opts) if opts else None), pbar=pbar)
+
+        # image-to-video when a start_image is wired; else text-to-video. The start
+        # image is staged as a QFRAW01 raw-RGB blob (engine load_image reads it
+        # directly) and passed as the sole ref path (= first-frame condition).
+        staging_dir = "/dev/shm" if (os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK)) \
+            else tempfile.gettempdir()
+        start_image_path = None
+        try:
+            if start_image is not None:
+                # LTX i2v (first-frame conditioning) is NOT yet wired in the engine
+                # (LTX2VideoPipeline::generate_video ignores cond_images — "P5"), so on
+                # an LTX pipeline the start_image is silently discarded and a plain t2v
+                # clip is produced. Warn LOUDLY rather than silently mislead. Wan I2V is
+                # supported by capable Wan checkpoints (a t2v-only Wan checkpoint throws
+                # a clear engine error instead of ignoring it). We still forward the
+                # start_image so a future LTX-i2v-capable engine works unchanged.
+                if family == "ltx":
+                    logging.warning(
+                        "[QuantFunc] LTX i2v (start_image conditioning) is not yet "
+                        "supported by the engine — the start_image will likely be "
+                        "IGNORED and a text-to-video clip produced. (Wan I2V is "
+                        "supported on capable Wan checkpoints.)")
+                start_image_path = _write_qfraw_image(start_image, staging_dir)
+                if not start_image_path:
+                    raise RuntimeError("Failed to stage start_image for image-to-video")
+                logging.info("[QuantFunc] video i2v (%s): start_image conditioned, "
+                             "%d frames @ %.1f fps", family or "auto", length, fps)
+                frames, audio = _manager.image_to_video(
+                    cache_key, prompt, [start_image_path], height, width, steps, seed,
+                    float(guidance_scale), length, negative_prompt=neg,
+                    options_json=opts_json, pbar=pbar)
+            else:
+                logging.info("[QuantFunc] video t2v (%s): %d frames @ %.1f fps",
+                             family or "auto", length, fps)
+                frames, audio = _manager.text_to_video(
+                    cache_key, prompt, height, width, steps, seed, float(guidance_scale),
+                    length, options_json=opts_json, pbar=pbar)
+        finally:
+            if start_image_path:
+                try:
+                    os.unlink(start_image_path)
+                except OSError:
+                    pass
+
         image = torch.from_numpy(frames)                 # [N, H, W, 3] float32 [0,1] = IMAGE
         audio_out = None
         if audio is not None:
             wav = torch.from_numpy(audio["waveform"]).unsqueeze(0)  # [1, C, N]
             audio_out = {"waveform": wav, "sample_rate": int(audio["sample_rate"])}
-        return (image, audio_out)
+        # frames + audio (computed above) are packed INTO the single VIDEO output.
+        video_out = _frames_to_video(image, audio_out, fps)
+        return (video_out,)
+
+
+def _frames_to_video(image, audio_out, fps):
+    """Pack the frame batch (+ optional AUDIO) into a native ComfyUI VIDEO — the
+    node's SOLE output — so `video → Save Video` is one wire. Built exactly like the
+    core `Create Video` node. On a ComfyUI too old to have the VIDEO type this warns
+    and returns None (the output is then unusable — update ComfyUI); a genuine
+    VideoComponents/VideoFromComponents construction error is NOT swallowed."""
+    try:
+        from comfy_api.input_impl import VideoFromComponents
+        from comfy_api.latest import VideoComponents
+    except ImportError as e:
+        logging.warning("[QuantFunc] this ComfyUI lacks the native VIDEO type (%s) — "
+                        "update ComfyUI to use the Generate Video 'video' output.", e)
+        return None
+    from fractions import Fraction
+    return VideoFromComponents(VideoComponents(
+        images=image, audio=audio_out, frame_rate=Fraction(float(fps) or 24.0)))
+
+
+def _encode_video_preview(frames_u8, fps, audio, out_path, container_fmt):
+    """Encode a [N,H,W,3] uint8 RGB frame batch (+ optional audio) into a
+    browser-playable clip at `out_path`.
+
+    audio: None or {"waveform": np.float32 [C, N], "sample_rate": int}.
+    Primary encoder is PyAV (bundles ffmpeg libs → muxes video + audio in ONE
+    container with NO external ffmpeg binary). Falls back to cv2 VideoWriter
+    (video-only) when PyAV is unavailable. Returns True if audio was muxed, False
+    if the clip is video-only. Raises when NO encoder is available."""
+    N, H, W = int(frames_u8.shape[0]), int(frames_u8.shape[1]), int(frames_u8.shape[2])
+    # yuv420p (h264/vp9) needs even width/height — crop the last row/col if odd.
+    if W % 2:
+        frames_u8 = frames_u8[:, :, :W - 1, :]; W -= 1
+    if H % 2:
+        frames_u8 = frames_u8[:, :H - 1, :, :]; H -= 1
+    rate = max(1, int(round(float(fps) or 24.0)))
+
+    # ---- Primary: PyAV (video + optional audio, single container) ----
+    # Recipe mirrors ComfyUI core's VideoFromComponents.save_to (h264 + per-frame
+    # reformat('yuv420p'); audio = planar 'fltp' [C,N] frame with pts=0). CRUCIAL:
+    # BOTH streams are created UP FRONT, before muxing any packet — the muxer
+    # writes the container header on the first mux and assigns each stream a
+    # time_base then; an audio stream added AFTER the first video mux keeps
+    # time_base=0 → PyAV crashes "Cannot rebase to zero time" at the audio mux
+    # (verified on PyAV 17.1.0).
+    container = None
+    try:
+        import av
+        from fractions import Fraction
+        vcodec = "h264" if container_fmt == "mp4" else "libvpx-vp9"
+        acodec = "aac" if container_fmt == "mp4" else "libopus"
+        container = av.open(out_path, mode="w")
+        vstream = container.add_stream(vcodec, rate=Fraction(rate, 1))
+        vstream.width = W
+        vstream.height = H
+        vstream.pix_fmt = "yuv420p"
+
+        # Prepare the audio stream BEFORE encoding any video (see note above).
+        astream = None
+        wav = None
+        layout = "stereo"
+        sr = 16000
+        if audio is not None:
+            try:
+                wav = np.asarray(audio["waveform"], dtype=np.float32)  # [C, N] planar
+                if wav.ndim == 1:
+                    wav = wav[None, :]
+                ch = int(wav.shape[0])
+                if ch > 2:                       # downmix >2ch to stereo (keep 0,1)
+                    wav = np.ascontiguousarray(wav[:2]); ch = 2
+                else:
+                    wav = np.ascontiguousarray(wav)
+                sr = int(audio.get("sample_rate", 16000)) or 16000
+                layout = {1: "mono", 2: "stereo"}.get(ch, "stereo")
+                astream = container.add_stream(acodec, rate=sr, layout=layout)
+            except Exception as ae:
+                logging.warning("[QuantFunc] video preview: audio stream setup "
+                                "failed (%s) — video-only", ae)
+                astream = None
+
+        # Encode + mux the video frames.
+        for i in range(N):
+            vframe = av.VideoFrame.from_ndarray(np.ascontiguousarray(frames_u8[i]),
+                                                format="rgb24").reformat(format="yuv420p")
+            for pkt in vstream.encode(vframe):
+                container.mux(pkt)
+        for pkt in vstream.encode():  # flush video
+            container.mux(pkt)
+
+        # Encode + mux the audio (stream already registered up front).
+        has_audio = False
+        if astream is not None:
+            try:
+                aframe = av.AudioFrame.from_ndarray(wav, format="fltp", layout=layout)
+                aframe.sample_rate = sr
+                aframe.pts = 0
+                container.mux(astream.encode(aframe))
+                container.mux(astream.encode(None))  # flush audio
+                has_audio = True
+            except Exception as ae:
+                logging.warning("[QuantFunc] video preview: audio mux failed "
+                                "(%s) — video-only", ae)
+        container.close()
+        return has_audio
+    except Exception as e:
+        logging.warning("[QuantFunc] video preview: PyAV encode failed (%s) — "
+                        "falling back to cv2 (video-only)", e)
+        # Close the open container's fd + drop the partially-written file so the
+        # cv2 fallback re-opens a clean out_path (no fd/partial-file leak).
+        if container is not None:
+            try:
+                container.close()
+            except Exception:
+                pass
+        try:
+            if os.path.exists(out_path):
+                os.unlink(out_path)
+        except OSError:
+            pass
+
+    # ---- Fallback: cv2 VideoWriter (video-only) ----
+    try:
+        import cv2
+        fourcc = cv2.VideoWriter_fourcc(*("mp4v" if container_fmt == "mp4" else "VP80"))
+        vw = cv2.VideoWriter(out_path, fourcc, float(rate), (W, H))
+        if not vw.isOpened():
+            raise RuntimeError("cv2.VideoWriter failed to open")
+        for i in range(N):
+            bgr = cv2.cvtColor(np.ascontiguousarray(frames_u8[i]), cv2.COLOR_RGB2BGR)
+            vw.write(bgr)
+        vw.release()
+        if audio is not None:
+            logging.warning("[QuantFunc] video preview: cv2 fallback cannot mux "
+                            "audio — clip is silent (install PyAV for A/V).")
+        return False
+    except Exception as e2:
+        raise RuntimeError(
+            "No usable video encoder — install PyAV (`pip install av`) or a cv2 "
+            f"with video support. PyAV+cv2 both failed: {e2}")
+
+
+class QuantFuncVideoPreview:
+    """In-graph A/V playback for QuantFunc video output. Wire the `frames` IMAGE
+    (and optional `audio` AUDIO) from 'QuantFunc Generate Video'.
+
+    Encodes the frames to a browser-playable clip (H.264 mp4 by default, muxing the
+    AUDIO track when present via PyAV — no external ffmpeg binary needed) into
+    ComfyUI's temp dir and returns ComfyUI's NATIVE video-preview payload
+    ({"ui": {"images": [...], "animated": (True,)}}), the SAME mechanism the core
+    SaveVideo / SaveWEBM nodes use (ui.PreviewVideo) — so ComfyUI renders its own
+    <video> player with controls + audio on this node, no custom widget. Wan clips
+    (no audio) play silently. The `frames` remain a standard IMAGE elsewhere in the
+    graph (this node is a terminal viewer), so the core CreateVideo/SaveVideo and
+    VHS nodes still work off the same output. For the fully-official flow you can
+    instead wire frames+audio into CreateVideo → SaveVideo."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "frames": ("IMAGE",),
+                "fps": ("FLOAT", {"default": 24.0, "min": 1.0, "max": 60.0, "step": 1.0,
+                    "tooltip": "Playback frame rate. Match the value used on Generate Video."}),
+            },
+            "optional": {
+                "audio": ("AUDIO", {"tooltip": "Optional audio track (LTX-2). Muxed into "
+                    "the clip when present; Wan has none → silent."}),
+                "container": (["mp4", "webm"], {"default": "mp4"}),
+            },
+            "hidden": {"unique_id": "UNIQUE_ID"},
+        }
+
+    RETURN_TYPES = ()
+    FUNCTION = "preview"
+    OUTPUT_NODE = True
+    CATEGORY = "QuantFunc"
+
+    def preview(self, frames, fps, audio=None, container="mp4", unique_id=None):
+        import random
+        import folder_paths
+
+        imgs = frames.detach().cpu().numpy()            # [N,H,W,3] float [0,1]
+        if imgs.ndim == 3:
+            imgs = imgs[None, ...]
+        frames_u8 = (np.clip(imgs, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
+        N, H, W = frames_u8.shape[0], frames_u8.shape[1], frames_u8.shape[2]
+
+        temp_dir = folder_paths.get_temp_directory()
+        os.makedirs(temp_dir, exist_ok=True)
+        ext = "webm" if container == "webm" else "mp4"
+        prefix = "qfvideo_" + "".join(random.choice("abcdefghijklmnopqrstuvwxyz") for _ in range(6))
+        filename = f"{prefix}.{ext}"
+        out_path = os.path.join(temp_dir, filename)
+
+        # Convert a ComfyUI AUDIO dict ({"waveform": [B,C,N] tensor, "sample_rate"})
+        # to the planar numpy [C, N] the encoder expects (first batch item).
+        audio_np = None
+        if isinstance(audio, dict) and audio.get("waveform") is not None:
+            try:
+                wf = audio["waveform"]
+                w = wf.detach().cpu().numpy() if hasattr(wf, "detach") else np.asarray(wf)
+                if w.ndim == 3:      # [B, C, N] → first batch
+                    w = w[0]
+                elif w.ndim == 1:    # [N] → mono
+                    w = w[None, :]
+                audio_np = {"waveform": w.astype(np.float32),
+                            "sample_rate": int(audio.get("sample_rate", 16000))}
+            except Exception as e:
+                logging.warning("[QuantFunc] video preview: bad AUDIO input (%s) — silent", e)
+
+        try:
+            _encode_video_preview(frames_u8, fps, audio_np, out_path, ext)
+        except Exception as e:
+            logging.error("[QuantFunc] video preview encode failed: %s", e)
+            return {"ui": {"text": [f"video preview encode failed: {e}"]}}
+
+        # ComfyUI NATIVE video-preview payload (== ui.PreviewVideo.as_dict()): a
+        # SavedResult {filename, subfolder, type} list under "images" + animated=(True,).
+        # The frontend infers a video from the .mp4/.webm extension and renders its
+        # own <video> player (audio via the muxed track). `format` is an extra hint
+        # some frontend builds use to pick the video widget.
+        return {"ui": {"images": [{
+            "filename": filename,
+            "subfolder": "",
+            "type": "temp",
+            "format": f"video/{ext}",
+        }], "animated": (True,)}}
 
 
 class QuantFuncLayerViewer:
@@ -4306,8 +5204,11 @@ class QuantFuncLayerViewer:
 NODE_CLASS_MAPPINGS = {
     "QuantFuncLayerViewer": QuantFuncLayerViewer,
     "QuantFuncGenerateVideo": QuantFuncGenerateVideo,
+    "QuantFuncVideoPreview": QuantFuncVideoPreview,
     "QuantFuncPipelineConfig": QuantFuncPipelineConfig,
     "QuantFuncModelLoader": QuantFuncModelLoader,
+    "QuantFuncWanCombineExperts": QuantFuncWanCombineExperts,
+    "QuantFuncWanCombineExpertsAuto": QuantFuncWanCombineExpertsAuto,
     "QuantFuncModelAutoLoader": QuantFuncModelAutoLoader,
     # QuantFuncBuildPipeline lives in nodes_format_adapters.py (one canonical
     # implementation; loaded after this map → __init__.py's update() lifts it
@@ -4336,6 +5237,8 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "QuantFuncPipelineConfig": "QuantFunc Pipeline Config",
     "QuantFuncModelLoader": "QuantFunc Model Loader",
+    "QuantFuncWanCombineExperts": "QuantFunc Wan Combine Experts (A14B two-transformer)",
+    "QuantFuncWanCombineExpertsAuto": "QuantFunc Wan Combine Experts (Auto)",
     "QuantFuncModelAutoLoader": "QuantFunc Model Auto Loader",
     # QuantFuncBuildPipeline display name is set in nodes_format_adapters.py.
     "QuantFuncPrequantAutoLoader": "QuantFunc Prequant Auto Loader",
@@ -4353,7 +5256,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "QuantFuncLayeredConfig": "QuantFunc Layered Config",
     "QuantFuncGenerate": "QuantFunc Generate",
     "QuantFuncLayerViewer": "QuantFunc Layer Viewer",
-    "QuantFuncGenerateVideo": "QuantFunc Generate Video (LTX-2 +Audio)",
+    "QuantFuncGenerateVideo": "QuantFunc Generate Video (Wan / LTX · t2v + i2v)",
+    "QuantFuncVideoPreview": "QuantFunc Video Preview (A/V)",
     "QuantFuncLatentPreview": "QuantFunc Latent Preview",
     "QuantFuncImageList": "QuantFunc Image List",
     "QuantFuncMaskConfig": "QuantFunc Mask Config",

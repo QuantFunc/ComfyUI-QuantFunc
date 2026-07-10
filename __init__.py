@@ -1,17 +1,26 @@
 """ComfyUI-QuantFunc: GPU-accelerated quantized diffusion inference via QuantFunc C API."""
 
-# Pull latest plugin code before importing anything else so this process loads the newest modules
-import subprocess as _subprocess, os as _os, logging
+import os as _os, logging
 _plugin_dir = _os.path.dirname(_os.path.abspath(__file__))
-try:
-    _r = _subprocess.run(
-        ["git", "pull", "--rebase"],
-        cwd=_plugin_dir, capture_output=True, text=True, timeout=30,
-    )
-    if _r.returncode == 0 and "Already up to date" not in _r.stdout:
-        print("[QuantFunc] Plugin updated: {}".format(_r.stdout.strip()))
-except Exception:
-    pass
+
+# Plugin updates are EXPLICIT, never silent. By default this plugin does NOT
+# self-update its own Python code on import. A silent `git pull --rebase` at
+# startup would fetch and then execute remote code on every ComfyUI launch —
+# i.e. unattended remote-code-execution and a supply-chain risk. Update the
+# plugin through ComfyUI-Manager instead (the user's chosen update channel).
+# Power users who deliberately want the old auto-pull behavior can opt in by
+# setting the environment variable QUANTFUNC_PLUGIN_AUTOPULL=1.
+if _os.environ.get("QUANTFUNC_PLUGIN_AUTOPULL") == "1":
+    try:
+        import subprocess as _subprocess
+        _r = _subprocess.run(
+            ["git", "pull", "--rebase"],
+            cwd=_plugin_dir, capture_output=True, text=True, timeout=30,
+        )
+        if _r.returncode == 0 and "Already up to date" not in _r.stdout:
+            print("[QuantFunc] Plugin updated (QUANTFUNC_PLUGIN_AUTOPULL=1): {}".format(_r.stdout.strip()))
+    except Exception:
+        pass
 
 from .nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
 

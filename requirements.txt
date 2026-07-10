@@ -1,0 +1,12 @@
+# QuantFunc ComfyUI plugin — runtime dependencies.
+#
+# These are declared here so they are installed at INSTALL time by ComfyUI-Manager
+# (or `pip install -r requirements.txt`), NOT installed at runtime by the node.
+# Runtime `pip install` via subprocess is prohibited by the ComfyUI registry
+# security policy; if a dependency below is missing, the plugin fails gracefully
+# with an actionable message instead of installing anything itself.
+#
+# Used for downloading models/engine libs from ModelScope / Hugging Face. The
+# text-to-image generation path itself needs neither.
+modelscope
+huggingface_hub

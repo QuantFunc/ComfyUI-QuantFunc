@@ -306,6 +306,16 @@ def _load_dll(dll_path):
     except AttributeError:
         log("video API not present in this DLL (t2i-only engine)")
 
+    # #329/#330 — image-to-video (first ref image = first-frame condition). Reuses
+    # the i2i param struct; num_frames/fps ride in options_json. Guarded SEPARATELY
+    # from _HAS_VIDEO so a t2v-only engine still enables t2v (i2v is a superset add).
+    global _HAS_I2V
+    _HAS_I2V = False
+    if _HAS_VIDEO and hasattr(_lib, "quantfunc_image_to_video"):
+        _lib.quantfunc_image_to_video.restype = ctypes.c_int
+        _lib.quantfunc_image_to_video.argtypes = [PIPE_PTR, ctypes.POINTER(I2IParams), ctypes.POINTER(VID_PTR)]
+        _HAS_I2V = True
+
     # Optional: quantfunc_set_api_key (may not exist in older DLLs)
     try:
         _lib.quantfunc_set_api_key.restype = ctypes.c_int
@@ -712,6 +722,63 @@ def handle_text_to_video(msg):
     _extract_and_send_video(vid, req_id)
 
 
+def handle_image_to_video(msg):
+    """#329/#330 — image-to-video (Wan I2V / LTX i2v). Mirrors handle_text_to_video
+    but takes the i2i param struct: the FIRST ref image is the first-frame
+    condition. num_frames/fps ride in options_json; guidance rides in
+    true_cfg_scale (the i2i struct has no guidance_scale field — the engine's
+    quantfunc_image_to_video reads guidance from true_cfg_scale)."""
+    req_id = msg["req_id"]
+    if not _HAS_VIDEO or not _HAS_I2V:
+        send_json({"type": "result", "req_id": req_id, "status": "error",
+                   "error_code": -1,
+                   "error_message": "This QuantFunc engine build has no image-to-video "
+                                    "API (needs quantfunc_image_to_video, #329/#330+)."})
+        return
+    pipe = _get_pipeline(msg, req_id)
+    if pipe is None:
+        return
+    _cancel_flag.clear()
+    cb = _make_progress_cb(req_id)
+
+    ref_paths = msg.get("ref_image_paths", [])
+    num_refs = len(ref_paths)
+    ref_encoded = [p.encode() for p in ref_paths]
+    ref_arr = (ctypes.c_char_p * num_refs)(*ref_encoded) if num_refs > 0 else None
+
+    i2i = I2IParams()
+    i2i.prompt = msg["prompt"].encode()
+    i2i.ref_image_paths = ref_arr
+    i2i.num_ref_images = num_refs
+    i2i.height = msg.get("height", 512)
+    i2i.width = msg.get("width", 512)
+    i2i.num_steps = msg.get("num_steps", 30)
+    # Video CFG rides in true_cfg_scale (see docstring). >0 → engine uses it.
+    i2i.true_cfg_scale = float(msg.get("guidance_scale", 5.0))
+    neg = msg.get("negative_prompt")
+    i2i.negative_prompt = neg.encode() if neg else None
+    i2i.seed = msg.get("seed", 0)
+    i2i.options_json = msg["options_json"].encode() if msg.get("options_json") else None
+    i2i.progress_callback = cb
+    i2i.callback_user_data = None
+    # No inpaint / latent-preview / brush conditioning on the video path.
+    i2i.mask_path = None
+    i2i.latent_preview_callback = LATENT_PREVIEW_CB()  # NULL
+    i2i.latent_preview_user_data = None
+
+    vid = VID_PTR()
+    status = _lib.quantfunc_image_to_video(pipe, ctypes.byref(i2i), ctypes.byref(vid))
+    if status == QUANTFUNC_ERROR_CANCELLED:
+        send_json({"type": "result", "req_id": req_id, "status": "cancelled"})
+        return
+    if status != QUANTFUNC_OK:
+        send_json({"type": "result", "req_id": req_id, "status": "error",
+                   "error_code": status, "error_message": _get_error()})
+        return
+
+    _extract_and_send_video(vid, req_id)
+
+
 def handle_export(msg):
     req_id = msg["req_id"]
 
@@ -884,6 +951,7 @@ HANDLERS = {
     "text_to_image":  handle_text_to_image,
     "image_to_image": handle_image_to_image,
     "text_to_video":  handle_text_to_video,   # #344 LTX-2 t2v + audio
+    "image_to_video": handle_image_to_video,  # #329/#330 Wan/LTX i2v (first-frame)
     "export":         handle_export,
     "set_api_key":    handle_set_api_key,
     "unload":         handle_unload,

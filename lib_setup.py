@@ -309,22 +309,21 @@ _MODELSCOPE_RAW_URL = "https://www.modelscope.cn/models/QuantFunc/Plugin/resolve
 
 
 def _ensure_modelscope():
-    """Install modelscope SDK if not available."""
+    """Return True if the modelscope SDK is importable; do NOT install it at runtime.
+
+    Runtime `pip install` from a custom node is prohibited by the ComfyUI registry
+    security policy (it bypasses the user's package manager). modelscope is declared
+    in requirements.txt and installed at install time by ComfyUI-Manager / pip; if it
+    is missing we fail gracefully with an actionable message instead of installing.
+    """
     try:
         import modelscope  # noqa: F401
         return True
     except ImportError:
-        print("[QuantFunc] Installing modelscope SDK...")
-        try:
-            subprocess.check_call(
-                [sys.executable, "-m", "pip", "install", "modelscope", "-q"],
-                stdout=subprocess.DEVNULL,
-            )
-            print("[QuantFunc] modelscope installed successfully")
-            return True
-        except Exception as e:
-            print(f"[QuantFunc] Failed to install modelscope: {e}")
-            return False
+        print("[QuantFunc] modelscope is not installed; ModelScope features are "
+              "unavailable. Install it with `pip install modelscope` (declared in "
+              "requirements.txt) and restart ComfyUI.")
+        return False
 
 
 def _download_from_modelscope(file_path: str):
@@ -386,31 +385,94 @@ def _download_dep_zip(cuda_major: int, dest_dir: str) -> bool:
 
 
 def _detect_gpu_sm() -> int:
-    """Detect GPU compute capability (SM version). Returns e.g. 120, 89, 86, or 0."""
+    """Compute capability (SM) of the FIRST CUDA GPU, e.g. 120 / 89 / 86, or 0.
+
+    Thin front for `_detect_all_gpu_sms` (one detection implementation) — takes
+    the first entry. Used by `detect_gpu_variant` (base-model 50x split)."""
+    sms = _detect_all_gpu_sms()
+    return sms[0] if sms else 0
+
+
+def _detect_default_device_sm() -> int:
+    """SM of the DEFAULT CUDA device (index 0) via torch, e.g. 120 / 89 / 86; 0 if
+    no CUDA / no torch.
+
+    This is what the transformer GPU-match filter keys on (`_target_gpu_sm`): torch
+    device 0 is the SAME device index BuildPipeline runs the transformer on BY
+    DEFAULT (the worker inherits the identical CVD/order env), so a weight
+    offered/auto-picked against it is runnable on the actual DEFAULT run-device —
+    no `CUDA_VISIBLE_DEVICES` mask or `CUDA_DEVICE_ORDER` makes them disagree (both
+    are "CUDA device 0"). Under the default FASTEST_FIRST ordering device 0 is the
+    BEST GPU, so on a 3060+4090 box device 0 is the 4090 (SM89) → the 40x/FP8 tier
+    shows + auto-picks (the user's reported ask). Deliberately TORCH, not
+    nvidia-smi: nvidia-smi is CVD-UNAWARE and PCI-bus-ordered, so its "device 0"
+    can be a hidden or different physical GPU than CUDA device 0 — keying on it
+    could offer a tier the actual run-device can't run (→ __trap). CPU-only / no
+    CUDA → 0 (caller does NOT filter). NOTE: the guarantee holds for the DEFAULT
+    device; if the user manually routes BuildPipeline to a non-default WEAKER GPU
+    the auto-picked tier could still exceed it (a known, accepted limitation — see
+    `model_auto_loader._target_gpu_sm`). (History: keying on max/min OVER ALL GPUs
+    was worse — min over-hid the user's 40x on every config; max over the physical
+    set could over-offer a tier the CVD-visible / PCI-slot-0 DEFAULT run-device
+    couldn't run. Keying on CUDA device 0 removes that common-path __trap.)"""
+    try:
+        import torch
+        if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+            cap = torch.cuda.get_device_capability(0)
+            return cap[0] * 10 + cap[1]
+    except Exception:
+        pass
+    return 0
+
+
+def _detect_all_gpu_sms() -> list:
+    """Compute capabilities (SM) of every visible CUDA GPU, e.g. [120, 86]; [] if
+    none. Consumed only by `_detect_gpu_sm` (which takes the first entry) for the
+    base-model 50x-above/50x-below variant pick in `detect_gpu_variant`. The
+    transformer GPU-match filter does NOT use this — it keys on the DEFAULT CUDA
+    device via `_detect_default_device_sm` (the device that actually runs the
+    transformer). PRIMARY nvidia-smi (per-line-guarded), torch FALLBACK
+    (per-device-guarded) when nvidia-smi is unavailable.
+    """
+    sms = []
     try:
         out = subprocess.check_output(
             ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
             timeout=5, stderr=subprocess.DEVNULL
         ).decode().strip()
-        # Parse "12.0" → 120, "8.9" → 89
+        # One line per GPU: "12.0" → 120, "8.6" → 86. Parse each line under its
+        # OWN guard so one malformed line (e.g. "N/A") skips that GPU rather than
+        # aborting the loop and silently dropping every GPU after it.
         for line in out.split("\n"):
             line = line.strip()
-            if "." in line:
+            if "." not in line:
+                continue
+            try:
                 major, minor = line.split(".")[:2]
-                return int(major) * 10 + int(minor)
+                sms.append(int(major) * 10 + int(minor))
+            except (ValueError, IndexError):
+                continue
     except Exception:
         pass
+    if sms:
+        return sms
 
-    # Fallback: try torch
+    # Fallback (only when nvidia-smi is unavailable): torch enumerates every
+    # CUDA-visible device. Guard EACH device individually so one throwing
+    # get_device_capability(i) skips that device rather than dropping i+1..n
+    # (mirrors the nvidia-smi per-line isolation above).
     try:
         import torch
         if torch.cuda.is_available():
-            cap = torch.cuda.get_device_capability(0)
-            return cap[0] * 10 + cap[1]
+            for i in range(torch.cuda.device_count()):
+                try:
+                    cap = torch.cuda.get_device_capability(i)
+                    sms.append(cap[0] * 10 + cap[1])
+                except Exception:
+                    continue
     except Exception:
         pass
-
-    return 0
+    return sms
 
 
 def resolve_library() -> str:
