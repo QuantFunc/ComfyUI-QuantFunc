@@ -99,6 +99,78 @@ def remap_key(k: str) -> str:
     return k  # patch_embedding.*, and anything already diffusers-shaped
 
 
+def _remap_wan_vae_resnet_subkey(r: str) -> str:
+    """Original-Wan VAE resnet sub-keys -> diffusers AutoencoderKLWan names.
+
+    The original block is an nn.Sequential `residual` ([norm,SiLU,conv,norm,SiLU,
+    dropout,conv] -> indices 0/2/3/6) + optional `shortcut`; diffusers names them
+    norm1/conv1/norm2/conv2/conv_shortcut.
+    """
+    r = re.sub(r"^residual\.0\.gamma$", "norm1.gamma", r)
+    r = re.sub(r"^residual\.2\.", "conv1.", r)
+    r = re.sub(r"^residual\.3\.gamma$", "norm2.gamma", r)
+    r = re.sub(r"^residual\.6\.", "conv2.", r)
+    r = re.sub(r"^shortcut\.", "conv_shortcut.", r)
+    return r
+
+
+def remap_wan_vae_key(k: str) -> str:
+    """Translate one original-Wan / ComfyUI VAE key to its diffusers
+    AutoencoderKLWan name (the naming the engine's Wan VAE loader reads).
+
+    Derived empirically from the ComfyUI `wan2.2_vae.safetensors` (196 keys,
+    original naming: conv1/conv2, {en,de}coder.{conv1,head,middle,{up,down}samples})
+    vs the diffusers `Wan2.2-TI2V-5B-Diffusers/vae` reference (196 keys:
+    {quant,post_quant}_conv, conv_{in,out}, norm_out, mid_block, {up,down}_blocks)
+    and VALIDATED key-exact + shape-exact against that reference (see
+    tests/test_wan_5b_single_file.py). Structure-driven (resample/time_conv =>
+    the block's {up,down}sampler; residual/shortcut => resnets.J), so it holds
+    for any Wan VAE using the original naming, not just the 5B channel widths.
+    Pass-through for keys already diffusers-shaped.
+    """
+    if k.startswith("conv1."):
+        return "quant_conv." + k[len("conv1."):]
+    if k.startswith("conv2."):
+        return "post_quant_conv." + k[len("conv2."):]
+    m = re.match(r"^(encoder|decoder)\.(.*)$", k)
+    if not m:
+        return k
+    side, rest = m.group(1), m.group(2)
+    if rest.startswith("conv1."):
+        rest = "conv_in." + rest[len("conv1."):]
+    elif rest == "head.0.gamma":
+        rest = "norm_out.gamma"
+    elif rest.startswith("head.2."):
+        rest = "conv_out." + rest[len("head.2."):]
+    else:
+        mm = re.match(r"^middle\.(\d)\.(.*)$", rest)
+        if mm:
+            i, sub = int(mm.group(1)), mm.group(2)
+            if i == 1:   # attention block: norm/to_qkv/proj names are shared
+                rest = f"mid_block.attentions.0.{sub}"
+            else:        # middle.0 -> resnets.0, middle.2 -> resnets.1
+                rest = (f"mid_block.resnets.{0 if i == 0 else 1}."
+                        f"{_remap_wan_vae_resnet_subkey(sub)}")
+        else:
+            mu = re.match(r"^upsamples\.(\d+)\.upsamples\.(\d+)\.(.*)$", rest)
+            md = re.match(r"^downsamples\.(\d+)\.downsamples\.(\d+)\.(.*)$", rest)
+            if mu:
+                blk, j, sub = mu.group(1), mu.group(2), mu.group(3)
+                if sub.startswith(("resample.", "time_conv.")):
+                    rest = f"up_blocks.{blk}.upsampler.{sub}"
+                else:
+                    rest = (f"up_blocks.{blk}.resnets.{j}."
+                            f"{_remap_wan_vae_resnet_subkey(sub)}")
+            elif md:
+                blk, j, sub = md.group(1), md.group(2), md.group(3)
+                if sub.startswith(("resample.", "time_conv.")):
+                    rest = f"down_blocks.{blk}.downsampler.{sub}"
+                else:
+                    rest = (f"down_blocks.{blk}.resnets.{j}."
+                            f"{_remap_wan_vae_resnet_subkey(sub)}")
+    return f"{side}.{rest}"
+
+
 def _is_scale_sibling(k: str) -> bool:
     return k.endswith(".scale_weight") or k.endswith(".scale_input")
 
@@ -224,8 +296,16 @@ _ST_DTYPE_BYTES = {"F64": 8, "F32": 4, "F16": 2, "BF16": 2, "F8_E4M3": 1, "F8_E5
                    "U8": 1, "BOOL": 1}
 
 
-def remap_dequant_file(src: str | Path, dst: str | Path) -> int:
+def remap_dequant_file(src: str | Path, dst: str | Path,
+                       key_fn=remap_key,
+                       extra_drop: tuple = ()) -> int:
     """Remap keys AND dequant fp8 (F8_E4M3 × scale_weight → fp16). Needs torch.
+
+    `key_fn` maps each kept source key to its output name (default: the Wan
+    TRANSFORMER remap). `extra_drop` names additional exact keys to omit beyond
+    the fp8 scale siblings/marker (e.g. ComfyUI's embedded `spiece_model` blob
+    in the umt5 text-encoder single-file). Defaults are byte-identical to the
+    original two-argument behaviour.
 
     The working path for the current engine (Wan factory has no DequantFP8). The
     scale siblings + `scaled_fp8` marker are consumed here and NOT written.
@@ -279,7 +359,7 @@ def remap_dequant_file(src: str | Path, dst: str | Path) -> int:
     plan: list = []   # (out_key, is_fp8, src_dt, (s,e), scale_key_or_None, out_bytes)
     cursor = 0
     for k, info in raw.items():
-        if _is_droppable(k):
+        if _is_droppable(k) or k in extra_drop:
             continue
         src_dt = info["dtype"]
         if src_dt not in st2torch:
@@ -300,7 +380,7 @@ def remap_dequant_file(src: str | Path, dst: str | Path) -> int:
                 f"{src}: fp8 tensor {k!r} carries the 'scaled_fp8' marker but has NO "
                 f"'{sk}' sibling — a bare fp8→fp16 cast would be numerically wrong "
                 f"(unscaled). The checkpoint is malformed; refusing to dequantize.")
-        out_key = remap_key(k)
+        out_key = key_fn(k)
         out_hdr[out_key] = {"dtype": out_dt, "shape": info["shape"],
                             "data_offsets": [cursor, cursor + size]}
         plan.append((out_key, is_fp8, src_dt, (s, e), sk, size))
@@ -341,7 +421,7 @@ def remap_dequant_file(src: str | Path, dst: str | Path) -> int:
     return len(plan)
 
 
-def estimate_dequant_output_bytes(src: str | Path) -> int:
+def estimate_dequant_output_bytes(src: str | Path, extra_drop: tuple = ()) -> int:
     """Exact DATA bytes `remap_dequant_file` will write for `src` (kept tensors,
     fp8→F16 widening applied) — the same plan math, header-only, no torch. Used for
     the free-disk pre-check; the output json header (~100 KB) rides in the caller's
@@ -349,7 +429,7 @@ def estimate_dequant_output_bytes(src: str | Path) -> int:
     hdr = _read_header(src)   # DoS-guarded
     total = 0
     for k, info in hdr.items():
-        if _is_droppable(k):
+        if _is_droppable(k) or k in extra_drop:
             continue
         src_dt = info["dtype"]
         if src_dt not in _ST_DTYPE_BYTES:
@@ -727,6 +807,101 @@ def _expert_basename_hint_check(high_expert: str, low_expert: str) -> None:
             hi_name, lo_name)
 
 
+
+def _run_staged_build(out_dir: str, fp: str, need_bytes: int, build_fn,
+                      label: str, force: bool = False) -> str:
+    """Cache-aware, locked, CRASH-SAFE staged build — the shared core extracted
+    from `stage_two_expert` (byte-identical behaviour): under `<out_dir>.lock`,
+    (1) fingerprint cache-hit check, (2) free-disk pre-check with the caller's
+    exact planned bytes, (3) build into `<out_dir>.tmp-<pid>` via `build_fn(tmp)`,
+    (4) marker-first atomic swap with rollback (SF1/SF2/SF3/S3/S4 semantics
+    unchanged; `label` only decorates messages)."""
+    marker_name = ".qf_stage_complete"
+    marker = os.path.join(out_dir, marker_name)
+    with _stage_lock(out_dir):
+        if not force and os.path.isfile(marker):
+            with open(marker, "r", encoding="utf-8") as f:
+                if f.read().strip() == fp:
+                    logger.info("[comfyui_wan_remap] staged dir cache hit -> %s", out_dir)
+                    return out_dir
+
+        # S4 — free-disk pre-check with the EXACT planned output bytes (fail with an
+        # actionable message instead of ENOSPC halfway through a multi-GB write).
+        space_probe = out_dir
+        while not os.path.isdir(space_probe):
+            parent = os.path.dirname(space_probe)
+            if parent == space_probe:
+                break
+            space_probe = parent
+        free = shutil.disk_usage(space_probe).free
+        if free < need_bytes:
+            raise RuntimeError(
+                f"not enough free disk for the staged {label}: need "
+                f"~{need_bytes / 1024**3:.1f} GiB (dequantized weights + margin) but only "
+                f"{free / 1024**3:.1f} GiB free at {space_probe!r}. Point output_dir "
+                f"(or QUANTFUNC_CACHE_DIR) at a roomier disk.")
+
+        # S3 — ATOMIC staging: build in <out_dir>.tmp-<pid>, then swap into place.
+        _cleanup_stale_dirs(out_dir)
+        tmp_dir = f"{out_dir}.tmp-{os.getpid()}"
+        if os.path.isdir(tmp_dir):
+            if os.path.isfile(os.path.join(tmp_dir, _TMP_SENTINEL)):
+                shutil.rmtree(tmp_dir)
+            else:
+                raise RuntimeError(f"staging tmp path {tmp_dir!r} exists and is not ours")
+        os.makedirs(tmp_dir)
+        with open(os.path.join(tmp_dir, _TMP_SENTINEL), "w", encoding="utf-8") as f:
+            f.write(fp)
+
+        # SF3 — reap own tmp on a BUILD-phase exception; gated OFF once the swap
+        # starts (tmp may then hold the ONLY completed build).
+        swap_started = False
+        try:
+            build_fn(tmp_dir)
+
+            # SF2 — CRASH-SAFE swap (marker FIRST, sentinel off SECOND — the tmp
+            # carries >=1 ownership proof at every instant).
+            with open(os.path.join(tmp_dir, marker_name), "w", encoding="utf-8") as f:
+                f.write(fp)
+            swap_started = True                  # from here on, NEVER reap tmp blindly
+            try:
+                os.unlink(os.path.join(tmp_dir, _TMP_SENTINEL))
+            except OSError as exc:
+                logger.warning(
+                    "[comfyui_wan_remap] could not remove the staging sentinel "
+                    "(%s) — proceeding with the swap; a stray %s file may remain "
+                    "inside the staged dir (harmless).", exc, _TMP_SENTINEL)
+            trash_dir = f"{out_dir}.trash-{os.getpid()}"
+            old_moved = False
+            if os.path.isdir(out_dir):
+                os.replace(out_dir, trash_dir)   # old stage aside, atomically
+                old_moved = True
+            try:
+                os.replace(tmp_dir, out_dir)     # new stage live, atomically
+            except BaseException:
+                if old_moved and not os.path.isdir(out_dir):
+                    for _attempt in range(_ROLLBACK_RETRIES):
+                        try:
+                            os.replace(trash_dir, out_dir)
+                            break
+                        except OSError:
+                            time.sleep(_ROLLBACK_RETRY_DELAY_S)
+                    else:
+                        logger.error(
+                            "[comfyui_wan_remap] COMPOUND fault: the swap-in AND the "
+                            "rollback both failed — %s is ABSENT. Nothing is lost: the "
+                            "OLD complete stage is at %s and the NEW complete stage is "
+                            "at %s (both marker-carrying). Re-running the stage "
+                            "self-heals (reaps + rebuilds), or move either dir into "
+                            "place manually.", out_dir, trash_dir, tmp_dir)
+                raise
+            if old_moved and os.path.isdir(trash_dir):
+                shutil.rmtree(trash_dir, ignore_errors=True)
+        finally:
+            if not swap_started and os.path.isdir(tmp_dir):
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+    return out_dir
+
 def stage_two_expert(high_expert: str, low_expert: str, shared_dir: str,
                      out_dir: str, *, boundary_ratio: float | None = None,
                      force: bool = False) -> str:
@@ -824,166 +999,53 @@ def stage_two_expert(high_expert: str, low_expert: str, shared_dir: str,
     for rel in ("model_index.json", "vae/config.json", "transformer/config.json"):
         fp_inputs.append(os.path.join(shared_dir, rel))
     fp = _fingerprint(fp_inputs, extra=f"{eff_boundary}|dequant|{in_ch}|{out_ch}")
-    marker_name = ".qf_stage_complete"
-    marker = os.path.join(out_dir, marker_name)
 
     # SF1 — EXCLUSIVE whole-stage lock: everything from the cache-hit check to the
     # final swap runs under `<out_dir>.lock`. A concurrent instance staging the same
     # out_dir BLOCKS here until the holder finishes, then sees the completed marker
     # and cache-hits — it can never reap the holder's live tmp (the old defect) nor
     # observe a half-swapped dir. The lock dies with a crashed holder (flock).
-    with _stage_lock(out_dir):
-        if not force and os.path.isfile(marker):
-            with open(marker, "r", encoding="utf-8") as f:
-                if f.read().strip() == fp:
-                    logger.info("[comfyui_wan_remap] staged dir cache hit -> %s", out_dir)
-                    return out_dir
+    def _build(tmp_dir: str) -> None:
+        # -- transformers (base_xfm_cfg loaded early, before boundary resolution) --
+        for sub, src in (("transformer", high_expert), ("transformer_2", low_expert)):
+            d = os.path.join(tmp_dir, sub)
+            os.makedirs(d, exist_ok=True)
+            n_layers = _count_layers(_read_header(src))
+            cfg = synthesize_transformer_config(base_xfm_cfg, in_ch, out_ch, n_layers)
+            _dump_json(cfg, os.path.join(d, "config.json"))
+            weight_dst = os.path.join(d, "diffusion_pytorch_model.safetensors")
+            nk = remap_dequant_file(src, weight_dst)
+            logger.info("[comfyui_wan_remap] %s <- %s (remap+dequant, %d keys)",
+                        sub, os.path.basename(src), nk)
 
-        # S4 — free-disk pre-check with the EXACT planned output bytes (fail with an
-        # actionable message instead of ENOSPC halfway through a 56 GB write).
-        need = (estimate_dequant_output_bytes(high_expert)
-                + estimate_dequant_output_bytes(low_expert) + _FREE_SPACE_MARGIN_BYTES)
-        space_probe = out_dir
-        while not os.path.isdir(space_probe):
-            parent = os.path.dirname(space_probe)
-            if parent == space_probe:
-                break
-            space_probe = parent
-        free = shutil.disk_usage(space_probe).free
-        if free < need:
-            raise RuntimeError(
-                f"not enough free disk for the staged A14B: need ~{need / 1024**3:.1f} GiB "
-                f"(dequantized experts + margin) but only {free / 1024**3:.1f} GiB free at "
-                f"{space_probe!r}. Point output_dir (or QUANTFUNC_CACHE_DIR) at a roomier disk.")
+        # -- shared components (dir symlink / copy) ----------------------------
+        for sub in _SHARED_SUBDIRS:
+            s2 = os.path.join(shared_dir, sub)
+            if os.path.isdir(s2):
+                _stage_shared_dir(s2, os.path.join(tmp_dir, sub))
 
-        # S3 — ATOMIC staging: build in <out_dir>.tmp-<pid>, then swap into place.
-        # Under the lock, any leftover tmp/trash is from a CRASHED run (a live stager
-        # holds the lock for its tmp's whole lifetime) — reap the dead ones.
-        _cleanup_stale_dirs(out_dir)
-        tmp_dir = f"{out_dir}.tmp-{os.getpid()}"
-        if os.path.isdir(tmp_dir):
-            # same-pid leftover (previous exception in this process) — ours by sentinel.
-            if os.path.isfile(os.path.join(tmp_dir, _TMP_SENTINEL)):
-                shutil.rmtree(tmp_dir)
-            else:
-                raise RuntimeError(f"staging tmp path {tmp_dir!r} exists and is not ours")
-        os.makedirs(tmp_dir)
-        with open(os.path.join(tmp_dir, _TMP_SENTINEL), "w", encoding="utf-8") as f:
-            f.write(fp)
+        # -- vae (link weights via the shared Windows-safe helper + fixed cfg) --
+        vae_src = os.path.join(shared_dir, "vae")
+        if os.path.isdir(vae_src):
+            vae_dst = os.path.join(tmp_dir, "vae")
+            os.makedirs(vae_dst, exist_ok=True)
+            for wf in os.listdir(vae_src):
+                if wf.endswith(".safetensors"):
+                    link_or_copy(os.path.join(vae_src, wf), os.path.join(vae_dst, wf))
+            vae_cfg_path = os.path.join(vae_src, "config.json")
+            base_vae_cfg = _load_json(vae_cfg_path) if os.path.isfile(vae_cfg_path) else {}
+            _dump_json(synthesize_vae_config(base_vae_cfg),
+                       os.path.join(vae_dst, "config.json"))
 
-        # SF3 — this process's own tmp is reaped on a BUILD-phase exception (no 56 GB
-        # orphan per crash). Once the SWAP starts, tmp may hold the ONLY completed
-        # build → the reap is gated OFF (swap_started) and swap failures roll back
-        # instead (a marker-carrying leftover tmp is reaped by the next run's
-        # cleanup — marker counts as ownership proof).
-        swap_started = False
-        try:
-            # -- transformers (base_xfm_cfg loaded early, before boundary resolution) --
-            for sub, src in (("transformer", high_expert), ("transformer_2", low_expert)):
-                d = os.path.join(tmp_dir, sub)
-                os.makedirs(d, exist_ok=True)
-                n_layers = _count_layers(_read_header(src))
-                cfg = synthesize_transformer_config(base_xfm_cfg, in_ch, out_ch, n_layers)
-                _dump_json(cfg, os.path.join(d, "config.json"))
-                weight_dst = os.path.join(d, "diffusion_pytorch_model.safetensors")
-                nk = remap_dequant_file(src, weight_dst)
-                logger.info("[comfyui_wan_remap] %s <- %s (remap+dequant, %d keys)",
-                            sub, os.path.basename(src), nk)
+        # -- model_index --------------------------------------------------------
+        _dump_json(synthesize_model_index(base_mi, class_name, eff_boundary),
+                   os.path.join(tmp_dir, "model_index.json"))
 
-            # -- shared components (dir symlink / copy) ----------------------------
-            for sub in _SHARED_SUBDIRS:
-                s2 = os.path.join(shared_dir, sub)
-                if os.path.isdir(s2):
-                    _stage_shared_dir(s2, os.path.join(tmp_dir, sub))
-
-            # -- vae (link weights via the shared Windows-safe helper + fixed cfg) --
-            vae_src = os.path.join(shared_dir, "vae")
-            if os.path.isdir(vae_src):
-                vae_dst = os.path.join(tmp_dir, "vae")
-                os.makedirs(vae_dst, exist_ok=True)
-                for wf in os.listdir(vae_src):
-                    if wf.endswith(".safetensors"):
-                        link_or_copy(os.path.join(vae_src, wf), os.path.join(vae_dst, wf))
-                vae_cfg_path = os.path.join(vae_src, "config.json")
-                base_vae_cfg = _load_json(vae_cfg_path) if os.path.isfile(vae_cfg_path) else {}
-                _dump_json(synthesize_vae_config(base_vae_cfg),
-                           os.path.join(vae_dst, "config.json"))
-
-            # -- model_index --------------------------------------------------------
-            _dump_json(synthesize_model_index(base_mi, class_name, eff_boundary),
-                       os.path.join(tmp_dir, "model_index.json"))
-
-            # SF2 — CRASH-SAFE swap. Marker into tmp FIRST, sentinel off SECOND, then:
-            #   old out_dir --atomic rename--> .trash-<pid>
-            #   tmp         --atomic rename--> out_dir     (failure ⇒ ROLLBACK trash→out)
-            #   rmtree(.trash)
-            # Invariant after ANY crash/exception: at least one COMPLETE marker-carrying
-            # stage exists ON DISK — at out_dir (old rolled back, or new landed) or in a
-            # leftover tmp/trash that the next run's cleanup reaps (marker = ownership
-            # proof). Never a markerless partial. Residual (accepted + LOUD): a COMPOUND
-            # persistent fault that fails the swap-in AND the retried rollback leaves
-            # out_dir absent — both complete stages survive as recovery dirs, an ERROR
-            # names them, and the next run self-heals (reap + rebuild).
-            # Marker FIRST, sentinel off SECOND — the tmp carries >=1 ownership
-            # proof at every instant, so even a SIGKILL between the two operations
-            # leaves a reapable dir (never a neither-proof unreapable orphan).
-            with open(os.path.join(tmp_dir, marker_name), "w", encoding="utf-8") as f:
-                f.write(fp)
-            # The marker IS the "completed build" proof — gate the finally-reap OFF
-            # from this exact instant (NOT after the sentinel unlink: a transient
-            # unlink failure must never let the finally blind-reap the only
-            # completed build).
-            swap_started = True                  # from here on, NEVER reap tmp blindly
-            try:
-                os.unlink(os.path.join(tmp_dir, _TMP_SENTINEL))
-            except OSError as exc:
-                # Best-effort: the build is complete and marker-carrying; a stray
-                # sentinel file riding along into the staged dir is harmless (no
-                # consumer reads it inside out_dir), whereas failing here would
-                # discard a multi-GB completed build over a transient fault.
-                logger.warning(
-                    "[comfyui_wan_remap] could not remove the staging sentinel "
-                    "(%s) — proceeding with the swap; a stray %s file may remain "
-                    "inside the staged dir (harmless).", exc, _TMP_SENTINEL)
-            trash_dir = f"{out_dir}.trash-{os.getpid()}"
-            old_moved = False
-            if os.path.isdir(out_dir):
-                os.replace(out_dir, trash_dir)   # old stage aside, atomically, marker intact
-                old_moved = True
-            try:
-                os.replace(tmp_dir, out_dir)     # new stage live, atomically
-            except BaseException:
-                # ROLLBACK: restore the old stage to the canonical path (bounded
-                # retry — the rollback rename is the same syscall shape as the
-                # failed swap-in, so a PERSISTENT fault can hit it too; retries
-                # only rescue transient classes). The completed new build stays in
-                # tmp for the next run's cleanup/rebuild either way.
-                if old_moved and not os.path.isdir(out_dir):
-                    for _attempt in range(_ROLLBACK_RETRIES):
-                        try:
-                            os.replace(trash_dir, out_dir)
-                            break
-                        except OSError:
-                            time.sleep(_ROLLBACK_RETRY_DELAY_S)
-                    else:
-                        logger.error(
-                            "[comfyui_wan_remap] COMPOUND fault: the swap-in AND the "
-                            "rollback both failed — %s is ABSENT. Nothing is lost: the "
-                            "OLD complete stage is at %s and the NEW complete stage is "
-                            "at %s (both marker-carrying). Re-running the stage "
-                            "self-heals (reaps + rebuilds), or move either dir into "
-                            "place manually.", out_dir, trash_dir, tmp_dir)
-                raise
-            if old_moved and os.path.isdir(trash_dir):
-                # Best-effort: the swap already SUCCEEDED (out_dir is the valid new
-                # stage) — a trash-cleanup failure must not raise over that success;
-                # a surviving dead-pid trash is reaped by the next run's cleanup.
-                shutil.rmtree(trash_dir, ignore_errors=True)
-        finally:
-            if not swap_started and os.path.isdir(tmp_dir):
-                # BUILD-phase exception only (success renamed tmp away; swap-phase
-                # failures keep tmp — it may be the only completed build).
-                shutil.rmtree(tmp_dir, ignore_errors=True)
+    # S4 need-bytes: the two dequantized experts + margin (shared components are
+    # links/small configs — covered by the margin, as before).
+    need = (estimate_dequant_output_bytes(high_expert)
+            + estimate_dequant_output_bytes(low_expert) + _FREE_SPACE_MARGIN_BYTES)
+    _run_staged_build(out_dir, fp, need, _build, "A14B", force=force)
 
     logger.info("[comfyui_wan_remap] staged two-expert %s dir (dequant-fp16, "
                 "boundary=%.3f [%s]) -> %s",
@@ -1160,3 +1222,257 @@ def list_wan_a14b_choices(roots: list[str]) -> tuple[dict, dict]:
                 seen_f.add(real)
                 expert_paths.append(full)
     return _labeled(expert_paths), _labeled(a14b_shared + other_shared)
+
+
+# ============================================================================
+# Single-file TI2V-5B trio → diffusers staging + self-registering adapter
+#
+# The user-facing gap this closes: UNETLoader(wan2.2_ti2v_5B_*.safetensors,
+# original-Wan keys) + CLIPLoader(umt5_xxl_*) + VAELoader(wan2.2_vae) into
+# Build Pipeline previously matched NO adapter ("No format adapter matched"):
+# the A14B Combine node only accepts high/low expert PAIRS, and the generic
+# single-file adapter has no Wan arch fingerprint. TI2V-5B is a SINGLE
+# transformer, so it stages exactly like one A14B expert minus the pairing —
+# reusing remap_dequant_file (key remap + optional fp8 dequant) for all three
+# legs and the same crash-safe _run_staged_build core.
+# ============================================================================
+
+# TI2V-5B modality: t2v single transformer over the Wan2.2 48-ch VAE (in==out).
+_TI2V5B_LATENT_CHANNELS = 48
+# Bundled engine-verified assets (fetched verbatim from the official
+# Wan2.2-TI2V-5B-Diffusers release the engine was verified against).
+_WAN_ASSET_TRANSFORMER_CFG = "transformer_configs/Wan22TI2V5B.json"
+_WAN_ASSET_VAE_CFG = "vae_configs/Wan22TI2V5B.json"
+_WAN_ASSET_TE_CFG = "text_encoder_configs/Wan.json"
+_WAN_ASSET_SCHEDULER_CFG = "scheduler_configs/Wan22TI2V5B.json"
+_WAN_ASSET_TOKENIZER_DIR = "tokenizers/Wan"
+# ComfyUI's umt5 single-file embeds the sentencepiece model as a raw U8 tensor
+# (`spiece_model`) — not a weight. The engine's UMT5 tokenizer reads
+# tokenizer/tokenizer.json (bundled) instead, so the blob is dropped.
+_UMT5_EXTRA_DROP = ("spiece_model",)
+
+# model_index for the staged single-transformer TI2V-5B — field-for-field from
+# the official Wan2.2-TI2V-5B-Diffusers model_index.json (boundary_ratio null =
+# single transformer, no expert switch; expand_timesteps true is 5B-specific).
+_TI2V5B_MODEL_INDEX = {
+    "_class_name": _ENGINE_WAN_PIPELINE_CLASS,
+    "boundary_ratio": None,
+    "expand_timesteps": True,
+    "scheduler": ["diffusers", "UniPCMultistepScheduler"],
+    "text_encoder": ["transformers", "UMT5EncoderModel"],
+    "tokenizer": ["transformers", "T5TokenizerFast"],
+    "transformer": ["diffusers", "WanTransformer3DModel"],
+    "vae": ["diffusers", "AutoencoderKLWan"],
+}
+
+
+def _wan_bundled_asset(rel: str) -> str:
+    """Absolute path of a bundled Wan asset under <plugin>/bin/ — fail-LOUD when
+    absent (a broken plugin install must not stage a half-configured model)."""
+    plugin_root = Path(__file__).resolve().parent.parent
+    p = plugin_root / "bin" / rel
+    if not p.exists():
+        raise RuntimeError(
+            f"plugin bundled asset missing: {p} — reinstall/update the "
+            f"ComfyUI-QuantFunc plugin (bin/{rel} ships with it).")
+    return str(p)
+
+
+def _looks_like_umt5_single_file(path: str | Path) -> bool:
+    """Cheap header check: HF-T5 naming (`encoder.block.N...`) = the ComfyUI
+    umt5_xxl single-file (fp16 or fp8_scaled)."""
+    try:
+        hdr = _read_header(path)
+    except Exception:  # noqa: BLE001
+        return False
+    return any(k.startswith("encoder.block.") for k in hdr)
+
+
+def _looks_like_wan_vae_single_file(path: str | Path) -> bool:
+    """Cheap header check: original-Wan VAE naming (`decoder.head.2.*`) OR the
+    already-diffusers naming (`decoder.conv_out.*` — remap passes through)."""
+    try:
+        hdr = _read_header(path)
+    except Exception:  # noqa: BLE001
+        return False
+    return any(k.startswith(("decoder.head.2.", "decoder.conv_out."))
+               for k in hdr)
+
+
+def default_wan_5b_stage_dir() -> str:
+    """VOLATILE staging root for the 5B trio (ComfyUI temp — cleared on restart;
+    tempfile.gettempdir() outside ComfyUI). Deliberately NEVER a persistent
+    cache: model-weight copies must not survive reboots (metadata-only files
+    may). Session-cached via _run_staged_build's fingerprint marker."""
+    try:
+        import folder_paths
+        root = folder_paths.get_temp_directory()
+    except Exception:  # noqa: BLE001 — outside ComfyUI (tests)
+        import tempfile as _tf
+        root = _tf.gettempdir()
+    return os.path.join(root, "qf_wan_ti2v5b")
+
+
+def stage_ti2v_5b_trio(xfm_path: str | Path, te_path: str | Path,
+                       vae_path: str | Path, out_dir: str | Path,
+                       force: bool = False) -> str:
+    """Stage a ComfyUI single-file TI2V-5B trio into the engine's diffusers
+    layout. All three legs run through remap_dequant_file (streamed, memory-
+    bounded; fp8_scaled variants dequant to fp16 inline):
+
+        transformer/  original-Wan keys → diffusers (remap_key; VERIFIED
+                      key-exact 825/825 vs the official 5B diffusers release)
+        text_encoder/ HF-T5 keys pass through unchanged; fp8 scale siblings +
+                      the embedded `spiece_model` blob dropped (VERIFIED the
+                      remaining 242 keys == the official release exactly)
+        vae/          original-Wan VAE keys → diffusers AutoencoderKLWan
+                      (remap_wan_vae_key; VERIFIED key+shape-exact 196/196)
+        tokenizer/ scheduler/ model_index.json + per-component config.json
+                      from the bundled engine-verified assets.
+
+    Cache-aware + crash-safe via _run_staged_build (same core as the A14B
+    two-expert stage). Returns the staged model_dir.
+    """
+    xfm_path, te_path, vae_path = str(xfm_path), str(te_path), str(vae_path)
+    out_dir = os.path.abspath(str(out_dir))
+
+    if not os.path.isfile(xfm_path) or not is_comfyui_wan_single_file(xfm_path):
+        raise RuntimeError(
+            f"not an original-Wan single-file transformer (no blocks.N.self_attn"
+            f"/ffn.0/patch_embedding): {xfm_path}")
+    in_ch, out_ch = detect_wan_modality(xfm_path)
+    if (in_ch, out_ch) != (_TI2V5B_LATENT_CHANNELS, _TI2V5B_LATENT_CHANNELS):
+        raise RuntimeError(
+            f"unsupported Wan single-file modality ({in_ch},{out_ch}) — this "
+            f"path stages the TI2V-5B (48,48) only. A 16-channel file is a "
+            f"Wan2.1/A14B-family transformer: an A14B high/low expert PAIR "
+            f"loads via the 'QuantFunc Wan Combine Experts' node; a standalone "
+            f"Wan2.1 single-file is not yet supported here.")
+    if not _looks_like_umt5_single_file(te_path):
+        raise RuntimeError(
+            f"the wired CLIP file does not look like the Wan umt5_xxl text "
+            f"encoder (no encoder.block.* keys): {te_path}")
+    if not _looks_like_wan_vae_single_file(vae_path):
+        raise RuntimeError(
+            f"the wired VAE file does not look like a Wan VAE (no decoder.head"
+            f".2/decoder.conv_out keys): {vae_path}")
+
+    # Resolve every bundled asset UP FRONT (fail-loud before any GB write).
+    xfm_cfg_asset = _wan_bundled_asset(_WAN_ASSET_TRANSFORMER_CFG)
+    vae_cfg_asset = _wan_bundled_asset(_WAN_ASSET_VAE_CFG)
+    te_cfg_asset = _wan_bundled_asset(_WAN_ASSET_TE_CFG)
+    sched_asset = _wan_bundled_asset(_WAN_ASSET_SCHEDULER_CFG)
+    tok_dir_asset = _wan_bundled_asset(_WAN_ASSET_TOKENIZER_DIR)
+
+    _assert_safe_out_dir(out_dir, [xfm_path, te_path, vae_path,
+                                   os.path.dirname(xfm_path),
+                                   os.path.dirname(te_path),
+                                   os.path.dirname(vae_path)])
+
+    fp = _fingerprint([xfm_path, te_path, vae_path,
+                       xfm_cfg_asset, vae_cfg_asset, te_cfg_asset, sched_asset],
+                      extra=f"ti2v5b|dequant|{in_ch}|{out_ch}")
+
+    def _build(tmp_dir: str) -> None:
+        # -- transformer (config: bundled base + measured dims, mirroring the
+        #    A14B path's synthesize_transformer_config precedence) -------------
+        d = os.path.join(tmp_dir, "transformer")
+        os.makedirs(d, exist_ok=True)
+        n_layers = _count_layers(_read_header(xfm_path))
+        cfg = synthesize_transformer_config(_load_json(xfm_cfg_asset),
+                                            in_ch, out_ch, n_layers)
+        _dump_json(cfg, os.path.join(d, "config.json"))
+        nk = remap_dequant_file(
+            xfm_path, os.path.join(d, "diffusion_pytorch_model.safetensors"))
+        logger.info("[comfyui_wan_remap] transformer <- %s (remap+dequant, %d keys)",
+                    os.path.basename(xfm_path), nk)
+
+        # -- text encoder (keys pass through; fp8 dequant; spiece blob dropped) --
+        d = os.path.join(tmp_dir, "text_encoder")
+        os.makedirs(d, exist_ok=True)
+        shutil.copyfile(te_cfg_asset, os.path.join(d, "config.json"))
+        nk = remap_dequant_file(te_path, os.path.join(d, "model.safetensors"),
+                                key_fn=lambda k: k,
+                                extra_drop=_UMT5_EXTRA_DROP)
+        logger.info("[comfyui_wan_remap] text_encoder <- %s (dequant, %d keys)",
+                    os.path.basename(te_path), nk)
+
+        # -- vae (original-Wan naming → diffusers AutoencoderKLWan) -------------
+        d = os.path.join(tmp_dir, "vae")
+        os.makedirs(d, exist_ok=True)
+        shutil.copyfile(vae_cfg_asset, os.path.join(d, "config.json"))
+        nk = remap_dequant_file(
+            vae_path, os.path.join(d, "diffusion_pytorch_model.safetensors"),
+            key_fn=remap_wan_vae_key)
+        logger.info("[comfyui_wan_remap] vae <- %s (remap, %d keys)",
+                    os.path.basename(vae_path), nk)
+
+        # -- tokenizer / scheduler / model_index --------------------------------
+        d = os.path.join(tmp_dir, "tokenizer")
+        os.makedirs(d, exist_ok=True)
+        for f in os.listdir(tok_dir_asset):
+            src_f = os.path.join(tok_dir_asset, f)
+            if os.path.isfile(src_f):
+                shutil.copyfile(src_f, os.path.join(d, f))
+        d = os.path.join(tmp_dir, "scheduler")
+        os.makedirs(d, exist_ok=True)
+        shutil.copyfile(sched_asset, os.path.join(d, "scheduler_config.json"))
+        _dump_json(_TI2V5B_MODEL_INDEX, os.path.join(tmp_dir, "model_index.json"))
+
+    need = (estimate_dequant_output_bytes(xfm_path)
+            + estimate_dequant_output_bytes(te_path, extra_drop=_UMT5_EXTRA_DROP)
+            + estimate_dequant_output_bytes(vae_path)
+            + _FREE_SPACE_MARGIN_BYTES)
+    _run_staged_build(out_dir, fp, need, _build, "single-file TI2V-5B",
+                      force=force)
+    logger.info("[comfyui_wan_remap] staged single-file TI2V-5B -> %s", out_dir)
+    return out_dir
+
+
+# ---- self-registering Build Pipeline adapter --------------------------------
+from .base import BuildContext, FormatAdapter, SourceBundle, StagingResult  # noqa: E402
+from .factory import adapter  # noqa: E402
+
+
+@adapter(priority=60)
+class ComfyUIWanSingleFileAdapter(FormatAdapter):
+    """Single-file original-Wan transformer (TI2V-5B) + bare umt5 CLIP + Wan VAE.
+
+    Sits ABOVE the generic ComfyUIDiffusionModelAdapter (50) — original-Wan
+    keys carry no ComfyUI prefix and no fingerprintable arch, so without this
+    adapter the trio matched nothing. Files living inside a diffusers
+    model_dir never reach us (HFLayoutAdapter, priority 100, wins first).
+    """
+
+    @classmethod
+    def detect(cls, sources: SourceBundle) -> bool:
+        if sources.checkpoint is not None or sources.transformer is None:
+            return False
+        try:
+            return is_comfyui_wan_single_file(sources.transformer.path)
+        except Exception:  # noqa: BLE001
+            return False
+
+    def adapt(self, sources: SourceBundle, staging_dir: Path,
+              context: BuildContext) -> StagingResult:
+        xfm_path = sources.transformer.path
+        if sources.text_encoder is None or sources.vae is None:
+            raise RuntimeError(
+                "Wan single-file needs all three inputs wired into Build "
+                "Pipeline: the transformer (UNETLoader), the umt5_xxl text "
+                "encoder (CLIPLoader) and the Wan VAE (VAELoader). Missing: "
+                + ", ".join(n for n, v in (("clip", sources.text_encoder),
+                                           ("vae", sources.vae)) if v is None))
+        # stage_ti2v_5b_trio re-validates modality/te/vae and fails LOUD with
+        # actionable guidance (A14B pairs -> the Combine Experts node).
+        staged = stage_ti2v_5b_trio(xfm_path, sources.text_encoder.path,
+                                    sources.vae.path,
+                                    default_wan_5b_stage_dir())
+        # arch/method mirror what the verified A14B flow yields downstream
+        # (hf_native on a staged Wan dir: _class_name "WanPipeline" -> "Wan").
+        return StagingResult(
+            model_dir=staged,
+            arch="Wan",
+            method_hint="online_quant",
+            cleanup_dir=None,   # volatile session cache — reused across builds
+        )

@@ -33,6 +33,7 @@ from . import comfyui_clip       # noqa: F401
 from . import comfyui_vae        # noqa: F401
 from . import comfyui_lora       # noqa: F401
 from . import bundled_checkpoint  # noqa: F401
+from . import comfyui_wan_remap   # noqa: F401  (Wan single-file TI2V-5B trio adapter)
 
 __all__ = [
     "FileRef",
