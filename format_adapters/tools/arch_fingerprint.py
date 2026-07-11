@@ -28,6 +28,11 @@ CLASS_NAME_TO_ARCH = {
     "Flux2Transformer2DModel":       "Flux2Klein",
     "Ideogram4Pipeline":             "Ideogram4",
     "Ideogram4Transformer2DModel":   "Ideogram4",
+    # Krea-2 / Krea-2-Turbo (single-stream 28-block MMDiT). A diffusers-layout
+    # export carries the class in metadata; the common ComfyUI single-files are
+    # BFL/akira layout with NO _class_name → the key-pattern arm below catches them.
+    "Krea2Transformer2DModel":       "Krea2",
+    "Krea2Pipeline":                 "Krea2",
     # Qwen-Image-Layered reuses QwenImageTransformer2DModel for its transformer
     # (so the TRANSFORMER class can't disambiguate — only the PIPELINE class can).
     "QwenImageLayeredPipeline":      "QwenImageLayered",
@@ -58,6 +63,24 @@ def _detect_arch_by_keys(keys: list[str]) -> str:
     has_single_xfm = any("single_transformer_blocks." in k for k in keys[:500])
     if has_single_xfm:
         return "Flux2Klein"
+
+    # Krea-2 (28-block single-stream MMDiT): the BFL/akira reference layout uses
+    # `txtfusion.*` (the Qwen3-VL layer-tap fusion tower: layerwise_blocks /
+    # refiner_blocks / projector) — a top-level name NO other supported arch
+    # carries — together with single-stream `blocks.N.attn.wq`/`blocks.N.mod.lin`
+    # (adaLN-single modulation), NOT the diffusers `transformer_blocks.*` naming.
+    # Checked BEFORE the generic `transformer_blocks` block-count fallback and the
+    # ZImage/Qwen paths: Krea-2 shares the bare `blocks.N` prefix with Wan, but Wan
+    # has `blocks.N.self_attn`/`attn1` (dual attention, no `.attn.wq`, no `.mod.lin`,
+    # no `txtfusion`) — so the txtfusion + attn.wq/mod.lin double-signal is
+    # collision-free vs Klein(single/double_blocks), Wan, Qwen(transformer_blocks),
+    # ZImage(cap_embedder), Ideogram4(llm_cond_*), QwenImageLayered(addition_t_embedding).
+    has_txtfusion = any("txtfusion." in k for k in keys)
+    has_krea_block = any(
+        re.search(r"(^|\.)blocks\.\d+\.(attn\.(wq|to_gate|gate)|mod\.lin)", k)
+        for k in keys)
+    if has_txtfusion and has_krea_block:
+        return "Krea2"
 
     # Ideogram-4: `llm_cond_proj`/`llm_cond_norm` (the LLM-conditioning
     # projection read by Ideogram4TransformerLighting) is unique to this arch —

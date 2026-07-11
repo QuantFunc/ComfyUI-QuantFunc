@@ -17,6 +17,7 @@ Detection (either signal sufficient):
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 
@@ -149,6 +150,32 @@ class HFLayoutAdapter(FormatAdapter):
             # fall back to the bundled per-arch tokenizer.
             if not (_ex_tok / "vocab.json").is_file():
                 _copy_tokenizer(arch, _ex_tok, [])
+            # Krea-2 fp8 TE: this branch hands the model_dir to the engine AS-IS —
+            # no add_text_encoder(), so the staging-route sweep does not cover it —
+            # yet the engine still loads that dir's text_encoder/. An unsupported
+            # fp8 layout there hits the implicit-1.0-scale blind spot (silent
+            # garbage), so guard the dir's own TE weights too. This dir is only
+            # resolvable as Krea2 because this feature added the arch fingerprint,
+            # so the hole is ours to close.
+            if arch == "Krea2":
+                from .tools.krea2_fp8_te import guard_krea2_te_fp8
+                # The dir is passed to the engine AS-IS, INCLUDING its own
+                # quantfunc_config.json — which may declare the TE prequantized.
+                # The engine reads that as skip_fp8_dequant=true and would
+                # byte-reinterpret the fp8 into its BF16 container, so the guard
+                # must see the SAME flag the engine will (fp8 + prequantized is a
+                # refusal, not a pass).
+                _preq = False
+                try:
+                    _qc = Path(existing) / "quantfunc_config.json"
+                    if _qc.is_file():
+                        _obj = json.loads(_qc.read_text())
+                        _te_h = (_obj or {}).get("text_encoder") or {}
+                        _preq = bool(_te_h.get("prequantized", False))
+                except Exception as e:                    # never fail staging on this
+                    logger.debug("[hf_native] Krea-2 prequantized probe failed: %s", e)
+                for _te in sorted((Path(existing) / "text_encoder").glob("*.safetensors")):
+                    guard_krea2_te_fp8(str(_te), prequantized_hint=_preq)
             return StagingResult(
                 model_dir=str(existing),
                 arch=arch,
@@ -207,6 +234,12 @@ class HFLayoutAdapter(FormatAdapter):
         # num_heads=32 → head_dim=80 vs real Qwen2.5-VL head_dim=128 →
         # cudaMemcpy illegal memory access at TE load).
         if sources.text_encoder:
+            # Krea-2 fp8 TE: this branch STAGES the TE for the engine, so it must
+            # pass the shared fp8 guard — an unsupported fp8 layout would be
+            # dequantized with an implicit 1.0 scale => silent garbage.
+            if arch == "Krea2":
+                from .tools.krea2_fp8_te import guard_krea2_te_fp8
+                guard_krea2_te_fp8(sources.text_encoder.path)
             layout.add_text_encoder(
                 sources.text_encoder.path,
                 config=(_sibling_config(sources.text_encoder.path)
@@ -310,6 +343,17 @@ class HFLayoutAdapter(FormatAdapter):
         layout.apply_user_precisions(
             text_precision=context.text_precision,
             vae_precision=context.vae_precision)
+        # Krea-2 fp8 TE, FINAL check: the sibling-quantfunc_config merge above can
+        # set `text_encoder.prequantized=true` from an UNTRUSTED sidecar AFTER the
+        # early guard ran. The engine reads that flag as skip_fp8_dequant=true and
+        # byte-reinterprets the fp8 into its BF16 container => silent garbage. So
+        # re-run the guard against the hints that will ACTUALLY be written, i.e.
+        # the same state the engine will see. (fp8 + prequantized => refuse.)
+        if arch == "Krea2" and sources.text_encoder is not None:
+            from .tools.krea2_fp8_te import guard_krea2_te_fp8 as _guard_te
+            _te_hints = layout._hints.get("text_encoder") or {}
+            _guard_te(sources.text_encoder.path,
+                      prequantized_hint=bool(_te_hints.get("prequantized", False)))
         layout.write_quantfunc_config()
         # When the source carried `vision_encoder/`, the runtime arch is
         # really QwenImageEdit (or another edit pipeline) regardless of
@@ -318,7 +362,13 @@ class HFLayoutAdapter(FormatAdapter):
         # pipeline class.
         if ve_extra_cfg and arch == "QwenImage":
             arch = "QwenImageEdit"
-        layout.write_model_index(arch)
+        # Krea-2: this branch SYNTHESISES model_index.json (the source had no
+        # sibling index), so the distillation marker must be derived from a real
+        # signal — never left to a silent default. (An existing source model_dir
+        # is returned AS-IS above, preserving its own is_distilled verbatim.)
+        from .tools.hf_layout import krea2_is_distilled as _krea2_is_distilled
+        layout.write_model_index(
+            arch, is_distilled=_krea2_is_distilled(arch, ref.path))
         return StagingResult(
             model_dir=str(staging_dir),
             arch=arch,

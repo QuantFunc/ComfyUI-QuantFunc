@@ -1,0 +1,11 @@
+{
+  "_class_name": "FlowMatchEulerDiscreteScheduler",
+  "base_image_seq_len": 256,
+  "max_image_seq_len": 6400,
+  "base_shift": 0.5,
+  "max_shift": 1.15,
+  "shift": 1.0,
+  "time_shift_type": "exponential",
+  "use_dynamic_shifting": true,
+  "num_train_timesteps": 1000
+}

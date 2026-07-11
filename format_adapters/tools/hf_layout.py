@@ -25,14 +25,137 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 from pathlib import Path
 from typing import Optional
 
 from .fs_util import link_or_copy
+
 from .safetensors_io import read_safetensors_header
 
 logger = logging.getLogger(__name__)
+
+
+# Krea-2 guidance-distillation marker, for adapters that SYNTHESISE a
+# model_index.json. The engine picks Krea-2's timestep shift from
+# model_index.json `is_distilled` (Krea2Pipeline.cpp): true => FIXED (turbo)
+# shift; key ABSENT => computed (base) shift, the reference default (the engine
+# logs which branch it took). The two schedules differ SILENTLY, so the marker
+# must never be guessed:
+#   * positive NAME signal (`turbo` / `distill`)  => True
+#   * anything else                               => None (omit the key) + WARN
+# A ComfyUI single-file carries no model_index.json and no distillation flag in
+# its metadata (the released krea2 single-files expose only
+# `_quantization_metadata` + `format`), so the checkpoint NAME is the only signal
+# available to a synthesising adapter.
+#
+# The match is TOKEN-based with DIRECTIONAL negation, NOT a naive substring: a bare
+# `"distill" in name` reads `krea2_UNdistilled` / `krea2_NON_distilled` /
+# `krea2_distill-FREE` as POSITIVE and stamps the turbo FIXED shift onto a
+# checkpoint whose name says the opposite — silently off-schedule, via the
+# "positive" branch so it wouldn't even WARN.
+#
+# A negation token only counts as a DISTILLATION negation when it actually points
+# at a distillation token in reading order (English scope), NOT merely co-occurs:
+#   * prefix negators (`no`/`not`/`non`/`un`/`without`/`anti`) negate the first
+#     distill-or-cfg token WITHIN THE NEXT 2 tokens (`not_a_turbo` -> turbo at +2;
+#     `no_longer_distilled` -> distilled at +2); plus the postfix idiom
+#     `<distilled> not/no anymore|longer`.
+#   * the suffix negator `free` negates the first distill-or-cfg token within the
+#     PREVIOUS 2 tokens (`distill-free`).
+#   * fused `undistilled`/`nondistilled` self-negate.
+# When the negation's actual target is CFG/GUIDANCE, not distillation, it is IGNORED
+# — `turbo-no-cfg` / `cfg-free` / `guidance-free` is standard naming for a
+# guidance-DISTILLED (turbo) model and must resolve True; whereas `cfg-no-turbo`
+# ("no turbo") negates the distillation and resolves ambiguous. This directionality
+# is what separates them, and it stops unrelated qualifier words from false-
+# negating a real turbo name (`turbo-de-noise`, `turbo_anti_aliased`,
+# `turbo_no_artifact`, `turbo_non_square` all stay True — their negation-looking
+# token points at a non-distillation word).
+#
+# NOTE: an HF-diffusers SOURCE DIR never needs this — HFLayoutAdapter returns
+# such a dir AS-IS (hf_native.py), so its own model_index.json (and therefore its
+# real is_distilled) is preserved untouched. This helper is only for the
+# synthesised-index paths.
+_KREA2_DISTILLED_TOKENS = ("turbo", "distill", "distilled")
+_KREA2_PREFIX_NEGATORS = ("no", "not", "non", "un", "without", "anti")
+_KREA2_SUFFIX_NEGATORS = ("free",)
+_KREA2_FUSED_NEGATORS = ("undistilled", "nondistilled")
+_KREA2_IDIOM_COMPLETERS = ("anymore", "longer", "more")
+# The negation's actual target: distillation words disclaim distillation; cfg/
+# guidance words do NOT (a guidance-free / no-cfg model is still distilled).
+_KREA2_CFG_TOKENS = ("cfg", "guidance")
+_KREA2_NEG_TARGETS = _KREA2_DISTILLED_TOKENS + _KREA2_CFG_TOKENS
+
+
+def _krea2_negates_distillation(tokens: list[str]) -> bool:
+    """True iff a negation token in `tokens` points, in reading order, at a
+    DISTILLATION token (not a cfg/guidance token)."""
+    n = len(tokens)
+    for i, tok in enumerate(tokens):
+        if tok in _KREA2_FUSED_NEGATORS:
+            return True
+        forward = tok in _KREA2_PREFIX_NEGATORS
+        backward = tok in _KREA2_SUFFIX_NEGATORS
+        if not (forward or backward):
+            continue
+        window = ((i + 1, i + 2) if forward else (i - 1, i - 2))
+        target = ""
+        for j in window:
+            if 0 <= j < n and tokens[j] in _KREA2_NEG_TARGETS:
+                target = tokens[j]
+                break
+        if target in _KREA2_DISTILLED_TOKENS:
+            return True          # e.g. `non_distilled`, `not_a_turbo`, `distill-free`
+        if target in _KREA2_CFG_TOKENS:
+            continue             # `no-cfg` / `cfg-free` — negates CFG, keep positive
+        # postfix idiom: `<distilled> not/no anymore|longer` (nothing forward)
+        if (forward and i > 0 and tokens[i - 1] in _KREA2_DISTILLED_TOKENS
+                and i + 1 < n and tokens[i + 1] in _KREA2_IDIOM_COMPLETERS):
+            return True
+    return False
+
+
+def krea2_is_distilled(arch: str, src_path: str | Path) -> Optional[bool]:
+    """Positive Krea-2 distillation signal, else None (omit + WARN). Non-Krea2 => None.
+
+    A positive marker (`turbo`/`distill`/`distilled`) resolves True ONLY when no
+    negation in the name actually points at a distillation token (see the module
+    comment for the directional rule). Any real distillation-negation makes the name
+    AMBIGUOUS → omit the key + WARN, so we never silently stamp the FIXED (turbo)
+    schedule onto a checkpoint whose own name disclaims it. Safe by construction:
+    the two schedules differ silently, so when in doubt we fall to the engine's
+    reference-default computed (base) shift, never guess turbo.
+    """
+    if arch != "Krea2":
+        return None
+    name = Path(src_path).name.lower()
+    tokens = [t for t in re.split(r"[^a-z0-9]+", name) if t]
+    positive = any(t in _KREA2_DISTILLED_TOKENS for t in tokens)
+    negated = _krea2_negates_distillation(tokens)
+    if positive and not negated:
+        logger.info("[hf_layout] Krea-2: '%s' names a distilled/turbo checkpoint "
+                    "→ model_index is_distilled=true (FIXED timestep shift).", name)
+        return True
+    if positive and negated:
+        logger.warning(
+            "[hf_layout] Krea-2: '%s' carries BOTH a distillation marker and a "
+            "negation — the name is AMBIGUOUS, so is_distilled is omitted and the "
+            "engine uses its reference-default COMPUTED (base) timestep shift. If "
+            "this IS a Krea-2-Turbo checkpoint, rename it unambiguously (e.g. "
+            "'krea2_turbo') or wire the HF-diffusers model dir (staged as-is, so "
+            "its model_index.json is_distilled is honoured verbatim).", name)
+        return None
+    logger.warning(
+        "[hf_layout] Krea-2: cannot determine distillation from '%s' (this "
+        "checkpoint carries no is_distilled marker) — omitting the key, so the "
+        "engine uses its reference-default COMPUTED (base) timestep shift. If this "
+        "IS a Krea-2-Turbo checkpoint it will generate OFF-SCHEDULE: put 'turbo' in "
+        "the filename, or wire the HF-diffusers model dir (which is staged as-is, "
+        "so its model_index.json is_distilled is honoured verbatim).", name)
+    return None
+
 
 
 # Map our internal arch tag → diffusers _class_name (what detectPipelineKind expects)
@@ -42,6 +165,7 @@ ARCH_TO_PIPELINE_CLASS = {
     "QwenImageLayered": "QwenImageLayeredPipeline",
     "Flux2Klein":       "Flux2KleinPipeline",
     "ZImage":           "ZImagePipeline",
+    "Krea2":            "Krea2Pipeline",
 }
 
 ARCH_TO_TRANSFORMER_CLASS = {
@@ -50,6 +174,15 @@ ARCH_TO_TRANSFORMER_CLASS = {
     "QwenImageLayered": "QwenImageTransformer2DModel",  # same class, use_additional_t_cond=true
     "Flux2Klein":       "Flux2Transformer2DModel",
     "ZImage":           "ZImageTransformer2DModel",
+    "Krea2":            "Krea2Transformer2DModel",  # engine krea2_xfm_match keys on this
+}
+
+# model_index.json text_encoder class per arch (informational — the engine's TE
+# factory dispatches on the TE config's model_type/hidden_size, not this entry).
+# Krea-2 uses a Qwen3-VL 4B text tower (model_type qwen3_vl, hidden 2560).
+ARCH_TO_TE_CLASS = {
+    "QwenImageEdit": "Qwen2_5VLForConditionalGeneration",
+    "Krea2":         "Qwen3VLForConditionalGeneration",
 }
 
 # Arch variants whose bundled TEXT-ENCODER / TOKENIZER / SCHEDULER assets are
@@ -386,8 +519,19 @@ class HFLayout:
     # ── Index files ───────────────────────────────────────────────────────
 
     def write_model_index(self, arch: str,
-                           extra_components: Optional[dict] = None) -> None:
-        """Write model_index.json so detectPipelineKind() can identify the arch."""
+                           extra_components: Optional[dict] = None,
+                           is_distilled: Optional[bool] = None) -> None:
+        """Write model_index.json so detectPipelineKind() can identify the arch.
+
+        `is_distilled` (Krea-2): the engine reads this key to pick the timestep
+        shift — True => FIXED (turbo) shift; key ABSENT => computed (base) shift,
+        which is the reference default (Krea2Pipeline.cpp logs either way). It is
+        written ONLY when the CALLER positively determined it, because the two
+        values produce different (and silently different) schedules — a staged
+        turbo checkpoint missing the key generates off-schedule, and a base
+        checkpoint forced to True does too. Pass None when there is no signal;
+        the engine then takes its reference default and says so in the log.
+        """
         cls = ARCH_TO_PIPELINE_CLASS.get(arch, "")
         if not cls:
             raise ValueError(f"Unknown arch: {arch!r}")
@@ -399,9 +543,15 @@ class HFLayout:
         if (self.root / "vae").exists():
             idx["vae"] = ["diffusers", "AutoencoderKL"]
         if (self.root / "text_encoder").exists():
-            idx["text_encoder"] = ["transformers", "Qwen2_5VLForConditionalGeneration"
-                                    if arch == "QwenImageEdit"
-                                    else "Qwen3ForCausalLM"]
+            idx["text_encoder"] = ["transformers",
+                                    ARCH_TO_TE_CLASS.get(arch, "Qwen3ForCausalLM")]
+        # Krea-2 guidance-distillation marker. Written ONLY from a CALLER-supplied
+        # positive determination (see the docstring): never defaulted to True here.
+        # An unconditional True would silently force the FIXED (turbo) shift onto a
+        # base checkpoint — a schedule error with no error message, exactly the
+        # silent-quality class this codebase treats as highest severity.
+        if is_distilled is not None:
+            idx["is_distilled"] = bool(is_distilled)
         if extra_components:
             idx.update(extra_components)
         (self.root / "model_index.json").write_text(json.dumps(idx, indent=2))

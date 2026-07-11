@@ -131,6 +131,9 @@ class NunchakuSVDQAdapter(FormatAdapter):
             te_cfg = bundled_te_config(arch) or {
                 "_class_name": "Qwen2_5VLForConditionalGeneration",
             }
+            if arch == "Krea2":      # not reachable today; keeps the sweep total
+                from .tools.krea2_fp8_te import guard_krea2_te_fp8
+                guard_krea2_te_fp8(te_path)
             layout.add_text_encoder(te_path, config=te_cfg)
             if te_prefix:
                 layout.set_key_strip("te", te_prefix)
@@ -139,6 +142,9 @@ class NunchakuSVDQAdapter(FormatAdapter):
             te_cfg = bundled_te_config(arch) or {
                 "_class_name": "Qwen2_5VLForConditionalGeneration",
             }
+            if arch == "Krea2":      # not reachable today; keeps the sweep total
+                from .tools.krea2_fp8_te import guard_krea2_te_fp8
+                guard_krea2_te_fp8(xfm_path)
             layout.add_text_encoder(xfm_path, config=te_cfg)
             logger.warning("[nunchaku_svdq] no text_encoder source — engine will fail "
                            "unless cfg.transformer-side TE is provided downstream")
@@ -184,7 +190,9 @@ class NunchakuSVDQAdapter(FormatAdapter):
         layout.set_extra("svdq_transformer_path", str(xfm_path))
 
         layout.write_quantfunc_config()
-        layout.write_model_index(arch)
+        from .tools.hf_layout import krea2_is_distilled as _krea2_is_distilled
+        layout.write_model_index(
+            arch, is_distilled=_krea2_is_distilled(arch, sources.transformer.path))
 
         logger.info("[nunchaku_svdq] arch=%s xfm_class=%r staging=%s",
                      arch, xfm_class, staging_dir)

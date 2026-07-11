@@ -42,6 +42,7 @@ from .tools.safetensors_io import (
     read_safetensors_keys,
 )
 from .tools.hf_layout import (
+    krea2_is_distilled,
     HFLayout,
     ARCH_TO_TRANSFORMER_CLASS,
     copy_tokenizer_bundle,
@@ -360,6 +361,19 @@ class BundledCheckpointAdapter(FormatAdapter):
             "_class_name": ("Qwen2_5VLForConditionalGeneration"
                             if arch == "QwenImageEdit" else "Qwen3ForCausalLM"),
         }
+        # Krea-2 fp8 TE: a bundle stages the TE as a PREFIX SLICE of this same
+        # file, so guard that slice (scanning the whole file would false-refuse on
+        # the transformer's own fp8). `prequantized` comes from the bundle's OWN
+        # untrusted metadata and the engine reads it as skip_fp8_dequant=true —
+        # which would byte-reinterpret fp8 as BF16 (silent garbage), so the guard
+        # refuses that combination.
+        if arch == "Krea2":
+            from .tools.krea2_fp8_te import guard_krea2_te_fp8
+            _flat = _read_bundle_flat_metadata(ckpt_path)
+            _preq = str(_flat.get("text_encoder.prequantized", "")).lower() in (
+                "true", "1", "yes")
+            guard_krea2_te_fp8(ckpt_path, prefix=scheme["te"],
+                               prequantized_hint=_preq)
         layout.add_text_encoder(ckpt_path, config=te_cfg)
         layout.set_key_filter("transformer", scheme["transformer"])
         layout.set_key_filter("te",          scheme["te"])
@@ -464,7 +478,8 @@ class BundledCheckpointAdapter(FormatAdapter):
                 vae_precision=context.vae_precision)
 
         layout.write_quantfunc_config()
-        layout.write_model_index(arch)
+        layout.write_model_index(
+            arch, is_distilled=krea2_is_distilled(arch, ckpt_path))
 
         return StagingResult(
             model_dir=str(staging_dir),

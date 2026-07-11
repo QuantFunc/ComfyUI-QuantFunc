@@ -41,10 +41,12 @@ from .tools import (
     fingerprint_arch_from_keys,
     read_safetensors_keys,
 )
+from .tools.krea2_fp8_te import guard_krea2_te_fp8
 from .tools.hf_layout import (
     HFLayout,
     ARCH_TO_TRANSFORMER_CLASS,
     copy_tokenizer_bundle,
+    krea2_is_distilled,
     bundled_te_config,
     bundled_vae_config,
     assert_vae_matches_arch,
@@ -71,6 +73,56 @@ def _detect_transformer_prefix(file_path: str) -> str:
         if any(k.startswith(px) for k in sample):
             return px
     return ""
+
+
+def _detect_krea2_te_prefix(te_path: str) -> str:
+    """Prefix to strip from a Krea-2 Qwen3-VL 4B text-encoder file.
+
+    The engine's krea2 TE factory (ComponentImpl.cpp) accepts the tower under
+    `language_model.*` (full Qwen3-VL source — KEEP; it prepends the prefix
+    itself) or bare `embed_tokens.weight` (QF export). A ComfyUI standalone
+    Qwen3-VL text tower is stored under `model.*` → strip to bare so the
+    export-layout probe fires. Returns "" when no strip is needed.
+    """
+    keys = list(read_safetensors_keys(te_path))
+    if any(k.startswith("language_model.") for k in keys):
+        return ""                       # full source layout — engine handles it
+    if any(k == "model.embed_tokens.weight" or k.startswith("model.") for k in keys):
+        return "model."                 # text-only tower → strip to bare
+    return ""                            # already bare
+
+
+# --------------------------------------------------------------------------- #
+# Krea-2 fp8 text-encoder acceptance. NOTE every "the engine dequantizes / throws"
+# statement in this file and in tools/krea2_fp8_te.py describes the engine build
+# carrying the krea2 TE fp8 dequant (branch fix/krea2-te-fp8-dequant, d44f01b8) —
+# NOT engine main, which hardcodes skip_fp8_dequant=true and would byte-reinterpret
+# the fp8 into its BF16 container. See ENGINE DEPENDENCY below.
+# The guard lives in tools/krea2_fp8_te.py
+# because `arch == "Krea2"` is reachable from MORE than this adapter (bundled
+# checkpoints, hf-native synthesised staging). A guard wired into only one route
+# is not a guard. See that module for the engine contract + blind spots; the
+# sweep-lock test fails the suite if a Krea-2 TE staging route skips it.
+#
+# ENGINE DEPENDENCY (read before touching the guard):
+#   Routing an fp8 Qwen3-VL TE into staging is ONLY safe on an engine whose krea2
+#   TE factory runs the generic DequantFP8Provider (fp8 -> bf16 container -> int4)
+#   AND whose DequantFP8Provider carries the per-tensor DEFAULT-DENY scale guard.
+#   That engine change is NOT yet on engine main — it lives on the engine branch
+#   `fix/krea2-te-fp8-dequant` (d44f01b8) pending merge + ship. An engine WITHOUT
+#   it loads the krea2 TE with `skip_fp8_dequant=true` and byte-reinterprets the
+#   fp8 bytes into the BF16 container => SILENT GARBAGE.
+#   => This plugin change MUST NOT be RELEASED ahead of that engine build.
+#      A VERSION gate is not possible: the engine exposes only
+#      `quantfunc_version()`, and the fixed build reports the SAME version string
+#      (0.0.12) as the unfixed shipped one, so it cannot discriminate.
+#      The project's REAL coupling mechanism is the SHA-256 ship-manifest
+#      (tests/scripts/verify_manifest.py + auto_update.py::_verify_local_lib):
+#      it pins a plugin release to a specific engine-binary SHA-256 and
+#      self-heals on mismatch. When this plugin version ships, its verify.json
+#      MUST require the engine build that contains the krea2 TE fp8 dequant.
+#      Until then the safe sequence is ship-engine-then-plugin.
+# --------------------------------------------------------------------------- #
 
 
 @adapter(priority=50)
@@ -160,6 +212,26 @@ class ComfyUIDiffusionModelAdapter(FormatAdapter):
                 # The remapped file is HF-diffusers native (no prefix to strip).
                 remap_used = True
 
+        # Krea-2 single-file (BFL/akira `blocks.N.attn.wq` + `txtfusion.*`): the
+        # engine's Krea2TransformerLighting reads diffusers-internal names
+        # (`transformer_blocks.N.attn.to_q` / `ff.gate` / `norm1` /
+        # `scale_shift_table` / `img_in` / `txt_in` / `time_embed` /
+        # `time_mod_proj` / `final_layer` / `text_fusion`), so a zero-copy
+        # key_remap.json manifest translates the BFL layout on load (the engine's
+        # fresh-quant DequantFP8Provider handles the FP8 weights). The int8
+        # ConvRot format is rejected fail-loud inside the remap (unsupported).
+        if not remap_used and arch == "Krea2":
+            from .comfyui_krea2_remap import is_krea2_bfl, stage_krea2
+            if is_krea2_bfl(xfm_path):
+                logger.info("[comfyui_unet] Krea-2 BFL layout detected; writing "
+                             "zero-copy key_remap.json (blocks/attn/mlp/mod/txtfusion "
+                             "→ transformer_blocks/to_q/ff/scale_shift_table/text_fusion)")
+                layout.add_transformer_remapped(
+                    xfm_path,
+                    remap_fn=lambda s, d: stage_krea2(str(s), d.parent, force=False),
+                    config={"_class_name": ARCH_TO_TRANSFORMER_CLASS.get(arch, "")})
+                remap_used = True
+
         if not remap_used:
             # Transformer (symlink + on-load prefix strip)
             layout.add_transformer(
@@ -177,9 +249,25 @@ class ComfyUIDiffusionModelAdapter(FormatAdapter):
         if sources.text_encoder is not None:
             from .comfyui_clip import _detect_te_prefix
             te_path = sources.text_encoder.path
-            te_prefix = _detect_te_prefix(te_path)
-            te_class = "Qwen2_5VLForConditionalGeneration" \
-                if arch == "QwenImageEdit" else "Qwen3ForCausalLM"
+            if arch == "Krea2":
+                # Krea-2's Qwen3-VL 4B text tower: the engine's krea2 TE factory
+                # expects the tower under `language_model.*` (full Qwen3-VL
+                # source) or bare `embed_tokens.weight` (QF export). A ComfyUI
+                # Qwen3-VL text-encoder file uses `model.*` → strip to bare so
+                # the engine's export-layout probe fires; a full-source
+                # `language_model.*` file is kept as-is (engine prepends it).
+                # The engine's krea2 TE factory now dequantizes the per-tensor
+                # F32 fp8_scaled Qwen3-VL TE (DequantFP8Provider, fp8→bf16→int4),
+                # so that layout is ALLOWED through; a per-channel/block/non-F32
+                # fp8 the engine can't dequant still fails loud here.
+                guard_krea2_te_fp8(te_path)
+                te_prefix = _detect_krea2_te_prefix(te_path)
+            else:
+                te_prefix = _detect_te_prefix(te_path)
+            te_class = ("Qwen2_5VLForConditionalGeneration"
+                        if arch == "QwenImageEdit"
+                        else "Qwen3VLForConditionalGeneration" if arch == "Krea2"
+                        else "Qwen3ForCausalLM")
             # Use bundled full TE config when available — it carries
             # hidden_size / num_attention_heads / head_dim / etc. that the
             # C++ engine needs to allocate the right tensor shapes. Minimal
@@ -245,7 +333,10 @@ class ComfyUIDiffusionModelAdapter(FormatAdapter):
             text_precision=context.text_precision,
             vae_precision=context.vae_precision)
         layout.write_quantfunc_config()
-        layout.write_model_index(arch)
+        # Krea-2: derive the distillation marker from a real signal (shared with
+        # every other synthesising adapter) — never a silent default.
+        layout.write_model_index(
+            arch, is_distilled=krea2_is_distilled(arch, xfm_path))
 
         path_label = "comfyui-prefix" if prefix else "bare-bfl/diffusers"
         logger.info("[comfyui_unet] arch=%s prefix=%r path=%s staging=%s",
