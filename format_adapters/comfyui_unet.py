@@ -113,15 +113,15 @@ def _detect_krea2_te_prefix(te_path: str) -> str:
 #   it loads the krea2 TE with `skip_fp8_dequant=true` and byte-reinterprets the
 #   fp8 bytes into the BF16 container => SILENT GARBAGE.
 #   => This plugin change MUST NOT be RELEASED ahead of that engine build.
-#      A VERSION gate is not possible: the engine exposes only
-#      `quantfunc_version()`, and the fixed build reports the SAME version string
-#      (0.0.12) as the unfixed shipped one, so it cannot discriminate.
-#      The project's REAL coupling mechanism is the SHA-256 ship-manifest
-#      (tests/scripts/verify_manifest.py + auto_update.py::_verify_local_lib):
-#      it pins a plugin release to a specific engine-binary SHA-256 and
-#      self-heals on mismatch. When this plugin version ships, its verify.json
-#      MUST require the engine build that contains the krea2 TE fp8 dequant.
-#      Until then the safe sequence is ship-engine-then-plugin.
+#      This is now enforced in CODE, not only by release discipline: the guard
+#      (tools/krea2_fp8_te.py) DEFAULT-REFUSES a well-formed fp8 TE unless it can
+#      byte-scan a krea2-fp8-TE-dequant capability sentinel in the installed .so
+#      (the same string-literal probe the tiny-VAE guard uses). A VERSION gate
+#      cannot do this: the engine exposes only `quantfunc_version()`, and the
+#      fixed build reports the SAME string (0.0.12) as the unfixed shipped one.
+#      The SHA-256 ship-manifest (verify_manifest.py + auto_update._verify_local_lib)
+#      remains the release-time belt: a shipping verify.json MUST pin the engine
+#      build carrying the dequant. Belt (manifest) AND braces (the code gate).
 # --------------------------------------------------------------------------- #
 
 

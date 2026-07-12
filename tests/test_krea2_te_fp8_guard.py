@@ -23,6 +23,7 @@ import json
 import struct
 import tempfile
 import importlib
+import contextlib
 from pathlib import Path as pathlib_Path
 
 _PLUGIN = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -62,16 +63,56 @@ def _write_st(tensors, metadata=None):
     return p
 
 
-def _allows(tensors, metadata=None):
-    """(guard_allowed, message). The guard RAISES to block, returns to allow."""
-    p = _write_st(tensors, metadata)
+def _cap_lib(supported=True):
+    """A tiny fake engine .so that DOES / DOESN'T carry the krea2 fp8-TE
+    capability sentinel — drives the guard's engine-capability probe.
+    Returns a path the caller must os.remove()."""
+    fd, p = tempfile.mkstemp(suffix=".so", prefix="krea2cap_")
+    with os.fdopen(fd, "wb") as f:
+        f.write(b"\x7fELF" + b"\0" * 64)          # plausible ELF preamble
+        if supported:
+            f.write(_g._KREA2_FP8_TE_CAP_TOKEN)    # the .rodata sentinel
+        f.write(b"\0" * 4096)                      # exercise the streaming scan
+    return p
+
+
+@contextlib.contextmanager
+def _capable_engine_env(supported=True):
+    """Point the guard's SELF-resolution (QUANTFUNC_LIB) at a fake engine .so that
+    DOES/DOESN'T advertise the capability — for tests that drive the guard through
+    an adapter (which calls it internally, so no lib_path can be injected)."""
+    lib = _cap_lib(supported)
+    prev = os.environ.get("QUANTFUNC_LIB")
+    os.environ["QUANTFUNC_LIB"] = lib
+    _g._ENGINE_CAP_PROBE_CACHE.clear()
     try:
-        _g.guard_krea2_te_fp8(p)
+        yield lib
+    finally:
+        if prev is None:
+            os.environ.pop("QUANTFUNC_LIB", None)
+        else:
+            os.environ["QUANTFUNC_LIB"] = prev
+        _g._ENGINE_CAP_PROBE_CACHE.clear()
+        os.remove(lib)
+
+
+def _allows(tensors, metadata=None):
+    """(guard_allowed, message). The guard RAISES to block, returns to allow.
+
+    Layout-acceptance helper: runs against a fake engine that DOES advertise the
+    krea2 fp8-TE capability, so it isolates the LAYOUT decision from the
+    engine-capability gate (which has its own dedicated tests below). A BF16 TE
+    short-circuits before the gate, so the fake lib is a harmless no-op there."""
+    p = _write_st(tensors, metadata)
+    lib = _cap_lib(True)
+    try:
+        _g.guard_krea2_te_fp8(p, lib_path=lib)
         return True, ""
     except Exception as e:
         return False, str(e)
     finally:
         os.remove(p)
+        os.remove(lib)
 
 
 # ---- ALLOW: the engine-supported per-tensor F32 fp8_scaled layout ----
@@ -417,13 +458,14 @@ def test_prequantized_plus_fp8_is_refused():
     """
     good_fp8 = _write_st([("m.l0.q" + W, "F8_E4M3", [4, 2]),
                           ("m.l0.q.weight_scale", "F32", [])])
-    _g.guard_krea2_te_fp8(good_fp8)                       # fine on its own
+    cap = _cap_lib(True)                                  # capability-advertising engine
+    _g.guard_krea2_te_fp8(good_fp8, lib_path=cap)         # fine on its own
     try:
-        _g.guard_krea2_te_fp8(good_fp8, prequantized_hint=True)
+        _g.guard_krea2_te_fp8(good_fp8, prequantized_hint=True, lib_path=cap)
         raised = False
     except RuntimeError as e:
         raised = "PREQUANTIZED" in str(e) or "prequantized" in str(e).lower()
-    os.remove(good_fp8)
+    os.remove(good_fp8); os.remove(cap)
     assert raised, "fp8 + prequantized must be REFUSED (engine would skip dequant)"
     # a BF16 TE marked prequantized is legitimate — must NOT be refused
     bf16 = _write_st([("m.l0.q" + W, "BF16", [4, 2])])
@@ -446,7 +488,9 @@ def test_bundle_prefix_scoped_scan():
     ])
     v, reason = _g.krea2_te_fp8_support(f, prefix="text_encoder.")
     assert v == "ok", f"TE slice wrongly refused: {reason}"
-    _g.guard_krea2_te_fp8(f, prefix="text_encoder.")             # no raise
+    cap = _cap_lib(True)
+    _g.guard_krea2_te_fp8(f, prefix="text_encoder.", lib_path=cap)   # no raise
+    os.remove(cap)
     # ...and a BAD TE slice IS refused even though the transformer slice is fine
     f2 = _write_st([
         ("text_encoder.l0.q" + W, "F8_E4M3", [4, 2]),            # no scale sibling
@@ -472,6 +516,151 @@ def test_same_length_invalid_json_header_refused_cleanly():
         assert v == "refuse" and "unreadable" in reason
     finally:
         os.remove(p)
+
+
+# ---- engine-capability gate: default-REFUSE a well-formed fp8 TE on a skewed
+#      engine (a version floor cannot see the skew; silent garbage otherwise) ----
+_GOOD_FP8 = [("m.l0.q" + W, "F8_E4M3", [4, 2]), ("m.l0.q.weight_scale", "F32", [])]
+
+
+@contextlib.contextmanager
+def _clean_cap_env():
+    """Neutralise the two ambient inputs to the capability gate (QUANTFUNC_LIB +
+    the opt-in env) so a test drives it deterministically, and restore after."""
+    saved = {k: os.environ.get(k)
+             for k in ("QUANTFUNC_LIB", _g._KREA2_FP8_TE_OPT_IN_ENV)}
+    for k in saved:
+        os.environ.pop(k, None)
+    _g._ENGINE_CAP_PROBE_CACHE.clear()
+    try:
+        yield
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        _g._ENGINE_CAP_PROBE_CACHE.clear()
+
+
+def test_wellformed_fp8_refused_when_engine_lacks_capability():
+    """The VULN backstop: a PERFECT per-tensor-F32 fp8 TE staged onto an engine
+    that does NOT advertise the krea2 fp8-TE dequant (shipping main) must be
+    REFUSED — otherwise the engine byte-reinterprets fp8 -> BF16 = silent garbage."""
+    with _clean_cap_env():
+        p = _write_st(_GOOD_FP8)
+        lib = _cap_lib(supported=False)          # engine WITHOUT the sentinel
+        try:
+            raised = False
+            try:
+                _g.guard_krea2_te_fp8(p, lib_path=lib)
+            except RuntimeError as e:
+                raised = "does not advertise" in str(e)
+            assert raised, "well-formed fp8 TE was ALLOWED on a non-capable engine"
+        finally:
+            os.remove(p); os.remove(lib)
+
+
+def test_wellformed_fp8_allowed_when_engine_advertises_capability():
+    """On an engine that DOES carry the capability sentinel, the same well-formed
+    fp8 TE is allowed (option (a): no UX cost once the fixed engine ships)."""
+    with _clean_cap_env():
+        p = _write_st(_GOOD_FP8)
+        lib = _cap_lib(supported=True)
+        try:
+            _g.guard_krea2_te_fp8(p, lib_path=lib)   # must not raise
+        finally:
+            os.remove(p); os.remove(lib)
+
+
+def test_wellformed_fp8_refused_when_engine_unresolvable():
+    """If the installed engine cannot be located to verify (probe -> None), the
+    guard fails CLOSED — 'cannot verify' is not 'safe'."""
+    with _clean_cap_env():
+        p = _write_st(_GOOD_FP8)
+        try:
+            raised = False
+            try:
+                _g.guard_krea2_te_fp8(p, lib_path="/nonexistent/libquantfunc.so")
+            except RuntimeError as e:
+                raised = "could not be located" in str(e)
+            assert raised, "unverifiable engine did not fail closed on a fp8 TE"
+        finally:
+            os.remove(p)
+
+
+def test_opt_in_env_overrides_capability_gate():
+    """A user who KNOWS their engine supports it can opt in — even with no capable
+    lib resolvable — and the fp8 TE is allowed (with a loud override warning)."""
+    with _clean_cap_env():
+        os.environ[_g._KREA2_FP8_TE_OPT_IN_ENV] = "1"
+        p = _write_st(_GOOD_FP8)
+        try:
+            _g.guard_krea2_te_fp8(p, lib_path="/nonexistent/libquantfunc.so")
+        finally:
+            os.remove(p)
+
+
+def test_opt_in_env_falsey_values_do_not_override():
+    """An explicit falsey opt-in ('0'/'false'/'no'/'off'/'') must NOT lift the
+    gate — only a truthy value does."""
+    with _clean_cap_env():
+        p = _write_st(_GOOD_FP8)
+        try:
+            for falsey in ("0", "false", "no", "off", "", "  "):
+                os.environ[_g._KREA2_FP8_TE_OPT_IN_ENV] = falsey
+                _g._ENGINE_CAP_PROBE_CACHE.clear()
+                raised = False
+                try:
+                    _g.guard_krea2_te_fp8(p, lib_path="/nonexistent/libquantfunc.so")
+                except RuntimeError:
+                    raised = True
+                assert raised, f"falsey opt-in {falsey!r} wrongly lifted the gate"
+        finally:
+            os.remove(p)
+
+
+def test_bf16_te_unaffected_by_capability_gate():
+    """A BF16-native TE short-circuits BEFORE the capability gate — it is allowed
+    even against a non-capable engine (nothing to dequantize, nothing to garble)."""
+    with _clean_cap_env():
+        p = _write_st([("m.l0.q" + W, "BF16", [4, 2])])
+        lib = _cap_lib(supported=False)
+        try:
+            _g.guard_krea2_te_fp8(p, lib_path=lib)   # must not raise
+        finally:
+            os.remove(p); os.remove(lib)
+
+
+def test_capability_probe_scans_across_chunk_boundary():
+    """The streaming byte-scan must find a sentinel that STRADDLES a read-chunk
+    boundary (the .rodata token can sit anywhere in a ~300MB .so). The scan's
+    invariant is chunk >> token (production chunk = 8MB, token = 33B); the test
+    uses the smallest realistic chunk (> token) that still forces a straddle."""
+    with _clean_cap_env():
+        tok = _g._KREA2_FP8_TE_CAP_TOKEN
+        chunk = len(tok) + 8                     # > token, so a straddle fits the window
+        fd, lib = tempfile.mkstemp(suffix=".so", prefix="krea2capX_")
+        with os.fdopen(fd, "wb") as f:
+            # token spans the first chunk edge: 5 bytes in chunk 1, the rest in chunk 2.
+            f.write(b"\0" * (chunk - 5) + tok + b"\0" * 40)
+        saved_chunk = _g._CAP_PROBE_CHUNK_BYTES
+        _g._CAP_PROBE_CHUNK_BYTES = chunk
+        try:
+            assert _g.engine_supports_krea2_te_fp8_dequant(lib_path=lib) is True, \
+                "sentinel straddling a chunk boundary was missed"
+        finally:
+            _g._CAP_PROBE_CHUNK_BYTES = saved_chunk
+            os.remove(lib)
+
+
+def test_capability_probe_none_when_no_lib_resolves():
+    """No explicit lib, no QUANTFUNC_LIB, nodes not importable -> probe returns
+    None (not a false True/False)."""
+    with _clean_cap_env():
+        # lib_path pointing at a missing file resolves to None deterministically.
+        assert _g.engine_supports_krea2_te_fp8_dequant(
+            lib_path="/nonexistent/libquantfunc.so") is None
 
 
 # Adapters that can resolve arch=="Krea2" and hand a TE to the engine. Any route
@@ -564,12 +753,15 @@ def test_prequantized_sidecar_cannot_skip_dequant_on_an_fp8_te():
         hn.HFLayoutAdapter().adapt(base.SourceBundle(transformer=ref),
                                    _P(_tf.mkdtemp()), base.BuildContext())
 
-    _adapt(False)                       # valid fp8 TE, no sidecar -> allowed
-    try:
-        _adapt(True)
-        refused = False
-    except RuntimeError as e:
-        refused = "PREQUANTIZED" in str(e) or "prequantized" in str(e).lower()
+    # A capability-advertising engine, so the allow path isolates the PREQUANTIZED
+    # decision from the engine-capability gate (which has its own tests).
+    with _capable_engine_env(True):
+        _adapt(False)                   # valid fp8 TE, no sidecar -> allowed
+        try:
+            _adapt(True)
+            refused = False
+        except RuntimeError as e:
+            refused = "PREQUANTIZED" in str(e) or "prequantized" in str(e).lower()
     assert refused, ("an untrusted prequantized sidecar silently disabled the fp8 "
                      "dequant on a genuine fp8 Krea-2 TE (engine => silent garbage)")
 
@@ -610,15 +802,17 @@ def test_asis_model_dir_route_is_also_guarded():
         hn.HFLayoutAdapter().adapt(base.SourceBundle(transformer=ref),
                                    _P(_tf.mkdtemp()), base.BuildContext())
 
-    # BROKEN fp8 TE (no scale sibling) -> must be refused
+    # BROKEN fp8 TE (no scale sibling) -> refused regardless of engine capability
+    # (the layout refusal precedes the capability gate).
     try:
         _adapt([("m.l0.q" + W, "F8_E4M3", [4, 2])])
         refused = False
     except RuntimeError:
         refused = True
     assert refused, "AS-IS model_dir route staged a BROKEN fp8 Krea-2 TE unguarded"
-    # GOOD fp8 + BF16 TEs must still pass
-    _adapt([("m.l0.q" + W, "F8_E4M3", [4, 2]), ("m.l0.q.weight_scale", "F32", [])])
+    # GOOD fp8 (on a capability-advertising engine) + BF16 TEs must still pass
+    with _capable_engine_env(True):
+        _adapt([("m.l0.q" + W, "F8_E4M3", [4, 2]), ("m.l0.q.weight_scale", "F32", [])])
     _adapt([("m.l0.q" + W, "BF16", [4, 2])])
 
 
