@@ -1,0 +1,6 @@
+{
+  "_class_name": "UniPCMultistepScheduler",
+  "flow_shift": 5.0,
+  "num_train_timesteps": 1000,
+  "prediction_type": "flow_prediction"
+}
