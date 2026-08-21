@@ -382,6 +382,12 @@ def main():
     _ot = out.model.extra_conds(**_kw)
     check("t2v package: NO c_concat (in==16, extra_channels 0)", "c_concat" not in _ot,
           f"-> {sorted(_ot)}")
+    # inter-stage thrash fix: comfy's eviction decisions read memory_required — ours must be
+    # the small comfy-side cushion, NOT the torch-WAN activation estimate (GBs at 33.6k tok).
+    _mr = out.model.memory_required([1, 16, 21, 80, 80])
+    check("memory_required returns the comfy-side cushion (no torch-estimate evictions)",
+          _mr == type(out.model)._QF_COMFY_SIDE_INFERENCE_BYTES and _mr <= 1 << 30,
+          f"-> {_mr}")
 
     # single-expert staging shape (direct helper call — no single-expert family is wired yet,
     # but the helper's contract must already hold for the one that will be)

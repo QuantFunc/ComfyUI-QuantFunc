@@ -241,6 +241,21 @@ class QFSessionModelMixin:
     deferred until a GPU box is available (same gate as the H3 fl2va proof).
     """
 
+    # ── comfy inference-memory estimate override (inter-stage thrash fix, 2026-08-22) ──
+    # comfy's load_models_gpu decides evictions from BaseModel.memory_required(input_shape),
+    # which for a torch WAN at seq_len 33600 estimates GBs of activation memory. Our engine
+    # manages its OWN working VRAM inside the session (the estimate is not just wrong — acting
+    # on it is harmful): measured on the user's 4090 log, loading the SECOND stage's 64MB
+    # shadow patcher triggered "All models offloaded to CPU" on the primary (a ~15s/prompt
+    # engine offload+reload round-trip between the two KSamplerAdvanced stages). The comfy-side
+    # truth for this wrapper is just the latent/cond tensors + conversion scratch — a fixed
+    # small cushion. Engine working memory is the ENGINE's ledger, reported via the patcher's
+    # model_size/loaded_size (already wired), not via inference estimates.
+    _QF_COMFY_SIDE_INFERENCE_BYTES = 512 * 1024 * 1024
+
+    def memory_required(self, input_shape):
+        return self._QF_COMFY_SIDE_INFERENCE_BYTES
+
     def _sigma_step_index(self, sigma, sig_all, transformer_options):
         """SAMPLER step index from the sigma's position in the schedule — call-count-independent.
 
