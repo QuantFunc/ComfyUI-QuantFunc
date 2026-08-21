@@ -113,6 +113,9 @@ class DenoiseBeginEditCondParams(ctypes.Structure):
         ("cond_tail", ctypes.c_void_p),
         ("cond_tail_dims", ctypes.c_int32 * 5),
         ("cond_tail_dtype", ctypes.c_int),
+        ("cond_tail_bytes", ctypes.c_uint64),   # D1: declared allocation length; engine
+                                                # refuses any mismatch with dims*itemsize
+                                                # AND verifies the real extent covers it
     ]
 
 

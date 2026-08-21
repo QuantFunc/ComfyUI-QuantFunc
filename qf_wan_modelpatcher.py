@@ -251,6 +251,7 @@ class QFWanModel(QFSessionModelMixin, comfy.model_base.WAN21):
             cpx.cond_tail = ctypes.c_void_p(int(cond_tail.data_ptr()))
             cpx.cond_tail_dims = (ctypes.c_int32 * 5)(*[int(d) for d in cond_tail.shape])
             cpx.cond_tail_dtype = _qf_dtype(cond_tail.dtype)
+            cpx.cond_tail_bytes = int(cond_tail.numel()) * int(cond_tail.element_size())
             st = lib.quantfunc_denoise_begin_edit_cond(self._qf.pipeline, ctypes.byref(cpx),
                                                        ctypes.byref(session))
             self._begin_keep = cpx

@@ -382,12 +382,37 @@ def main():
     _ot = out.model.extra_conds(**_kw)
     check("t2v package: NO c_concat (in==16, extra_channels 0)", "c_concat" not in _ot,
           f"-> {sorted(_ot)}")
-    # inter-stage thrash fix: comfy's eviction decisions read memory_required — ours must be
-    # the small comfy-side cushion, NOT the torch-WAN activation estimate (GBs at 33.6k tok).
-    _mr = out.model.memory_required([1, 16, 21, 80, 80])
-    check("memory_required returns the comfy-side cushion (no torch-estimate evictions)",
-          _mr == type(out.model)._QF_COMFY_SIDE_INFERENCE_BYTES and _mr <= 1 << 30,
-          f"-> {_mr}")
+    # inter-stage thrash fix (D3/D4-hardened): comfy's eviction decisions call
+    # memory_required THROUGH sampler_helpers.estimate_memory — `memory_required(shape,
+    # cond_shapes=cond_shapes)` (KEYWORD). D4: the old positional-only override TypeError'd
+    # on every real KSampler run while the old positional-only arm stayed green — so this
+    # arm now (a) calls EXACTLY like the real call site, (b) asserts signature
+    # compatibility against comfy's own BaseModel.memory_required so future comfy drift
+    # goes red here, (c) asserts the D3 honesty properties: geometry-proportional,
+    # monotonic, and far below the torch-WAN activation estimate that caused the eviction
+    # thrash.
+    import inspect as _insp
+    from comfy.model_base import BaseModel as _CB
+    _base_params = [q for q in _insp.signature(_CB.memory_required).parameters
+                    if q != "self"]
+    _ours = _insp.signature(type(out.model).memory_required)
+    try:
+        _ours.bind(out.model, [1, 16, 21, 80, 80],
+                   **{q: {} for q in _base_params[1:]})
+        _sig_ok = True
+    except TypeError:
+        _sig_ok = False
+    check("memory_required signature accepts every BaseModel caller form (D4)", _sig_ok,
+          f"-> base params {_base_params} vs ours {list(_ours.parameters)}")
+    _shape = [2, 16, 21, 80, 80]      # sampler_helpers doubles batch for cfg
+    _conds = {"c_crossattn": [[1, 512, 4096]], "c_concat": [[1, 20, 21, 80, 80]]}
+    _mr = out.model.memory_required(_shape, cond_shapes=_conds)   # the REAL call form
+    _mr_small = out.model.memory_required([1, 16, 3, 8, 8], cond_shapes={})
+    _mr_big = out.model.memory_required([2, 16, 21, 192, 192], cond_shapes=_conds)
+    check("memory_required geometry-proportional + monotonic (D3)",
+          _mr_small < _mr < _mr_big, f"-> {_mr_small} < {_mr} < {_mr_big}")
+    check("memory_required stays far below the torch-WAN estimate (thrash fix preserved)",
+          _mr <= 1 << 30, f"-> {_mr}")
 
     # ── B1 (CR-2b): the OLD-.so compat qfa pin is SM-GATED — NEVER on the SM80 fault tier ──
     # The engine's qfa forward THROWS on SM80 (kQfaForwardFaultsOnSm) even for explicit

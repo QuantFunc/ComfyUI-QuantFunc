@@ -251,10 +251,41 @@ class QFSessionModelMixin:
     # truth for this wrapper is just the latent/cond tensors + conversion scratch — a fixed
     # small cushion. Engine working memory is the ENGINE's ledger, reported via the patcher's
     # model_size/loaded_size (already wired), not via inference estimates.
-    _QF_COMFY_SIDE_INFERENCE_BYTES = 512 * 1024 * 1024
+    # D3/D4 (delta CR): the estimate is GEOMETRY-PROPORTIONAL and the signature matches the
+    # REAL call site — comfy/sampler_helpers.py estimate_memory() calls
+    # `memory_required(shape, cond_shapes=cond_shapes)` (keyword!) on EVERY standard
+    # KSampler run; the earlier positional-only `(self, input_shape)` override raised
+    # TypeError there (D4 NO-GO — the 6/6 suite arm called positionally and proved only the
+    # return value, not the calling convention). `**_kw` tolerates future comfy drift.
+    # Honest accounting (D3): comfy-side bytes for this wrapper are the latent in/out copies
+    # + cond tensors + conversion scratch — proportional to geometry, NOT the torch-WAN
+    # activation estimate (2.36 GB at 33.6k tok; acting on it evicted the engine = the
+    # measured 15 s/prompt inter-stage thrash), and NOT a flat constant that under-reports
+    # huge geometries to OTHER tenants' eviction math. K factors: input + noise + output
+    # velocity + c_concat tail + ~4x conversion/temporary copies ≈ 8 latent-sized tensors;
+    # cond tensors counted 2x (borrowed + converted). Floor keeps small runs honest.
+    _QF_COMFY_SIDE_BASE_BYTES = 64 * 1024 * 1024
+    _QF_COMFY_SIDE_LATENT_COPIES = 8
+    _QF_COMFY_SIDE_COND_COPIES = 2
+    _QF_COMFY_SIDE_ITEMSIZE = 2  # fp16/bf16 latents+conds
 
-    def memory_required(self, input_shape):
-        return self._QF_COMFY_SIDE_INFERENCE_BYTES
+    def memory_required(self, input_shape, cond_shapes=None, **_kw):
+        n_lat = 1
+        for d in list(input_shape):
+            n_lat *= max(1, int(d))
+        n_cond = 0
+        for shapes in (cond_shapes or {}).values():
+            for sh in (shapes or []):
+                try:
+                    n = 1
+                    for d in list(sh):
+                        n *= max(1, int(d))
+                    n_cond += n
+                except (TypeError, ValueError):
+                    continue
+        return int(self._QF_COMFY_SIDE_BASE_BYTES +
+                   self._QF_COMFY_SIDE_ITEMSIZE * (n_lat * self._QF_COMFY_SIDE_LATENT_COPIES +
+                                                   n_cond * self._QF_COMFY_SIDE_COND_COPIES))
 
     def _sigma_step_index(self, sigma, sig_all, transformer_options):
         """SAMPLER step index from the sigma's position in the schedule — call-count-independent.
