@@ -139,54 +139,90 @@ def main():
     qfn._FAMILY_MATCHERS.clear()
     qfn._register_families()
 
-    Loader = qfn.NODE_CLASS_MAPPINGS["QuantFuncNativeLoader"]()
+    WanL = qfn.NODE_CLASS_MAPPINGS["QuantFuncWanLoader"]()
+    LtxL = qfn.NODE_CLASS_MAPPINGS["QuantFuncLTXLoader"]()
+    H3L = qfn.NODE_CLASS_MAPPINGS["QuantFuncH3Loader"]()
 
-    # ── 1) UI surface: exactly the redesigned widgets, nothing from the old package loader ──
-    it = Loader.INPUT_TYPES()
-    check("required = transformer1/model_config/resident_block_count",
-          list(it["required"].keys()) == ["transformer1", "model_config", "resident_block_count"],
+    # ── 1) UI surface (per-family pivot): wan = dual required transformers + DUAL MODEL outputs;
+    #      single-expert nodes = one transformer; preset dropdowns are FAMILY-FILTERED ──
+    it = WanL.INPUT_TYPES()
+    check("wan required = transformer1/transformer2/model_config/resident_block_count",
+          list(it["required"].keys()) == ["transformer1", "transformer2", "model_config",
+                                          "resident_block_count"],
           f"-> {list(it['required'].keys())}")
-    check("optional = transformer2 only", list(it.get("optional", {}).keys()) == ["transformer2"],
-          f"-> {list(it.get('optional', {}).keys())}")
+    check("wan has NO optional block (transformer2 is required)", not it.get("optional"))
+    check("wan RETURN = two MODELs named high/low",
+          WanL.RETURN_TYPES == ("MODEL", "MODEL")
+          and WanL.RETURN_NAMES == ("model_high", "model_low"))
     cfgs = it["required"]["model_config"][0]
-    check("model_config lists the shipped official presets (data-driven)",
-          "wan2.2-a14b-t2v" in cfgs and "fx-ltx" in cfgs, f"-> {cfgs}")
+    check("wan model_config lists ONLY wan presets (family-filtered)",
+          "wan2.2-a14b-t2v" in cfgs and "fx-single" in cfgs and "fx-ltx" not in cfgs
+          and "fx-alien" not in cfgs, f"-> {cfgs}")
+    ltx_cfgs = LtxL.INPUT_TYPES()["required"]["model_config"][0]
+    check("ltx model_config lists ONLY ltx2 presets",
+          "fx-ltx" in ltx_cfgs and "wan2.2-a14b-t2v" not in ltx_cfgs, f"-> {ltx_cfgs}")
+    h3_cfgs = H3L.INPUT_TYPES()["required"]["model_config"][0]
+    check("h3 model_config lists ONLY minimax-h3 presets",
+          "fx-h3" in h3_cfgs and "wan2.2-a14b-t2v" not in h3_cfgs, f"-> {h3_cfgs}")
     t1 = it["required"]["transformer1"][0]
     check("transformer1 lists .safetensors FILES (and only those)",
           "fx-t2v-4steps-high-quantfunc-int4.safetensors" in t1 and "not-a-model.txt" not in t1)
-    check("transformer2 leads with (none)", it["optional"]["transformer2"][0][0] == "(none)")
 
-    # ── 2) dispatch by MANIFEST family: ltx2/minimax-h3 loud not-wired; unknown family loud;
-    #      model_config traversal refused ──
-    for preset in ("fx-ltx", "fx-h3"):
+    # ── 2) dispatch: family-node guard; ltx2/minimax-h3 loud not-wired via THEIR nodes;
+    #      cross-family preset refused; model_config traversal refused ──
+    for node, preset in ((LtxL, "fx-ltx"), (H3L, "fx-h3")):
         try:
-            Loader.load("fx-t2v-4steps-high-quantfunc-int4.safetensors", preset, 999)
+            node.load("fx-t2v-4steps-high-quantfunc-int4.safetensors", preset, 999)
             check(f"{preset} refuses loud (family not wired for file mode)", False, "-> no exception")
         except RuntimeError as e:
             check(f"{preset} refuses loud (family not wired for file mode)", "not" in str(e).lower())
+    # a preset whose manifest family does not match the NODE's family → the defense-in-depth guard
     try:
-        Loader.load("fx-t2v-4steps-high-quantfunc-int4.safetensors", "fx-alien", 999)
-        check("unknown family refuses loud", False, "-> no exception")
+        WanL.load("fx-t2v-4steps-high-quantfunc-int4.safetensors",
+                  "fx-t2v-4steps-low-quantfunc-int4.safetensors", "fx-ltx", 999)
+        check("cross-family preset on the wan node refused", False, "-> no exception")
     except RuntimeError as e:
-        check("unknown family refuses loud", "no registered native seam" in str(e))
+        check("cross-family preset on the wan node refused", "declares family" in str(e))
+    try:
+        LtxL.load("fx-t2v-4steps-high-quantfunc-int4.safetensors", "fx-alien", 999)
+        check("unknown-family preset refused (family guard)", False, "-> no exception")
+    except RuntimeError as e:
+        check("unknown-family preset refused (family guard)", "declares family" in str(e))
     for evil_cfg in ("../wan2.2-a14b-t2v", "a/b", "..", ""):
         try:
-            Loader.load("fx-t2v-4steps-high-quantfunc-int4.safetensors", evil_cfg, 999)
+            WanL.load("fx-t2v-4steps-high-quantfunc-int4.safetensors",
+                      "fx-t2v-4steps-low-quantfunc-int4.safetensors", evil_cfg, 999)
             check(f"model_config refuses {evil_cfg!r}", False, "-> loaded!")
         except RuntimeError:
             check(f"model_config refuses {evil_cfg!r}", True)
     # manifest-driven SHAPE mismatches
     try:
-        Loader.load("fx-t2v-4steps-high-quantfunc-int4.safetensors", "fx-single", 999, transformer2="fx-t2v-4steps-low-quantfunc-int4.safetensors")
+        WanL.load("fx-t2v-4steps-high-quantfunc-int4.safetensors",
+                  "fx-t2v-4steps-low-quantfunc-int4.safetensors", "fx-single", 999)
         check("single-expert preset + transformer2 refused", False, "-> no exception")
     except RuntimeError as e:
         check("single-expert preset + transformer2 refused", "single-transformer" in str(e))
 
-    # ── 3) wan dual-expert staging + denoise_only create cfg ──
+    # ── 3) wan dual-expert staging + denoise_only create cfg + DUAL MODEL outputs ──
     try:
-        out = Loader.load("fx-t2v-4steps-high-quantfunc-int4.safetensors", "wan2.2-a14b-t2v", 999,
-                          transformer2="fx-t2v-4steps-low-quantfunc-int4.safetensors")[0]
-        check("wan dual-expert returns a QFModelPatcher", type(out).__name__ == "QFModelPatcher")
+        pair = WanL.load("fx-t2v-4steps-high-quantfunc-int4.safetensors",
+                         "fx-t2v-4steps-low-quantfunc-int4.safetensors", "wan2.2-a14b-t2v", 999)
+        check("wan loader returns a (high, low) pair", isinstance(pair, tuple) and len(pair) == 2)
+        out, low = pair
+        check("both outputs are QFModelPatcher",
+              type(out).__name__ == "QFModelPatcher" and type(low).__name__ == "QFModelPatcher")
+        check("both outputs SHARE one engine object", low.model._qf is out.model._qf)
+        check("low output is the SHADOW (flag on the MODEL, survives clones)",
+              getattr(low.model, "_qf_shadow", False) is True
+              and not getattr(out.model, "_qf_shadow", False))
+        check("shadow ledger share is the tiny constant (no double-count)",
+              low.model_size() == type(low)._QF_SHADOW_LEDGER_BYTES
+              and out.model_size() == max(1, int(out.model._qf.footprint_bytes)),
+              f"-> low={low.model_size()} out={out.model_size()}")
+        check("shadow never drives shared-engine eviction (partially_unload -> 0)",
+              low.partially_unload(None, 10 ** 12) == 0)
+        check("shadow reports 0 host RAM (primary owns the backup line)",
+              low.loaded_ram_size() == 0)
         n0 = len(creates)
         _ = out.model._qf.lib          # first touch materializes
         check("create deferred until first touch", len(creates) == n0 + 1)
@@ -212,16 +248,16 @@ def main():
 
     # a NON-conforming file name for the preset must be refused loud (file_hints mechanism)
     try:
-        Loader.load("other.safetensors", "wan2.2-a14b-t2v", 999,
-                    transformer2="fx-t2v-4steps-low-quantfunc-int4.safetensors")
+        WanL.load("other.safetensors", "fx-t2v-4steps-low-quantfunc-int4.safetensors",
+                  "wan2.2-a14b-t2v", 999)
         check("file_hints refuses a non-conforming transformer1", False, "-> loaded!")
     except RuntimeError as e:
         check("file_hints refuses a non-conforming transformer1",
               "does not look like" in str(e))
 
-    # wan single-file must refuse (A14B is dual-expert)
+    # wan without a low expert must refuse (A14B is dual-expert; "" maps to the none-sentinel)
     try:
-        Loader.load("fx-t2v-4steps-high-quantfunc-int4.safetensors", "wan2.2-a14b-t2v", 999)
+        WanL.load("fx-t2v-4steps-high-quantfunc-int4.safetensors", "", "wan2.2-a14b-t2v", 999)
         check("wan single-file refused (dual-expert required)", False, "-> no exception")
     except RuntimeError as e:
         check("wan single-file refused (dual-expert required)", "DUAL-expert" in str(e))
@@ -263,39 +299,32 @@ def main():
         qfn._resolve_lora = lambda n: os.path.join(lora_dir, n)
         LoraNode = qfn.NODE_CLASS_MAPPINGS["QuantFuncNativeLoRA"]()
 
-        base = Loader.load("fx-t2v-4steps-high-quantfunc-int4.safetensors", "wan2.2-a14b-t2v", 999,
-                           transformer2="fx-t2v-4steps-low-quantfunc-int4.safetensors")[0]
-        shifted = ModelSamplingSD3().patch(base, 11.0)[0]     # upstream comfy patch
-        n0 = len(creates)
-        chained1 = LoraNode.apply(shifted, "a.safetensors", 0.8)[0]
-        chained2 = LoraNode.apply(chained1, "b.safetensors", 0.5)[0]
-        check("LoRA chain defers ALL creates (0 so far)", len(creates) == n0,
-              f"-> {len(creates) - n0} eager creates")
-        check("LoRA node returns a DIFFERENT patcher (two-instance transplant)",
-              chained2 is not shifted and chained2.model is not shifted.model)
-        check("upstream ModelSampling patch transplanted onto the rebuilt patcher",
-              "model_sampling" in chained2.object_patches)
-        chained2.patch_model()
-        got_shift = float(getattr(chained2.model.model_sampling, "shift", -1))
-        check("transplanted shift survives across instances", got_shift == 11.0,
-              f"-> {got_shift}")
-        stack = qfn.qfmp.lora_stack_of(chained2)
-        check("chained stack accumulated both entries", len(stack) == 2
-              and stack[0]["scale"] == 0.8 and stack[1]["scale"] == 0.5, f"-> {stack}")
-        _ = chained2.model._qf.lib          # what the sampler's first touch does
-        check("first touch creates EXACTLY ONE pipeline for the whole chain",
-              len(creates) == n0 + 1, f"-> {len(creates) - n0}")
-        check("that one create carries the full accumulated LoRA set + denoise_only",
-              len(creates[-1].get("lora", [])) == 2 and creates[-1].get("denoise_only") is True,
-              f"-> {creates[-1]}")
+        base, base_low = WanL.load("fx-t2v-4steps-high-quantfunc-int4.safetensors",
+                                   "fx-t2v-4steps-low-quantfunc-int4.safetensors",
+                                   "wan2.2-a14b-t2v", 999)
+        shifted = ModelSamplingSD3().patch(base, 11.0)[0]     # upstream comfy patch on the pair's high
+        check("comfy patches still apply to the dual outputs (clone path intact)",
+              "model_sampling" in shifted.object_patches)
+        # v1 pivot contract: chaining the LoRA node onto EITHER dual output must refuse LOUD
+        # (a rebuild would fork the shared engine — see _lora_rebuild_dual). Both directions:
+        for tag, target in (("high", shifted), ("low", base_low)):
+            try:
+                LoraNode.apply(target, "a.safetensors", 0.8)
+                check(f"LoRA chain on the dual wan {tag} output refuses loud", False,
+                      "-> applied!")
+            except RuntimeError as e:
+                check(f"LoRA chain on the dual wan {tag} output refuses loud",
+                      "cannot chain onto the dual-output wan loader" in str(e), f"-> {e}")
     except Exception as e:  # noqa: BLE001
-        check("real LoRA-node chain", False, f"-> raised {type(e).__name__}: {e}")
+        check("dual-output LoRA refusal arm", False, f"-> raised {type(e).__name__}: {e}")
 
     # ── 6) HOST-RAM honesty on a DEDICATED file pair (isolated ckey) ──
     try:
         for f in ("ram-t2v-high-quantfunc-int4.safetensors", "ram-t2v-low-quantfunc-int4.safetensors"):
             open(os.path.join(dm, f), "wb").write(b"\0" * 16)
-        fresh = Loader.load("ram-t2v-high-quantfunc-int4.safetensors", "wan2.2-a14b-t2v", 999, transformer2="ram-t2v-low-quantfunc-int4.safetensors")[0]
+        fresh, fresh_low = WanL.load("ram-t2v-high-quantfunc-int4.safetensors",
+                                     "ram-t2v-low-quantfunc-int4.safetensors",
+                                     "wan2.2-a14b-t2v", 999)
         eng = fresh.model._qf
         check("never-created engine reports 0 host RAM", fresh.loaded_ram_size() == 0)
         check("never-created engine frees 0 host RAM", fresh.partially_unload_ram(10 ** 12) == 0)
@@ -317,8 +346,10 @@ def main():
         import gc
         for f in ("sh-t2v-high-quantfunc-int4.safetensors", "sh-t2v-low-quantfunc-int4.safetensors"):
             open(os.path.join(dm, f), "wb").write(b"\0" * 16)
-        pa = Loader.load("sh-t2v-high-quantfunc-int4.safetensors", "wan2.2-a14b-t2v", 999, transformer2="sh-t2v-low-quantfunc-int4.safetensors")[0]
-        pb = Loader.load("sh-t2v-high-quantfunc-int4.safetensors", "wan2.2-a14b-t2v", 999, transformer2="sh-t2v-low-quantfunc-int4.safetensors")[0]
+        pa, pa_low = WanL.load("sh-t2v-high-quantfunc-int4.safetensors",
+                               "sh-t2v-low-quantfunc-int4.safetensors", "wan2.2-a14b-t2v", 999)
+        pb, pb_low = WanL.load("sh-t2v-high-quantfunc-int4.safetensors",
+                               "sh-t2v-low-quantfunc-int4.safetensors", "wan2.2-a14b-t2v", 999)
         ra = pa.model._qf.ensure()
         rb = pb.model._qf.ensure()
         check("two loads of one file-pair share the real handle", ra is rb)
@@ -328,14 +359,14 @@ def main():
         check("sibling's pipeline SURVIVES the refused release",
               pb.model._qf.pipeline is not None)
         check("sibling still honestly reports its backup", pb.loaded_ram_size() > 0)
-        del pb, rb
+        del pb, pb_low, rb
         gc.collect()
         freed = pa.partially_unload_ram(10 ** 12)
         check("sole-consumer release DOES free once the sibling is gone", freed > 0, f"-> {freed}")
         check("released wrapper reports 0 afterwards", pa.loaded_ram_size() == 0)
         check("released wrapper self-heals on next use",
               pa.model._qf.ensure().pipeline is not None)
-        del pa, ra
+        del pa, pa_low, ra
         gc.collect()
     except Exception as e:  # noqa: BLE001
         check("shared-handle sibling safety", False, f"-> raised {type(e).__name__}: {e}")

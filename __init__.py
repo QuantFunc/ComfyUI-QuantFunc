@@ -60,14 +60,30 @@ _CONFIGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs
 _NO_CFG_HINT = "(no official model config shipped)"
 
 
-def _model_config_choices():
+def _model_config_choices(family=None):
     """The OFFICIAL model-config presets shipped with the plugin — one subdir of configs/ per
     model, each carrying a qf_native.json manifest (family routing + shape) beside the arch/VAE
     config JSONs. The dropdown lists the DIRECTORY NAMES, so adding a model preset = drop in a
-    config dir; no code change (configs are data, not code)."""
+    config dir; no code change (configs are data, not code). `family` filters the list for the
+    PER-FAMILY loader nodes (user 2026-08-21 pivot: one loader node per model family), so a wan
+    preset can never appear in the LTX node's dropdown; a manifest whose family key is unreadable
+    is simply not listed for a filtered call (the unfiltered call still shows it, and load()
+    fail-louds on it)."""
     try:
-        return sorted(d for d in os.listdir(_CONFIGS_DIR)
-                      if os.path.isfile(os.path.join(_CONFIGS_DIR, d, "qf_native.json")))                or [_NO_CFG_HINT]
+        out = []
+        for d in sorted(os.listdir(_CONFIGS_DIR)):
+            mp = os.path.join(_CONFIGS_DIR, d, "qf_native.json")
+            if not os.path.isfile(mp):
+                continue
+            if family is not None:
+                try:
+                    with open(mp, "r", encoding="utf-8") as fh:
+                        if str(json.load(fh).get("family")) != family:
+                            continue
+                except Exception:  # noqa: BLE001 — unreadable manifest: hide from filtered lists
+                    continue
+            out.append(d)
+        return out or [_NO_CFG_HINT]
     except Exception:  # noqa: BLE001
         return [_NO_CFG_HINT]
 
@@ -305,10 +321,21 @@ def _may_release_handle(ckey, requester):
     destroyed handle (NULL pipeline at its next denoise) while still reporting its backup to
     comfy's ledger. On grant, the cache entry is dropped (the caller destroys the handle; the
     next load re-creates from disk). The requester itself STAYS bound: if it re-materializes
-    later it becomes a live consumer of the ckey's NEXT handle."""
+    later it becomes a live consumer of the ckey's NEXT handle.
+
+    PAIR-MATE EXEMPTION (dual-output pivot): the wan loader emits model_high + model_low sharing
+    ONE QFLazyEngine INSTANCE. A pair-mate is NOT "another consumer" for release purposes — both
+    models see the SAME lazy wrapper, which re-materializes coherently for both on the next
+    touch, so releasing under a live pair-mate strands nothing (unlike a SEPARATE load's sibling,
+    whose OWN wrapper would be left holding the destroyed handle). Discriminator: identity of the
+    model's `_qf` wrapper object — pair-mates share it; separate loads never do."""
+    req_qf = getattr(requester, "_qf", None)
     for m in _live_pipeline_models(ckey):
-        if m is not requester:
-            return False
+        if m is requester:
+            continue
+        if req_qf is not None and getattr(m, "_qf", None) is req_qf:
+            continue    # pair-mate on the SAME lazy wrapper: coherent re-create, not stranded
+        return False
     _PIPELINE_CACHE.pop(ckey, None)
     return True
 
@@ -421,113 +448,166 @@ if _IMPORT_OK:
 
 
 
-    class QuantFuncNativeLoader:
-        """ONE loader for every QuantFunc native family — like the reference INT8-Fast
-        UNetLoaderINTW8A8: you pick a transformer .safetensors FILE from models/diffusion_models
-        and a model_type; it returns a native comfy MODEL that a STOCK KSampler drives with
-        LATENTS. CLIP + VAE + latent + sampler + video nodes all stay stock comfy nodes — only the
-        transformer (denoise) is this engine.
+    def _run_family_load(expect_family, transformer1, model_config,
+                         resident_block_count, transformer2):
+        """The SHARED loader core behind the per-family nodes (user 2026-08-21 pivot). All
+        validation is preserved verbatim from the original single-node load(); the per-family
+        nodes add only (a) a family-filtered preset dropdown and (b) this family guard —
+        defense-in-depth against a preset dir whose manifest family drifted after the dropdown
+        rendered. Returns the family builder's result AS-IS (wan: a (model_high, model_low)
+        patcher pair; single-expert families: one patcher)."""
+        bundle_dir, manifest = _load_model_config(model_config)
+        family = str(manifest["family"])
+        if family != expect_family:
+            raise RuntimeError(
+                f"qf_native: model_config '{model_config}' declares family '{family}' but this "
+                f"loader node is the '{expect_family}' loader — pick a '{expect_family}' preset "
+                f"(the dropdown lists only those; this mismatch means the preset dir changed "
+                f"after the UI rendered).")
+        builder = _FAMILY_BUILDERS.get(family)
+        if builder is None:
+            raise RuntimeError(
+                f"qf_native: model_config '{model_config}' routes to family '{family}', which "
+                f"has no registered native seam in this install (available: "
+                f"{sorted(_FAMILY_BUILDERS)}). An import of the seam module probably failed "
+                f"at startup — check the log for a [qf_native] warning.")
+        xfm1 = _resolve_transformer(transformer1)
+        xfm2 = None if transformer2 in (_XFM_NONE, "", None) else _resolve_transformer(transformer2)
+        if bool(manifest.get("dual_expert")) and xfm2 is None:
+            raise RuntimeError(
+                f"qf_native: model_config '{model_config}' is DUAL-expert — transformer1 = the "
+                f"HIGH-noise expert AND transformer2 = the LOW-noise expert are both required "
+                f"(the export ships them as a *-high-* / *-low-* pair).")
+        # file_hints validation (DATA-driven; the manifest names what its transformers look
+        # like). DESIGN BOUNDARY, recorded deliberately: comfy combo values must be the REAL
+        # relative filenames (they resolve through folder_paths) and INPUT_TYPES is rendered
+        # statically — so the dropdown CANNOT dynamically filter by the sibling model_config
+        # widget without frontend JS. The correspondence contract is therefore enforced HERE,
+        # fail-loud at load, with the expected patterns named.
+        import fnmatch
+        hints = manifest.get("file_hints") or {}
+        for arm, val in (("transformer1", transformer1),
+                         ("transformer2", None if xfm2 is None else transformer2)):
+            pats = hints.get(arm) or []
+            if val is None or not pats:
+                continue
+            base = os.path.basename(val).lower()
+            if not any(fnmatch.fnmatch(base, p.lower()) for p in pats):
+                raise RuntimeError(
+                    f"qf_native: {arm}={val!r} does not look like a '{model_config}' "
+                    f"{arm} weight (expected a name matching {pats}). Pick the file the "
+                    f"preset names — see the model_config tooltip — or choose the preset "
+                    f"matching this file.")
+        if not manifest.get("dual_expert") and xfm2 is not None:
+            raise RuntimeError(
+                f"qf_native: model_config '{model_config}' is single-transformer — leave "
+                f"transformer2 = \"(none)\" (a second expert here would be silently ignored "
+                f"at best; refused instead).")
+        return builder(transformer1_path=xfm1, transformer2_path=xfm2,
+                       resident_block_count=int(resident_block_count),
+                       bundle_dir=bundle_dir)
 
-        wan A14B is dual-expert, so there are TWO transformer slots: transformer1 (high-noise) and
-        an optional transformer2 (low-noise). Single-expert families (LTX-2.5 / MiniMax-H3) use
-        transformer1 only and leave transformer2 = "(none)". LoRAs attach DOWNSTREAM via
-        QuantFuncNativeLoRA.
-        """
+    _RESIDENT_BLOCKS_INPUT = ("INT", {"default": 999, "min": 1, "max": 1024,
+                                      "tooltip": "GPU-resident transformer blocks — the native "
+                                                 "seam's ONLY residency knob. The engine clamps "
+                                                 "to the model's block count, so the default "
+                                                 "keeps every block resident on a card that "
+                                                 "fits."})
+    _COMMON_LIMITS = (
+        "Sampler/scheduler/CFG stay ENTIRELY ComfyUI-side — the engine only denoises per step "
+        "(latents in, velocity out). Limits: (1) ControlNet is not consumed by this seam "
+        "(refused loud). (2) Interrupt stops BETWEEN denoise steps. (3) On Linux a fail-closed "
+        "CUDA-toolchain check refuses a torch/.so CUDA-major mismatch; on Windows/macOS set "
+        "QF_NATIVE_ALLOW_UNVERIFIED_TOOLCHAIN=1 after confirming they share a CUDA major.")
+
+    class QuantFuncWanLoader:
+        """Wan 2.x loader — DUAL MODEL outputs (high-noise, low-noise) over ONE shared engine,
+        mirroring the official two-UNETLoader wan2.2 A14B workflow 1:1: wire model_high to the
+        first KSamplerAdvanced stage and model_low to the second, keep CLIP/VAE/latent/video
+        nodes stock. Expert selection is engine-side per-step sigma (boundary_ratio from the
+        preset), so sub-range stages (start/end_at_step) are fully supported — and even a
+        mis-wired stage still computes correctly."""
 
         @classmethod
         def INPUT_TYPES(cls):
             _xfms = _transformer_choices()
             return {"required": {
-                "transformer1": (_xfms,
-                                 {"tooltip": "The transformer weight .safetensors under "
-                                             "models/diffusion_models (wan A14B: the HIGH-noise "
-                                             "expert; single-expert LTX-2.5 / H3: the only "
-                                             "transformer)."}),
-                "model_config": (_model_config_choices(),
-                                 {"tooltip": "The OFFICIAL model config for this transformer "
-                                             "(shipped with the plugin: arch + VAE geometry + "
-                                             "family routing + expected-file naming). Pick the "
-                                             "preset matching your weights — a bare .safetensors "
-                                             "has no metadata to auto-detect from. "
+                "transformer1": (_xfms, {"tooltip": "The HIGH-noise expert .safetensors under "
+                                                    "models/diffusion_models."}),
+                "transformer2": (_xfms, {"tooltip": "The LOW-noise expert .safetensors (wan A14B "
+                                                    "ships them as a *-high-* / *-low-* pair)."}),
+                "model_config": (_model_config_choices(family="wan"),
+                                 {"tooltip": "The OFFICIAL wan model config preset (arch + VAE "
+                                             "geometry + expected-file naming). "
                                              + _preset_file_expectations()}),
-                "resident_block_count": ("INT", {"default": 999, "min": 1, "max": 1024,
-                                                 "tooltip": "GPU-resident transformer blocks — the "
-                                                            "native seam's ONLY residency knob. The "
-                                                            "engine clamps to the model's block "
-                                                            "count, so the default keeps every "
-                                                            "block resident on a card that fits."}),
-            }, "optional": {
-                "transformer2": ([_XFM_NONE] + _xfms,
-                                 {"tooltip": "wan A14B ONLY: the LOW-noise expert .safetensors. "
-                                             "Leave \"(none)\" for single-expert families "
-                                             "(LTX-2.5 / MiniMax-H3) — an expert2 there is refused "
-                                             "loud."}),
+                "resident_block_count": _RESIDENT_BLOCKS_INPUT,
             }}
-            # NOTE: NO `so_path` / `keyfile` widgets — the native library + auth keyfile resolve from
-            # the package bundle + the PROCESS ENVIRONMENT only, never from workflow JSON (#vuln: a
-            # workflow-serializable path into ctypes.CDLL is an arbitrary-code-execution primitive).
+
+        RETURN_TYPES = ("MODEL", "MODEL")
+        RETURN_NAMES = ("model_high", "model_low")
+        FUNCTION = "load"
+        CATEGORY = "loaders"
+        DESCRIPTION = (
+            "QuantFunc Wan loader (svdq, denoise_only): TWO MODEL outputs (high/low-noise expert) "
+            "over ONE shared engine — a drop-in for the official wan2.2 A14B dual-UNETLoader "
+            "workflow (dual KSamplerAdvanced stages + trimmed step ranges fully supported; the "
+            "engine picks the expert per step by sigma). LoRA: use checkpoints with the LoRA "
+            "baked in — chaining QuantFuncNativeLoRA onto these outputs is refused loud. "
+            + _COMMON_LIMITS)
+
+        def load(self, transformer1, transformer2, model_config, resident_block_count=999):
+            return _run_family_load("wan", transformer1, model_config,
+                                    resident_block_count, transformer2)
+
+    class QuantFuncLTXLoader:
+        """LTX-2 loader — single MODEL output (single-expert family)."""
+
+        @classmethod
+        def INPUT_TYPES(cls):
+            return {"required": {
+                "transformer": (_transformer_choices(),
+                                {"tooltip": "The LTX-2 transformer .safetensors under "
+                                            "models/diffusion_models."}),
+                "model_config": (_model_config_choices(family="ltx2"),
+                                 {"tooltip": "The OFFICIAL LTX-2 model config preset. "
+                                             + _preset_file_expectations()}),
+                "resident_block_count": _RESIDENT_BLOCKS_INPUT,
+            }}
 
         RETURN_TYPES = ("MODEL",)
         FUNCTION = "load"
         CATEGORY = "loaders"
-        DESCRIPTION = (
-            "Loads a QuantFunc svdq TRANSFORMER .safetensors (wan / LTX-2 / MiniMax-H3) from "
-            "models/diffusion_models and exposes it as a native comfy MODEL a STOCK KSampler drives "
-            "with LATENTS — only the transformer is swapped in; CLIP, VAE, latent, sampler and "
-            "video nodes stay stock (INT8-Fast-aligned: the inference path takes latents only). "
-            "wan A14B is dual-expert → set transformer2. Limits: (1) A SINGLE full-range KSampler: a "
-            "trimmed/partial denoise (KSamplerAdvanced start_step/last_step, denoise<1) mis-times "
-            "the engine's internal schedule and is refused loud. (2) ControlNet is not consumed by "
-            "this seam (refused loud). (3) Interrupt stops BETWEEN denoise steps. (4) On Linux a "
-            "fail-closed CUDA-toolchain check refuses a torch/.so CUDA-major mismatch; on "
-            "Windows/macOS set QF_NATIVE_ALLOW_UNVERIFIED_TOOLCHAIN=1 after confirming they share a "
-            "CUDA major.")
+        DESCRIPTION = ("QuantFunc LTX-2 loader (svdq, denoise_only): one native MODEL a stock "
+                       "sampler drives with latents. " + _COMMON_LIMITS)
 
-        def load(self, transformer1, model_config, resident_block_count=999, transformer2=_XFM_NONE):
-            bundle_dir, manifest = _load_model_config(model_config)
-            family = str(manifest["family"])
-            builder = _FAMILY_BUILDERS.get(family)
-            if builder is None:
-                raise RuntimeError(
-                    f"qf_native: model_config '{model_config}' routes to family '{family}', which "
-                    f"has no registered native seam in this install (available: "
-                    f"{sorted(_FAMILY_BUILDERS)}). An import of the seam module probably failed "
-                    f"at startup — check the log for a [qf_native] warning.")
-            xfm1 = _resolve_transformer(transformer1)
-            xfm2 = None if transformer2 in (_XFM_NONE, "", None) else _resolve_transformer(transformer2)
-            if bool(manifest.get("dual_expert")) and xfm2 is None:
-                raise RuntimeError(
-                    f"qf_native: model_config '{model_config}' is DUAL-expert — transformer1 = the "
-                    f"HIGH-noise expert AND transformer2 = the LOW-noise expert are both required "
-                    f"(the export ships them as a *-high-* / *-low-* pair).")
-            # file_hints validation (DATA-driven; the manifest names what its transformers look
-            # like). DESIGN BOUNDARY, recorded deliberately: comfy combo values must be the REAL
-            # relative filenames (they resolve through folder_paths) and INPUT_TYPES is rendered
-            # statically — so the dropdown CANNOT dynamically filter by the sibling model_config
-            # widget without frontend JS. The correspondence contract is therefore enforced HERE,
-            # fail-loud at load, with the expected patterns named.
-            import fnmatch
-            hints = manifest.get("file_hints") or {}
-            for arm, val in (("transformer1", transformer1),
-                             ("transformer2", None if xfm2 is None else transformer2)):
-                pats = hints.get(arm) or []
-                if val is None or not pats:
-                    continue
-                base = os.path.basename(val).lower()
-                if not any(fnmatch.fnmatch(base, p.lower()) for p in pats):
-                    raise RuntimeError(
-                        f"qf_native: {arm}={val!r} does not look like a '{model_config}' "
-                        f"{arm} weight (expected a name matching {pats}). Pick the file the "
-                        f"preset names — see the model_config tooltip — or choose the preset "
-                        f"matching this file.")
-            if not manifest.get("dual_expert") and xfm2 is not None:
-                raise RuntimeError(
-                    f"qf_native: model_config '{model_config}' is single-transformer — leave "
-                    f"transformer2 = \"(none)\" (a second expert here would be silently ignored "
-                    f"at best; refused instead).")
-            return (builder(transformer1_path=xfm1, transformer2_path=xfm2,
-                            resident_block_count=int(resident_block_count),
-                            bundle_dir=bundle_dir),)
+        def load(self, transformer, model_config, resident_block_count=999):
+            return (_run_family_load("ltx2", transformer, model_config,
+                                     resident_block_count, None),)
+
+    class QuantFuncH3Loader:
+        """MiniMax-H3 loader — single MODEL output (single-expert AV family)."""
+
+        @classmethod
+        def INPUT_TYPES(cls):
+            return {"required": {
+                "transformer": (_transformer_choices(),
+                                {"tooltip": "The MiniMax-H3 transformer .safetensors under "
+                                            "models/diffusion_models."}),
+                "model_config": (_model_config_choices(family="minimax-h3"),
+                                 {"tooltip": "The OFFICIAL MiniMax-H3 model config preset. "
+                                             + _preset_file_expectations()}),
+                "resident_block_count": _RESIDENT_BLOCKS_INPUT,
+            }}
+
+        RETURN_TYPES = ("MODEL",)
+        FUNCTION = "load"
+        CATEGORY = "loaders"
+        DESCRIPTION = ("QuantFunc MiniMax-H3 loader (svdq, denoise_only): one native AV MODEL a "
+                       "stock sampler drives with latents. " + _COMMON_LIMITS)
+
+        def load(self, transformer, model_config, resident_block_count=999):
+            return (_run_family_load("minimax-h3", transformer, model_config,
+                                     resident_block_count, None),)
 
     class QuantFuncNativeLoRA:
         """Sidecar LoRA for the QuantFunc native loader — MODEL in, MODEL out (LoraLoaderModelOnly
@@ -579,8 +659,14 @@ if _IMPORT_OK:
             return (rebuilt.adopt_comfy_state_from(model),)
 
     # merge into (not replace) the mappings — matches the real plugin's multi-file NODE_CLASS_MAPPINGS.update
-    NODE_CLASS_MAPPINGS.update({"QuantFuncNativeLoader": QuantFuncNativeLoader,
+    NODE_CLASS_MAPPINGS.update({"QuantFuncWanLoader": QuantFuncWanLoader,
+                                "QuantFuncLTXLoader": QuantFuncLTXLoader,
+                                "QuantFuncH3Loader": QuantFuncH3Loader,
                                 "QuantFuncNativeLoRA": QuantFuncNativeLoRA})
+    NODE_DISPLAY_NAME_MAPPINGS.update({
+        "QuantFuncWanLoader": "QuantFunc Wan Loader (high+low)",
+        "QuantFuncLTXLoader": "QuantFunc LTX-2 Loader",
+        "QuantFuncH3Loader": "QuantFunc MiniMax-H3 Loader"})
 
     # AUTOMATION — a mechanism must not depend on someone remembering to run it (CR): run the reject-list
     # completeness scan AT IMPORT so a comfy upgrade that adds a consumable conditioning key emits a loud

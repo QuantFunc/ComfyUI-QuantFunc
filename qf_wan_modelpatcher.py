@@ -180,10 +180,8 @@ class QFWanModel(QFSessionModelMixin, comfy.model_base.WAN21):
     def _derive_geometry(self, xin, transformer_options):
         """DERIVE the session geometry from the graph (official-loader shape — the loader has no
         geometry widgets). xin: [B,C,Tlat,Hl,Wl] from WanImageToVideo / EmptyHunyuanLatentVideo;
-        the step count from the sampler's own sigma schedule. The only refusal left is the one
-        that is a REAL incompatibility, not a widget disagreement: a TRIMMED sigma range
-        (KSamplerAdvanced start_step/last_step) would mis-time the engine's internal dual-expert
-        swap, which is keyed to a full-range schedule."""
+        the step count from the sampler's own sigma schedule. The only refusal left is a sampler
+        that publishes NO sigma schedule at all; sub-range schedules are legal (see below)."""
         Tlat = int(xin.shape[2])
         self._num_frames = (Tlat - 1) * self._VAE_T + 1
         sigmas = transformer_options.get("sample_sigmas") if isinstance(transformer_options, dict) else None
@@ -193,24 +191,19 @@ class QFWanModel(QFSessionModelMixin, comfy.model_base.WAN21):
                 "'sample_sigmas']) — the engine session needs the step count. Use a stock KSampler / "
                 "SamplerCustom on this model.")
         self._num_steps = len(sigmas) - 1
-        # A trimmed sub-range (denoise<1 / start_step>0 / last_step<steps) does not START at the
-        # schedule's first sigma or END at ~0 — the engine's dual-expert swap timing assumes the
-        # full range, so refuse LOUD instead of rendering a silently mis-timed result.
-        try:
-            s_first, s_last = float(sigmas[0]), float(sigmas[-1])
-        except Exception:  # noqa: BLE001 — non-tensor sigmas: skip the range check, keep the count
-            return
-        ms = getattr(self, "model_sampling", None)
-        s_max = float(getattr(ms, "sigma_max", s_first)) if ms is not None else s_first
-        if s_last > 1e-3 or (s_max > 0 and s_first < 0.98 * s_max):
-            raise RuntimeError(
-                f"qf_native: partial / trimmed denoise is NOT supported (sigmas run "
-                f"{s_first:.4f}→{s_last:.4f}, full range would be {s_max:.4f}→0). The engine session "
-                f"runs its OWN internal schedule (including the dual-expert swap timing) keyed to the "
-                f"full step range, so a trimmed sub-range would mis-time the swap and corrupt the "
-                f"output. Use a single full-range KSampler (denoise=1.0, no start_step/last_step).")
+        # SUB-RANGE sigma schedules (KSamplerAdvanced start/end_at_step, denoise<1) are LEGAL —
+        # verified engine-side 2026-08-21: the external session's expert selection is PER-STEP
+        # sigma-driven over ABSOLUTE quantities (WanVideoPipeline makeVideoStepFn: ts = sigma *
+        # scheduler num_train_timesteps vs boundary_t = boundary_ratio * the SAME constant — no
+        # schedule-range dependence), and residency is per-step ENSURE-RESIDENT, not a one-way
+        # full-range latch (the c5.7a legC-replay hardening). So the official two-KSamplerAdvanced
+        # wan workflow maps 1:1: the high-noise stage's sigmas are all >= the boundary -> engine
+        # runs transformer1; the low stage's are below -> transformer2 — even a MIS-wired stage
+        # (low MODEL into the high sampler) still computes correctly, because the engine picks by
+        # sigma, not by which loader output was used. An earlier refusal here guarded a mis-timing
+        # that cannot occur under that mechanism; it blocked the official dual-sampler template
+        # and is deliberately removed (sampler/scheduler are ComfyUI-owned — user directive).
 
-    # ---- session lifecycle -------------------------------------------------
     def _begin(self, x_group, ctx_group):
         """Open the edit session. x_group/ctx_group are PER-COND-GROUP (B==1) slices — begin binds
         the geometry MAXIMA with B==1 (the engine + include/quantfunc.h require cond B==1)."""
@@ -462,9 +455,12 @@ def register(deps):
                 dev = comfy.model_management.get_torch_device()
                 eng, ckey = get_engine(model_dir, create_cfg=cfg,
                                        device_idx=getattr(dev, "index", 0) or 0)
-                # Liveness tracker for the host-RAM sweep: when comfy GC's this patcher's model the
-                # weakref goes dead → the package sweep may destroy the (unreferenced) handle.
-                bind_pipeline_model(ckey, model)
+                # Liveness tracker for the host-RAM sweep: BOTH loader outputs (model_high +
+                # model_low) are live consumers of the ONE shared handle — bind each, so the
+                # sweep keeps the handle while EITHER survives (the registry holds a weakref
+                # LIST per ckey; _may_release refuses while any sibling lives).
+                for _m in (model_high, model_low):
+                    bind_pipeline_model(ckey, _m)
                 return eng, ckey
 
             # DEFERRED create (QFLazyEngine): a chained QuantFuncNativeLoRA rebuilds for its
@@ -482,18 +478,46 @@ def register(deps):
 
             device = comfy.model_management.get_torch_device()
             offload = comfy.model_management.unet_offload_device()
-            model = QFWanModel(model_config, engine, None, device=device,
-                               resident_block_count=resident_block_count)
+            # DUAL MODEL outputs over ONE shared engine (user 2026-08-21 pivot: the wan loader
+            # mirrors the official two-UNETLoader workflow shape — model_high wires to the
+            # high-noise KSamplerAdvanced stage, model_low to the low stage). Expert selection is
+            # ENGINE-side per-step sigma (see _derive_geometry) — the outputs exist for workflow
+            # shape + per-stage comfy bookkeeping, and even a mis-wired stage still computes
+            # correctly. model_low is the SHADOW (tiny ledger share, never drives the shared
+            # engine's eviction — see QFModelPatcher._is_shadow); both models bind to the ckey so
+            # handle destruction waits for both.
+            model_high = QFWanModel(model_config, engine, None, device=device,
+                                    resident_block_count=resident_block_count)
+            model_low = QFWanModel(model_config, engine, None, device=device,
+                                   resident_block_count=resident_block_count)
+            model_low._qf_shadow = True
             # Default the sampler to the CHECKPOINT'S OWN flow schedule when the staged package
             # declares one (no-op-safe when absent; a stock ModelSamplingSD3 downstream still wins).
-            apply_checkpoint_flow_shift(model, model_dir)
-            patcher = QFModelPatcher(model, load_device=device, offload_device=offload)
-            print(f"[qf_native] loaded QuantFunc Native Loader (wan svdq, denoise_only) "
+            apply_checkpoint_flow_shift(model_high, model_dir)
+            apply_checkpoint_flow_shift(model_low, model_dir)
+            patcher_high = QFModelPatcher(model_high, load_device=device, offload_device=offload)
+            patcher_low = QFModelPatcher(model_low, load_device=device, offload_device=offload)
+            print(f"[qf_native] loaded QuantFunc Wan Loader (svdq, denoise_only, dual MODEL) "
                   f"high={os.path.basename(transformer1_path)} "
                   f"low={os.path.basename(transformer2_path)} "
                   f"resident_blocks={resident_block_count} loras={len(entries)} "
                   f"footprint~{engine.footprint_bytes // (1024*1024)}MB (create deferred)")
-            return qfmp.tag_lora_rebuild(patcher, entries, _build)
+
+            def _lora_rebuild_dual(_entries):
+                # v1 refusal, LOUD (never silent): a QuantFuncNativeLoRA chained on ONE of the two
+                # outputs would rebuild a NEW engine pair while the OTHER output still references
+                # the old engine — two full engines resident (2x VRAM) and a silently split LoRA
+                # state. Engine-side per-expert LoRA (target high/low) belongs on the LOADER as a
+                # lora input — tracked follow-up; the 4-step production checkpoints ship BAKED.
+                raise RuntimeError(
+                    "qf_native wan: QuantFuncNativeLoRA cannot chain onto the dual-output wan "
+                    "loader yet (it would fork the shared engine). Use checkpoints with the LoRA "
+                    "baked in (the shipped 4-step exports), or wait for the loader-level lora "
+                    "input.")
+
+            qfmp.tag_lora_rebuild(patcher_high, entries, _lora_rebuild_dual)
+            qfmp.tag_lora_rebuild(patcher_low, entries, _lora_rebuild_dual)
+            return patcher_high, patcher_low
 
         return _build(list(lora_entries))
 

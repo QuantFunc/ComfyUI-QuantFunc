@@ -503,7 +503,24 @@ class QFModelPatcher(comfy.model_patcher.ModelPatcher):
     def _engine(self):
         return getattr(getattr(self, "model", None), "_qf", None)
 
+    # A SHADOW patcher is the second (and any further) MODEL output sharing ONE engine (the wan
+    # dual-expert loader emits model_high + model_low over a single engine handle). Only the
+    # PRIMARY output carries the engine's footprint in comfy's ledger and may drive co-eviction;
+    # a shadow reports a tiny constant and never unloads the shared engine — otherwise the ledger
+    # would double-count the engine (2x ~14GB > the card) and an eviction aimed at the shadow
+    # would silently rip the engine out from under the primary mid-workflow. The flag lives on
+    # the MODEL (not the patcher) because comfy clone()s patchers freely; the model object is
+    # shared by reference so the marker survives every clone. Handle DESTRUCTION stays governed
+    # by the liveness registry (both models bind to the ckey), so a shadow still keeps the
+    # handle alive — this flag only affects ledger REPORTING + co-EVICTION drive.
+    _QF_SHADOW_LEDGER_BYTES = 64 * 1024 * 1024
+
+    def _is_shadow(self):
+        return bool(getattr(getattr(self, "model", None), "_qf_shadow", False))
+
     def _footprint(self):
+        if self._is_shadow():
+            return self._QF_SHADOW_LEDGER_BYTES
         eng = self._engine()
         return max(1, int(eng.footprint_bytes)) if eng is not None else 1
 
@@ -531,6 +548,10 @@ class QFModelPatcher(comfy.model_patcher.ModelPatcher):
         # (unload_sync → GPU->CPU, reloads on next generate) and return the REAL freed bytes so comfy's
         # ledger is honest. The old 0-return let comfy pop us + believe multi-GB was free while the
         # engine stayed fully resident → the next model loaded into that "freed" space OOM'd.
+        if self._is_shadow():
+            # A shadow never drives the SHARED engine's eviction (the primary output owns it);
+            # its ledger share is the tiny constant, so comfy loses nothing by this 0.
+            return 0
         eng = self._engine()
         if eng is None:
             return 0
@@ -599,6 +620,8 @@ class QFModelPatcher(comfy.model_patcher.ModelPatcher):
     def loaded_ram_size(self):
         """HOST-RAM this model is actually responsible for: the engine's CPU backup after a
         co-eviction, else 0 (including for a handle that was never created)."""
+        if self._is_shadow():
+            return 0   # the PRIMARY output reports the shared engine's backup — no double-count
         holds, eng = self._engine_holds_cpu_backup()
         return max(0, int(getattr(eng, "footprint_bytes", 0))) if holds else 0
 
