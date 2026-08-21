@@ -17,6 +17,7 @@ try:
     import comfy.model_management
     import comfy.supported_models
     from . import qf_engine as qfe
+    from . import qf_modelpatcher as qfmp
     from .qf_modelpatcher import QFWanModel, QFModelPatcher, QFLazyEngine
     _IMPORT_OK = True
 except Exception as _exc:  # noqa: BLE001 — never break registration; report loudly
@@ -41,6 +42,23 @@ _NO_MODELS_HINT = "(no QuantFunc model package in models/diffusion_models)"
 _NO_LORA_HINT = "(no LoRA in models/loras)"
 
 
+def _model_roots():
+    """The folders scanned for QuantFunc model packages: comfy's models/diffusion_models (where
+    these packages are kept — CR raised switching to the `diffusers` key instead; MEASURED, that
+    would not change comfy's native UNETLoader dropdown, which already recurses into any package
+    dir placed there: with k9b present it lists k9b/transformer/model.safetensors etc. whether or
+    not this plugin reads that folder. The listing is a consequence of the on-disk layout, not of
+    our scan, so switching our READ key would move nothing off that dropdown while contradicting
+    where the models actually live) PLUS models/diffusers for users who keep packages there."""
+    roots = []
+    for key in ("diffusion_models", "diffusers"):
+        try:
+            roots.extend(_folder_paths.get_folder_paths(key))
+        except Exception:  # noqa: BLE001 — a missing key must not break listing
+            pass
+    return roots
+
+
 def _list_quantfunc_packages():
     """Relative paths of every QuantFunc model PACKAGE (a dir holding model_index.json) under
     comfy's models/diffusion_models roots. Single-file .safetensors UNETs are deliberately NOT
@@ -49,7 +67,7 @@ def _list_quantfunc_packages():
     out = []
     if _folder_paths is None:
         return [_NO_MODELS_HINT]
-    for root_dir in _folder_paths.get_folder_paths("diffusion_models"):
+    for root_dir in _model_roots():
         if not os.path.isdir(root_dir):
             continue
         for r, dirs, files in os.walk(root_dir, followlinks=True):
@@ -60,19 +78,34 @@ def _list_quantfunc_packages():
 
 
 def _resolve_package(name):
+    """Resolve a listed package name to its directory — CONFINED to the registered model roots.
+
+    #vuln (CR): a widget value is workflow-serializable, so `name` is UNTRUSTED. comfy's own
+    get_full_path_or_raise does this containment for FILES (that is what _resolve_lora and the
+    connector dropdown use); there is no folder_paths equivalent for a package DIRECTORY, so the
+    containment is done here explicitly: resolve both sides with realpath and require the
+    candidate to sit under the root, so "../../.." / an absolute path / a symlink pointing out
+    cannot escape models/diffusion_models (or models/diffusers)."""
     if _folder_paths is None:
         raise RuntimeError("qf_native: comfy folder_paths unavailable")
     if name == _NO_MODELS_HINT:
         raise RuntimeError(
             "qf_native: no QuantFunc model package found. Put the model DIRECTORY (the one with "
             "model_index.json + transformer/) under ComfyUI/models/diffusion_models/ and refresh.")
-    for root_dir in _folder_paths.get_folder_paths("diffusion_models"):
-        cand = os.path.join(root_dir, name)
+    if os.path.isabs(name):
+        raise RuntimeError(f"qf_native: model_name must be a name inside a model folder, not an "
+                           f"absolute path ({name!r})")
+    for root_dir in _model_roots():
+        root = os.path.realpath(root_dir)
+        cand = os.path.realpath(os.path.join(root, name))
+        if os.path.commonpath([root, cand]) != root:
+            continue                      # escaped the root — not a candidate, keep looking
         if os.path.isfile(os.path.join(cand, "model_index.json")):
             return cand
     raise RuntimeError(
-        f"qf_native: model package '{name}' not found under models/diffusion_models "
-        f"(a package dir must contain model_index.json)")
+        f"qf_native: model package '{name}' not found inside the model folders "
+        f"(a package dir must contain model_index.json, and must live under one of "
+        f"{[os.path.basename(r.rstrip('/')) for r in _model_roots()]})")
 
 
 def _package_weight_paths(pkg):
@@ -278,119 +311,175 @@ def _get_engine(model_dir, create_cfg=None):
 
 
 if _IMPORT_OK:
-    class QuantFuncNativeWanLoader:
-        """Load a QuantFunc wan svdq model PACKAGE → native comfy MODEL (stock-KSampler seam).
+    def _build_wan(model_dir, model_name, resident_block_count, start_image=None,
+                   connector_ckpt="(none)", lora_entries=()):
+        """wan svdq family builder (called by the single loader node + by a LoRA rebuild)."""
+        def _build(entries):
+            # text_precision pinned to int8 (#329-verified W8A16). WHY (mechanism traced to source
+            # after a §6.5 round caught an earlier wrong explanation here): with NO text_precision the
+            # engine's resolve-at-entry falls to its SM-DEFAULT tier (est::smDefaultTextPrecision = fp4
+            # on SM120+, int4 below) and WAN's UMT5 factory REJECTS both 4-bit tiers fail-loud. The
+            # engine TE is not even used by this seam (conditioning comes from comfy's NATIVE CLIP),
+            # but create still builds it; int8 is the verified quantized-UMT5 tier.
+            cfg = {"text_precision": "int8"}
+            if entries:
+                cfg["lora"] = list(entries)   # WanVideoPipeline splits target-tagged entries per expert
 
-        OFFICIAL-LOADER SHAPE (UNETLoader/DiffusersLoader precedent): the loader takes the
-        MODEL only. Everything else comes from the workflow's own stock nodes —
-        steps/seed/cfg from KSampler, width/height/length from WanImageToVideo or
-        EmptyHunyuanLatentVideo, fps from CreateVideo, the flow shift from
-        ModelSamplingSD3 (or the package's scheduler_config, applied here as the default).
-        LoRAs attach DOWNSTREAM via QuantFuncNativeLoRA (MODEL -> MODEL), like LoraLoaderModelOnly.
+            def _factory():
+                eng, ckey = _get_engine(model_dir, create_cfg=cfg)
+                # Liveness tracker for the host-RAM sweep: when comfy GC's this patcher's model the
+                # weakref goes dead → _sweep_dead_pipelines may destroy the (unreferenced) handle.
+                _PIPELINE_MODELS[ckey] = weakref.ref(model)
+                return eng, ckey
+
+            # DEFERRED create (QFLazyEngine): a chained QuantFuncNativeLoRA rebuilds for its
+            # accumulated set, so an eager create here would build ONE PIPELINE PER CHAIN LINK.
+            engine = QFLazyEngine(_factory, _estimate_package_footprint(model_dir))
+
+            # Wan A14B uses the Wan 2.1 VAE (16-ch AutoencoderKLWan) → WAN21_I2V latent_format
+            # (Wan21, 16-ch). NOT WAN22_T2V (48-ch, that is the 5B TI2V VAE). UNet build DISABLED
+            # (no 14B torch weights — _apply_model is overridden to drive the engine).
+            unet_config = {"image_model": "wan2.1", "model_type": "i2v",
+                           "disable_unet_model_creation": True}
+            model_config = comfy.supported_models.WAN21_I2V(unet_config)
+            for attr, default in (("manual_cast_dtype", None), ("custom_operations", None),
+                                  ("optimizations", {}), ("scaled_fp8", None)):
+                if not hasattr(model_config, attr):
+                    setattr(model_config, attr, default)
+
+            device = comfy.model_management.get_torch_device()
+            offload = comfy.model_management.unet_offload_device()
+            model = QFWanModel(model_config, engine, start_image, device=device,
+                               resident_block_count=resident_block_count)
+            # Default the sampler to the CHECKPOINT'S OWN flow schedule when the package declares
+            # one (a stock ModelSamplingSD3 downstream still overrides it — as on any comfy model).
+            _apply_checkpoint_flow_shift(model, model_dir)
+            patcher = QFModelPatcher(model, load_device=device, offload_device=offload)
+            print(f"[qf_native] loaded QuantFunc Native Loader (wan svdq) package={model_name} "
+                  f"resident_blocks={resident_block_count} loras={len(entries)} "
+                  f"footprint~{engine.footprint_bytes // (1024*1024)}MB (create deferred)")
+            return qfmp.tag_lora_rebuild(patcher, entries, _build)
+
+        return _build(list(lora_entries))
+
+    # ── family detection: the ENGINE's OWN detector strings, transcribed from its registered
+    #    predicates so plugin and engine cannot disagree (WanVideoPipeline.cpp wan_detect =
+    #    pipeline_class prefix "Wan"; LTX2VideoPipeline.cpp = "LTX2Pipeline"; MiniMaxH3Pipeline.cpp
+    #    = "MiniMaxH3ModularPipeline"/"MiniMaxH3Pipeline"). A package whose model_index.json names
+    #    a family the native seam does not implement is refused LOUD with the class it reported —
+    #    never silently routed to the wrong seam.
+    _FAMILY_LABELS = ["auto", "wan", "ltx2", "minimax-h3"]
+
+    def _detect_family(model_dir):
+        try:
+            with open(os.path.join(model_dir, "model_index.json"), "r") as f:
+                cls = str(json.load(f).get("_class_name", ""))
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(
+                f"qf_native: cannot read model_index.json in {model_dir} ({exc}) — a QuantFunc "
+                f"model package must contain it (it is what names the pipeline family).")
+        if cls.startswith("Wan"):
+            return "wan", cls
+        if cls == "LTX2Pipeline":
+            return "ltx2", cls
+        if cls in ("MiniMaxH3ModularPipeline", "MiniMaxH3Pipeline"):
+            return "minimax-h3", cls
+        raise RuntimeError(
+            f"qf_native: model_index.json reports _class_name='{cls}', which the native loader "
+            f"does not implement (supported: Wan*, LTX2Pipeline, MiniMaxH3[Modular]Pipeline). "
+            f"Pick a different package, or set model_type explicitly if the metadata is wrong.")
+
+    class QuantFuncNativeLoader:
+        """ONE loader for every QuantFunc native family — the model dropdown picks which.
+
+        Shape follows the reference INT8 loader (UNetLoaderINTW8A8): a model dropdown + a
+        model_type selector + CATEGORY "loaders". Everything else comes from the workflow's own
+        stock nodes — length/size from the empty-latent / image-to-video node, steps from
+        KSampler, fps from CreateVideo, flow shift from ModelSamplingSD3 (wan/LTX) or
+        ModelSamplingMiniMaxH3 (H3). LoRAs attach DOWNSTREAM via QuantFuncNativeLoRA.
         """
+
         @classmethod
         def INPUT_TYPES(cls):
+            _ckpts = []
+            if _folder_paths is not None:
+                try:
+                    _ckpts = list(_folder_paths.get_filename_list("checkpoints"))
+                except Exception:  # noqa: BLE001
+                    _ckpts = []
             return {"required": {
-                "model_name": (_list_quantfunc_packages(),),
-                # [manual-residency] GPU-resident transformer blocks (the native seam's ONLY
-                # residency mechanism; engine clamps to the model's block count, so the
-                # default keeps every block resident on a card that fits it).
-                "resident_block_count": ("INT", {"default": 999, "min": 1, "max": 1024}),
+                "model_name": (_list_quantfunc_packages(),
+                               {"tooltip": "QuantFunc model PACKAGE (the directory holding "
+                                           "model_index.json + transformer/) under "
+                                           "models/diffusion_models or models/diffusers."}),
+                "model_type": (_FAMILY_LABELS,
+                               {"default": "auto",
+                                "tooltip": "auto reads the family from the package's "
+                                           "model_index.json; pick one explicitly to override."}),
+                "resident_block_count": ("INT", {"default": 999, "min": 1, "max": 1024,
+                                                 "tooltip": "GPU-resident transformer blocks — the "
+                                                            "native seam's ONLY residency knob. The "
+                                                            "engine clamps to the model's block "
+                                                            "count, so the default keeps every "
+                                                            "block resident on a card that fits."}),
             }, "optional": {
-                # Option C: the i2v reference frame arrives as an IMAGE GRAPH input — fan a stock
-                # LoadImage into THIS (leave WanImageToVideo.start_image EMPTY). The engine VAE-encodes
-                # the original pixels itself; it cannot consume comfy's encoded concat_latent_image
-                # (no ref-latent field in the denoise ABI). Omit it entirely for t2v.
-                "start_image": ("IMAGE",),
+                "start_image": ("IMAGE", {"tooltip": "i2v reference frame (wan / LTX video-only). "
+                                                     "Leave the stock node's own start_image EMPTY "
+                                                     "— the engine VAE-encodes these pixels itself. "
+                                                     "Omit for t2v."}),
+                "connector_ckpt": (["(none)"] + _ckpts,
+                                   {"tooltip": "LTX-2.3 / 19B VIDEO-ONLY packages only: the comfy "
+                                               "checkpoint carrying video_embeddings_connector. "
+                                               "Unused by wan, H3 and LTX-2.5 joint-AV."}),
             }}
-            # NOTE: NO `so_path` / `keyfile` widgets — the native library + auth keyfile are resolved
-            # from the package bundle + the PROCESS ENVIRONMENT only, never from workflow JSON (#vuln:
-            # a workflow-serializable path into ctypes.CDLL is an arbitrary-code-execution primitive).
-            # Dev override: QF_NATIVE_SO_PATH / QF_NATIVE_KEYFILE env vars (see qf_engine.resolve_so_path).
+            # NOTE: NO `so_path` / `keyfile` widgets — the native library + auth keyfile resolve from
+            # the package bundle + the PROCESS ENVIRONMENT only, never from workflow JSON (#vuln: a
+            # workflow-serializable path into ctypes.CDLL is an arbitrary-code-execution primitive).
 
         RETURN_TYPES = ("MODEL",)
         FUNCTION = "load"
-        CATEGORY = "QuantFunc/native"
+        CATEGORY = "loaders"
         DESCRIPTION = (
-            "Loads a QuantFunc wan svdq model PACKAGE from models/diffusion_models (the model "
-            "DIRECTORY holding model_index.json + transformer/) and exposes it as a native comfy "
-            "MODEL that a STOCK KSampler drives (only this loader is swapped in; CLIP, VAE, latent, "
-            "sampler and video nodes stay stock). Requirements & limits: (1) i2v — fan a LoadImage "
-            "into this loader's 'start_image' (leave WanImageToVideo.start_image EMPTY); omit it for "
-            "t2v. (2) Use a SINGLE full-range KSampler — a KSamplerAdvanced two-stage / partial "
-            "denoise (start_step/last_step) is NOT supported: it trims the sigma range, which "
-            "mis-times the engine's internal dual-expert swap (the node fails loud if you try, it "
-            "never renders silently-wrong). (3) ControlNet is not consumed by this seam (fails loud). "
-            "(4) The Interrupt button stops BETWEEN denoise steps. (5) The engine loads in-process; on "
-            "LINUX a fail-closed CUDA-toolchain check refuses a torch/.so CUDA-major mismatch. On "
-            "WINDOWS/macOS, after confirming your torch and the engine binary share a CUDA major, set "
-            "QF_NATIVE_ALLOW_UNVERIFIED_TOOLCHAIN=1 to load.")
+            "Loads a QuantFunc svdq model PACKAGE (wan / LTX-2 / MiniMax-H3) and exposes it as a "
+            "native comfy MODEL a STOCK KSampler drives — only this loader is swapped in; CLIP, "
+            "VAE, latent, sampler and video nodes stay stock. Limits: (1) i2v — fan a LoadImage "
+            "into this loader's start_image and leave the stock node's own start_image EMPTY. "
+            "(2) A SINGLE full-range KSampler: a trimmed/partial denoise (KSamplerAdvanced "
+            "start_step/last_step, denoise<1) mis-times the engine's internal schedule and is "
+            "refused loud. (3) ControlNet is not consumed by this seam (refused loud). (4) Interrupt "
+            "stops BETWEEN denoise steps. (5) On Linux a fail-closed CUDA-toolchain check refuses a "
+            "torch/.so CUDA-major mismatch; on Windows/macOS set "
+            "QF_NATIVE_ALLOW_UNVERIFIED_TOOLCHAIN=1 after confirming they share a CUDA major.")
 
-        def load(self, model_name, resident_block_count=999, start_image=None):
+        def load(self, model_name, model_type="auto", resident_block_count=999,
+                 start_image=None, connector_ckpt="(none)"):
             model_dir = _resolve_package(model_name)
-
-            def _build(lora_entries):
-                """Create (or reuse) the pipeline for THIS lora set and wrap it in a patcher.
-                Re-invoked by QuantFuncNativeLoRA downstream: the engine applies sidecar LoRA at
-                CREATE time, so attaching one re-creates the pipeline for the new set (the handle
-                cache keys on it; the previous set's VRAM is released by _evict_other_pipelines)."""
-                # text_precision pinned to int8 (#329-verified W8A16). WHY (mechanism traced to source
-                # after a §6.5 round caught an earlier wrong explanation here): with NO text_precision
-                # the engine's resolve-at-entry falls to its SM-DEFAULT tier (est::smDefaultTextPrecision
-                # = fp4 on SM120+, int4 below) and WAN's UMT5 factory REJECTS both 4-bit tiers fail-loud.
-                # The engine TE is not even used by this seam (conditioning comes from comfy's NATIVE
-                # CLIP), but create still builds it; int8 is the verified quantized-UMT5 tier.
-                cfg = {"text_precision": "int8"}
-                if lora_entries:
-                    cfg["lora"] = list(lora_entries)   # WanVideoPipeline splits target-tagged entries per expert
-
-                def _factory():
-                    eng, ckey = _get_engine(model_dir, create_cfg=cfg)
-                    # Liveness tracker for the host-RAM cache sweep: when comfy GC's this patcher's
-                    # model, the weakref goes dead → _sweep_dead_pipelines may destroy the handle.
-                    _PIPELINE_MODELS[ckey] = weakref.ref(model)
-                    return eng, ckey
-
-                # DEFERRED create (QFLazyEngine): a chained QuantFuncNativeLoRA rebuilds for its
-                # accumulated set, so an eager create here would build a pipeline per chain link.
-                engine = QFLazyEngine(_factory, _estimate_package_footprint(model_dir))
-
-                # Wan A14B uses the Wan 2.1 VAE (16-ch AutoencoderKLWan) → WAN21_I2V latent_format
-                # (Wan21, 16-ch). NOT WAN22_T2V (48-ch, that is the 5B TI2V VAE). UNet build DISABLED
-                # (no 14B torch weights — _apply_model is overridden to drive the engine).
-                unet_config = {"image_model": "wan2.1", "model_type": "i2v",
-                               "disable_unet_model_creation": True}
-                model_config = comfy.supported_models.WAN21_I2V(unet_config)
-                for attr, default in (("manual_cast_dtype", None), ("custom_operations", None),
-                                      ("optimizations", {}), ("scaled_fp8", None)):
-                    if not hasattr(model_config, attr):
-                        setattr(model_config, attr, default)
-
-                device = comfy.model_management.get_torch_device()
-                offload = comfy.model_management.unet_offload_device()
-                model = QFWanModel(model_config, engine, start_image, device=device,
-                                   resident_block_count=resident_block_count)
-                # Default the sampler to the CHECKPOINT'S OWN flow schedule when the package declares
-                # one (a stock ModelSamplingSD3 downstream still overrides it — as on any comfy model).
-                _apply_checkpoint_flow_shift(model, model_dir)
-                model._qf_lora_stack = list(lora_entries)   # what QuantFuncNativeLoRA appends to
-                model._qf_rebuild = _build                  # how it re-creates with the new set
-                patcher = QFModelPatcher(model, load_device=device, offload_device=offload)
-                print(f"[qf_native] loaded QuantFuncNativeWanLoader (wan svdq) package={model_name} "
-                      f"resident_blocks={resident_block_count} loras={len(lora_entries)} "
-                      f"footprint~{engine.footprint_bytes // (1024*1024)}MB (create deferred to first use)")
-                return patcher
-
-            return (_build([]),)
+            detected, reported = _detect_family(model_dir)
+            family = detected if model_type == "auto" else model_type
+            if model_type != "auto" and family != detected:
+                logging.warning("[qf_native] model_type=%s overrides the package's own "
+                                "_class_name=%s (detected %s) — override honored, but a mismatch "
+                                "usually means the wrong package is selected.",
+                                model_type, reported, detected)
+            builder = _FAMILY_BUILDERS.get(family)
+            if builder is None:
+                raise RuntimeError(
+                    f"qf_native: family '{family}' has no registered native seam in this install "
+                    f"(available: {sorted(_FAMILY_BUILDERS)}). An import of the seam module "
+                    f"probably failed at startup — check the log for a [qf_native] warning.")
+            return (builder(model_dir=model_dir, model_name=model_name,
+                            resident_block_count=int(resident_block_count),
+                            start_image=start_image, connector_ckpt=connector_ckpt),)
 
     class QuantFuncNativeLoRA:
-        """Sidecar LoRA for the QuantFunc native loaders — MODEL in, MODEL out (LoraLoaderModelOnly
+        """Sidecar LoRA for the QuantFunc native loader — MODEL in, MODEL out (LoraLoaderModelOnly
         shape). Chain several to stack them.
 
-        The engine applies sidecar LoRA at pipeline CREATE time (runtime hot-swap is not wired for
-        the video pipelines), so this node RE-CREATES the pipeline for the accumulated LoRA set.
-        The engine merges each LoRA onto the svdq slots' sidecar branches — the int4 base weights
-        are never touched — and a wrong-arch / typo'd file fails LOUD at create, never silently.
+        The engine merges sidecar LoRA at pipeline CREATE time (runtime hot-swap is not wired for
+        the video pipelines), so this node RE-CREATES the pipeline for the accumulated set — the
+        create itself is deferred (QFLazyEngine), so a chain of N nodes still builds ONE pipeline.
+        Comfy-level patches applied upstream (ModelSampling*, set_model_* …) are TRANSPLANTED onto
+        the rebuilt patcher, so this node may sit anywhere in the chain.
         """
         @classmethod
         def INPUT_TYPES(cls):
@@ -399,36 +488,39 @@ if _IMPORT_OK:
                 "lora_name": (_lora_choices(),),
                 "strength": ("FLOAT", {"default": 1.0, "min": -100.0, "max": 100.0, "step": 0.01}),
             }, "optional": {
-                # wan A14B per-expert routing: all (default) | high | low. Single-transformer
-                # families (LTX/H3) take "all"; an explicit high/low there fails loud engine-side
-                # rather than silently mis-routing.
-                "target": (["all", "high", "low"],),
+                "target": (["all", "high", "low"],
+                           {"tooltip": "wan A14B per-expert routing. Single-transformer families "
+                                       "(LTX / H3) take 'all'; an explicit high/low there is "
+                                       "refused engine-side rather than silently mis-routed."}),
             }}
 
         RETURN_TYPES = ("MODEL",)
         FUNCTION = "apply"
-        CATEGORY = "QuantFunc/native"
-        DESCRIPTION = ("Attaches a sidecar LoRA to a QuantFunc native MODEL (wire it downstream of a "
-                       "QuantFunc native loader; chain several to stack). Applying or changing a LoRA "
-                       "re-creates the engine pipeline, because the engine merges sidecar LoRA at "
-                       "create time.")
+        CATEGORY = "loaders"
+        DESCRIPTION = ("Attaches a sidecar LoRA to a QuantFunc native MODEL (wire downstream of the "
+                       "QuantFunc Native Loader; chain several to stack). The engine merges sidecar "
+                       "LoRA at create time, so the pipeline is re-created for the new set.")
 
         def apply(self, model, lora_name, strength, target="all"):
-            inner = getattr(model, "model", None)
-            rebuild = getattr(inner, "_qf_rebuild", None)
+            rebuild = qfmp.rebuild_of(model)
             if rebuild is None:
                 raise RuntimeError(
                     "QuantFuncNativeLoRA: this MODEL is not a QuantFunc native model — wire it "
-                    "downstream of a QuantFunc Native Wan/LTX/H3 Loader. (For a stock comfy model "
-                    "use the built-in LoraLoaderModelOnly instead.)")
-            stack = list(getattr(inner, "_qf_lora_stack", []))
+                    "downstream of the QuantFunc Native Loader. (For a stock comfy model use the "
+                    "built-in LoraLoaderModelOnly instead.)")
+            stack = qfmp.lora_stack_of(model)
             stack.append({"path": _resolve_lora(lora_name), "scale": float(strength),
                           "target": target})
-            return (rebuild(stack),)
+            rebuilt = rebuild(stack)
+            # CR regression fix: carry the UPSTREAM comfy state (ModelSampling* object patches,
+            # set_model_* options, callbacks/wrappers/hooks) onto the re-created patcher, so a
+            # LoRA node placed after a ModelSampling node cannot silently drop its shift.
+            return (rebuilt.adopt_comfy_state_from(model),)
 
     # merge into (not replace) the mappings — matches the real plugin's multi-file NODE_CLASS_MAPPINGS.update
-    NODE_CLASS_MAPPINGS.update({"QuantFuncNativeWanLoader": QuantFuncNativeWanLoader,
-                            "QuantFuncNativeLoRA": QuantFuncNativeLoRA})
+    _FAMILY_BUILDERS = {"wan": _build_wan}     # LTX / H3 register theirs below
+    NODE_CLASS_MAPPINGS.update({"QuantFuncNativeLoader": QuantFuncNativeLoader,
+                                "QuantFuncNativeLoRA": QuantFuncNativeLoRA})
 
     # AUTOMATION — a mechanism must not depend on someone remembering to run it (CR): run the reject-list
     # completeness scan AT IMPORT so a comfy upgrade that adds a consumable conditioning key emits a loud
@@ -444,17 +536,16 @@ if _IMPORT_OK:
         _rc.warn_if_stale(comfy_root=os.path.dirname(os.path.dirname(comfy.model_management.__file__)))
     except Exception as _rc_exc:  # noqa: BLE001 — the self-check must never break plugin import
         logging.debug("[qf_native] reject-list self-check skipped: %r", _rc_exc)
-    NODE_DISPLAY_NAME_MAPPINGS.update({"QuantFuncNativeWanLoader": "QuantFunc Native Wan Loader",
-                                   "QuantFuncNativeLoRA": "QuantFunc Native LoRA"})
+    NODE_DISPLAY_NAME_MAPPINGS.update({"QuantFuncNativeLoader": "QuantFunc Native Loader",
+                                       "QuantFuncNativeLoRA": "QuantFunc Native LoRA"})
 
     # LTX-2 native seam (qf_ltx_modelpatcher). Additive + defensively guarded: a bug in the LTX file
     # must NEVER break the wan loader's registration. _get_engine + _PIPELINE_MODELS are threaded in
     # (they live here, not in qf_modelpatcher) to avoid a circular import.
     try:
         from . import qf_ltx_modelpatcher as _qf_ltx
-        _qf_ltx.register(NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS, _get_engine, _PIPELINE_MODELS,
-                         _list_quantfunc_packages, _resolve_package,
-                         _estimate_package_footprint)
+        _FAMILY_BUILDERS["ltx2"] = _qf_ltx.register(
+            _get_engine, _PIPELINE_MODELS, _estimate_package_footprint, QFLazyEngine)
     except Exception as _ltx_exc:  # noqa: BLE001 — LTX registration must never break plugin import
         logging.warning("[qf_native] LTX loader registration skipped: %r", _ltx_exc)
 
@@ -462,8 +553,7 @@ if _IMPORT_OK:
     # a bug in the H3 file must NEVER break the wan/LTX loaders' registration.
     try:
         from . import qf_h3_modelpatcher as _qf_h3
-        _qf_h3.register(NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS, _get_engine, _PIPELINE_MODELS,
-                        _list_quantfunc_packages, _resolve_package,
-                         _estimate_package_footprint)
+        _FAMILY_BUILDERS["minimax-h3"] = _qf_h3.register(
+            _get_engine, _PIPELINE_MODELS, _estimate_package_footprint, QFLazyEngine)
     except Exception as _h3_exc:  # noqa: BLE001 — H3 registration must never break plugin import
         logging.warning("[qf_native] H3 loader registration skipped: %r", _h3_exc)

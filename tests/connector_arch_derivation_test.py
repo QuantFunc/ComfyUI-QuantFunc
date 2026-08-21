@@ -90,16 +90,19 @@ def main():
         except Exception as e:  # noqa: BLE001
             print(f"  [FAIL] {label}: raised {type(e).__name__}, expected RuntimeError"); bad[0] += 1
 
-    # 1) real 8-block gated VIDEO connector -> (n_layers, num_heads, head_dim, n_registers)
+    # 1) real 8-block gated VIDEO connector ->
+    #    (n_layers, num_heads, head_dim, n_registers, has_gate) — FIVE values: has_gate is
+    #    load-bearing (the caller passes it as Embeddings1DConnector(apply_gated_attention=...)),
+    #    so it is asserted, not sliced off. These fixtures are GATED, hence True.
     try:
-        check("real video 8-block", derive(_blocks(8), "video") == (8, 32, 128, 128),
-              f"-> {derive(_blocks(8), 'video')} (expect (8, 32, 128, 128))")
+        check("real video 8-block", derive(_blocks(8), "video") == (8, 32, 128, 128, True),
+              f"-> {derive(_blocks(8), 'video')} (expect (8, 32, 128, 128, True))")
     except Exception as e:  # noqa: BLE001
         check("real video 8-block", False, f"raised {e!r}")
     # 1b) real AUDIO shape (inner=2048 -> head_dim=64) -- Reviewer A: audio shape was untested
     try:
-        check("real audio (inner=2048)", derive(_blocks(8, inner=2048), "audio") == (8, 32, 64, 128),
-              f"-> {derive(_blocks(8, inner=2048), 'audio')} (expect (8, 32, 64, 128))")
+        check("real audio (inner=2048)", derive(_blocks(8, inner=2048), "audio") == (8, 32, 64, 128, True),
+              f"-> {derive(_blocks(8, inner=2048), 'audio')} (expect (8, 32, 64, 128, True))")
     except Exception as e:  # noqa: BLE001
         check("real audio (inner=2048)", False, f"raised {e!r}")
 
@@ -148,7 +151,7 @@ def main():
     #    ACCEPT (proves the ceiling does NOT false-reject a per-axis-large-but-product-ok single connector).
     try:
         r = derive(_blocks(4, inner=8192), "wide-within")
-        check("within: 4L/8192 (~6 GiB) accepted", r == (4, 32, 256, 128), f"-> {r}")
+        check("within: 4L/8192 (~6 GiB) accepted", r == (4, 32, 256, 128, True), f"-> {r}")
     except Exception as e:  # noqa: BLE001
         check("within: 4L/8192 (~6 GiB) accepted", False, f"raised {e!r}")
 

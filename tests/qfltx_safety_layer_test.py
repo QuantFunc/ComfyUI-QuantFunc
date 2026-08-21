@@ -3,7 +3,7 @@
 
 WHY THIS EXISTS (the self-CR regression/correctness NEEDS-EVIDENCE): reject_list_completeness.py proves the
 reject-LIST is COMPLETE (a static textual scan of comfy's consumed keys vs the tuple), but nothing EXECUTED
-the ported methods — extra_conds / scale_latent_inpaint / _check_geometry and the Interrupt session-clearing
+the ported methods — extra_conds / scale_latent_inpaint / _derive_geometry and the Interrupt session-clearing
 guard. "4/4 pass" read as if the safety layer was exercised when it was not. This file closes that: it drives
 the REAL on-disk method bodies and asserts raise / no-raise on both directions.
 
@@ -307,8 +307,14 @@ def _t_wan_interrupt(src):
           "_interrupt_poll_end_session_on_raise": helper}
     exec(_extract_method(wan_src, "QFWanModel", "_apply_model"), ns)  # noqa: S102 — trusted repo source
     fn = ns["_apply_model"]
-    eng = _MockEngine(open_session=object())   # session OPEN → _begin/_check_geometry are skipped
-    me = _mock_self(_qf=eng, _max_batch=0, _out=None, _step_i=0)
+    eng = _MockEngine(open_session=object())   # session OPEN → _begin/_derive_geometry are skipped
+    me = _mock_self(_qf=eng, _max_batch=0, _out=None, _step_i=0,
+                    # the real WAN _apply_model consults these before the interrupt poll;
+                    # stub them so this arm exercises the GUARD, not the surrounding plumbing.
+                    _sigma_step_index=lambda *a, **k: 0,
+                    _derive_geometry=lambda *a, **k: None,
+                    _ctx_key_assigner=types.SimpleNamespace(key_for=lambda *a, **k: 0,
+                                                            reset=lambda: None))
     x = torch.zeros(1, 16, 2, 2, 2)            # [B,C,T,Hl,Wl] wan latent shape (values irrelevant)
     bad = 0
     try:
@@ -382,42 +388,54 @@ def _t_scale_latent_inpaint(src):
         print("  scale_latent_inpaint: OK (a wired denoise mask fails loud)"); return 0
 
 
-def _t_check_geometry(src):
+def _t_derive_geometry(src):
+    """The loader carries NO geometry widgets any more (official-loader shape), so the seam DERIVES
+    the session geometry from the graph. This pins the derivation + the ONE refusal that is a real
+    incompatibility (a trimmed sigma range mis-times the engine's internal schedule)."""
     kT = _extract_const(src, "_LTX_TEMPORAL")
     kS = _extract_const(src, "_LTX_SPATIAL")
-    fn, _ = _bind(src, "_check_geometry", {"_LTX_TEMPORAL": kT, "_LTX_SPATIAL": kS})
-    # a MATCHING geometry: num_frames=9 -> F_lat=(9-1)//8+1=2; 64x64 px -> 2x2 latent (kS=32); 4 steps.
-    nf, W, H, steps = 9, 64, 64, 4
-    Flat = (nf - 1) // kT + 1
-    Wl, Hl = W // kS, H // kS
-    me = _mock_self(_num_frames=nf, _width=W, _height=H, _num_steps=steps)
-    good = torch.zeros(1, 128, Flat, Hl, Wl)
-    to_ok = {"sample_sigmas": list(range(steps + 1))}   # len-1 == steps
+    fn, _ = _bind(src, "_derive_geometry", {"_LTX_TEMPORAL": kT, "_LTX_SPATIAL": kS})
     bad = 0
+    Flat, steps = 4, 6
+    x = torch.zeros(1, 128, Flat, 2, 2)
+    ms = types.SimpleNamespace(sigma_max=1.0)
+
+    # 1) a FULL-range schedule derives BOTH quantities from the graph (no widgets involved).
+    me = _mock_self(_num_frames=0, _num_steps=0, model_sampling=ms)
+    full = [1.0 - i / steps for i in range(steps)] + [0.0]     # 1.0 -> 0.0, len == steps+1
     try:
-        fn(me, good, to_ok)   # must NOT raise
+        fn(me, x, {"sample_sigmas": full})
+        want_frames = (Flat - 1) * kT + 1
+        if me._num_frames != want_frames:
+            print(f"  [FAIL] _derive_geometry: num_frames {me._num_frames} != {want_frames}"); bad += 1
+        if me._num_steps != steps:
+            print(f"  [FAIL] _derive_geometry: num_steps {me._num_steps} != {steps}"); bad += 1
     except RuntimeError as e:
-        print(f"  [FAIL] _check_geometry raised on a MATCHING geometry: {e}"); bad += 1
-    # each mismatch axis must raise INDIVIDUALLY:
-    axes = {
-        "frames": torch.zeros(1, 128, Flat + 1, Hl, Wl),
-        "width":  torch.zeros(1, 128, Flat, Hl, Wl + 1),
-        "height": torch.zeros(1, 128, Flat, Hl + 1, Wl),
-    }
-    for name, x in axes.items():
+        print(f"  [FAIL] _derive_geometry raised on a FULL-range schedule: {e}"); bad += 1
+
+    # 2) no schedule at all -> refuse (the seam cannot invent a step count).
+    for name, to in (("missing", {}), ("too-short", {"sample_sigmas": [1.0]})):
         try:
-            fn(me, x, to_ok)
-            print(f"  [FAIL] _check_geometry did NOT raise on {name} mismatch"); bad += 1
+            fn(_mock_self(_num_frames=0, _num_steps=0, model_sampling=ms), x, to)
+            print(f"  [FAIL] _derive_geometry did NOT raise on a {name} sigma schedule"); bad += 1
         except RuntimeError:
             pass
-    # steps mismatch (sigmas len-1 != num_steps) must raise:
-    try:
-        fn(me, good, {"sample_sigmas": list(range(steps + 3))})
-        print("  [FAIL] _check_geometry did NOT raise on steps mismatch"); bad += 1
-    except RuntimeError:
-        pass
-    print(f"  _check_geometry: {'OK' if bad == 0 else 'FAIL'} (matching passes; frames/width/height/steps "
-          "each raise individually)")
+
+    # 3) a TRIMMED range must refuse, both directions:
+    #    end trimmed (denoise<1 / last_step<steps) and start trimmed (start_step>0).
+    trims = {
+        "end-trimmed":   [1.0 - i / steps for i in range(steps + 1)][:-1] + [0.3],
+        "start-trimmed": [0.5 - i * (0.5 / steps) for i in range(steps)] + [0.0],
+    }
+    for name, sig in trims.items():
+        try:
+            fn(_mock_self(_num_frames=0, _num_steps=0, model_sampling=ms), x, {"sample_sigmas": sig})
+            print(f"  [FAIL] _derive_geometry did NOT raise on a {name} schedule"); bad += 1
+        except RuntimeError:
+            pass
+
+    print(f"  _derive_geometry: {'OK' if bad == 0 else 'FAIL'} (derives frames+steps from the graph; "
+          "missing/short/trimmed schedules each refuse)")
     return bad
 
 
@@ -433,8 +451,12 @@ def _t_interrupt(src):
     eng = _MockEngine(open_session=object())   # a session is OPEN when the interrupt fires
     me = _mock_self(
         _qf=eng, _num_frames=9, _width=64, _height=64, _num_steps=4,
-        _check_geometry=lambda *a, **k: None,                      # geometry not under test here
-        _run_connector=lambda ca: torch.zeros(1, 3, 4096),        # skip the real connector
+        _derive_geometry=lambda *a, **k: None,                     # geometry not under test here
+        _run_connector=lambda ca, *a, **k: torch.zeros(1, 3, 4096),   # skip the real connector
+        _sigma_step_index=lambda *a, **k: 0,                       # consulted before the poll
+        _ctx_key_assigner=types.SimpleNamespace(key_for=lambda *a, **k: 0, reset=lambda: None),
+        #                    ^ the real call passes attention_mask — accept-anything keeps this
+        #                      mock from drifting again when the seam grows another kwarg.
         _out=None, _step_i=0,
     )
     x = torch.zeros(1, 128, 2, 2, 2)
@@ -461,7 +483,7 @@ def main():
     print(f"=== QFLTXModel safety-layer behavioral test (src={os.path.relpath(_SRC, _HERE)}) ===")
     bad = 0
     for t in (_t_extra_conds, _t_max_ctx_seq, _t_post_connector_seq, _t_scale_latent_inpaint,
-              _t_check_geometry, _t_interrupt, _t_wan_interrupt, _t_shared_interrupt_helper):
+              _t_derive_geometry, _t_interrupt, _t_wan_interrupt, _t_shared_interrupt_helper):
         try:
             bad += t(src)
         except Exception as e:   # noqa: BLE001 — a harness error is a FAIL, not a crash-through

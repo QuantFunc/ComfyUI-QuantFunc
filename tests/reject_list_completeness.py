@@ -75,6 +75,23 @@ _AUDITED_MODELS = (
     _Model("LTXV", "qf_ltx_modelpatcher.py",
            {"attention_mask", "frame_rate"},
            ("concat_cond", "encode_adm")),
+    # MiniMax-H3 joint-AV (QFH3Model) — this seam was UNAUDITED until the roster scan was repaired
+    # (the class pattern stopped matching once the shared mixin was introduced, so the check
+    # silently certified nothing; MEASURED). Its reject-list is the same defensive superset shape.
+    # Documented-ACCEPTED keys, each CONSUMED by the seam rather than dropped:
+    #  • minimax_keyframes / minimax_refs / minimax_token_tags — read in extra_conds and forwarded
+    #    to the engine through the av_conds bridge (the fl2va keyframe + ref2va reference paths).
+    #  • minimax_payload — the OFFICIAL model_base.MiniMaxH3 channel; the seam re-emits it as a
+    #    CONDConstant and binds it session-wide at _begin (with the C2 ordering guard).
+    #  • cross_attn — emitted as c_crossattn (the one channel the engine takes).
+    #  • latent_shapes — NOT dropped: comfy sets model.latent_shapes and _apply_model uses it to
+    #    split the PACKED [B,1,N] AV latent into its video/audio halves (a dedicated mechanism).
+    #  • seed — the engine denoises the latent comfy's sampler already noised, so the seam needs no
+    #    seed of its own; comfy's own use of it (noise/unclip) is upstream of this model.
+    _Model("MiniMaxH3", "qf_h3_modelpatcher.py",
+           {"minimax_keyframes", "minimax_refs", "minimax_token_tags", "minimax_payload",
+            "latent_shapes", "seed"},
+           ("concat_cond", "encode_adm")),
 )
 
 
@@ -177,8 +194,17 @@ def _derived_roster_defects():
             continue
         # `class QF<Name>Model(comfy.model_base.<Base>):` — the native-seam pattern. <Base> (WAN21/LTXV/…) is
         # the comfy class whose extra_conds the subclass bypasses, i.e. exactly the _AUDITED_MODELS.comfy_class.
-        for m in re.finditer(r"class\s+(QF\w*Model)\s*\(\s*comfy\.model_base\.(\w+)\s*\)", src):
-            qf_cls, base = m.group(1), m.group(2)
+        # The base list may carry OTHER bases before the comfy one (the seams are
+        # `class QFWanModel(QFSessionModelMixin, comfy.model_base.WAN21)`), so match the whole
+        # base list and find the comfy base inside it. Pinning comfy.model_base to the FIRST
+        # position is what made this scan match NOTHING once the shared mixin was introduced —
+        # i.e. the completeness check silently certified nothing (MEASURED, pre-existing).
+        for m in re.finditer(r"class\s+(QF\w*Model)\s*\(([^)]*)\)", src):
+            qf_cls, bases = m.group(1), m.group(2)
+            bm = re.search(r"comfy\.model_base\.(\w+)", bases)
+            if bm is None:
+                continue                 # QFLTXAVModel(QFLTXModel): inherits an already-audited seam
+            base = bm.group(1)
             seen.add(base)
             if base not in audited:
                 defects.append(

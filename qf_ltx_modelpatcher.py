@@ -45,6 +45,7 @@ from . import qf_engine as qfe
 # Reuse the wan seam's shared, already-CR'd model-layer helpers. NOTE: _get_engine + _PIPELINE_MODELS
 # live in __init__.py (which imports THIS file), so they are threaded into register() as params to
 # avoid a circular import — mirroring where the wan loader is defined (inline in __init__.py).
+from . import qf_modelpatcher as qfmp
 from .qf_modelpatcher import (_qf_dtype, QFModelPatcher, _QFStub,
                               _interrupt_poll_end_session_on_raise,
                               save_ref_tempfile, cleanup_ref_tempfile,
@@ -157,7 +158,9 @@ _LTX_CHANNELS = 128
 def _derive_connector_arch(sd, desc, authoritative_heads=None):
     """Derive the FULL Embeddings1DConnector arch from the checkpoint state_dict -- EVERY dim is a checkpoint
     property, NOT a constant (dossier seq-250/252 + Finding #1). Returns (n_layers, num_heads, head_dim,
-    n_registers). Non-gated is REFUSED (see below) so has_gate is not returned (always True on success).
+    n_registers, has_gate) -- 5 values. has_gate IS returned and IS load-bearing: the caller passes it as
+    Embeddings1DConnector(apply_gated_attention=...). A non-gated checkpoint is refused ONLY when no
+    authoritative head count is available (see below); with one it loads with has_gate False.
 
       * n_layers = 1 + max transformer_1d_blocks index (^-anchored). A wrong value trips the 0/0 load guard
         (unexpected/missing weights) -> that is how the quarter-depth 2-vs-8 bug surfaced (unexpected=100).
@@ -1003,154 +1006,48 @@ class QFLTXAVModel(QFLTXModel):
         return super(QFLTXModel, self).process_latent_out(latent)
 
 
-def register(NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS, get_engine, pipeline_models,
-             list_packages, resolve_package, estimate_footprint):
-    """Register the LTX loader node (called from __init__.py alongside the wan loader). get_engine,
-    pipeline_models + the models/quantfunc package helpers are __init__.py's shared helpers,
-    threaded in to avoid a circular import."""
+def register(get_engine, pipeline_models, estimate_footprint, QFLazyEngine):
+    """Return the LTX-2 family BUILDER for the single QuantFunc Native Loader node (the per-family
+    loader node is gone — one node with a model dropdown dispatches here). get_engine,
+    pipeline_models, estimate_footprint + QFLazyEngine are __init__.py's shared helpers, threaded
+    in to avoid a circular import."""
 
-    class QuantFuncNativeLTXLoader:
-        """Create an LTX-2 svdq pipeline and expose it as a native comfy MODEL (native-KSampler seam, t2v).
+    def build(model_dir, model_name, resident_block_count, start_image=None,
+              connector_ckpt="(none)", lora_entries=()):
+        if connector_ckpt and connector_ckpt != "(none)":
+            import folder_paths as _fp
+            connector_ckpt = _fp.get_full_path_or_raise("checkpoints", connector_ckpt)
+        else:
+            connector_ckpt = ""
 
-        The engine model_dir must be a VIDEO-ONLY svdq LTX-2 checkpoint (the engine refuses a joint-AV
-        checkpoint's external session). connector_ckpt is the comfy LTX-2.3 checkpoint that carries
-        model.diffusion_model.video_embeddings_connector.* (this seam runs that connector itself because it
-        bypasses comfy's LTX diffusion model). Only THIS node is swapped into a stock LTX-2.3 T2V workflow;
-        the LTX CLIPTextEncode / KSampler / VAEDecode / SaveVideo stay stock."""
 
-        @classmethod
-        def INPUT_TYPES(cls):
-            _ckpts = []
-            try:
-                import folder_paths as _fp
-                _ckpts = _fp.get_filename_list("checkpoints")
-            except Exception:  # noqa: BLE001
-                _ckpts = []
-            return {"required": {
-                "model_name": (list_packages(),),
-                # [manual-residency] GPU-resident transformer blocks (the native seam's ONLY
-                # residency mechanism; engine clamps to the model's block count).
-                "resident_block_count": ("INT", {"default": 999, "min": 1, "max": 1024}),
-            }, "optional": {
-                # LTX-2.3 / 19B VIDEO-ONLY path ONLY: the comfy LTX checkpoint carrying
-                # model.diffusion_model.video_embeddings_connector.* (this seam runs that connector
-                # itself because it bypasses comfy's LTX diffusion model). UNUSED on the LTX-2.5
-                # JOINT-AV path (that package ships audio_vae/ and the engine runs its own connector).
-                "connector_ckpt": (["(none)"] + list(_ckpts),),
-                # i2v: wire a LoadImage here (frame-0 conditioning; the engine center-crop-fills the
-                # image to the latent's size — aspect mismatch = crop, never stretch — then VAE-encodes
-                # it and pins frame 0 through denoise + finalize). Absent = t2v.
-                # Do NOT use LTXVImgToVideo / LTXVAddGuide with this loader — their conditioning keys
-                # are rejected fail-loud (this seam runs the engine's own schedule).
-                "start_image": ("IMAGE",),
-            }}
+        def _tag(patcher, lora_entries):
+            """Mark the built model so the downstream QuantFuncNativeLoRA node can append to
+            its stack and re-create the pipeline (create-time sidecar LoRA)."""
+            m = patcher.model
+            
+            
+            return patcher
 
-        RETURN_TYPES = ("MODEL",)
-        FUNCTION = "load"
-        CATEGORY = "QuantFunc/native"
-        DESCRIPTION = (
-            "Loads a QuantFunc LTX-2 svdq pipeline and exposes it as a native comfy MODEL a STOCK "
-            "KSampler drives (only this loader node is swapped in). VIDEO-ONLY model_dir (no audio_vae/): "
-            "the 19B/2.3 path — connector_ckpt (comfy ckpt with video_embeddings_connector) required; "
-            "keep the stock LTX CLIPTextEncode / KSampler / VAEDecode / SaveVideo; i2v via start_image "
-            "(engine center-crop-fills; LTXVImgToVideo/LTXVAddGuide conditioning is rejected fail-loud). "
-            "JOINT-AV model_dir (ships audio_vae/, e.g. LTX-2.5): t2av — wire the LTX-2.5 'with-proj' "
-            "gemma4 TE, LTXVEmptyLatentAudio + LTXVConcatAVLatent into the sampler, and "
-            "LTXVSeparateAVLatent → VAEDecode + VAEDecodeAudio → CreateVideo(audio) on the way out; "
-            "connector_ckpt is unused (the engine runs its own checkpoint connector).")
-
-        def load(self, model_name, resident_block_count=999, connector_ckpt="(none)",
-                 start_image=None):
-            model_dir = resolve_package(model_name)
-            if connector_ckpt and connector_ckpt != "(none)":
-                import folder_paths as _fp
-                connector_ckpt = _fp.get_full_path_or_raise("checkpoints", connector_ckpt)
-            else:
-                connector_ckpt = ""
-
-            def _tag(patcher, lora_entries):
-                """Mark the built model so the downstream QuantFuncNativeLoRA node can append to
-                its stack and re-create the pipeline (create-time sidecar LoRA)."""
-                m = patcher.model
-                m._qf_lora_stack = list(lora_entries)
-                m._qf_rebuild = _build
-                return patcher
-
-            def _build(lora_entries):
-                """Create (or reuse) the pipeline for THIS lora set + wrap it in a patcher."""
-                join_audio_prompt = False        # a2v split not implemented in this seam (see below)
-                _lora_cfg = {}
-                if lora_entries:
-                    _lora_cfg["lora"] = list(lora_entries)   # engine svdq factory: sidecar apply post-load
-                # ── LTX-2.5 JOINT-AV auto-detect (c5.8b): the SAME discriminant the engine's own
-                # has_audio_ uses — the engine model_dir ships audio_vae/ weights (the video-only
-                # 19B staging deliberately omits it) — so plugin and engine agree by construction.
-                # AV → QFLTXAVModel (t2av; engine-side connector via av_unprocessed_ctx; NO
-                # connector_ckpt needed). Video-only → the existing path, byte-unchanged.
-                _avae_dir = os.path.join(model_dir, "audio_vae")
-                _is_av = os.path.isdir(_avae_dir) and any(
-                    f.endswith(".safetensors") for f in os.listdir(_avae_dir))
-                if _is_av:
-                    if join_audio_prompt:
-                        raise RuntimeError(
-                            "QuantFuncNativeLTXLoader: join_audio_prompt belongs to the LEGACY 2.3 "
-                            "plugin-connector split and is not used on the LTX-2.5 AV path — the AV "
-                            "session derives BOTH modality embeds engine-side. Leave it False.")
-                    def _factory():
-                        eng, ckey = get_engine(model_dir, create_cfg=(_lora_cfg or None))
-                        pipeline_models[ckey] = weakref.ref(model)
-                        return eng, ckey
-
-                    # DEFERRED create (QFLazyEngine): a chained QuantFuncNativeLoRA rebuilds for its
-                    # accumulated LoRA set, so an eager create here would build ONE PIPELINE PER
-                    # CHAIN LINK (and comfy's node-output cache would pin every intermediate's
-                    # multi-GB CPU backup). Only the model the sampler touches is ever created.
-                    engine = QFLazyEngine(_factory, estimate_footprint(model_dir))
-                    device = comfy.model_management.get_torch_device()
-                    offload = comfy.model_management.unet_offload_device()
-                    unet_config = {"image_model": "ltxav", "disable_unet_model_creation": True}
-                    model_config = comfy.supported_models.LTXAV(unet_config)
-                    for attr, default in (("manual_cast_dtype", None), ("custom_operations", None),
-                                          ("optimizations", {}), ("scaled_fp8", None)):
-                        if not hasattr(model_config, attr):
-                            setattr(model_config, attr, default)
-                    model = QFLTXAVModel(model_config, engine, device=device,
-                                         start_image=start_image,
-                                         resident_block_count=resident_block_count)
-                    patcher = QFModelPatcher(model, load_device=device, offload_device=offload)
-                    print(f"[qf_native] loaded QuantFuncNativeLTXLoader (LTX-2.5 JOINT-AV svdq) "
-                          f"package={model_name} resident_blocks={resident_block_count} "
-                          f"footprint~{engine.footprint_bytes // (1024*1024)}MB (create deferred)", flush=True)
-                    return _tag(patcher, lora_entries)
-                if not connector_ckpt:
-                    raise RuntimeError("QuantFuncNativeLTXLoader: connector_ckpt (comfy LTX-2.3 ckpt with the "
-                                       "video_embeddings_connector) is required")
-                # ★ join_audio_prompt=True is a KNOWN-BROKEN config (CR vuln): the joint audio+video (a2v) path needs
-                # an engine external-step split (makeExternalStepFn) this seam does NOT yet implement, so building the
-                # audio connector + passing a 6144 cond would drive a wrong/degenerate result with NO error. REFUSE it
-                # loud (this file's own 21-raise fail-loud pattern) rather than silently misbehave. The audio-connector
-                # loader below is now UNREACHABLE until this guard lifts; it is kept because its combined-footprint
-                # ACCOUNTING helpers (_derive_connector_arch / _accumulate_connector_footprint) are exercised by
-                # connector_arch_derivation_test (arm-9) + document/BOUND the future a2v split. (The loader function
-                # _load_ltx_audio_connector itself is NOT directly unit-tested — only those accounting helpers are.)
-                if join_audio_prompt:
-                    raise RuntimeError(
-                        "QuantFuncNativeLTXLoader: join_audio_prompt=True (joint audio+video) is not supported yet — "
-                        "the engine external-step audio/video split (makeExternalStepFn) it requires is not implemented "
-                        "in this seam, so the joint path would produce a wrong result. Use join_audio_prompt=False "
-                        "(video-only) until the engine a2v split lands.")
-                # LTX svdq is PRE-quantized: pass the MINIMUM to create (minimal=True → empty config_json).
-                # The svdquant metadata carries the layout/precision (embedded config: cross_attn_mod=True /
-                # audio_cross_attn_mod=True / cross_attention_dim 4096 / num_heads 32 → 9-mod). ANYTHING
-                # supplied on top (auto_optimize / height / width / a precision map) competes with it and the
-                # engine resolves to the 19b default (connector 3840 / transformer 6-mod — the E2E run-1..8
-                # create mis-size). The harness's whole svdq entry is {backend:svdq, model_dir}; mirror that.
-                # RESIDUAL (tracked, §6.5 wan text_precision round): an EMPTY config also means the engine's
-                # resolve-at-entry text-precision falls to its SM-DEFAULT tier (est::smDefaultTextPrecision:
-                # fp4 on SM120+, int4 below). That default is what BROKE the wan loader (UMT5 rejects 4-bit);
-                # it currently WORKS here because LTX's TE tiers accept the default — but if an LTX TE arch
-                # without a wired 4-bit tier ever routes through this minimal create, it hits the same class.
-                # No fix now (adding keys back defeats minimal=True's purpose); this note is the tripwire.
+        def _build(lora_entries):
+            """Create (or reuse) the pipeline for THIS lora set + wrap it in a patcher."""
+            # NOTE (CR simplicity): the joint audio+video (a2v) path needs an engine external-step
+            # split (makeExternalStepFn) this seam does not implement, and since the widget was
+            # removed there is no way to request it — so the old join_audio_prompt flag and its two
+            # refusal branches are GONE (structurally unreachable code is not a guard). The AV path
+            # below is LTX-2.5's own engine-side joint AV, which is a different mechanism.
+            _lora_cfg = {}
+            if lora_entries:
+                _lora_cfg["lora"] = list(lora_entries)   # engine svdq factory: sidecar apply post-load
+            # ── LTX-2.5 JOINT-AV auto-detect (c5.8b): the SAME discriminant the engine's own
+            # has_audio_ uses — the engine model_dir ships audio_vae/ weights (the video-only
+            # 19B staging deliberately omits it) — so plugin and engine agree by construction.
+            # AV → QFLTXAVModel (t2av; engine-side connector via av_unprocessed_ctx; NO
+            # connector_ckpt needed). Video-only → the existing path, byte-unchanged.
+            _avae_dir = os.path.join(model_dir, "audio_vae")
+            _is_av = os.path.isdir(_avae_dir) and any(
+                f.endswith(".safetensors") for f in os.listdir(_avae_dir))
+            if _is_av:
                 def _factory():
                     eng, ckey = get_engine(model_dir, create_cfg=(_lora_cfg or None))
                     pipeline_models[ckey] = weakref.ref(model)
@@ -1161,59 +1058,105 @@ def register(NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS, get_engine, pipeli
                 # CHAIN LINK (and comfy's node-output cache would pin every intermediate's
                 # multi-GB CPU backup). Only the model the sampler touches is ever created.
                 engine = QFLazyEngine(_factory, estimate_footprint(model_dir))
-                # [19B non-gated connector] authoritative head count from the ORIGINAL model dir\'s diffusers
-                # LTX2TextConnectors config (the 19B family ships NON-gated connector weights; the head split
-                # lives ONLY here). Absent/malformed -> None (gated checkpoints need nothing; a non-gated one
-                # then fail-louds in _derive_connector_arch). The staged video-only dir may symlink or omit
-                # connectors/ -- we also probe the transformer_path\'s parent for the original layout.
-                auth_heads = None
-                for _cand in (os.path.join(model_dir, "connectors", "config.json"),
-                              os.path.join(os.path.dirname(os.path.realpath(os.path.join(model_dir, "transformer"))),
-                                           "connectors", "config.json")):
-                    try:
-                        with open(_cand) as _cf:
-                            _cc = json.load(_cf)
-                        _v = _cc.get("video_connector_num_attention_heads")
-                        if isinstance(_v, int) and 1 <= _v <= _MAX_CONNECTOR_HEADS:
-                            auth_heads = _v
-                            break
-                    except (OSError, ValueError):
-                        continue
                 device = comfy.model_management.get_torch_device()
                 offload = comfy.model_management.unet_offload_device()
-                # ★ PER-LOAD combined-footprint running total: THIS load() holds the video connector AND (when
-                # join_audio_prompt=True) the audio connector CONCURRENTLY, so their host allocs ADD. `conn_budget` is
-                # a fresh 1-element list scoped to THIS call (NO cross-call/module state -- a module accumulator would
-                # drift upward across loads and false-reject legitimate configs after N runs). Each connector load adds
-                # its est to it and REJECTS if the running total exceeds _MAX_CONNECTOR_TOTAL_BYTES before its eager build.
-                conn_budget = [0]
-                connector = _load_ltx_video_connector(connector_ckpt, device, _budget=conn_budget,
-                                                       authoritative_heads=auth_heads)
-                # (b) SKIP (default, join_audio_prompt=False): audio_connector=None -> _run_connector returns 4096
-                # video-only (ltx's RULED path; the engine skips the audio arm and the video arm gets its 4096).
-                # (a) SPLIT (join_audio_prompt=True): load the audio connector -> 6144, which additionally needs the
-                # engine external-step split (makeExternalStepFn), NOT part of the (b) skip (dossier seq-242). The audio
-                # load adds to conn_budget ON TOP of the video -> the COMBINED pair is bounded, not each connector alone.
-                audio_connector = (_load_ltx_audio_connector(connector_ckpt, device, _budget=conn_budget)
-                                   if join_audio_prompt else None)
-
-                unet_config = {"image_model": "ltxv", "disable_unet_model_creation": True}
-                model_config = comfy.supported_models.LTXV(unet_config)
+                unet_config = {"image_model": "ltxav", "disable_unet_model_creation": True}
+                model_config = comfy.supported_models.LTXAV(unet_config)
                 for attr, default in (("manual_cast_dtype", None), ("custom_operations", None),
                                       ("optimizations", {}), ("scaled_fp8", None)):
                     if not hasattr(model_config, attr):
                         setattr(model_config, attr, default)
-
-                model = QFLTXModel(model_config, engine, connector, device=device,
-                                   audio_connector=audio_connector, start_image=start_image,
-                                   resident_block_count=resident_block_count)
+                model = QFLTXAVModel(model_config, engine, device=device,
+                                     start_image=start_image,
+                                     resident_block_count=resident_block_count)
                 patcher = QFModelPatcher(model, load_device=device, offload_device=offload)
-                print(f"[qf_native] loaded QuantFuncNativeLTXLoader (LTX-2 svdq) package={model_name} "
-                      f"resident_blocks={resident_block_count} "
+                print(f"[qf_native] loaded QuantFuncNativeLTXLoader (LTX-2.5 JOINT-AV svdq) "
+                      f"package={model_name} resident_blocks={resident_block_count} "
                       f"footprint~{engine.footprint_bytes // (1024*1024)}MB (create deferred)", flush=True)
-                return _tag(patcher, lora_entries)
+                return qfmp.tag_lora_rebuild(patcher, lora_entries, _build)
+            if not connector_ckpt:
+                raise RuntimeError("QuantFuncNativeLTXLoader: connector_ckpt (comfy LTX-2.3 ckpt with the "
+                                   "video_embeddings_connector) is required")
+            # NOTE: the plugin-side a2v (joint audio+video) connector split is NOT implemented — it
+            # needs an engine external-step split (makeExternalStepFn). There is no widget for it, so
+            # it cannot be requested; _load_ltx_audio_connector + the combined-footprint accounting
+            # helpers (_derive_connector_arch / _accumulate_connector_footprint, exercised by
+            # connector_arch_derivation_test arm-9) are kept as the BOUND for that future work.
+            # LTX svdq is PRE-quantized: pass the MINIMUM to create (minimal=True → empty config_json).
+            # The svdquant metadata carries the layout/precision (embedded config: cross_attn_mod=True /
+            # audio_cross_attn_mod=True / cross_attention_dim 4096 / num_heads 32 → 9-mod). ANYTHING
+            # supplied on top (auto_optimize / height / width / a precision map) competes with it and the
+            # engine resolves to the 19b default (connector 3840 / transformer 6-mod — the E2E run-1..8
+            # create mis-size). The harness's whole svdq entry is {backend:svdq, model_dir}; mirror that.
+            # RESIDUAL (tracked, §6.5 wan text_precision round): an EMPTY config also means the engine's
+            # resolve-at-entry text-precision falls to its SM-DEFAULT tier (est::smDefaultTextPrecision:
+            # fp4 on SM120+, int4 below). That default is what BROKE the wan loader (UMT5 rejects 4-bit);
+            # it currently WORKS here because LTX's TE tiers accept the default — but if an LTX TE arch
+            # without a wired 4-bit tier ever routes through this minimal create, it hits the same class.
+            # No fix now (adding keys back defeats minimal=True's purpose); this note is the tripwire.
+            def _factory():
+                eng, ckey = get_engine(model_dir, create_cfg=(_lora_cfg or None))
+                pipeline_models[ckey] = weakref.ref(model)
+                return eng, ckey
 
-            return (_build([]),)
+            # DEFERRED create (QFLazyEngine): a chained QuantFuncNativeLoRA rebuilds for its
+            # accumulated LoRA set, so an eager create here would build ONE PIPELINE PER
+            # CHAIN LINK (and comfy's node-output cache would pin every intermediate's
+            # multi-GB CPU backup). Only the model the sampler touches is ever created.
+            engine = QFLazyEngine(_factory, estimate_footprint(model_dir))
+            # [19B non-gated connector] authoritative head count from the ORIGINAL model dir\'s diffusers
+            # LTX2TextConnectors config (the 19B family ships NON-gated connector weights; the head split
+            # lives ONLY here). Absent/malformed -> None (gated checkpoints need nothing; a non-gated one
+            # then fail-louds in _derive_connector_arch). The staged video-only dir may symlink or omit
+            # connectors/ -- we also probe the transformer_path\'s parent for the original layout.
+            auth_heads = None
+            for _cand in (os.path.join(model_dir, "connectors", "config.json"),
+                          os.path.join(os.path.dirname(os.path.realpath(os.path.join(model_dir, "transformer"))),
+                                       "connectors", "config.json")):
+                try:
+                    with open(_cand) as _cf:
+                        _cc = json.load(_cf)
+                    _v = _cc.get("video_connector_num_attention_heads")
+                    if isinstance(_v, int) and 1 <= _v <= _MAX_CONNECTOR_HEADS:
+                        auth_heads = _v
+                        break
+                except (OSError, ValueError):
+                    continue
+            device = comfy.model_management.get_torch_device()
+            offload = comfy.model_management.unet_offload_device()
+            # ★ PER-LOAD combined-footprint running total: THIS load() holds the video connector AND (when
+            # join_audio_prompt=True) the audio connector CONCURRENTLY, so their host allocs ADD. `conn_budget` is
+            # a fresh 1-element list scoped to THIS call (NO cross-call/module state -- a module accumulator would
+            # drift upward across loads and false-reject legitimate configs after N runs). Each connector load adds
+            # its est to it and REJECTS if the running total exceeds _MAX_CONNECTOR_TOTAL_BYTES before its eager build.
+            conn_budget = [0]
+            connector = _load_ltx_video_connector(connector_ckpt, device, _budget=conn_budget,
+                                                   authoritative_heads=auth_heads)
+            # (b) SKIP (default, join_audio_prompt=False): audio_connector=None -> _run_connector returns 4096
+            # video-only (ltx's RULED path; the engine skips the audio arm and the video arm gets its 4096).
+            # (a) SPLIT: load the audio connector -> 6144, which additionally needs the engine
+            # external-step split (makeExternalStepFn), NOT part of the (b) skip (dossier seq-242).
+            # NOT REACHABLE from any node input (there is no widget for it and the dead flag was
+            # removed) — kept as the documented BOUND for that future work; conn_budget already
+            # accounts for the COMBINED pair, which is what _accumulate_connector_footprint tests.
+            audio_connector = None
 
-    NODE_CLASS_MAPPINGS.update({"QuantFuncNativeLTXLoader": QuantFuncNativeLTXLoader})
-    NODE_DISPLAY_NAME_MAPPINGS.update({"QuantFuncNativeLTXLoader": "QuantFunc Native LTX Loader"})
+            unet_config = {"image_model": "ltxv", "disable_unet_model_creation": True}
+            model_config = comfy.supported_models.LTXV(unet_config)
+            for attr, default in (("manual_cast_dtype", None), ("custom_operations", None),
+                                  ("optimizations", {}), ("scaled_fp8", None)):
+                if not hasattr(model_config, attr):
+                    setattr(model_config, attr, default)
+
+            model = QFLTXModel(model_config, engine, connector, device=device,
+                               audio_connector=audio_connector, start_image=start_image,
+                               resident_block_count=resident_block_count)
+            patcher = QFModelPatcher(model, load_device=device, offload_device=offload)
+            print(f"[qf_native] loaded QuantFuncNativeLTXLoader (LTX-2 svdq) package={model_name} "
+                  f"resident_blocks={resident_block_count} "
+                  f"footprint~{engine.footprint_bytes // (1024*1024)}MB (create deferred)", flush=True)
+            return qfmp.tag_lora_rebuild(patcher, lora_entries, _build)
+
+        return _build(list(lora_entries))
+
+    return build

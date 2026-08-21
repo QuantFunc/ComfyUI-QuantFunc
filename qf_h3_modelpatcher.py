@@ -38,6 +38,7 @@ import comfy.supported_models
 import comfy.nested_tensor
 
 from . import qf_engine as qfe
+from . import qf_modelpatcher as qfmp
 from .qf_modelpatcher import (_qf_dtype, QFModelPatcher, _QFStub,
                               _interrupt_poll_end_session_on_raise,
                               QFSessionModelMixin, QFLazyEngine)
@@ -96,7 +97,15 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
 
     # Conditioning keys this external session does NOT consume — a wired node feeding one would be
     # SILENTLY dropped -> plausible-but-wrong AV. FAIL LOUD (mirror QFLTXModel's defensive superset).
-    _ENGINE_IGNORED_COND_KEYS = ("denoise_mask", "concat_mask", "noise_concat", "concat_latent_image")
+    # Defensive SUPERSET (wan/LTX precedent): every key comfy's MiniMaxH3.extra_conds + the
+    # BaseModel callees can consume that this seam does NOT implement. The noise-aug pair and
+    # cross_attn_controlnet have NO producer node in this ComfyUI (measured: read-only in
+    # model_base), so guarding them cannot break the stock graph — it makes a FUTURE producer
+    # fail loud instead of silently changing the conditioning (comfy's own MiniMaxH3 puts the
+    # noise-aug values into its payload; this seam builds its own payload and would drop them).
+    _ENGINE_IGNORED_COND_KEYS = ("denoise_mask", "concat_mask", "noise_concat",
+                                 "concat_latent_image", "cross_attn_controlnet",
+                                 "minimax_visual_cond_noise_aug", "minimax_audio_cond_noise_aug")
 
     def extra_conds(self, **kwargs):
         # RUN-START clean slate FIRST (session lifecycle) — before the loud-fails, so a rejected
@@ -217,7 +226,7 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
         # schedule: MEASURED — ModelSamplingSD3 on an H3 model yields ModelSamplingAdvanced with no
         # audio_shift, so a silent getattr default would run the audio branch at 3.0 while the user
         # believes they set the schedule. Refuse LOUD instead of rendering a silently mis-scheduled AV.
-        if not hasattr(ms, "audio_shift"):
+        if not hasattr(ms, "shift") or not hasattr(ms, "audio_shift"):
             raise RuntimeError(
                 f"qf_native H3: the model_sampling object is {type(ms).__name__}, which carries no "
                 f"audio_shift — a GENERIC model-sampling node (ModelSamplingSD3 / ModelSamplingFlux / "
@@ -227,7 +236,7 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
         _opts = {
             "resident_block_count": self._resident_block_count,   # [manual-residency]
             "audio_dims": audio_dims,
-            "av_sigma_shift_video": float(getattr(ms, "shift", 12.0)),
+            "av_sigma_shift_video": float(ms.shift),
             "av_sigma_shift_audio": float(ms.audio_shift or 3.0),
             "num_frames": self._num_frames,
             "fps": float(self._fps),
@@ -454,90 +463,56 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
         return super().process_latent_out(latent)
 
 
-def register(NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS, get_engine, pipeline_models,
-             list_packages, resolve_package, estimate_footprint):
-    """Register the H3 loader node (called from __init__.py). get_engine, pipeline_models + the
-    models/quantfunc package helpers are __init__.py's shared helpers, threaded in to avoid a
-    circular import (mirrors the LTX register)."""
+def register(get_engine, pipeline_models, estimate_footprint, QFLazyEngine):
+    """Return the MiniMax-H3 family BUILDER for the single QuantFunc Native Loader node (the
+    per-family loader node is gone — one node with a model dropdown dispatches here)."""
 
-    class QuantFuncNativeH3Loader:
-        """Create a MiniMax-H3 joint-AV svdq pipeline and expose it as a native comfy MODEL a STOCK
-        KSampler drives. Swap ONLY this loader into the stock H3 workflow; keep the stock
-        MiniMaxH3ImageToVideo (prompt only = t2va; first_frame/last_frame = fl2va keyframes,
-        forwarded to the engine as pre-encoded latents) OR MiniMaxH3ReferenceToVideo (ref2va:
-        image + audio references, begin-bound via the same av_conds bridge; video/video_audio
-        reference kinds fail loud) / ModelSamplingMiniMaxH3 / KSampler / the H3 VAE decode
-        (LTXVSeparateAVLatent → VAEDecode + VAEDecodeAudio → CreateVideo(audio)) / SaveVideo."""
+    def build(model_dir, model_name, resident_block_count, start_image=None,
+              connector_ckpt="(none)", lora_entries=()):
+        if start_image is not None:
+            raise RuntimeError(
+                "qf_native H3: start_image is not an H3 input — the H3 seam takes its image/audio "
+                "references through the stock MiniMaxH3ImageToVideo / MiniMaxH3ReferenceToVideo "
+                "nodes (first_frame / last_frame / ref_image_*), which reach the engine as "
+                "av_conds. Disconnect start_image.")
 
-        @classmethod
-        def INPUT_TYPES(cls):
-            return {"required": {
-                "model_name": (list_packages(),),
-                # [manual-residency] GPU-resident transformer blocks (the native seam's ONLY
-                # residency mechanism; engine clamps to the model's block count).
-                "resident_block_count": ("INT", {"default": 999, "min": 1, "max": 1024}),
-            }}
 
-        RETURN_TYPES = ("MODEL",)
-        FUNCTION = "load"
-        CATEGORY = "QuantFunc/native"
-        DESCRIPTION = (
-            "Loads a QuantFunc MiniMax-H3 svdq joint audio+video pipeline as a native comfy MODEL a STOCK "
-            "KSampler drives (swap ONLY this loader in; keep the stock MiniMaxH3ImageToVideo prompt / "
-            "ModelSamplingMiniMaxH3 / KSampler / H3 VAE decode / SaveVideo). model_dir = an engine svdq H3 "
-            "package (models/quantfunc) with transformer/ + vae/ + audio_vae/. Geometry (length/size), "
-            "steps and the AV flow shifts all come from the STOCK nodes — MiniMaxH3ImageToVideo / "
-            "MiniMaxH3ReferenceToVideo, KSampler and ModelSamplingMiniMaxH3 — exactly as in the official "
-            "workflow; this loader only picks the model and the resident block count. LoRAs chain in via "
-            "QuantFuncNativeLoRA.")
 
-        def load(self, model_name, resident_block_count=999):
-            model_dir = resolve_package(model_name)
+        def _build(lora_entries):
+            """Create (or reuse) the pipeline for THIS lora set + wrap it in a patcher."""
+            _lora_cfg = {}
+            if lora_entries:
+                _lora_cfg["lora"] = list(lora_entries)   # engine svdq load: sidecar apply post-load
+            # H3 svdq is PRE-quantized: create is MINIMAL. The svdquant metadata carries the
+            # layout/precision; anything on top competes + mis-resolves (LTX minimal note).
+            def _factory():
+                eng, ckey = get_engine(model_dir, create_cfg=(_lora_cfg or None))
+                pipeline_models[ckey] = weakref.ref(model)
+                return eng, ckey
 
-            def _tag(patcher, lora_entries):
-                """Mark the built model so the downstream QuantFuncNativeLoRA node can append to
-                its stack and re-create the pipeline (create-time sidecar LoRA)."""
-                m = patcher.model
-                m._qf_lora_stack = list(lora_entries)
-                m._qf_rebuild = _build
-                return patcher
+            # DEFERRED create (QFLazyEngine): a chained QuantFuncNativeLoRA rebuilds for its
+            # accumulated LoRA set, so an eager create here would build ONE PIPELINE PER
+            # CHAIN LINK (and comfy's node-output cache would pin every intermediate's
+            # multi-GB CPU backup). Only the model the sampler touches is ever created.
+            engine = QFLazyEngine(_factory, estimate_footprint(model_dir))
+            device = comfy.model_management.get_torch_device()
+            offload = comfy.model_management.unet_offload_device()
 
-            def _build(lora_entries):
-                """Create (or reuse) the pipeline for THIS lora set + wrap it in a patcher."""
-                _lora_cfg = {}
-                if lora_entries:
-                    _lora_cfg["lora"] = list(lora_entries)   # engine svdq load: sidecar apply post-load
-                # H3 svdq is PRE-quantized: create is MINIMAL. The svdquant metadata carries the
-                # layout/precision; anything on top competes + mis-resolves (LTX minimal note).
-                def _factory():
-                    eng, ckey = get_engine(model_dir, create_cfg=(_lora_cfg or None))
-                    pipeline_models[ckey] = weakref.ref(model)
-                    return eng, ckey
+            unet_config = {"image_model": "minimax_h3", "disable_unet_model_creation": True}
+            model_config = comfy.supported_models.MiniMaxH3(unet_config)
+            for attr, default in (("manual_cast_dtype", None), ("custom_operations", None),
+                                  ("optimizations", {}), ("scaled_fp8", None)):
+                if not hasattr(model_config, attr):
+                    setattr(model_config, attr, default)
 
-                # DEFERRED create (QFLazyEngine): a chained QuantFuncNativeLoRA rebuilds for its
-                # accumulated LoRA set, so an eager create here would build ONE PIPELINE PER
-                # CHAIN LINK (and comfy's node-output cache would pin every intermediate's
-                # multi-GB CPU backup). Only the model the sampler touches is ever created.
-                engine = QFLazyEngine(_factory, estimate_footprint(model_dir))
-                device = comfy.model_management.get_torch_device()
-                offload = comfy.model_management.unet_offload_device()
+            model = QFH3Model(model_config, engine, device=device,
+                              resident_block_count=resident_block_count)
+            patcher = QFModelPatcher(model, load_device=device, offload_device=offload)
+            print(f"[qf_native] loaded QuantFuncNativeH3Loader (MiniMax-H3 svdq AV) package={model_name} "
+                  f"resident_blocks={resident_block_count} "
+                  f"footprint~{engine.footprint_bytes // (1024*1024)}MB (create deferred)", flush=True)
+            return qfmp.tag_lora_rebuild(patcher, lora_entries, _build)
 
-                unet_config = {"image_model": "minimax_h3", "disable_unet_model_creation": True}
-                model_config = comfy.supported_models.MiniMaxH3(unet_config)
-                for attr, default in (("manual_cast_dtype", None), ("custom_operations", None),
-                                      ("optimizations", {}), ("scaled_fp8", None)):
-                    if not hasattr(model_config, attr):
-                        setattr(model_config, attr, default)
+        return _build(list(lora_entries))
 
-                model = QFH3Model(model_config, engine, device=device,
-                                  resident_block_count=resident_block_count)
-                patcher = QFModelPatcher(model, load_device=device, offload_device=offload)
-                print(f"[qf_native] loaded QuantFuncNativeH3Loader (MiniMax-H3 svdq AV) package={model_name} "
-                      f"resident_blocks={resident_block_count} "
-                      f"footprint~{engine.footprint_bytes // (1024*1024)}MB (create deferred)", flush=True)
-                return _tag(patcher, lora_entries)
-
-            return (_build([]),)
-
-    NODE_CLASS_MAPPINGS.update({"QuantFuncNativeH3Loader": QuantFuncNativeH3Loader})
-    NODE_DISPLAY_NAME_MAPPINGS.update({"QuantFuncNativeH3Loader": "QuantFunc Native H3 Loader"})
+    return build

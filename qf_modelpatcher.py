@@ -728,6 +728,45 @@ class QFLazyEngine:
         if self._real is not None:
             self._real.destroy()
 
+    def release(self):
+        """Free the created pipeline (VRAM + the CPU backup) and go back to UNMATERIALIZED — the
+        factory re-creates it from disk on the next use. Used by comfy's RAM manager
+        (partially_unload_ram); refuses while a session is open."""
+        if self._real is None:
+            return
+        if getattr(self._real, "current_session", None) is not None:
+            return
+        try:
+            self._real.destroy()
+        finally:
+            self._real = None
+            self._unloaded = True
+
+
+# ── shared sidecar-LoRA rebuild contract (CR simplicity: ONE definition, not one per family) ──
+# The engine merges sidecar LoRA at pipeline CREATE time, so a downstream QuantFuncNativeLoRA node
+# re-creates the pipeline for the accumulated set. Every family's builder tags its model with these
+# two attributes through tag_lora_rebuild(); the LoRA node reads them through lora_stack_of()/
+# rebuild_of(). Names live here so the three seams cannot drift apart.
+QF_LORA_STACK_ATTR = "_qf_lora_stack"
+QF_LORA_REBUILD_ATTR = "_qf_rebuild"
+
+
+def tag_lora_rebuild(patcher, lora_entries, rebuild):
+    """Mark a freshly built patcher's model with its LoRA set + how to re-create with a new one."""
+    m = patcher.model
+    setattr(m, QF_LORA_STACK_ATTR, list(lora_entries))
+    setattr(m, QF_LORA_REBUILD_ATTR, rebuild)
+    return patcher
+
+
+def lora_stack_of(patcher):
+    return list(getattr(getattr(patcher, "model", None), QF_LORA_STACK_ATTR, []) or [])
+
+
+def rebuild_of(patcher):
+    return getattr(getattr(patcher, "model", None), QF_LORA_REBUILD_ATTR, None)
+
 
 class QFModelPatcher(comfy.model_patcher.ModelPatcher):
     """ModelPatcher over an engine-managed pipeline. The engine owns + moves its own VRAM, so the
@@ -770,6 +809,64 @@ class QFModelPatcher(comfy.model_patcher.ModelPatcher):
         if eng is None:
             return 0
         return eng.unload_vram()
+
+
+    # ---- comfy lifecycle / VRAM+RAM manager integration ----------------------------------
+    def adopt_comfy_state_from(self, src):
+        """Return a patcher that has THIS patcher's model but SRC's comfy-level state.
+
+        WHY (CR regression, measured class): a downstream QuantFuncNativeLoRA re-creates the
+        pipeline, so it hands back a DIFFERENT patcher+model. Anything an upstream node had
+        applied with add_object_patch — most importantly ModelSamplingSD3 /
+        ModelSamplingMiniMaxH3's shift patch — lives on the OLD patcher and would be silently
+        dropped, leaving the checkpoint default with no error (the exact silent-shift class the
+        H3 guard was added for). Transplanting via comfy's OWN clone(model_override=...) carries
+        object_patches, model_options, callbacks, wrappers, attachments, injections and hooks —
+        one authoritative list, so it cannot drift as comfy's clone() grows fields.
+        """
+        override = (self.model, (self.backup, self.backup_buffers,
+                                 self.object_patches_backup, self.pinned))
+        return src.clone(model_override=override)
+
+    def detach(self, unpatch_all=True):
+        """comfy is dropping this model — release the engine's VRAM NOW instead of waiting for a
+        GC sweep. unload_vram keeps the CPU backup, so a later run reloads lazily (no destroy =
+        no use-after-free against a model comfy may still hold)."""
+        eng = self._engine()
+        if eng is not None and not getattr(eng, "unloaded", False):
+            try:
+                eng.unload_vram()
+            except Exception:  # noqa: BLE001 — detach must never raise
+                pass
+        return super().detach(unpatch_all=unpatch_all)
+
+    def loaded_ram_size(self):
+        """HOST-RAM pressure this model is responsible for. After a co-eviction the engine holds a
+        full CPU backup of the weights — invisible to comfy's RAM manager unless reported here."""
+        eng = self._engine()
+        if eng is not None and getattr(eng, "unloaded", False):
+            return max(0, int(getattr(eng, "footprint_bytes", 0)))
+        return 0
+
+    def partially_unload_ram(self, ram_to_unload):
+        """comfy's RAM manager asking for host memory back. Releasing the engine handle frees the
+        CPU backup; the lazy handle re-creates from disk on the next use, so this is a real
+        reclaim, not a leak — but only when nothing is in flight (an open session must not have
+        its pipeline pulled out from under it)."""
+        eng = self._engine()
+        if eng is None or not getattr(eng, "unloaded", False):
+            return 0
+        if getattr(eng, "current_session", None) is not None:
+            return 0
+        release = getattr(eng, "release", None)
+        if release is None:            # a plain (non-lazy) handle cannot be re-created: keep it
+            return 0
+        freed = max(0, int(getattr(eng, "footprint_bytes", 0)))
+        try:
+            release()
+        except Exception:  # noqa: BLE001
+            return 0
+        return freed
 
     def patch_model(self, device_to=None, lowvram_model_memory=0, load_weights=True,
                     force_patch_weights=False):
