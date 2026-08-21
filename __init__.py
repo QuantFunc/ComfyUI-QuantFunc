@@ -25,87 +25,14 @@ except Exception as _exc:  # noqa: BLE001 — never break registration; report l
     _IMPORT_OK = False
 
 
-# ── official-loader UX: scan the STANDARD models/diffusion_models folder ──
-# A QuantFunc engine model is a PACKAGE DIRECTORY (model_index.json + transformer[_2]/ with
-# the svdq weights + vae/ + text_encoder/ + tokenizer/ [+ scheduler/]) — the engine detects the
-# pipeline family from model_index.json and loads transformer[_2]/ itself. Those packages live
-# in comfy's OWN models/diffusion_models next to the single-file UNETs (that folder holds both),
-# so they are listed from there with DiffusersLoader's walk-for-model_index.json mechanism
-# pointed at diffusion_models — no private model folder.
+# folder_paths gives the model-file listing surface (INT8-Fast-aligned: FILES, not dirs).
 try:
     import folder_paths as _folder_paths
 except Exception as _fp_exc:  # noqa: BLE001 — never break registration
     _folder_paths = None
     logging.warning("[qf_native] folder_paths unavailable: %r", _fp_exc)
 
-_NO_MODELS_HINT = "(no QuantFunc model package in models/diffusion_models)"
 _NO_LORA_HINT = "(no LoRA in models/loras)"
-
-
-def _model_roots():
-    """The folders scanned for QuantFunc model packages: comfy's models/diffusion_models (where
-    these packages are kept — CR raised switching to the `diffusers` key instead; MEASURED, that
-    would not change comfy's native UNETLoader dropdown, which already recurses into any package
-    dir placed there: with k9b present it lists k9b/transformer/model.safetensors etc. whether or
-    not this plugin reads that folder. The listing is a consequence of the on-disk layout, not of
-    our scan, so switching our READ key would move nothing off that dropdown while contradicting
-    where the models actually live) PLUS models/diffusers for users who keep packages there."""
-    roots = []
-    for key in ("diffusion_models", "diffusers"):
-        try:
-            roots.extend(_folder_paths.get_folder_paths(key))
-        except Exception:  # noqa: BLE001 — a missing key must not break listing
-            pass
-    return roots
-
-
-def _list_quantfunc_packages():
-    """Relative paths of every QuantFunc model PACKAGE (a dir holding model_index.json) under
-    comfy's models/diffusion_models roots. Single-file .safetensors UNETs are deliberately NOT
-    listed: the engine needs the package (arch metadata + its own transformer/vae/TE layout), so
-    offering a bare file would be a choice that can only fail."""
-    out = []
-    if _folder_paths is None:
-        return [_NO_MODELS_HINT]
-    for root_dir in _model_roots():
-        if not os.path.isdir(root_dir):
-            continue
-        for r, dirs, files in os.walk(root_dir, followlinks=True):
-            if "model_index.json" in files:
-                out.append(os.path.relpath(r, start=root_dir))
-                dirs[:] = []          # a package is a leaf — do not descend into its subdirs
-    return sorted(out) or [_NO_MODELS_HINT]
-
-
-def _resolve_package(name):
-    """Resolve a listed package name to its directory — CONFINED to the registered model roots.
-
-    #vuln (CR): a widget value is workflow-serializable, so `name` is UNTRUSTED. comfy's own
-    get_full_path_or_raise does this containment for FILES (that is what _resolve_lora and the
-    connector dropdown use); there is no folder_paths equivalent for a package DIRECTORY, so the
-    containment is done here explicitly: resolve both sides with realpath and require the
-    candidate to sit under the root, so "../../.." / an absolute path / a symlink pointing out
-    cannot escape models/diffusion_models (or models/diffusers)."""
-    if _folder_paths is None:
-        raise RuntimeError("qf_native: comfy folder_paths unavailable")
-    if name == _NO_MODELS_HINT:
-        raise RuntimeError(
-            "qf_native: no QuantFunc model package found. Put the model DIRECTORY (the one with "
-            "model_index.json + transformer/) under ComfyUI/models/diffusion_models/ and refresh.")
-    if os.path.isabs(name):
-        raise RuntimeError(f"qf_native: model_name must be a name inside a model folder, not an "
-                           f"absolute path ({name!r})")
-    for root_dir in _model_roots():
-        root = os.path.realpath(root_dir)
-        cand = os.path.realpath(os.path.join(root, name))
-        if os.path.commonpath([root, cand]) != root:
-            continue                      # escaped the root — not a candidate, keep looking
-        if os.path.isfile(os.path.join(cand, "model_index.json")):
-            return cand
-    raise RuntimeError(
-        f"qf_native: model package '{name}' not found inside the model folders "
-        f"(a package dir must contain model_index.json, and must live under one of "
-        f"{[os.path.basename(r.rstrip('/')) for r in _model_roots()]})")
 
 
 def _package_weight_paths(pkg):
@@ -127,6 +54,36 @@ def _estimate_package_footprint(pkg):
         return qfe.estimate_footprint_bytes(*_package_weight_paths(pkg))
     except Exception:  # noqa: BLE001 — a bad estimate must not break loading
         return 1
+
+
+_NO_XFM_HINT = "(no .safetensors in models/diffusion_models)"
+_XFM_NONE = "(none)"
+
+
+def _transformer_choices():
+    """The .safetensors FILES under comfy's models/diffusion_models — the SAME surface the
+    reference INT8-Fast UNetLoaderINTW8A8 lists (folder_paths.get_filename_list). The user picks a
+    transformer weight FILE directly (transformer1 = the / high-noise expert; transformer2 = the
+    optional low-noise expert for wan A14B). NOT a package DIRECTORY — the engine's denoise-only
+    create builds ONLY the transformer from this file (CLIP + VAE stay native comfy nodes)."""
+    if _folder_paths is None:
+        return [_NO_XFM_HINT]
+    try:
+        files = [f for f in _folder_paths.get_filename_list("diffusion_models")
+                 if f.lower().endswith(".safetensors")]
+    except Exception:  # noqa: BLE001
+        files = []
+    return sorted(files) or [_NO_XFM_HINT]
+
+
+def _resolve_transformer(name):
+    """Resolve a listed transformer filename to its full path via comfy's own containment
+    (get_full_path_or_raise confines it to the diffusion_models roots — the untrusted-widget
+    #vuln guard, same as _resolve_lora)."""
+    if _folder_paths is None or name in ("", _NO_XFM_HINT, _XFM_NONE):
+        raise RuntimeError("qf_native: no transformer weight selected — put the svdq .safetensors "
+                           "under ComfyUI/models/diffusion_models/ and pick it in transformer1.")
+    return _folder_paths.get_full_path_or_raise("diffusion_models", name)
 
 
 def _lora_choices():
@@ -350,18 +307,23 @@ def _get_engine(model_dir, create_cfg=None):
 
 if _IMPORT_OK:
     # ── family REGISTRY: assembled from the per-family modules. Family LOGIC lives in the family
-    #    modules; what remains here is the shared NODE SURFACE — and that surface is only family-
-    #    neutral as long as a new family reuses the existing optional inputs (start_image /
-    #    connector_ckpt / the LoRA target combo). A family needing a NEW optional input must extend
-    #    the loader's INPUT_TYPES here (and its tooltip), so "add a family = one module + one
-    #    _FAMILY_MODULES line" holds for the common case, not unconditionally. ──
+    #    modules; what remains here is the shared NODE SURFACE — transformer1/transformer2 FILE
+    #    dropdowns + model_type + resident_block_count (+ the LoRA node's target combo). That
+    #    surface is family-neutral as long as a new family fits the "1-2 transformer files +
+    #    shipped config bundle" shape; one needing a NEW input must extend INPUT_TYPES here, so
+    #    "add a family = one module + one _FAMILY_MODULES line" holds for the common case, not
+    #    unconditionally. ──
     # Each module owns ONE model family end to end (its comfy model subclass, its builder, and its
     # detection rule) and exposes exactly three names: FAMILY / matches() / register(deps).
     # Adding a family = write qf_<name>_modelpatcher.py + add it to _FAMILY_MODULES. No edit to the
     # node, the dispatch or the detection lives here, so families cannot bleed into each other.
     _FAMILY_MODULES = ("qf_wan_modelpatcher", "qf_ltx_modelpatcher", "qf_h3_modelpatcher")
     _FAMILY_BUILDERS = {}     # family key -> build(...)
-    _FAMILY_MATCHERS = []     # (family key, matches(pipeline_class)) in registration order
+    _FAMILY_MATCHERS = []     # (family key, matches) in registration order. The FILE-based
+    #    loader takes model_type EXPLICITLY (a bare .safetensors has no model_index to
+    #    detect from), so matches() is no longer called at load — it stays exported as each
+    #    family's transcription of its ENGINE detector predicate (parity documentation) and
+    #    this registry is the model_type choices' name/order source.
 
     def _register_families():
         """Import each family module and register its builder. A family whose module fails to
@@ -383,84 +345,39 @@ if _IMPORT_OK:
     _register_families()
     _FAMILY_LABELS = ["auto"] + [f for f, _ in _FAMILY_MATCHERS]
 
-    def _package_classes(model_dir):
-        """(pipeline_class, transformer_class) as the ENGINE reads them: model_index.json's
-        _class_name, and — because the wan and H3 engine detectors ALSO match on the transformer's
-        own class — transformer/config.json's _class_name. Missing/unreadable transformer config is
-        not an error here; it just leaves that half empty."""
-        try:
-            with open(os.path.join(model_dir, "model_index.json"), "r") as f:
-                pipeline_class = str(json.load(f).get("_class_name", ""))
-        except Exception as exc:  # noqa: BLE001
-            raise RuntimeError(
-                f"qf_native: cannot read model_index.json in {model_dir} ({exc}) — a QuantFunc "
-                f"model package must contain it (it is what names the pipeline family).")
-        transformer_class = ""
-        if not pipeline_class:
-            # ENGINE PARITY, input-derivation half (PipelineLoader.cpp detectPipelineKind): the
-            # engine populates transformer_class ONLY when model_index.json names no pipeline
-            # class. Reading it unconditionally made the plugin auto-detect a family for a
-            # package whose (unknown) pipeline_class the engine would refuse — the predicate
-            # halves matched the engine but the inputs fed to them did not.
-            try:
-                with open(os.path.join(model_dir, "transformer", "config.json"), "r") as f:
-                    transformer_class = str(json.load(f).get("_class_name", ""))
-            except Exception:  # noqa: BLE001 — optional half
-                pass
-        return pipeline_class, transformer_class
 
-    def _detect_family(model_dir):
-        """Ask each registered family whether this package is theirs. Returns (family, reported)
-        or (None, reported) — it does NOT raise on an unknown class, so an explicit model_type can
-        still override a package whose metadata is wrong/unsupported (that override is the whole
-        point of the widget; raising here made it unreachable).
 
-        The predicates are the ENGINE's own detector strings (each transcribed in its family
-        module) — including the transformer_class half, which the wan and H3 engine detectors also
-        match on, so a package the engine can load is not rejected here for lacking a known
-        pipeline_class."""
-        pipeline_class, transformer_class = _package_classes(model_dir)
-        reported = pipeline_class or f"(no pipeline class; transformer={transformer_class!r})"
-        for fam, matches in _FAMILY_MATCHERS:
-            try:
-                if matches(pipeline_class, transformer_class):
-                    return fam, reported
-            except Exception as exc:  # noqa: BLE001 — one broken predicate must not mask the others
-                # LOUD: a silently-skipped matcher looks exactly like "no family claims this
-                # package" (measured — an arity mismatch here made EVERY family undetectable and
-                # the bare `continue` hid it). Keep going so the other families still get a turn.
-                logging.warning("[qf_native] family %s matcher raised on "
-                                "(pipeline_class=%r, transformer_class=%r): %r — skipping it for "
-                                "this package", fam, pipeline_class, transformer_class, exc)
-        return None, reported
+    # model_type selector: a family MUST be chosen (a bare .safetensors has no model_index.json
+    # to auto-detect from). "auto" is intentionally NOT offered here.
+    _FAMILY_CHOICES = [f for f, _ in _FAMILY_MATCHERS] if _FAMILY_MATCHERS else ["wan", "ltx2", "minimax-h3"]
 
     class QuantFuncNativeLoader:
-        """ONE loader for every QuantFunc native family — the model dropdown picks which.
+        """ONE loader for every QuantFunc native family — like the reference INT8-Fast
+        UNetLoaderINTW8A8: you pick a transformer .safetensors FILE from models/diffusion_models
+        and a model_type; it returns a native comfy MODEL that a STOCK KSampler drives with
+        LATENTS. CLIP + VAE + latent + sampler + video nodes all stay stock comfy nodes — only the
+        transformer (denoise) is this engine.
 
-        Shape follows the reference INT8 loader (UNetLoaderINTW8A8): a model dropdown + a
-        model_type selector + CATEGORY "loaders". Everything else comes from the workflow's own
-        stock nodes — length/size from the empty-latent / image-to-video node, steps from
-        KSampler, fps from CreateVideo, flow shift from ModelSamplingSD3 (wan/LTX) or
-        ModelSamplingMiniMaxH3 (H3). LoRAs attach DOWNSTREAM via QuantFuncNativeLoRA.
+        wan A14B is dual-expert, so there are TWO transformer slots: transformer1 (high-noise) and
+        an optional transformer2 (low-noise). Single-expert families (LTX-2.5 / MiniMax-H3) use
+        transformer1 only and leave transformer2 = "(none)". LoRAs attach DOWNSTREAM via
+        QuantFuncNativeLoRA.
         """
 
         @classmethod
         def INPUT_TYPES(cls):
-            _ckpts = []
-            if _folder_paths is not None:
-                try:
-                    _ckpts = list(_folder_paths.get_filename_list("checkpoints"))
-                except Exception:  # noqa: BLE001
-                    _ckpts = []
+            _xfms = _transformer_choices()
             return {"required": {
-                "model_name": (_list_quantfunc_packages(),
-                               {"tooltip": "QuantFunc model PACKAGE (the directory holding "
-                                           "model_index.json + transformer/) under "
-                                           "models/diffusion_models or models/diffusers."}),
-                "model_type": (_FAMILY_LABELS,
-                               {"default": "auto",
-                                "tooltip": "auto reads the family from the package's "
-                                           "model_index.json; pick one explicitly to override."}),
+                "transformer1": (_xfms,
+                                 {"tooltip": "The transformer weight .safetensors under "
+                                             "models/diffusion_models (wan A14B: the HIGH-noise "
+                                             "expert; single-expert LTX-2.5 / H3: the only "
+                                             "transformer)."}),
+                "model_type": (_FAMILY_CHOICES,
+                               {"tooltip": "Which native family this transformer is — routes to "
+                                           "that family's engine build + arch config. A bare "
+                                           ".safetensors has no metadata to auto-detect from, so "
+                                           "pick it explicitly."}),
                 "resident_block_count": ("INT", {"default": 999, "min": 1, "max": 1024,
                                                  "tooltip": "GPU-resident transformer blocks — the "
                                                             "native seam's ONLY residency knob. The "
@@ -468,14 +385,11 @@ if _IMPORT_OK:
                                                             "count, so the default keeps every "
                                                             "block resident on a card that fits."}),
             }, "optional": {
-                "start_image": ("IMAGE", {"tooltip": "i2v reference frame (wan / LTX video-only). "
-                                                     "Leave the stock node's own start_image EMPTY "
-                                                     "— the engine VAE-encodes these pixels itself. "
-                                                     "Omit for t2v."}),
-                "connector_ckpt": (["(none)"] + _ckpts,
-                                   {"tooltip": "LTX-2.3 / 19B VIDEO-ONLY packages only: the comfy "
-                                               "checkpoint carrying video_embeddings_connector. "
-                                               "Unused by wan, H3 and LTX-2.5 joint-AV."}),
+                "transformer2": ([_XFM_NONE] + _xfms,
+                                 {"tooltip": "wan A14B ONLY: the LOW-noise expert .safetensors. "
+                                             "Leave \"(none)\" for single-expert families "
+                                             "(LTX-2.5 / MiniMax-H3) — an expert2 there is refused "
+                                             "loud."}),
             }}
             # NOTE: NO `so_path` / `keyfile` widgets — the native library + auth keyfile resolve from
             # the package bundle + the PROCESS ENVIRONMENT only, never from workflow JSON (#vuln: a
@@ -485,54 +399,30 @@ if _IMPORT_OK:
         FUNCTION = "load"
         CATEGORY = "loaders"
         DESCRIPTION = (
-            "Loads a QuantFunc svdq model PACKAGE (wan / LTX-2 / MiniMax-H3) and exposes it as a "
-            "native comfy MODEL a STOCK KSampler drives — only this loader is swapped in; CLIP, "
-            "VAE, latent, sampler and video nodes stay stock. Limits: (1) i2v — fan a LoadImage "
-            "into this loader's start_image and leave the stock node's own start_image EMPTY. "
-            "(2) A SINGLE full-range KSampler: a trimmed/partial denoise (KSamplerAdvanced "
-            "start_step/last_step, denoise<1) mis-times the engine's internal schedule and is "
-            "refused loud. (3) ControlNet is not consumed by this seam (refused loud). (4) Interrupt "
-            "stops BETWEEN denoise steps. (5) On Linux a fail-closed CUDA-toolchain check refuses a "
-            "torch/.so CUDA-major mismatch; on Windows/macOS set "
-            "QF_NATIVE_ALLOW_UNVERIFIED_TOOLCHAIN=1 after confirming they share a CUDA major.")
+            "Loads a QuantFunc svdq TRANSFORMER .safetensors (wan / LTX-2 / MiniMax-H3) from "
+            "models/diffusion_models and exposes it as a native comfy MODEL a STOCK KSampler drives "
+            "with LATENTS — only the transformer is swapped in; CLIP, VAE, latent, sampler and "
+            "video nodes stay stock (INT8-Fast-aligned: the inference path takes latents only). "
+            "wan A14B is dual-expert → set transformer2. Limits: (1) A SINGLE full-range KSampler: a "
+            "trimmed/partial denoise (KSamplerAdvanced start_step/last_step, denoise<1) mis-times "
+            "the engine's internal schedule and is refused loud. (2) ControlNet is not consumed by "
+            "this seam (refused loud). (3) Interrupt stops BETWEEN denoise steps. (4) On Linux a "
+            "fail-closed CUDA-toolchain check refuses a torch/.so CUDA-major mismatch; on "
+            "Windows/macOS set QF_NATIVE_ALLOW_UNVERIFIED_TOOLCHAIN=1 after confirming they share a "
+            "CUDA major.")
 
-        def load(self, model_name, model_type="auto", resident_block_count=999,
-                 start_image=None, connector_ckpt="(none)"):
-            model_dir = _resolve_package(model_name)
-            detected, reported = _detect_family(model_dir)
-            if model_type == "auto":
-                if detected is None:
-                    known = [f for f, _ in _FAMILY_MATCHERS]
-                    raise RuntimeError(
-                        f"qf_native: this package reports _class_name={reported}, which no "
-                        f"registered native family claims (registered: {known or 'NONE - a family '
-                        'module failed to import; check the startup log'}). Pick a different "
-                        f"package, or set model_type explicitly to force a family.")
-                family = detected
-            else:
-                # An EXPLICIT model_type WINS — including for a package whose metadata names a
-                # family we do not implement. That is exactly what the widget is for, and gating it
-                # behind a successful auto-detect made the override unreachable.
-                family = model_type
-                if detected is not None and detected != family:
-                    logging.warning("[qf_native] model_type=%s overrides the package's own "
-                                    "_class_name=%s (detected %s) — override honored, but a "
-                                    "mismatch usually means the wrong package is selected.",
-                                    model_type, reported, detected)
-                elif detected is None:
-                    logging.warning("[qf_native] model_type=%s forced for a package reporting "
-                                    "_class_name=%s, which no family claims — override honored; "
-                                    "the engine will refuse it if the layout does not match.",
-                                    model_type, reported)
+        def load(self, transformer1, model_type, resident_block_count=999, transformer2=_XFM_NONE):
+            family = model_type
             builder = _FAMILY_BUILDERS.get(family)
             if builder is None:
                 raise RuntimeError(
                     f"qf_native: family '{family}' has no registered native seam in this install "
                     f"(available: {sorted(_FAMILY_BUILDERS)}). An import of the seam module "
                     f"probably failed at startup — check the log for a [qf_native] warning.")
-            return (builder(model_dir=model_dir, model_name=model_name,
-                            resident_block_count=int(resident_block_count),
-                            start_image=start_image, connector_ckpt=connector_ckpt),)
+            xfm1 = _resolve_transformer(transformer1)
+            xfm2 = None if transformer2 in (_XFM_NONE, "", None) else _resolve_transformer(transformer2)
+            return (builder(transformer1_path=xfm1, transformer2_path=xfm2,
+                            resident_block_count=int(resident_block_count)),)
 
     class QuantFuncNativeLoRA:
         """Sidecar LoRA for the QuantFunc native loader — MODEL in, MODEL out (LoraLoaderModelOnly

@@ -544,7 +544,15 @@ def main():
     # shared file would silently pass on an EMPTY match once the seam moved out of it.
     wan_src = open(_WAN_SRC_PATH, encoding="utf-8").read()
     wired = ('transformer_options.get("uuids")' in wan_src and "self._ctx_key_assigner.key(" in wan_src)
-    no_hash = all(("content_ctx_key" not in t) and ("hashlib" not in t) for t in (src, wan_src))
+    # "no content hash" means no hash feeds a CTX KEY — a hash used for anything else (e.g. the
+    # staging helper derives a TEMP-DIR name with hashlib.sha1, wholly unrelated to conditioning
+    # identity) must not trip this. So: forbid the old content_ctx_key symbol outright, and forbid
+    # hashlib ONLY on a line that also mentions a ctx/context key.
+    def _hash_feeds_ctx_key(text):
+        return any(("hashlib" in ln or "sha1" in ln or "sha256" in ln or "md5(" in ln)
+                   and ("ctx_key" in ln or "context_key" in ln)
+                   for ln in text.splitlines())
+    no_hash = all(("content_ctx_key" not in t) and not _hash_feeds_ctx_key(t) for t in (src, wan_src))
     reset_wired = "self._ctx_key_assigner.reset()" in wan_src
     kno_wired = "_KNO_CTX_KEY" in src
     if wired and no_hash and reset_wired and kno_wired:

@@ -483,7 +483,17 @@ def register(deps):
     estimate_footprint = deps["estimate_footprint"]
 
 
-    def build(model_dir, model_name, resident_block_count, start_image=None,
+    def build(transformer1_path, transformer2_path, resident_block_count, lora_entries=()):
+        """File-based loading for this family is NOT WIRED YET (loud, not silent): the
+        engine's denoise_only create exists only for wan today. This family still needs
+        its engine-side flag + a shipped config bundle — tracked follow-up; wan is the
+        validation vehicle. The old package-dir builder below is kept for that wiring."""
+        raise RuntimeError(
+            "qf_native minimax-h3: file-based (transformer .safetensors) loading is not "
+            "wired for this family yet — wan2.2 A14B is the first; minimax-h3 follows once "
+            "its engine denoise_only create + config bundle land.")
+
+    def _build_from_package(model_dir, model_name, resident_block_count, start_image=None,
               connector_ckpt="(none)", lora_entries=()):
         if start_image is not None:
             raise RuntimeError(

@@ -1,0 +1,21 @@
+{
+  "_class_name": "WanPipeline",
+  "_qf_native_bundle": "wan-a14b",
+  "boundary_ratio": 0.875,
+  "scheduler": [
+    "diffusers",
+    "UniPCMultistepScheduler"
+  ],
+  "transformer": [
+    "diffusers",
+    "WanTransformer3DModel"
+  ],
+  "transformer_2": [
+    "diffusers",
+    "WanTransformer3DModel"
+  ],
+  "vae": [
+    "diffusers",
+    "AutoencoderKLWan"
+  ]
+}

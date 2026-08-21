@@ -14,6 +14,7 @@ Every family module exposes the same three names, which is the whole interface:
   matches(pipeline_class) -> bool       — the engine's OWN detector predicate, transcribed
   register(deps) -> builder             — deps carries the shared helpers; returns build(...)
 """
+import os
 import ctypes
 import json
 import logging
@@ -427,21 +428,31 @@ def register(deps):
     estimate_footprint = deps["estimate_footprint"]
     apply_checkpoint_flow_shift = deps["apply_checkpoint_flow_shift"]
 
-    def build(model_dir, model_name, resident_block_count, start_image=None,
-              connector_ckpt="(none)", lora_entries=()):
-        if connector_ckpt and connector_ckpt != "(none)":
+    _BUNDLE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs", "wan-a14b")
+
+    def build(transformer1_path, transformer2_path, resident_block_count, lora_entries=()):
+        """wan A14B from BARE transformer FILES (INT8-Fast-aligned): transformer1 = HIGH-noise
+        expert, transformer2 = LOW-noise expert — BOTH required (A14B is dual-expert; a missing
+        low expert would denoise the low-sigma phase with nothing). The engine create is
+        denoise_only: TE + VAE WEIGHTS are skipped (comfy's CLIP supplies conditioning, comfy's
+        VAEDecode decodes), configs come from the plugin-shipped wan-a14b bundle."""
+        if not transformer2_path:
             raise RuntimeError(
-                "qf_native wan: connector_ckpt is an LTX-2.3 input — the wan seam has no "
-                "connector. Disconnect it.")
+                "qf_native wan: wan2.2 A14B is DUAL-expert — transformer1 = the HIGH-noise "
+                "expert .safetensors AND transformer2 = the LOW-noise expert .safetensors are "
+                "both required (the export ships them as a *-high-* / *-low-* pair).")
 
         def _build(entries):
-            # text_precision pinned to int8 (#329-verified W8A16). WHY (mechanism traced to source
-            # after a §6.5 round caught an earlier wrong explanation here): with NO text_precision the
-            # engine's resolve-at-entry falls to its SM-DEFAULT tier (est::smDefaultTextPrecision = fp4
-            # on SM120+, int4 below) and WAN's UMT5 factory REJECTS both 4-bit tiers fail-loud. The
-            # engine TE is not even used by this seam (conditioning comes from comfy's NATIVE CLIP),
-            # but create still builds it; int8 is the verified quantized-UMT5 tier.
-            cfg = {"text_precision": "int8"}
+            # One staged, config-complete package per (bundle, file-pair): shipped A14B configs +
+            # weight symlinks. Weights stay where the user put them (no copy).
+            model_dir = qfmp.stage_denoise_only_package(_BUNDLE, transformer1_path,
+                                                        transformer2_path)
+            # denoise_only (engine WanVideoPipeline.cpp): skip the UMT5 TE (~10 GB dead mass here
+            # — conditioning comes from comfy's NATIVE CLIP) + the VAE weights (comfy decodes);
+            # the engine still reads the staged vae/config.json for session geometry. The old
+            # text_precision=int8 pin existed only because create used to BUILD the TE; with
+            # denoise_only it is obsolete and deliberately gone.
+            cfg = {"denoise_only": True}
             if entries:
                 cfg["lora"] = list(entries)   # WanVideoPipeline splits target-tagged entries per expert
 
@@ -467,13 +478,15 @@ def register(deps):
 
             device = comfy.model_management.get_torch_device()
             offload = comfy.model_management.unet_offload_device()
-            model = QFWanModel(model_config, engine, start_image, device=device,
+            model = QFWanModel(model_config, engine, None, device=device,
                                resident_block_count=resident_block_count)
-            # Default the sampler to the CHECKPOINT'S OWN flow schedule when the package declares
-            # one (a stock ModelSamplingSD3 downstream still overrides it — as on any comfy model).
+            # Default the sampler to the CHECKPOINT'S OWN flow schedule when the staged package
+            # declares one (no-op-safe when absent; a stock ModelSamplingSD3 downstream still wins).
             apply_checkpoint_flow_shift(model, model_dir)
             patcher = QFModelPatcher(model, load_device=device, offload_device=offload)
-            print(f"[qf_native] loaded QuantFunc Native Loader (wan svdq) package={model_name} "
+            print(f"[qf_native] loaded QuantFunc Native Loader (wan svdq, denoise_only) "
+                  f"high={os.path.basename(transformer1_path)} "
+                  f"low={os.path.basename(transformer2_path)} "
                   f"resident_blocks={resident_block_count} loras={len(entries)} "
                   f"footprint~{engine.footprint_bytes // (1024*1024)}MB (create deferred)")
             return qfmp.tag_lora_rebuild(patcher, entries, _build)
