@@ -379,7 +379,6 @@ if _IMPORT_OK:
                 logging.warning("[qf_native] family module %s not registered: %r", mod_name, exc)
 
     _register_families()
-    _FAMILY_LABELS = ["auto"] + [f for f, _ in _FAMILY_MATCHERS]
 
 
 

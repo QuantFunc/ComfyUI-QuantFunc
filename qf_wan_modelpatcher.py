@@ -129,15 +129,16 @@ class QFWanModel(QFSessionModelMixin, comfy.model_base.WAN21):
             print("[qf_native] closed a pre-existing session at run start "
                   f"(prior run interrupted/uncleaned); end ok={ok}", flush=True)
         # ★ HARD REQUIREMENT (CR): a wired-but-ignored WanImageToVideo.start_image shows up here as
-        # concat_latent_image. Silently discarding it is the exact defect the CR NO-GO'd — FAIL LOUD and
-        # point the user at the loader's own start_image input.
+        # concat_latent_image. Silently discarding it is the exact defect the CR NO-GO'd — FAIL LOUD
+        # with the TRUE current limitation (the loader's start_image widget was REMOVED in the
+        # file-based redesign; i2v is not yet wired on the denoise_only file path).
         if kwargs.get("concat_latent_image") is not None:
             raise RuntimeError(
-                "qf_native: WanImageToVideo.start_image is wired, but the QuantFunc engine takes the "
-                "reference frame through the QuantFuncNativeLoader's OWN 'start_image' IMAGE input "
-                "(it VAE-encodes the pixels itself and cannot use comfy's encoded concat_latent_image). "
-                "Wire your LoadImage into the LOADER's start_image and leave WanImageToVideo.start_image "
-                "EMPTY — otherwise the reference frame would be silently ignored.")
+                "qf_native: WanImageToVideo.start_image is wired, but i2v is NOT yet supported on the "
+                "file-based QuantFunc native loader (its denoise_only engine session cannot consume "
+                "comfy's encoded concat_latent_image, and the engine-side reference encode is "
+                "deliberately not loaded). Use the t2v preset/workflow for now — i2v arrives with its "
+                "own wan2.2-a14b-i2v preset. Silently ignoring your reference would be worse; refusing.")
         # ★ CLOSE THE SILENT-DISCARD CLASS: every OTHER image/reference channel WAN21.extra_conds consumes
         # that this bypass would drop (clip_fea / time_dim / reference / context / camera). The engine does
         # its OWN i2v conditioning from the loader's start_image, so any of these wired from a stock node
@@ -145,10 +146,10 @@ class QFWanModel(QFSessionModelMixin, comfy.model_base.WAN21):
         for _k in self._ENGINE_IGNORED_COND_KEYS:
             if kwargs.get(_k) is not None:
                 raise RuntimeError(
-                    f"qf_native: '{_k}' conditioning is wired, but the QuantFunc wan native session does "
-                    f"its OWN i2v/reference conditioning from the loader's start_image — it cannot consume "
-                    f"comfy's '{_k}', which would be silently ignored. Remove the node feeding '{_k}' "
-                    f"(the engine derives all i2v conditioning from the loader's start_image reference).")
+                    f"qf_native: '{_k}' conditioning is wired, but the QuantFunc wan native session "
+                    f"cannot consume comfy's '{_k}' — it would be silently ignored, so it is refused. "
+                    f"Remove the node feeding '{_k}'. (Reference/i2v conditioning is not yet supported "
+                    f"on the file-based loader; it arrives with the wan2.2-a14b-i2v preset.)")
         # We MIRROR WAN21's CONDRegular for cross_attn (the only channel the engine takes).
         out = {}
         cross_attn = kwargs.get("cross_attn", None)
@@ -173,8 +174,8 @@ class QFWanModel(QFSessionModelMixin, comfy.model_base.WAN21):
         raise RuntimeError(
             "qf_native: a denoise/inpaint mask (e.g. SetLatentNoiseMask) is wired, but the QuantFunc wan "
             "native session does not support masked inpainting — comfy's sampler would silently blend the "
-            "mask against the noise latent and corrupt the i2v result. Remove the mask / SetLatentNoiseMask "
-            "node (the engine derives the reference from the loader's start_image, not a latent mask).")
+            "mask against the noise latent and corrupt the result. Remove the mask / SetLatentNoiseMask "
+            "node.")
 
     def _derive_geometry(self, xin, transformer_options):
         """DERIVE the session geometry from the graph (official-loader shape — the loader has no
