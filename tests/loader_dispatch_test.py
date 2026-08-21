@@ -247,6 +247,18 @@ def main():
         vae = json.load(open(os.path.join(md, "vae", "config.json")))
         check("staged vae config carries the A14B wan2.1 scales (8 spatial / 4 temporal)",
               vae.get("scale_factor_spatial") == 8 and vae.get("scale_factor_temporal") == 4)
+        # R8 POSITIVE arm — the pair-mate exemption must GRANT, not just the shadow short-circuit:
+        # with the SHADOW STILL ALIVE, the primary's host-RAM release succeeds (same lazy-wrapper
+        # identity => coherent re-create), and the shared engine self-heals on next use.
+        out.detach(unpatch_all=False)       # engine holds its CPU backup now (already materialized)
+        held_pair = out.loaded_ram_size()
+        check("primary reports the backup while the shadow lives", held_pair > 0,
+              f"-> {held_pair}")
+        freed_pair = out.partially_unload_ram(10 ** 12)
+        check("pair-mate exemption GRANTS the primary's release (shadow alive)",
+              freed_pair == held_pair, f"-> freed {freed_pair} vs held {held_pair}")
+        check("released pair engine self-heals on next use",
+              out.model._qf.ensure().pipeline is not None and low.model._qf is out.model._qf)
     except Exception as e:  # noqa: BLE001
         check("wan dual-expert staging", False, f"-> raised {type(e).__name__}: {e}")
 

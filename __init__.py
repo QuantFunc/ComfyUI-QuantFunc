@@ -63,8 +63,13 @@ _NO_CFG_HINT = "(no official model config shipped)"
 def _model_config_choices(family=None):
     """The OFFICIAL model-config presets shipped with the plugin — one subdir of configs/ per
     model, each carrying a qf_native.json manifest (family routing + shape) beside the arch/VAE
-    config JSONs. The dropdown lists the DIRECTORY NAMES, so adding a model preset = drop in a
-    config dir; no code change (configs are data, not code). `family` filters the list for the
+    config JSONs. The dropdown lists the DIRECTORY NAMES, so adding a preset FOR AN EXISTING
+    family = drop in a config dir, data-only. A preset for a NEW family is NOT reachable by data
+    alone (R6, mutation-proven): it additionally needs its family seam module in _FAMILY_MODULES
+    AND a loader node class exposing that family's dropdown — the per-family node design trades
+    the old any-family node for family-scoped UX, so the code surface for a new family is the
+    node class + module entry, stated here so nobody trusts the old data-only claim. `family`
+    filters the list for the
     PER-FAMILY loader nodes (user 2026-08-21 pivot: one loader node per model family), so a wan
     preset can never appear in the LTX node's dropdown; a manifest whose family key is unreadable
     is simply not listed for a filtered call (the unfiltered call still shows it, and load()
@@ -682,7 +687,9 @@ if _IMPORT_OK:
         _rc.warn_if_stale(comfy_root=os.path.dirname(os.path.dirname(comfy.model_management.__file__)))
     except Exception as _rc_exc:  # noqa: BLE001 — the self-check must never break plugin import
         logging.debug("[qf_native] reject-list self-check skipped: %r", _rc_exc)
-    NODE_DISPLAY_NAME_MAPPINGS.update({"QuantFuncNativeLoader": "QuantFunc Native Loader",
-                                       "QuantFuncNativeLoRA": "QuantFunc Native LoRA"})
+    # (R7: the old single-node "QuantFuncNativeLoader" display entry is GONE with the class —
+    # a display mapping for an unregistered class is dead weight; the three per-family loaders
+    # register their display names beside their class mappings above.)
+    NODE_DISPLAY_NAME_MAPPINGS.update({"QuantFuncNativeLoRA": "QuantFunc Native LoRA"})
 
 

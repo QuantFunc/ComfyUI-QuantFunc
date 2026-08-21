@@ -392,8 +392,17 @@ def load_lib():
         # fails LOUD with the true unresolved soname, which is the honest error.
         so_dir = os.path.dirname(so_path)
         base = os.path.basename(so_path)
+        # The DIRECTORY scan carries the same skip-silently-here discipline as each
+        # individual sidecar load below (R1: an unreadable/vanished so_dir — e.g. a probe
+        # monkeypatching resolve_so_path to a nonexistent path — must not crash the scan;
+        # the engine dlopen below then fails LOUD with the true error, which keeps the
+        # "sidecars skip silently, the engine fails loud" statement TRUE for this path too).
+        try:
+            entries = os.listdir(so_dir)
+        except OSError:
+            entries = []
         pending = sorted(
-            f for f in os.listdir(so_dir)
+            f for f in entries
             if f.startswith("lib") and ".so" in f and f != base
             and not f.startswith(base + ".") and ".bak" not in f
         )
