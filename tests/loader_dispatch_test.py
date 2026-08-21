@@ -389,6 +389,39 @@ def main():
           _mr == type(out.model)._QF_COMFY_SIDE_INFERENCE_BYTES and _mr <= 1 << 30,
           f"-> {_mr}")
 
+    # ── B1 (CR-2b): the OLD-.so compat qfa pin is SM-GATED — NEVER on the SM80 fault tier ──
+    # The engine's qfa forward THROWS on SM80 (kQfaForwardFaultsOnSm) even for explicit
+    # requests, so an unconditional plugin pin turned A100/A800 from runs-with-collapse-risk
+    # into first-attention hard crash. The gate lives in _wan_device_sm() + the (86, 89) span;
+    # these arms pin BOTH directions by rebuilding with the SM query monkeypatched.
+    _wan_mod = sys.modules[type(out.model).__module__]
+    _orig_sm = _wan_mod._wan_device_sm
+    try:
+        for _sm_val, _want_pin, _why in ((89, True,  "sm89: consumable tier -> pin qfa"),
+                                         (86, True,  "sm86: consumable tier -> pin qfa"),
+                                         (80, False, "sm80: engine qfa-fwd FAULT tier -> NO pin (AUTO)"),
+                                         (75, False, "sm75: outside compat-pin span -> NO pin"),
+                                         (0,  False, "no CUDA -> NO pin (fail-safe AUTO)")):
+            _wan_mod._wan_device_sm = (lambda v: (lambda: v))(_sm_val)
+            _pair = WanL.load("fx-t2v-4steps-high-quantfunc-int4.safetensors",
+                              "fx-t2v-4steps-low-quantfunc-int4.safetensors", "wan2.2-a14b-t2v", 999)
+            _p = _pair[0]
+            _n0 = len(creates)
+            _ = _p.model._qf.lib          # touch -> create (or cache-hit on an identical cfg)
+            if len(creates) > _n0:
+                _cfg = creates[-1]
+            else:
+                # cache-hit: cfg identical to an earlier create — decode it from the cache
+                # key. cfg-json is the LAST element of BOTH the real _get_engine ckey (5-tuple)
+                # and the suite's fake ckey (3-tuple), so [-1] is shape-agnostic.
+                _cfg = json.loads(_p.model._qf._ckey[-1])
+            check("B1 " + _why,
+                  (_cfg.get("attention_backend") == "qfa") if _want_pin
+                  else ("attention_backend" not in _cfg),
+                  f"-> cfg={_cfg}")
+    finally:
+        _wan_mod._wan_device_sm = _orig_sm
+
     # single-expert staging shape (direct helper call — no single-expert family is wired yet,
     # but the helper's contract must already hold for the one that will be)
     try:

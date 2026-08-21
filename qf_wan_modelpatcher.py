@@ -472,6 +472,19 @@ class QFWanModel(QFSessionModelMixin, comfy.model_base.WAN21):
         return super().process_latent_out(latent)
 
 
+def _wan_device_sm():
+    """The compute-capability tier (major*10+minor) of comfy's torch device, for the OLD-.so
+    compat pin's SM gate. Monkeypatchable in the suite (the SM80-never-pins arm). Returns 0
+    when CUDA is unavailable/unqueryable — the pin then stays OFF (AUTO decides, fail-safe)."""
+    try:
+        import comfy.model_management as _mm
+        dev = _mm.get_torch_device()
+        cap = torch.cuda.get_device_capability(dev)
+        return cap[0] * 10 + cap[1]
+    except Exception:  # noqa: BLE001 — no CUDA / CPU device: no pin
+        return 0
+
+
 def register(deps):
     """Return the wan family BUILDER. `deps` gives the package-level helpers (engine cache,
     liveness registry, footprint estimator, lazy-engine class) without importing __init__."""
@@ -504,16 +517,23 @@ def register(deps):
             # the engine still reads the staged vae/config.json for session geometry. The old
             # text_precision=int8 pin existed only because create used to BUILD the TE; with
             # denoise_only it is obsolete and deliberately gone.
-            cfg = {"denoise_only": True,
-                   # HOTFIX (measured 2026-08-22, cu12 4090, engine-direct three-arm A/B at the
-                   # user's 640x640x81f geometry, seq_len=33600, same .so/weights/seed): sage2
-                   # i8f8 NUMERICALLY COLLAPSES at this seq_len (pure-white frames, run b68d —
-                   # the known 'sage2 long-sequence collapse' class re-manifesting on wan);
-                   # flash renders perfectly at 65s/gen (a747); qfa (tile INT8-QK) renders
-                   # perfectly at 51s/gen (9d33) — CORRECT **and** the FASTEST correct arm
-                   # (23% over flash). Until the engine's seq-aware routing lands (sage2 only
-                   # below its measured-healthy bound), the seam pins qfa.
-                   "attention_backend": "qfa"}
+            cfg = {"denoise_only": True}
+            # OLD-.so COMPAT PIN, SM-GATED (B1: the unconditional pin was a generality NO-GO —
+            # explicit "qfa" bypasses the engine's auto gate, and on the SM80 tier (A100/A800)
+            # the qfa forward is KNOWN-FAULTY (engine kQfaForwardFaultsOnSm): the fwd entry
+            # THROWS for explicit requests too, so an unconditional pin turned a
+            # runs-with-collapse-risk tier into a hard crash at the first attention.
+            # WHY the pin exists AT ALL (the deliberate second truth source): engines carrying
+            # 48d46b96 already AUTO-route wan to qfa on every runnable tier — but the user's
+            # deployed .so may PREDATE it (old AUTO = sage2, which numerically collapses at
+            # seq_len >= ~33600: the measured black-video class). The pin bridges exactly that
+            # window. REMOVAL CONDITION: drop this block once the 48d46b96-line .so is deployed
+            # everywhere this plugin runs. Gate mirrors the engine's exclusions: never on the
+            # SM80 fault tier (falls back to AUTO = the pre-pin behavior there), and only on
+            # tiers today's qfa consumable ships kernels for (sm86/89).
+            _sm = _wan_device_sm()
+            if _sm in (86, 89):
+                cfg["attention_backend"] = "qfa"
             if entries:
                 cfg["lora"] = list(entries)   # WanVideoPipeline splits target-tagged entries per expert
 
