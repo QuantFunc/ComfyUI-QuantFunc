@@ -122,10 +122,10 @@ def main():
     creates = []
     fake_cache = {}
 
-    def fake_get_engine(model_dir, create_cfg=None):
+    def fake_get_engine(model_dir, create_cfg=None, device_idx=0):
         # Mirrors the REAL _get_engine contract the liveness layer is built against: ONE handle
-        # per (model_dir, cfg) key, REUSED while its pipeline is valid.
-        ck = (model_dir, json.dumps(create_cfg or {}, sort_keys=True))
+        # per (model_dir, device, cfg) key, REUSED while its pipeline is valid.
+        ck = (model_dir, int(device_idx), json.dumps(create_cfg or {}, sort_keys=True))
         eng = fake_cache.get(ck)
         if eng is not None and eng.pipeline is not None:
             return eng, ck

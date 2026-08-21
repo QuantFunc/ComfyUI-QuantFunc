@@ -457,7 +457,11 @@ def register(deps):
                 cfg["lora"] = list(entries)   # WanVideoPipeline splits target-tagged entries per expert
 
             def _factory():
-                eng, ckey = get_engine(model_dir, create_cfg=cfg)
+                # comfy's device (0 when CUDA_VISIBLE_DEVICES pins one card; the real index on a
+                # multi-visible setup) — the engine must create on the SAME card comfy computes on.
+                dev = comfy.model_management.get_torch_device()
+                eng, ckey = get_engine(model_dir, create_cfg=cfg,
+                                       device_idx=getattr(dev, "index", 0) or 0)
                 # Liveness tracker for the host-RAM sweep: when comfy GC's this patcher's model the
                 # weakref goes dead → the package sweep may destroy the (unreferenced) handle.
                 bind_pipeline_model(ckey, model)

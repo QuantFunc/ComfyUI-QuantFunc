@@ -347,6 +347,16 @@ def load_lib():
     if _LIB is None:
         so_path = resolve_so_path()
         assert_toolchain_compatible(so_path)   # FORK-2 fail-closed torch-CUDA / .so-CUDA match check
+        # An engine built with QF_WITH_QFA_ATTN=ON links libquantfunc_attention.so (the standalone
+        # qfa INT8-QK attention library). Its build-time RUNPATH points at the BUILD box's dir,
+        # which doesn't exist on a deployed machine — so when the consumable is shipped NEXT TO
+        # the engine .so, preload it (RTLD_GLOBAL) and the dynamic linker resolves the dependency
+        # from the already-loaded image, no RPATH surgery / LD_LIBRARY_PATH needed. Absent file =
+        # no-op (an OFF-build engine has no such dependency); a PRESENT-but-broken qfa .so fails
+        # loud here rather than as an opaque dlopen error on the engine line below.
+        qfa_sidecar = os.path.join(os.path.dirname(so_path), "libquantfunc_attention.so")
+        if os.path.exists(qfa_sidecar):
+            ctypes.CDLL(qfa_sidecar, mode=ctypes.RTLD_GLOBAL)
         _LIB = _bind(ctypes.CDLL(so_path, mode=ctypes.RTLD_GLOBAL))
     return _LIB
 

@@ -308,7 +308,7 @@ def _sweep_dead_pipelines(keep_key):
                 pass
 
 
-def _get_engine(model_dir, create_cfg=None):
+def _get_engine(model_dir, create_cfg=None, device_idx=0):
     """Create (or reuse) the engine for a model PACKAGE dir. The native library path is
     resolved internally (resolve_so_path — NEVER a node input, #vuln). Create is MINIMAL:
     a PREQUANT svdq package carries its own layout/precision in its metadata; anything
@@ -317,7 +317,10 @@ def _get_engine(model_dir, create_cfg=None):
     create_cfg carries the per-family create keys (e.g. wan text_precision) + the
     declarative lora stack from chained QuantFuncNativeLoRA nodes."""
     lib = qfe.load_lib()
-    ckey = (qfe.resolve_so_path(), model_dir, "svdq",
+    # device_idx follows COMFY's torch device (the builders pass get_torch_device().index), so
+    # a ComfyUI started on a different GPU — or an in-process device choice — drives the engine
+    # on the SAME card comfy computes on. Part of the cache key: two devices = two handles.
+    ckey = (qfe.resolve_so_path(), model_dir, "svdq", int(device_idx),
             json.dumps(create_cfg or {}, sort_keys=True))
     _sweep_dead_pipelines(ckey)        # reclaim host RAM from configs whose patchers comfy dropped
     _evict_other_pipelines(ckey)       # keep only THIS config's VRAM resident (others reload lazily)
@@ -330,7 +333,7 @@ def _get_engine(model_dir, create_cfg=None):
         cfg["api_key"] = key
         cfg["server_url"] = surl
     pipeline = qfe.create_pipeline(lib, model_dir=model_dir, transformer_path=None,
-                                   model_backend="svdq", device_idx=0,
+                                   model_backend="svdq", device_idx=int(device_idx),
                                    config_json=(cfg if cfg else None))
     # Footprint = the ENGINE-RESIDENT transformer weight bytes only (dual-expert). VAE + text_encoder
     # stay NATIVE comfy nodes (comfy already accounts for them), so they must NOT be added here — an
