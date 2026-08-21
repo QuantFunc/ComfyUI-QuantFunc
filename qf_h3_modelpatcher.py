@@ -476,9 +476,6 @@ def register(NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS, get_engine, pipeli
                 # [manual-residency] GPU-resident transformer blocks (the native seam's ONLY
                 # residency mechanism; engine clamps to the model's block count).
                 "resident_block_count": ("INT", {"default": 999, "min": 1, "max": 1024}),
-            }, "optional": {
-                # Chained sidecar LoRA stack (QuantFuncNativeLoRA → this input).
-                "lora_stack": ("QF_LORA_STACK",),
             }}
 
         RETURN_TYPES = ("MODEL",)
@@ -494,32 +491,45 @@ def register(NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS, get_engine, pipeli
             "workflow; this loader only picks the model and the resident block count. LoRAs chain in via "
             "QuantFuncNativeLoRA.")
 
-        def load(self, model_name, resident_block_count=999, lora_stack=None):
+        def load(self, model_name, resident_block_count=999):
             model_dir = resolve_package(model_name)
-            _lora_cfg = {}
-            if lora_stack:
-                _lora_cfg["lora"] = list(lora_stack)   # engine svdq load: sidecar apply post-load
-            # H3 svdq is PRE-quantized: create is MINIMAL. The svdquant metadata carries the
-            # layout/precision; anything on top competes + mis-resolves (LTX minimal note).
-            engine, ckey = get_engine(model_dir, create_cfg=(_lora_cfg or None))
-            device = comfy.model_management.get_torch_device()
-            offload = comfy.model_management.unet_offload_device()
 
-            unet_config = {"image_model": "minimax_h3", "disable_unet_model_creation": True}
-            model_config = comfy.supported_models.MiniMaxH3(unet_config)
-            for attr, default in (("manual_cast_dtype", None), ("custom_operations", None),
-                                  ("optimizations", {}), ("scaled_fp8", None)):
-                if not hasattr(model_config, attr):
-                    setattr(model_config, attr, default)
+            def _tag(patcher, lora_entries):
+                """Mark the built model so the downstream QuantFuncNativeLoRA node can append to
+                its stack and re-create the pipeline (create-time sidecar LoRA)."""
+                m = patcher.model
+                m._qf_lora_stack = list(lora_entries)
+                m._qf_rebuild = _build
+                return patcher
 
-            model = QFH3Model(model_config, engine, device=device,
-                              resident_block_count=resident_block_count)
-            pipeline_models[ckey] = weakref.ref(model)
-            patcher = QFModelPatcher(model, load_device=device, offload_device=offload)
-            print(f"[qf_native] loaded QuantFuncNativeH3Loader (MiniMax-H3 svdq AV) package={model_name} "
-                  f"resident_blocks={resident_block_count} "
-                  f"footprint={engine.footprint_bytes // (1024*1024)}MB", flush=True)
-            return (patcher,)
+            def _build(lora_entries):
+                """Create (or reuse) the pipeline for THIS lora set + wrap it in a patcher."""
+                _lora_cfg = {}
+                if lora_entries:
+                    _lora_cfg["lora"] = list(lora_entries)   # engine svdq load: sidecar apply post-load
+                # H3 svdq is PRE-quantized: create is MINIMAL. The svdquant metadata carries the
+                # layout/precision; anything on top competes + mis-resolves (LTX minimal note).
+                engine, ckey = get_engine(model_dir, create_cfg=(_lora_cfg or None))
+                device = comfy.model_management.get_torch_device()
+                offload = comfy.model_management.unet_offload_device()
+
+                unet_config = {"image_model": "minimax_h3", "disable_unet_model_creation": True}
+                model_config = comfy.supported_models.MiniMaxH3(unet_config)
+                for attr, default in (("manual_cast_dtype", None), ("custom_operations", None),
+                                      ("optimizations", {}), ("scaled_fp8", None)):
+                    if not hasattr(model_config, attr):
+                        setattr(model_config, attr, default)
+
+                model = QFH3Model(model_config, engine, device=device,
+                                  resident_block_count=resident_block_count)
+                pipeline_models[ckey] = weakref.ref(model)
+                patcher = QFModelPatcher(model, load_device=device, offload_device=offload)
+                print(f"[qf_native] loaded QuantFuncNativeH3Loader (MiniMax-H3 svdq AV) package={model_name} "
+                      f"resident_blocks={resident_block_count} "
+                      f"footprint={engine.footprint_bytes // (1024*1024)}MB", flush=True)
+                return _tag(patcher, lora_entries)
+
+            return (_build([]),)
 
     NODE_CLASS_MAPPINGS.update({"QuantFuncNativeH3Loader": QuantFuncNativeH3Loader})
     NODE_DISPLAY_NAME_MAPPINGS.update({"QuantFuncNativeH3Loader": "QuantFunc Native H3 Loader"})
