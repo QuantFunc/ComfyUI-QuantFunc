@@ -111,6 +111,8 @@ def main():
     cfgroot = os.path.join(tmp, "configs")
     shutil.copytree(os.path.join(_PLUGIN, "configs", "wan2.2-a14b-t2v"),
                     os.path.join(cfgroot, "wan2.2-a14b-t2v"))
+    shutil.copytree(os.path.join(_PLUGIN, "configs", "wan2.2-a14b-i2v"),
+                    os.path.join(cfgroot, "wan2.2-a14b-i2v"))
     for name, mf in (("fx-ltx", {"family": "ltx2"}),
                      ("fx-h3", {"family": "minimax-h3"}),
                      ("fx-alien", {"family": "no-such-family"}),
@@ -158,6 +160,8 @@ def main():
     check("wan model_config lists ONLY wan presets (family-filtered)",
           "wan2.2-a14b-t2v" in cfgs and "fx-single" in cfgs and "fx-ltx" not in cfgs
           and "fx-alien" not in cfgs, f"-> {cfgs}")
+    check("the i2v preset ships and lists in the wan dropdown", "wan2.2-a14b-i2v" in cfgs,
+          f"-> {cfgs}")
     ltx_cfgs = LtxL.INPUT_TYPES()["required"]["model_config"][0]
     check("ltx model_config lists ONLY ltx2 presets",
           "fx-ltx" in ltx_cfgs and "wan2.2-a14b-t2v" not in ltx_cfgs, f"-> {ltx_cfgs}")
@@ -261,6 +265,33 @@ def main():
         check("wan single-file refused (dual-expert required)", False, "-> no exception")
     except RuntimeError as e:
         check("wan single-file refused (dual-expert required)", "DUAL-expert" in str(e))
+
+    # CROSS-task discrimination: the i2v preset must REFUSE a t2v file (and the t2v preset an
+    # i2v-named file) — file_hints are the only guard between the two same-family presets.
+    for f in ("fx-i2v-4steps-high-quantfunc-int4.safetensors",
+              "fx-i2v-4steps-low-quantfunc-int4.safetensors"):
+        with open(os.path.join(dm, f), "wb") as fh:
+            fh.write(b"\0" * 16)
+    try:
+        WanL.load("fx-t2v-4steps-high-quantfunc-int4.safetensors",
+                  "fx-i2v-4steps-low-quantfunc-int4.safetensors", "wan2.2-a14b-i2v", 999)
+        check("i2v preset refuses a t2v transformer1", False, "-> loaded!")
+    except RuntimeError as e:
+        check("i2v preset refuses a t2v transformer1", "does not look like" in str(e))
+    try:
+        WanL.load("fx-i2v-4steps-high-quantfunc-int4.safetensors",
+                  "fx-t2v-4steps-low-quantfunc-int4.safetensors", "wan2.2-a14b-t2v", 999)
+        check("t2v preset refuses an i2v transformer1", False, "-> loaded!")
+    except RuntimeError as e:
+        check("t2v preset refuses an i2v transformer1", "does not look like" in str(e))
+    pair_i2v = WanL.load("fx-i2v-4steps-high-quantfunc-int4.safetensors",
+                         "fx-i2v-4steps-low-quantfunc-int4.safetensors",
+                         "wan2.2-a14b-i2v", 999)
+    check("i2v preset loads a conforming pair (dual outputs)",
+          isinstance(pair_i2v, tuple) and len(pair_i2v) == 2)
+    mi_i2v = json.load(open(os.path.join(cfgroot, "wan2.2-a14b-i2v", "model_index.json")))
+    check("i2v preset carries the official boundary 0.9",
+          abs(float(mi_i2v.get("boundary_ratio", 0)) - 0.9) < 1e-6)
 
     # single-expert staging shape (direct helper call — no single-expert family is wired yet,
     # but the helper's contract must already hold for the one that will be)

@@ -1,0 +1,16 @@
+{
+  "family": "wan",
+  "display": "Wan2.2 A14B I2V (dual-expert, 4-step INT4)",
+  "dual_expert": true,
+  "notes": "official Wan2.2-I2V-A14B configs (boundary_ratio 0.9; transformers in36/out16 channel-concat); transformer1=high-noise, transformer2=low-noise; expected files: wan2.2-a14b-i2v-4steps-{high,low}-quantfunc-int4-r128.safetensors. STATUS: loads + stages today; SAMPLING refuses loud until the denoise_only cond-latent ABI lands (the engine i2v seam needs the reference as a LATENT from the workflow — engine VAE-encode is deliberately skipped in denoise_only).",
+  "file_hints": {
+    "transformer1": [
+      "*i2v*high*quantfunc*int4*",
+      "*i2v*high*quantfunc*fp4*"
+    ],
+    "transformer2": [
+      "*i2v*low*quantfunc*int4*",
+      "*i2v*low*quantfunc*fp4*"
+    ]
+  }
+}
