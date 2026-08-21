@@ -1,0 +1,6 @@
+{
+  "family": "wan",
+  "display": "Wan2.2 A14B T2V (dual-expert, 4-step INT4)",
+  "dual_expert": true,
+  "notes": "official Wan2.2-T2V-A14B configs; transformer1=high-noise, transformer2=low-noise; 4 steps, CFG 1.0, shift 5.0"
+}

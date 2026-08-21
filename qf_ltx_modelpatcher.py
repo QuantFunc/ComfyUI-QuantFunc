@@ -1024,7 +1024,8 @@ def register(deps):
     estimate_footprint = deps["estimate_footprint"]
 
 
-    def build(transformer1_path, transformer2_path, resident_block_count, lora_entries=()):
+    def build(transformer1_path, transformer2_path, resident_block_count, bundle_dir=None,
+              lora_entries=()):
         """File-based loading for this family is NOT WIRED YET (loud, not silent): the
         engine's denoise_only create exists only for wan today. This family still needs
         its engine-side flag + a shipped config bundle — tracked follow-up; wan is the

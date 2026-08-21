@@ -56,6 +56,42 @@ def _estimate_package_footprint(pkg):
         return 1
 
 
+_CONFIGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs")
+_NO_CFG_HINT = "(no official model config shipped)"
+
+
+def _model_config_choices():
+    """The OFFICIAL model-config presets shipped with the plugin — one subdir of configs/ per
+    model, each carrying a qf_native.json manifest (family routing + shape) beside the arch/VAE
+    config JSONs. The dropdown lists the DIRECTORY NAMES, so adding a model preset = drop in a
+    config dir; no code change (configs are data, not code)."""
+    try:
+        return sorted(d for d in os.listdir(_CONFIGS_DIR)
+                      if os.path.isfile(os.path.join(_CONFIGS_DIR, d, "qf_native.json")))                or [_NO_CFG_HINT]
+    except Exception:  # noqa: BLE001
+        return [_NO_CFG_HINT]
+
+
+def _load_model_config(name):
+    """Resolve + read a preset's manifest. The name is a widget value (workflow-serializable =
+    untrusted): it must be exactly one of the listed preset dirs — no separators, no traversal."""
+    if name == _NO_CFG_HINT or os.sep in name or "/" in name or "\\" in name or name in ("", ".", ".."):
+        raise RuntimeError(f"qf_native: invalid model_config {name!r} — pick one of the shipped "
+                           f"presets ({_model_config_choices()}).")
+    bundle = os.path.join(_CONFIGS_DIR, name)
+    mf = os.path.join(bundle, "qf_native.json")
+    if not os.path.isfile(mf):
+        raise RuntimeError(f"qf_native: model_config {name!r} has no qf_native.json manifest "
+                           f"(shipped presets: {_model_config_choices()}).")
+    try:
+        manifest = json.load(open(mf))
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"qf_native: model_config {name!r} manifest unreadable: {exc}") from exc
+    if not isinstance(manifest, dict) or not manifest.get("family"):
+        raise RuntimeError(f"qf_native: model_config {name!r} manifest must declare a family.")
+    return bundle, manifest
+
+
 _NO_XFM_HINT = "(no .safetensors in models/diffusion_models)"
 _XFM_NONE = "(none)"
 
@@ -347,10 +383,6 @@ if _IMPORT_OK:
 
 
 
-    # model_type selector: a family MUST be chosen (a bare .safetensors has no model_index.json
-    # to auto-detect from). "auto" is intentionally NOT offered here.
-    _FAMILY_CHOICES = [f for f, _ in _FAMILY_MATCHERS] if _FAMILY_MATCHERS else ["wan", "ltx2", "minimax-h3"]
-
     class QuantFuncNativeLoader:
         """ONE loader for every QuantFunc native family — like the reference INT8-Fast
         UNetLoaderINTW8A8: you pick a transformer .safetensors FILE from models/diffusion_models
@@ -373,11 +405,12 @@ if _IMPORT_OK:
                                              "models/diffusion_models (wan A14B: the HIGH-noise "
                                              "expert; single-expert LTX-2.5 / H3: the only "
                                              "transformer)."}),
-                "model_type": (_FAMILY_CHOICES,
-                               {"tooltip": "Which native family this transformer is — routes to "
-                                           "that family's engine build + arch config. A bare "
-                                           ".safetensors has no metadata to auto-detect from, so "
-                                           "pick it explicitly."}),
+                "model_config": (_model_config_choices(),
+                                 {"tooltip": "The OFFICIAL model config for this transformer "
+                                             "(shipped with the plugin: arch + VAE geometry + "
+                                             "family routing). Pick the preset matching your "
+                                             "weights — a bare .safetensors has no metadata to "
+                                             "auto-detect from."}),
                 "resident_block_count": ("INT", {"default": 999, "min": 1, "max": 1024,
                                                  "tooltip": "GPU-resident transformer blocks — the "
                                                             "native seam's ONLY residency knob. The "
@@ -411,18 +444,31 @@ if _IMPORT_OK:
             "Windows/macOS set QF_NATIVE_ALLOW_UNVERIFIED_TOOLCHAIN=1 after confirming they share a "
             "CUDA major.")
 
-        def load(self, transformer1, model_type, resident_block_count=999, transformer2=_XFM_NONE):
-            family = model_type
+        def load(self, transformer1, model_config, resident_block_count=999, transformer2=_XFM_NONE):
+            bundle_dir, manifest = _load_model_config(model_config)
+            family = str(manifest["family"])
             builder = _FAMILY_BUILDERS.get(family)
             if builder is None:
                 raise RuntimeError(
-                    f"qf_native: family '{family}' has no registered native seam in this install "
-                    f"(available: {sorted(_FAMILY_BUILDERS)}). An import of the seam module "
-                    f"probably failed at startup — check the log for a [qf_native] warning.")
+                    f"qf_native: model_config '{model_config}' routes to family '{family}', which "
+                    f"has no registered native seam in this install (available: "
+                    f"{sorted(_FAMILY_BUILDERS)}). An import of the seam module probably failed "
+                    f"at startup — check the log for a [qf_native] warning.")
             xfm1 = _resolve_transformer(transformer1)
             xfm2 = None if transformer2 in (_XFM_NONE, "", None) else _resolve_transformer(transformer2)
+            if bool(manifest.get("dual_expert")) and xfm2 is None:
+                raise RuntimeError(
+                    f"qf_native: model_config '{model_config}' is DUAL-expert — transformer1 = the "
+                    f"HIGH-noise expert AND transformer2 = the LOW-noise expert are both required "
+                    f"(the export ships them as a *-high-* / *-low-* pair).")
+            if not manifest.get("dual_expert") and xfm2 is not None:
+                raise RuntimeError(
+                    f"qf_native: model_config '{model_config}' is single-transformer — leave "
+                    f"transformer2 = \"(none)\" (a second expert here would be silently ignored "
+                    f"at best; refused instead).")
             return (builder(transformer1_path=xfm1, transformer2_path=xfm2,
-                            resident_block_count=int(resident_block_count)),)
+                            resident_block_count=int(resident_block_count),
+                            bundle_dir=bundle_dir),)
 
     class QuantFuncNativeLoRA:
         """Sidecar LoRA for the QuantFunc native loader — MODEL in, MODEL out (LoraLoaderModelOnly

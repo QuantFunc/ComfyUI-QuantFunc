@@ -2,8 +2,10 @@
 """Behavioural tests for the FILE-BASED loader node (INT8-Fast-aligned redesign) + the
 liveness/LoRA substrate:
 
-  1. UI surface — transformer1/transformer2 FILE dropdowns + model_type (no auto), nothing else
-  2. dispatch by model_type; ltx2/minimax-h3 refuse LOUD (not wired for file mode yet)
+  1. UI surface — transformer1/transformer2 FILE dropdowns + model_config (official presets,
+     data-driven from configs/), nothing else
+  2. dispatch by the preset MANIFEST's family; ltx2/minimax-h3 refuse LOUD (not wired yet);
+     traversal/shape-mismatch presets refused
   3. wan dual-expert STAGING — configs copied from the shipped bundle, weights SYMLINKED,
      denoise_only in the create cfg; single-file wan refused (A14B is dual-expert)
   4. transformer-name containment (comfy's own get_full_path_or_raise normalization)
@@ -102,6 +104,21 @@ def main():
             fh.write(b"\0" * 16)
     folder_paths.add_model_folder_path("diffusion_models", dm)
 
+    # OFFICIAL-CONFIG presets under a FIXTURE configs dir: the real shipped wan preset copied in,
+    # plus synthetic manifests that exercise routing (ltx2/h3 not-wired, unknown family,
+    # single-expert shape) without shipping fake production presets.
+    import shutil
+    cfgroot = os.path.join(tmp, "configs")
+    shutil.copytree(os.path.join(_PLUGIN, "configs", "wan2.2-a14b-t2v"),
+                    os.path.join(cfgroot, "wan2.2-a14b-t2v"))
+    for name, mf in (("fx-ltx", {"family": "ltx2"}),
+                     ("fx-h3", {"family": "minimax-h3"}),
+                     ("fx-alien", {"family": "no-such-family"}),
+                     ("fx-single", {"family": "wan", "dual_expert": False})):
+        os.makedirs(os.path.join(cfgroot, name))
+        json.dump(mf, open(os.path.join(cfgroot, name, "qf_native.json"), "w"))
+    qfn._CONFIGS_DIR = cfgroot
+
     creates = []
     fake_cache = {}
 
@@ -126,35 +143,48 @@ def main():
 
     # ── 1) UI surface: exactly the redesigned widgets, nothing from the old package loader ──
     it = Loader.INPUT_TYPES()
-    check("required = transformer1/model_type/resident_block_count",
-          list(it["required"].keys()) == ["transformer1", "model_type", "resident_block_count"],
+    check("required = transformer1/model_config/resident_block_count",
+          list(it["required"].keys()) == ["transformer1", "model_config", "resident_block_count"],
           f"-> {list(it['required'].keys())}")
     check("optional = transformer2 only", list(it.get("optional", {}).keys()) == ["transformer2"],
           f"-> {list(it.get('optional', {}).keys())}")
-    check("model_type has NO auto", "auto" not in it["required"]["model_type"][0]
-          and set(it["required"]["model_type"][0]) == {"wan", "ltx2", "minimax-h3"},
-          f"-> {it['required']['model_type'][0]}")
+    cfgs = it["required"]["model_config"][0]
+    check("model_config lists the shipped official presets (data-driven)",
+          "wan2.2-a14b-t2v" in cfgs and "fx-ltx" in cfgs, f"-> {cfgs}")
     t1 = it["required"]["transformer1"][0]
     check("transformer1 lists .safetensors FILES (and only those)",
           "wan-high.safetensors" in t1 and "not-a-model.txt" not in t1)
     check("transformer2 leads with (none)", it["optional"]["transformer2"][0][0] == "(none)")
 
-    # ── 2) dispatch: ltx2/minimax-h3 loud not-wired; unknown family loud ──
-    for fam in ("ltx2", "minimax-h3"):
+    # ── 2) dispatch by MANIFEST family: ltx2/minimax-h3 loud not-wired; unknown family loud;
+    #      model_config traversal refused ──
+    for preset in ("fx-ltx", "fx-h3"):
         try:
-            Loader.load("wan-high.safetensors", fam, 999)
-            check(f"{fam} refuses loud (not wired for file mode)", False, "-> no exception")
+            Loader.load("wan-high.safetensors", preset, 999)
+            check(f"{preset} refuses loud (family not wired for file mode)", False, "-> no exception")
         except RuntimeError as e:
-            check(f"{fam} refuses loud (not wired for file mode)", "not" in str(e).lower())
+            check(f"{preset} refuses loud (family not wired for file mode)", "not" in str(e).lower())
     try:
-        Loader.load("wan-high.safetensors", "no-such-family", 999)
+        Loader.load("wan-high.safetensors", "fx-alien", 999)
         check("unknown family refuses loud", False, "-> no exception")
     except RuntimeError as e:
         check("unknown family refuses loud", "no registered native seam" in str(e))
+    for evil_cfg in ("../wan2.2-a14b-t2v", "a/b", "..", ""):
+        try:
+            Loader.load("wan-high.safetensors", evil_cfg, 999)
+            check(f"model_config refuses {evil_cfg!r}", False, "-> loaded!")
+        except RuntimeError:
+            check(f"model_config refuses {evil_cfg!r}", True)
+    # manifest-driven SHAPE mismatches
+    try:
+        Loader.load("wan-high.safetensors", "fx-single", 999, transformer2="wan-low.safetensors")
+        check("single-expert preset + transformer2 refused", False, "-> no exception")
+    except RuntimeError as e:
+        check("single-expert preset + transformer2 refused", "single-transformer" in str(e))
 
     # ── 3) wan dual-expert staging + denoise_only create cfg ──
     try:
-        out = Loader.load("wan-high.safetensors", "wan", 999,
+        out = Loader.load("wan-high.safetensors", "wan2.2-a14b-t2v", 999,
                           transformer2="wan-low.safetensors")[0]
         check("wan dual-expert returns a QFModelPatcher", type(out).__name__ == "QFModelPatcher")
         n0 = len(creates)
@@ -182,7 +212,7 @@ def main():
 
     # wan single-file must refuse (A14B is dual-expert)
     try:
-        Loader.load("wan-high.safetensors", "wan", 999)
+        Loader.load("wan-high.safetensors", "wan2.2-a14b-t2v", 999)
         check("wan single-file refused (dual-expert required)", False, "-> no exception")
     except RuntimeError as e:
         check("wan single-file refused (dual-expert required)", "DUAL-expert" in str(e))
@@ -191,7 +221,7 @@ def main():
     # but the helper's contract must already hold for the one that will be)
     try:
         stage = qfn.qfmp.stage_denoise_only_package(
-            os.path.join(_PLUGIN, "configs", "wan-a14b"),
+            os.path.join(_PLUGIN, "configs", "wan2.2-a14b-t2v"),
             os.path.join(dm, "other.safetensors"), None)
         check("single-expert staging PRUNES transformer_2",
               not os.path.exists(os.path.join(stage, "transformer_2")))
@@ -224,7 +254,7 @@ def main():
         qfn._resolve_lora = lambda n: os.path.join(lora_dir, n)
         LoraNode = qfn.NODE_CLASS_MAPPINGS["QuantFuncNativeLoRA"]()
 
-        base = Loader.load("wan-high.safetensors", "wan", 999,
+        base = Loader.load("wan-high.safetensors", "wan2.2-a14b-t2v", 999,
                            transformer2="wan-low.safetensors")[0]
         shifted = ModelSamplingSD3().patch(base, 11.0)[0]     # upstream comfy patch
         n0 = len(creates)
@@ -256,7 +286,7 @@ def main():
     try:
         for f in ("ram-h.safetensors", "ram-l.safetensors"):
             open(os.path.join(dm, f), "wb").write(b"\0" * 16)
-        fresh = Loader.load("ram-h.safetensors", "wan", 999, transformer2="ram-l.safetensors")[0]
+        fresh = Loader.load("ram-h.safetensors", "wan2.2-a14b-t2v", 999, transformer2="ram-l.safetensors")[0]
         eng = fresh.model._qf
         check("never-created engine reports 0 host RAM", fresh.loaded_ram_size() == 0)
         check("never-created engine frees 0 host RAM", fresh.partially_unload_ram(10 ** 12) == 0)
@@ -278,8 +308,8 @@ def main():
         import gc
         for f in ("sh-h.safetensors", "sh-l.safetensors"):
             open(os.path.join(dm, f), "wb").write(b"\0" * 16)
-        pa = Loader.load("sh-h.safetensors", "wan", 999, transformer2="sh-l.safetensors")[0]
-        pb = Loader.load("sh-h.safetensors", "wan", 999, transformer2="sh-l.safetensors")[0]
+        pa = Loader.load("sh-h.safetensors", "wan2.2-a14b-t2v", 999, transformer2="sh-l.safetensors")[0]
+        pb = Loader.load("sh-h.safetensors", "wan2.2-a14b-t2v", 999, transformer2="sh-l.safetensors")[0]
         ra = pa.model._qf.ensure()
         rb = pb.model._qf.ensure()
         check("two loads of one file-pair share the real handle", ra is rb)

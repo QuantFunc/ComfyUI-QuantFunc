@@ -428,9 +428,8 @@ def register(deps):
     estimate_footprint = deps["estimate_footprint"]
     apply_checkpoint_flow_shift = deps["apply_checkpoint_flow_shift"]
 
-    _BUNDLE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs", "wan-a14b")
-
-    def build(transformer1_path, transformer2_path, resident_block_count, lora_entries=()):
+    def build(transformer1_path, transformer2_path, resident_block_count, bundle_dir,
+              lora_entries=()):
         """wan A14B from BARE transformer FILES (INT8-Fast-aligned): transformer1 = HIGH-noise
         expert, transformer2 = LOW-noise expert — BOTH required (A14B is dual-expert; a missing
         low expert would denoise the low-sigma phase with nothing). The engine create is
@@ -438,14 +437,14 @@ def register(deps):
         VAEDecode decodes), configs come from the plugin-shipped wan-a14b bundle."""
         if not transformer2_path:
             raise RuntimeError(
-                "qf_native wan: wan2.2 A14B is DUAL-expert — transformer1 = the HIGH-noise "
-                "expert .safetensors AND transformer2 = the LOW-noise expert .safetensors are "
-                "both required (the export ships them as a *-high-* / *-low-* pair).")
+                "qf_native wan: this builder currently supports the DUAL-expert A14B shape only "
+                "(transformer1 = high-noise + transformer2 = low-noise). A single-expert wan "
+                "preset needs its own config bundle + a single-expert model_config manifest.")
 
         def _build(entries):
             # One staged, config-complete package per (bundle, file-pair): shipped A14B configs +
             # weight symlinks. Weights stay where the user put them (no copy).
-            model_dir = qfmp.stage_denoise_only_package(_BUNDLE, transformer1_path,
+            model_dir = qfmp.stage_denoise_only_package(bundle_dir, transformer1_path,
                                                         transformer2_path)
             # denoise_only (engine WanVideoPipeline.cpp): skip the UMT5 TE (~10 GB dead mass here
             # — conditioning comes from comfy's NATIVE CLIP) + the VAE weights (comfy decodes);
