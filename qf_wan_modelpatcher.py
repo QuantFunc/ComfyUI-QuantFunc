@@ -374,6 +374,10 @@ class QFWanModel(QFSessionModelMixin, comfy.model_base.WAN21):
                 tail = tail[0:1].contiguous()
         if self._qf.current_session is None:
             self._derive_geometry(xin, transformer_options)  # session geometry from the GRAPH
+            # ALL-ZERO INITIAL LATENT GUARD — the SHARED substrate helper (one mechanism,
+            # three users; see qf_modelpatcher.refuse_all_zero_initial_latent for the full
+            # black-video root cause).
+            qfmp.refuse_all_zero_initial_latent(xin, FAMILY)
             self._begin(xin[0:1].contiguous(), ctx[0:1].contiguous(), cond_tail=tail)
         if self._out is None or self._out.shape != xin.shape or self._out.dtype != xin.dtype:
             self._out = torch.empty_like(xin)

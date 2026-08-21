@@ -684,6 +684,8 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
         vemb = self._run_connector(c_crossattn, attention_mask=kwargs.get("attention_mask")
                                    ).to(dev, dtype=torch.bfloat16).contiguous()
         if self._qf.current_session is None:
+            # shared black-video guard (see qf_modelpatcher.refuse_all_zero_initial_latent).
+            qfmp.refuse_all_zero_initial_latent(xin, FAMILY)
             self._begin(xin[0:1].contiguous(), vemb[0:1].contiguous())
         # packed velocity_out buffer [1, N, 128]
         _, C, F, H, W = xin.shape
@@ -890,6 +892,8 @@ class QFLTXAVModel(QFLTXModel):
         vemb = self._run_connector(c_crossattn, attention_mask=kwargs.get("attention_mask")
                                    ).to(dev, dtype=torch.bfloat16).contiguous()
         if self._qf.current_session is None:
+            # shared black-video guard (see qf_modelpatcher.refuse_all_zero_initial_latent).
+            qfmp.refuse_all_zero_initial_latent(xin, FAMILY)
             self._begin(xin[0:1].contiguous(), vemb[0:1].contiguous())
         _, C, F, H, W = xin.shape
         N = F * H * W

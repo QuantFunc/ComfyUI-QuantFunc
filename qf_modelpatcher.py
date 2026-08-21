@@ -478,6 +478,25 @@ def stage_denoise_only_package(bundle_dir, transformer1_path, transformer2_path=
     return stage
 
 
+def refuse_all_zero_initial_latent(xin, family):
+    """ALL-ZERO INITIAL LATENT GUARD — SHARED across every family seam (wan/ltx2/minimax-h3;
+    one mechanism, N users). An Empty latent whose first sampler stage has add_noise=disable
+    hands the engine a pure-zero tensor at sigma_max: int4 per-token quantization divides by
+    amax=0 (0/0 = NaN), the NaN propagates silently through every step, and VAEDecode writes
+    an EXACT-BLACK video with zero errors anywhere — the worst failure shape (measured on the
+    user's wan run 2026-08-21; the class is family-independent, any int4 transformer NaNs the
+    same way). Denoising pure zeros is never meaningful, so refuse LOUD at session begin,
+    BEFORE any engine call, with the actual fix named. A noised latent / any i2v or
+    latent-input flow is nonzero and never trips this."""
+    if float(xin.abs().max()) == 0.0:
+        raise RuntimeError(
+            f"qf_native {family}: the initial latent is ALL ZEROS — denoising pure zeros "
+            f"produces NaN through int4 quantization (amax=0) and renders a BLACK video. "
+            f"Almost always this means the FIRST sampler stage has add_noise=disable on an "
+            f"Empty latent: set add_noise=enable on the first stage (official templates ship "
+            f"it enabled; later stages keep disable — they receive the leftover-noise latent).")
+
+
 def tag_lora_rebuild(patcher, lora_entries, rebuild):
     """Mark a freshly built patcher's model with its LoRA set + how to re-create with a new one."""
     m = patcher.model

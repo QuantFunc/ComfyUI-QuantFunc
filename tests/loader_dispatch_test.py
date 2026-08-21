@@ -259,6 +259,30 @@ def main():
               freed_pair == held_pair, f"-> freed {freed_pair} vs held {held_pair}")
         check("released pair engine self-heals on next use",
               out.model._qf.ensure().pipeline is not None and low.model._qf is out.model._qf)
+        # ZERO-LATENT GUARD arm (user black-video class): _apply_model on an ALL-ZERO latent must
+        # refuse LOUD (naming add_noise) BEFORE any engine call; a noised latent must get PAST the
+        # guard (it then fails at _begin on the fixture's fake lib — proving the guard is the ONLY
+        # thing that fired for zeros, and that it does NOT fire for nonzero input).
+        import torch as _t
+        _sig = _t.tensor([1.0])
+        _topts = {"sample_sigmas": _t.tensor([1.0, 0.5, 0.0])}
+        _zero = _t.zeros(1, 16, 3, 8, 8)
+        _ctx = _t.zeros(1, 8, 4096)   # cond content is irrelevant to this guard
+        try:
+            out.model._apply_model(_zero, _sig, c_crossattn=_ctx, transformer_options=_topts)
+            check("zero-latent guard fires (black-video class)", False, "-> no exception")
+        except RuntimeError as e:
+            check("zero-latent guard fires (black-video class)",
+                  "ALL ZEROS" in str(e) and "add_noise" in str(e), f"-> {str(e)[:80]}")
+        try:
+            out.model._apply_model(_t.randn(1, 16, 3, 8, 8), _sig, c_crossattn=_ctx,
+                                   transformer_options=_topts)
+            check("noised latent passes the guard (reaches _begin)", False, "-> no exception??")
+        except Exception as e:  # noqa: BLE001 — ANY non-guard failure proves it got PAST the
+            # guard (on the fixture the fake lib then fails inside _begin, e.g. AttributeError);
+            # only the guard's own message would mean the guard misfired on nonzero input.
+            check("noised latent passes the guard (reaches _begin)",
+                  "ALL ZEROS" not in str(e), f"-> {type(e).__name__}: {str(e)[:60]}")
     except Exception as e:  # noqa: BLE001
         check("wan dual-expert staging", False, f"-> raised {type(e).__name__}: {e}")
 
