@@ -9,6 +9,8 @@ reviewers flagged as having zero automated coverage:
   4. adopt_comfy_state_from — an upstream ModelSampling patch must SURVIVE a LoRA rebuild
      (the silent-shift regression this contract exists to prevent)
   5. HOST-RAM accounting honesty — a never-created engine must report 0, not its estimate
+  6. SHARED-handle sibling safety — a release under a live sibling must refuse (measured UAF)
+  7. the REAL LoRA-node chain — two-instance state transplant + N-chain -> ONE deferred create
 
 Run:  python tests/loader_dispatch_test.py          (needs the ComfyUI env; SKIPs without it)
 """
@@ -71,6 +73,7 @@ class _DummyEngine:
 
     def destroy(self):
         self.pipeline = None
+        self.current_session = None
 
 
 def _make_pkg(root, name, pipeline_class=None, transformer_class=None):
@@ -107,10 +110,20 @@ def main():
     qfn._model_roots = lambda: [root]          # confine the scan to the fixture root
 
     creates = []
+    fake_cache = {}
 
     def fake_get_engine(model_dir, create_cfg=None):
+        # Mirrors the REAL _get_engine contract the liveness layer is built against: ONE handle
+        # per (model_dir, cfg) key, REUSED while its pipeline is valid — that sharing is exactly
+        # what the sibling-safety arms test, so a fresh-dummy-per-call stub would test nothing.
+        ck = (model_dir, json.dumps(create_cfg or {}, sort_keys=True))
+        eng = fake_cache.get(ck)
+        if eng is not None and eng.pipeline is not None:
+            return eng, ck
         creates.append(len((create_cfg or {}).get("lora", [])))
-        return _DummyEngine(), ("ckey", len(creates))
+        eng = _DummyEngine()
+        fake_cache[ck] = eng
+        return eng, ck
     qfn._get_engine = fake_get_engine
     # The family builders CAPTURE their deps at registration time (deps["get_engine"]), so a module
     # -attribute monkeypatch alone would leave them calling the real engine loader — which then
@@ -129,6 +142,16 @@ def main():
     _make_pkg(root, "xfm_only_pkg", pipeline_class=None,
               transformer_class="WanTransformer3DModel")
     _make_pkg(root, "alien_pkg", pipeline_class="Flux2KleinPipeline")
+    # INTERNALLY-INCONSISTENT package: unknown pipeline_class + a wan transformer config. The
+    # ENGINE only consults transformer_class when pipeline_class is EMPTY (PipelineLoader
+    # detectPipelineKind), so auto-detect must NOT claim this for wan — engine input-parity.
+    _make_pkg(root, "mixed_pkg", pipeline_class="Flux2KleinPipeline",
+              transformer_class="WanTransformer3DModel")
+    # DEDICATED packages for the lifecycle arms: liveness is per-ckey (per package+cfg), and any
+    # still-alive patcher from another arm on the same package legitimately pins its handle — the
+    # refusal that caused would be the mechanism WORKING, not the property each arm tests.
+    _make_pkg(root, "ram_pkg", pipeline_class="WanPipeline")
+    _make_pkg(root, "shared_pkg", pipeline_class="WanPipeline")
 
     for name, want in (("wan_pkg", "wan"), ("ltx_pkg", "ltx2"), ("h3_pkg", "minimax-h3")):
         got, _rep = qfn._detect_family(os.path.join(root, name))
@@ -138,6 +161,9 @@ def main():
     got, rep = qfn._detect_family(os.path.join(root, "alien_pkg"))
     check("unknown family reports None (does NOT raise)", got is None and "Flux2Klein" in rep,
           f"-> {got!r}, reported={rep!r}")
+    got, _rep = qfn._detect_family(os.path.join(root, "mixed_pkg"))
+    check("engine input-parity: transformer half ignored when pipeline_class present",
+          got is None, f"-> {got!r} (engine would never consult the transformer half here)")
 
     Loader = qfn.NODE_CLASS_MAPPINGS["QuantFuncNativeLoader"]()
 
@@ -189,7 +215,7 @@ def main():
 
         # ── 5) HOST-RAM honesty: a never-created engine holds NOTHING ─────────────────────
         try:
-            fresh = Loader.load("wan_pkg")[0]
+            fresh = Loader.load("ram_pkg")[0]
             eng = fresh.model._qf
             never_ram = fresh.loaded_ram_size()
             never_freed = fresh.partially_unload_ram(10 ** 12)
@@ -208,6 +234,75 @@ def main():
             check("partially_unload_ram accepts comfy's subsets kwarg", True)
         except Exception as e:  # noqa: BLE001
             check("host-RAM accounting", False, f"-> raised {type(e).__name__}: {e}")
+
+        # ── 6) SHARED-handle sibling safety (the round-2 NO-GO, exact measured shape):
+        #       two loader nodes on the SAME package share one cached handle; one sibling's
+        #       partially_unload_ram must NOT destroy it under the other ─────────────────────
+        try:
+            import gc
+            pa = Loader.load("shared_pkg")[0]
+            pb = Loader.load("shared_pkg")[0]
+            ra = pa.model._qf.ensure()
+            rb = pb.model._qf.ensure()
+            check("two loads of one package share the real handle", ra is rb)
+            pa.detach(unpatch_all=False)     # evict -> both wrappers now see the CPU backup
+            freed_a = pa.partially_unload_ram(10 ** 12)
+            check("sibling-shared release REFUSES (freed 0, sibling alive)", freed_a == 0,
+                  f"-> {freed_a}")
+            check("sibling's pipeline SURVIVES the refused release",
+                  pb.model._qf.pipeline is not None)
+            check("sibling still honestly reports its backup", pb.loaded_ram_size() > 0)
+            # drop sibling B entirely -> A becomes the sole consumer -> release now proceeds
+            del pb, rb
+            gc.collect()
+            freed_a2 = pa.partially_unload_ram(10 ** 12)
+            check("sole-consumer release DOES free once the sibling is gone", freed_a2 > 0,
+                  f"-> {freed_a2}")
+            check("released wrapper reports 0 afterwards", pa.loaded_ram_size() == 0)
+            check("released wrapper self-heals on next use",
+                  pa.model._qf.ensure().pipeline is not None)
+            del pa, ra
+            gc.collect()
+        except Exception as e:  # noqa: BLE001
+            check("shared-handle sibling safety", False, f"-> raised {type(e).__name__}: {e}")
+
+        # ── 7) REAL LoRA-node chain (production call shape): two-instance state transplant +
+        #       the deferred-create contract (N chained nodes -> ONE pipeline create) ─────────
+        try:
+            from comfy_extras.nodes_model_advanced import ModelSamplingSD3
+            lora_dir = os.path.join(tmp, "loras")
+            os.makedirs(lora_dir, exist_ok=True)
+            for f in ("a.safetensors", "b.safetensors"):
+                open(os.path.join(lora_dir, f), "wb").write(b"\0" * 16)
+            qfn._lora_choices = lambda: ["a.safetensors", "b.safetensors"]
+            qfn._resolve_lora = lambda n: os.path.join(lora_dir, n)
+            LoraNode = qfn.NODE_CLASS_MAPPINGS["QuantFuncNativeLoRA"]()
+
+            base = Loader.load("wan_pkg")[0]
+            shifted = ModelSamplingSD3().patch(base, 11.0)[0]     # upstream comfy patch
+            n0 = len(creates)
+            chained1 = LoraNode.apply(shifted, "a.safetensors", 0.8)[0]
+            chained2 = LoraNode.apply(chained1, "b.safetensors", 0.5)[0]
+            check("LoRA chain defers ALL creates (0 so far)", len(creates) == n0,
+                  f"-> {len(creates) - n0} eager creates")
+            check("LoRA node returns a DIFFERENT patcher (two-instance transplant)",
+                  chained2 is not shifted and chained2.model is not shifted.model)
+            check("upstream ModelSampling patch transplanted onto the rebuilt patcher",
+                  "model_sampling" in chained2.object_patches)
+            chained2.patch_model()
+            got_shift = float(getattr(chained2.model.model_sampling, "shift", -1))
+            check("transplanted shift survives across instances", got_shift == 11.0,
+                  f"-> {got_shift}")
+            stack = qfn.qfmp.lora_stack_of(chained2)
+            check("chained stack accumulated both entries", len(stack) == 2 and
+                  stack[0]["scale"] == 0.8 and stack[1]["scale"] == 0.5, f"-> {stack}")
+            _ = chained2.model._qf.lib          # what the sampler's first touch does
+            check("first touch creates EXACTLY ONE pipeline for the whole chain",
+                  len(creates) == n0 + 1, f"-> {len(creates) - n0}")
+            check("that one create carries the full accumulated LoRA set", creates[-1] == 2,
+                  f"-> {creates[-1]} loras in create_cfg")
+        except Exception as e:  # noqa: BLE001
+            check("real LoRA-node chain", False, f"-> raised {type(e).__name__}: {e}")
     else:
         check("wan family registered", False, "-> builders: %s" % sorted(qfn._FAMILY_BUILDERS))
 

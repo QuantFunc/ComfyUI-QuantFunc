@@ -1,5 +1,5 @@
-"""qf_native.qf_modelpatcher — the seam: a comfy ModelPatcher whose WAN21-shim `.model`
-drives quantfunc_denoise_step instead of a torch UNet.
+"""qf_native.qf_modelpatcher — the FAMILY-AGNOSTIC seam substrate: a comfy ModelPatcher whose
+shim `.model` (built by a family module) drives quantfunc_denoise_step instead of a torch UNet.
 
 Design (measured from comfy 0.27.0 + include/quantfunc.h + the proven native_session_video_t1.py):
 - `.model` = a FAMILY subclass of the matching comfy.model_base class, built with
@@ -292,9 +292,14 @@ class QFLazyEngine:
     __getattr__ magic: a typo must fail loud, not silently forward.
     """
 
-    def __init__(self, factory, footprint_bytes):
+    def __init__(self, factory, footprint_bytes, may_release=None):
         self._factory = factory          # () -> (QFEngineHandle, ckey)
         self._real = None
+        self._ckey = None                # the materialized handle's cache key (for may_release)
+        # may_release(ckey, requester_model) -> bool: the CACHE layer's verdict on whether this
+        # wrapper may DESTROY the (possibly shared) real handle. None => NEVER destroy (fail-safe:
+        # a wrapper that cannot prove exclusivity must not free a handle a sibling may hold).
+        self._may_release = may_release
         self.footprint_bytes = int(footprint_bytes)   # from the package weights: no create needed
         # Nothing created yet => nothing resident. Reporting "unloaded" keeps comfy's ledger
         # HONEST (loaded_size -> 0) for a chain link the sampler never touches.
@@ -304,8 +309,12 @@ class QFLazyEngine:
 
     # ---- materialization ----
     def ensure(self):
+        if self._real is not None and self._real.pipeline is None:
+            # The real handle was DESTROYED under us (a sibling's lifecycle path, or any future
+            # one). Never hand a NULL pipeline to denoise_begin — drop it and re-create from disk.
+            self._real = None
         if self._real is None:
-            self._real, _ckey = self._factory()
+            self._real, self._ckey = self._factory()
             self._real.step_count = self.step_count
             self._real.sampler_step_count = self.sampler_step_count
             self.footprint_bytes = int(self._real.footprint_bytes)
@@ -358,19 +367,34 @@ class QFLazyEngine:
         if self._real is not None:
             self._real.destroy()
 
-    def release(self):
+    def release(self, requester=None):
         """Free the created pipeline (VRAM + the CPU backup) and go back to UNMATERIALIZED — the
         factory re-creates it from disk on the next use. Used by comfy's RAM manager
-        (partially_unload_ram); refuses while a session is open."""
+        (partially_unload_ram); refuses while a session is open.
+
+        SHARED-HANDLE SAFETY (measured defect this closes): the real handle may be SHARED by
+        other live models (two loader nodes on the same package hit one cache entry), so destroy
+        is gated on the cache layer's may_release(ckey, requester) — destroying under a live
+        sibling left it a NULL pipeline for its next denoise while its ledger kept reporting the
+        destroyed backup. No callback wired => refuse (fail-safe; better an unreclaimed backup
+        than a use-after-destroy). Returns True iff the handle was actually destroyed."""
         if self._real is None:
-            return
+            return False
+        if self._real.pipeline is None:
+            # already destroyed elsewhere — nothing to free; just fall back to lazy re-create
+            self._real = None
+            self._unloaded = True
+            return False
         if getattr(self._real, "current_session", None) is not None:
-            return
+            return False
+        if self._may_release is None or not self._may_release(self._ckey, requester):
+            return False
         try:
             self._real.destroy()
         finally:
             self._real = None
             self._unloaded = True
+        return True
 
 
 # ── shared sidecar-LoRA rebuild contract (CR simplicity: ONE definition, not one per family) ──
@@ -503,6 +527,11 @@ class QFModelPatcher(comfy.model_patcher.ModelPatcher):
         # A lazy handle exposes `materialized`; a plain handle always has a real pipeline.
         if not getattr(eng, "materialized", True):
             return False, eng
+        # A DESTROYED handle (pipeline gone — e.g. a sibling wrapper legitimately released the
+        # last reference) holds no backup either; unload_vram keeps the pipeline valid, destroy
+        # nulls it, so this is exactly the "backup actually exists" discriminator.
+        if getattr(eng, "pipeline", None) is None:
+            return False, eng
         return True, eng
 
     def loaded_ram_size(self):
@@ -528,7 +557,12 @@ class QFModelPatcher(comfy.model_patcher.ModelPatcher):
             return 0
         freed = max(0, int(getattr(eng, "footprint_bytes", 0)))
         try:
-            release()
+            # requester=self.model: the cache layer refuses the destroy while any OTHER live
+            # model shares the handle (a sibling loader node on the same package) — report freed
+            # bytes ONLY when the destroy actually happened, else the ledger gets credited for
+            # memory a sibling still holds.
+            if not release(requester=self.model):
+                return 0
         except Exception:  # noqa: BLE001
             return 0
         return freed

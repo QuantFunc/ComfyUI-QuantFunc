@@ -18,7 +18,7 @@ try:
     import comfy.supported_models
     from . import qf_engine as qfe
     from . import qf_modelpatcher as qfmp
-    from .qf_modelpatcher import QFModelPatcher, QFLazyEngine
+    from .qf_modelpatcher import QFModelPatcher
     _IMPORT_OK = True
 except Exception as _exc:  # noqa: BLE001 — never break registration; report loudly
     logging.warning("[qf_native] disabled — a required import failed (ComfyUI API drift?): %r", _exc)
@@ -229,9 +229,14 @@ def _apply_checkpoint_flow_shift(model, model_dir):
 #    once its QFWanModel has been garbage-collected (comfy dropped the patcher) — a dead model cannot
 #    be use-after-freed, so destroy is safe there. Without this the unload_vram-only design leaks a
 #    multi-GB CPU backup per distinct config forever (a resolution/model sweep). `_PIPELINE_MODELS`
-#    holds a weakref to each config's model as the liveness signal (set in load() after construction).
+#    holds weakrefs to ALL of a config's live models as the liveness signal (bound in each build).
 _PIPELINE_CACHE = {}     # ckey -> QFEngineHandle
-_PIPELINE_MODELS = {}    # ckey -> weakref.ref(QFWanModel)  (liveness tracker for safe host-RAM eviction)
+_PIPELINE_MODELS = {}    # ckey -> [weakref.ref(model), ...] — ALL live consumers of that config's
+#                          handle. A LIST, not one ref: two loader nodes on the same package share
+#                          ONE handle, and a single last-load-wins ref made the FIRST model invisible
+#                          to liveness (measured: a sibling's release/sweep could destroy the shared
+#                          handle under a still-live patcher → NULL pipeline at its next denoise +
+#                          a ledger that kept reporting the destroyed backup).
 # KNOWN RESIDUALS — both UNREACHABLE in the production consumer (comfy's PromptExecutor runs every node on
 # a SINGLE execution thread, so load() is never concurrent with another load()); recorded, not silent:
 #  • These two dicts are mutated WITHOUT a lock. A hypothetical MULTI-THREADED caller could race the
@@ -244,6 +249,38 @@ _PIPELINE_MODELS = {}    # ckey -> weakref.ref(QFWanModel)  (liveness tracker fo
 #    mid-load AND is never retried leaks ONE CPU-backup handle. A retry of the SAME config REUSES the
 #    cached handle (faster) and, on success, binds the weakref → it becomes sweepable — so the pin is a
 #    reuse-on-retry feature except in the never-retried case; evicting on failure would forfeit it.
+
+
+def _bind_pipeline_model(ckey, model):
+    """Register `model` as a live consumer of ckey's cached handle (called by every family builder
+    after constructing its model). Prunes dead refs so the list tracks the true live set."""
+    refs = [r for r in _PIPELINE_MODELS.get(ckey, []) if r() is not None]
+    refs.append(weakref.ref(model))
+    _PIPELINE_MODELS[ckey] = refs
+
+
+def _live_pipeline_models(ckey):
+    """The models still alive on ckey's handle (prunes dead refs in place)."""
+    refs = [r for r in _PIPELINE_MODELS.get(ckey, []) if r() is not None]
+    if refs:
+        _PIPELINE_MODELS[ckey] = refs
+    else:
+        _PIPELINE_MODELS.pop(ckey, None)
+    return [r() for r in refs]
+
+
+def _may_release_handle(ckey, requester):
+    """May `requester`'s wrapper DESTROY ckey's shared handle? Only when no OTHER live model is
+    bound to it — a sibling loader node on the same package would otherwise be left holding a
+    destroyed handle (NULL pipeline at its next denoise) while still reporting its backup to
+    comfy's ledger. On grant, the cache entry is dropped (the caller destroys the handle; the
+    next load re-creates from disk). The requester itself STAYS bound: if it re-materializes
+    later it becomes a live consumer of the ckey's NEXT handle."""
+    for m in _live_pipeline_models(ckey):
+        if m is not requester:
+            return False
+    _PIPELINE_CACHE.pop(ckey, None)
+    return True
 
 
 def _evict_other_pipelines(keep_key):
@@ -263,9 +300,9 @@ def _sweep_dead_pipelines(keep_key):
     for k in list(_PIPELINE_CACHE.keys()):
         if k == keep_key:
             continue
-        ref = _PIPELINE_MODELS.get(k)
-        if ref is None or ref() is not None:
-            continue   # unbound (load in flight) or model still live → do NOT destroy (UAF-safe)
+        refs = _PIPELINE_MODELS.get(k)
+        if not refs or any(r() is not None for r in refs):
+            continue   # unbound (load in flight) or ANY consumer still live → do NOT destroy (UAF-safe)
         eng = _PIPELINE_CACHE.pop(k, None)
         _PIPELINE_MODELS.pop(k, None)
         if eng is not None:
@@ -311,7 +348,12 @@ def _get_engine(model_dir, create_cfg=None):
 
 
 if _IMPORT_OK:
-    # ── family REGISTRY: assembled from the per-family modules, nothing family-specific here ──
+    # ── family REGISTRY: assembled from the per-family modules. Family LOGIC lives in the family
+    #    modules; what remains here is the shared NODE SURFACE — and that surface is only family-
+    #    neutral as long as a new family reuses the existing optional inputs (start_image /
+    #    connector_ckpt / the LoRA target combo). A family needing a NEW optional input must extend
+    #    the loader's INPUT_TYPES here (and its tooltip), so "add a family = one module + one
+    #    _FAMILY_MODULES line" holds for the common case, not unconditionally. ──
     # Each module owns ONE model family end to end (its comfy model subclass, its builder, and its
     # detection rule) and exposes exactly three names: FAMILY / matches() / register(deps).
     # Adding a family = write qf_<name>_modelpatcher.py + add it to _FAMILY_MODULES. No edit to the
@@ -325,9 +367,9 @@ if _IMPORT_OK:
         import is SKIPPED WITH A LOUD WARNING (its models then say 'no registered native seam')
         — one broken family must not take the whole plugin's registration down."""
         import importlib
-        deps = {"get_engine": _get_engine, "pipeline_models": _PIPELINE_MODELS,
+        deps = {"get_engine": _get_engine, "bind_pipeline_model": _bind_pipeline_model,
+                "may_release_handle": _may_release_handle,
                 "estimate_footprint": _estimate_package_footprint,
-                "QFLazyEngine": QFLazyEngine,
                 "apply_checkpoint_flow_shift": _apply_checkpoint_flow_shift}
         for mod_name in _FAMILY_MODULES:
             try:
@@ -353,11 +395,17 @@ if _IMPORT_OK:
                 f"qf_native: cannot read model_index.json in {model_dir} ({exc}) — a QuantFunc "
                 f"model package must contain it (it is what names the pipeline family).")
         transformer_class = ""
-        try:
-            with open(os.path.join(model_dir, "transformer", "config.json"), "r") as f:
-                transformer_class = str(json.load(f).get("_class_name", ""))
-        except Exception:  # noqa: BLE001 — optional half
-            pass
+        if not pipeline_class:
+            # ENGINE PARITY, input-derivation half (PipelineLoader.cpp detectPipelineKind): the
+            # engine populates transformer_class ONLY when model_index.json names no pipeline
+            # class. Reading it unconditionally made the plugin auto-detect a family for a
+            # package whose (unknown) pipeline_class the engine would refuse — the predicate
+            # halves matched the engine but the inputs fed to them did not.
+            try:
+                with open(os.path.join(model_dir, "transformer", "config.json"), "r") as f:
+                    transformer_class = str(json.load(f).get("_class_name", ""))
+            except Exception:  # noqa: BLE001 — optional half
+                pass
         return pipeline_class, transformer_class
 
     def _detect_family(model_dir):
@@ -510,8 +558,9 @@ if _IMPORT_OK:
 
         RETURN_TYPES = ("MODEL",)
         FUNCTION = "apply"
-        # comfy's own convention: file-LOADING nodes are "loaders", MODEL-PATCHING nodes (LoraLoader,
-        # LoraLoaderModelOnly, ModelSampling*) are "model/loaders" — this node patches a MODEL.
+        # comfy's own convention, measured: LoraLoader / LoraLoaderModelOnly — the nodes this one
+        # is shaped after — use "model/loaders" (nodes.py); bare "loaders" is for file-loading
+        # nodes. (ModelSampling* use "model/patch*", so the rule is per-precedent, not universal.)
         CATEGORY = "model/loaders"
         DESCRIPTION = ("Attaches a sidecar LoRA to a QuantFunc native MODEL (wire downstream of the "
                        "QuantFunc Native Loader; chain several to stack). The engine merges sidecar "

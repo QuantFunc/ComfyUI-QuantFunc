@@ -41,9 +41,8 @@ from . import qf_engine as qfe
 from . import qf_modelpatcher as qfmp
 from .qf_modelpatcher import (_qf_dtype, QFModelPatcher, _QFStub,
                               _interrupt_poll_end_session_on_raise,
-                              QFSessionModelMixin, QFLazyEngine)
+                              QFSessionModelMixin)
 
-import weakref
 
 # ── H3 geometry constants (comfy comfy_extras/nodes_minimax_h3.py + ldm/minimax/model.py) ──
 _H3_SPATIAL = 16          # video latent -> pixels (width = W_lat * 16)
@@ -464,7 +463,6 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
 
 
 FAMILY = "minimax-h3"
-DISPLAY = "MiniMax-H3 joint audio+video"
 
 
 def matches(pipeline_class, transformer_class=""):
@@ -480,9 +478,9 @@ def register(deps):
     """Return the minimax-h3 family BUILDER. `deps` gives the package-level helpers (engine cache,
     liveness registry, footprint estimator, lazy-engine class) without importing __init__."""
     get_engine = deps["get_engine"]
-    pipeline_models = deps["pipeline_models"]
+    bind_pipeline_model = deps["bind_pipeline_model"]
+    may_release_handle = deps["may_release_handle"]
     estimate_footprint = deps["estimate_footprint"]
-    QFLazyEngine = deps["QFLazyEngine"]
 
 
     def build(model_dir, model_name, resident_block_count, start_image=None,
@@ -505,14 +503,15 @@ def register(deps):
             # layout/precision; anything on top competes + mis-resolves (LTX minimal note).
             def _factory():
                 eng, ckey = get_engine(model_dir, create_cfg=(_lora_cfg or None))
-                pipeline_models[ckey] = weakref.ref(model)
+                bind_pipeline_model(ckey, model)
                 return eng, ckey
 
             # DEFERRED create (QFLazyEngine): a chained QuantFuncNativeLoRA rebuilds for its
             # accumulated LoRA set, so an eager create here would build ONE PIPELINE PER
             # CHAIN LINK (and comfy's node-output cache would pin every intermediate's
             # multi-GB CPU backup). Only the model the sampler touches is ever created.
-            engine = QFLazyEngine(_factory, estimate_footprint(model_dir))
+            engine = qfmp.QFLazyEngine(_factory, estimate_footprint(model_dir),
+                                      may_release=may_release_handle)
             device = comfy.model_management.get_torch_device()
             offload = comfy.model_management.unet_offload_device()
 

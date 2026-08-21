@@ -199,8 +199,10 @@ def _derived_roster_defects():
         # base list and find the comfy base inside it. Pinning comfy.model_base to the FIRST
         # position is what made this scan match NOTHING once the shared mixin was introduced —
         # i.e. the completeness check silently certified nothing (MEASURED, pre-existing).
+        file_matches = 0
         for m in re.finditer(r"class\s+(QF\w*Model)\s*\(([^)]*)\)", src):
             qf_cls, bases = m.group(1), m.group(2)
+            file_matches += 1
             bm = re.search(r"comfy\.model_base\.(\w+)", bases)
             if bm is None:
                 continue                 # QFLTXAVModel(QFLTXModel): inherits an already-audited seam
@@ -210,6 +212,17 @@ def _derived_roster_defects():
                 defects.append(
                     f"{qf_cls} ({fn}) subclasses comfy.model_base.{base} but there is NO _AUDITED_MODELS row for "
                     f"'{base}' — its extra_conds bypass is UNAUDITED. Add a _Model row for it.")
+        # FAMILY-MODULE completeness (2nd derivation arm): every family module — the qf_*_modelpatcher.py
+        # naming the registry itself walks, MINUS the shared substrate — must contribute at least one
+        # scanned QF*Model seam class. Without this arm, a 4th family whose model class drifts from the
+        # QF*Model naming (or that defines none) registers and runs while contributing NOTHING to this
+        # audit — the hand-maintained-roster escape a generality review measured.
+        if (fn.startswith("qf_") and fn.endswith("_modelpatcher.py")
+                and fn != "qf_modelpatcher.py" and file_matches == 0):
+            defects.append(
+                f"family module {fn} contributes NO recognized `class QF<X>Model(...)` seam to this audit — "
+                f"either its model class naming drifted from the scan pattern (rename it QF<X>Model) or the "
+                f"family genuinely bypasses the extra_conds audit (add its seam + an _AUDITED_MODELS row).")
     if not seen:
         defects.append(
             "the QF*Model derivation scan matched NO seam in the plugin package (expected e.g. QFWanModel / "

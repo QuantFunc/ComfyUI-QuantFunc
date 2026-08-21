@@ -31,11 +31,9 @@ from .qf_modelpatcher import (_qf_dtype, _QFStub, _CtxKeyAssigner, QFModelPatche
                               QFSessionModelMixin, save_ref_tempfile, cleanup_ref_tempfile,
                               _interrupt_poll_end_session_on_raise)
 
-import weakref
 
 
 FAMILY = "wan"
-DISPLAY = "Wan 2.x video (t2v / i2v, single- or dual-expert)"
 
 
 def matches(pipeline_class, transformer_class=""):
@@ -424,9 +422,9 @@ def register(deps):
     """Return the wan family BUILDER. `deps` gives the package-level helpers (engine cache,
     liveness registry, footprint estimator, lazy-engine class) without importing __init__."""
     get_engine = deps["get_engine"]
-    pipeline_models = deps["pipeline_models"]
+    bind_pipeline_model = deps["bind_pipeline_model"]
+    may_release_handle = deps["may_release_handle"]
     estimate_footprint = deps["estimate_footprint"]
-    QFLazyEngine = deps["QFLazyEngine"]
     apply_checkpoint_flow_shift = deps["apply_checkpoint_flow_shift"]
 
     def build(model_dir, model_name, resident_block_count, start_image=None,
@@ -451,12 +449,13 @@ def register(deps):
                 eng, ckey = get_engine(model_dir, create_cfg=cfg)
                 # Liveness tracker for the host-RAM sweep: when comfy GC's this patcher's model the
                 # weakref goes dead → the package sweep may destroy the (unreferenced) handle.
-                pipeline_models[ckey] = weakref.ref(model)
+                bind_pipeline_model(ckey, model)
                 return eng, ckey
 
             # DEFERRED create (QFLazyEngine): a chained QuantFuncNativeLoRA rebuilds for its
             # accumulated set, so an eager create here would build ONE PIPELINE PER CHAIN LINK.
-            engine = QFLazyEngine(_factory, estimate_footprint(model_dir))
+            engine = qfmp.QFLazyEngine(_factory, estimate_footprint(model_dir),
+                                      may_release=may_release_handle)
 
             # Wan A14B uses the Wan 2.1 VAE (16-ch AutoencoderKLWan) → WAN21_I2V latent_format
             # (Wan21, 16-ch). NOT WAN22_T2V (48-ch, that is the 5B TI2V VAE). UNet build DISABLED

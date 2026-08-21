@@ -42,16 +42,15 @@ import comfy.supported_models
 import comfy.nested_tensor
 
 from . import qf_engine as qfe
-# Reuse the wan seam's shared, already-CR'd model-layer helpers. NOTE: _get_engine + _PIPELINE_MODELS
-# live in __init__.py (which imports THIS file), so they are threaded into register() as params to
-# avoid a circular import — mirroring where the wan loader is defined (inline in __init__.py).
+# Reuse the shared model-layer helpers. NOTE: the engine cache (_get_engine + the liveness
+# tracker) lives in __init__.py (which imports THIS file), so those are threaded into register()
+# via deps to avoid a circular import — same seam as every family module.
 from . import qf_modelpatcher as qfmp
 from .qf_modelpatcher import (_qf_dtype, QFModelPatcher, _QFStub,
                               _interrupt_poll_end_session_on_raise,
                               save_ref_tempfile, cleanup_ref_tempfile,
-                              QFSessionModelMixin, QFLazyEngine)
+                              QFSessionModelMixin)
 
-import weakref
 
 # ── LTX-2.3-22B connector config (av_model.py video connector; dossier seq-234) ─────────────────────
 # inner_dim = 32*128 = 4096 (NOT the Embeddings1DConnector default 30*128=3840); 2 layers; the video
@@ -1007,7 +1006,6 @@ class QFLTXAVModel(QFLTXModel):
 
 
 FAMILY = "ltx2"
-DISPLAY = "LTX-2 video (2.3 video-only / 2.5 joint-AV)"
 
 
 def matches(pipeline_class, transformer_class=""):
@@ -1021,9 +1019,9 @@ def register(deps):
     """Return the ltx2 family BUILDER. `deps` gives the package-level helpers (engine cache,
     liveness registry, footprint estimator, lazy-engine class) without importing __init__."""
     get_engine = deps["get_engine"]
-    pipeline_models = deps["pipeline_models"]
+    bind_pipeline_model = deps["bind_pipeline_model"]
+    may_release_handle = deps["may_release_handle"]
     estimate_footprint = deps["estimate_footprint"]
-    QFLazyEngine = deps["QFLazyEngine"]
 
 
     def build(model_dir, model_name, resident_block_count, start_image=None,
@@ -1057,14 +1055,15 @@ def register(deps):
             if _is_av:
                 def _factory():
                     eng, ckey = get_engine(model_dir, create_cfg=(_lora_cfg or None))
-                    pipeline_models[ckey] = weakref.ref(model)
+                    bind_pipeline_model(ckey, model)
                     return eng, ckey
 
                 # DEFERRED create (QFLazyEngine): a chained QuantFuncNativeLoRA rebuilds for its
                 # accumulated LoRA set, so an eager create here would build ONE PIPELINE PER
                 # CHAIN LINK (and comfy's node-output cache would pin every intermediate's
                 # multi-GB CPU backup). Only the model the sampler touches is ever created.
-                engine = QFLazyEngine(_factory, estimate_footprint(model_dir))
+                engine = qfmp.QFLazyEngine(_factory, estimate_footprint(model_dir),
+                                      may_release=may_release_handle)
                 device = comfy.model_management.get_torch_device()
                 offload = comfy.model_management.unet_offload_device()
                 unet_config = {"image_model": "ltxav", "disable_unet_model_creation": True}
@@ -1100,14 +1099,15 @@ def register(deps):
             # No fix now (adding keys back defeats minimal=True's purpose); this note is the tripwire.
             def _factory():
                 eng, ckey = get_engine(model_dir, create_cfg=(_lora_cfg or None))
-                pipeline_models[ckey] = weakref.ref(model)
+                bind_pipeline_model(ckey, model)
                 return eng, ckey
 
             # DEFERRED create (QFLazyEngine): a chained QuantFuncNativeLoRA rebuilds for its
             # accumulated LoRA set, so an eager create here would build ONE PIPELINE PER
             # CHAIN LINK (and comfy's node-output cache would pin every intermediate's
             # multi-GB CPU backup). Only the model the sampler touches is ever created.
-            engine = QFLazyEngine(_factory, estimate_footprint(model_dir))
+            engine = qfmp.QFLazyEngine(_factory, estimate_footprint(model_dir),
+                                      may_release=may_release_handle)
             # [19B non-gated connector] authoritative head count from the ORIGINAL model dir\'s diffusers
             # LTX2TextConnectors config (the 19B family ships NON-gated connector weights; the head split
             # lives ONLY here). Absent/malformed -> None (gated checkpoints need nothing; a non-gated one
