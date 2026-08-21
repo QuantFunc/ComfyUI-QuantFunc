@@ -1010,8 +1010,10 @@ FAMILY = "ltx2"
 DISPLAY = "LTX-2 video (2.3 video-only / 2.5 joint-AV)"
 
 
-def matches(pipeline_class):
-    """The ENGINE's own detector (src/LTX2VideoPipeline.cpp ltx2_detect), transcribed so plugin and engine cannot disagree."""
+def matches(pipeline_class, transformer_class=""):
+    """The ENGINE's own detector (src/LTX2VideoPipeline.cpp ltx2_pipeline_detect):
+        pipeline_class == "LTX2Pipeline"
+    — an EXACT match with no transformer_class half, so this seam has none either."""
     return str(pipeline_class) == "LTX2Pipeline"
 
 
@@ -1033,13 +1035,6 @@ def register(deps):
             connector_ckpt = ""
 
 
-        def _tag(patcher, lora_entries):
-            """Mark the built model so the downstream QuantFuncNativeLoRA node can append to
-            its stack and re-create the pipeline (create-time sidecar LoRA)."""
-            m = patcher.model
-            
-            
-            return patcher
 
         def _build(lora_entries):
             """Create (or reuse) the pipeline for THIS lora set + wrap it in a patcher."""
@@ -1074,10 +1069,7 @@ def register(deps):
                 offload = comfy.model_management.unet_offload_device()
                 unet_config = {"image_model": "ltxav", "disable_unet_model_creation": True}
                 model_config = comfy.supported_models.LTXAV(unet_config)
-                for attr, default in (("manual_cast_dtype", None), ("custom_operations", None),
-                                      ("optimizations", {}), ("scaled_fp8", None)):
-                    if not hasattr(model_config, attr):
-                        setattr(model_config, attr, default)
+                qfmp.ensure_model_config_attrs(model_config)
                 model = QFLTXAVModel(model_config, engine, device=device,
                                      start_image=start_image,
                                      resident_block_count=resident_block_count)
@@ -1155,10 +1147,7 @@ def register(deps):
 
             unet_config = {"image_model": "ltxv", "disable_unet_model_creation": True}
             model_config = comfy.supported_models.LTXV(unet_config)
-            for attr, default in (("manual_cast_dtype", None), ("custom_operations", None),
-                                  ("optimizations", {}), ("scaled_fp8", None)):
-                if not hasattr(model_config, attr):
-                    setattr(model_config, attr, default)
+            qfmp.ensure_model_config_attrs(model_config)
 
             model = QFLTXModel(model_config, engine, connector, device=device,
                                audio_connector=audio_connector, start_image=start_image,

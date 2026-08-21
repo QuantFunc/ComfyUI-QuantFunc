@@ -340,30 +340,50 @@ if _IMPORT_OK:
     _register_families()
     _FAMILY_LABELS = ["auto"] + [f for f, _ in _FAMILY_MATCHERS]
 
-    def _detect_family(model_dir):
-        """Ask each registered family whether the package's declared pipeline class is theirs.
-        The predicates are the ENGINE's own detector strings (each transcribed in its family
-        module), so plugin and engine cannot disagree; an unimplemented family is refused LOUD
-        with the class it reported — never silently routed to the wrong seam."""
+    def _package_classes(model_dir):
+        """(pipeline_class, transformer_class) as the ENGINE reads them: model_index.json's
+        _class_name, and — because the wan and H3 engine detectors ALSO match on the transformer's
+        own class — transformer/config.json's _class_name. Missing/unreadable transformer config is
+        not an error here; it just leaves that half empty."""
         try:
             with open(os.path.join(model_dir, "model_index.json"), "r") as f:
-                cls = str(json.load(f).get("_class_name", ""))
+                pipeline_class = str(json.load(f).get("_class_name", ""))
         except Exception as exc:  # noqa: BLE001
             raise RuntimeError(
                 f"qf_native: cannot read model_index.json in {model_dir} ({exc}) — a QuantFunc "
                 f"model package must contain it (it is what names the pipeline family).")
+        transformer_class = ""
+        try:
+            with open(os.path.join(model_dir, "transformer", "config.json"), "r") as f:
+                transformer_class = str(json.load(f).get("_class_name", ""))
+        except Exception:  # noqa: BLE001 — optional half
+            pass
+        return pipeline_class, transformer_class
+
+    def _detect_family(model_dir):
+        """Ask each registered family whether this package is theirs. Returns (family, reported)
+        or (None, reported) — it does NOT raise on an unknown class, so an explicit model_type can
+        still override a package whose metadata is wrong/unsupported (that override is the whole
+        point of the widget; raising here made it unreachable).
+
+        The predicates are the ENGINE's own detector strings (each transcribed in its family
+        module) — including the transformer_class half, which the wan and H3 engine detectors also
+        match on, so a package the engine can load is not rejected here for lacking a known
+        pipeline_class."""
+        pipeline_class, transformer_class = _package_classes(model_dir)
+        reported = pipeline_class or f"(no pipeline class; transformer={transformer_class!r})"
         for fam, matches in _FAMILY_MATCHERS:
             try:
-                if matches(cls):
-                    return fam, cls
-            except Exception:  # noqa: BLE001 — a broken predicate must not mask the others
-                continue
-        known = [f for f, _ in _FAMILY_MATCHERS]
-        raise RuntimeError(
-            f"qf_native: model_index.json reports _class_name='{cls}', which no registered native "
-            f"family claims (registered: {known if known else 'NONE - a family module failed to '
-            'import; check the startup log'}). Pick a different package, or set model_type "
-            f"explicitly if the metadata is wrong.")
+                if matches(pipeline_class, transformer_class):
+                    return fam, reported
+            except Exception as exc:  # noqa: BLE001 — one broken predicate must not mask the others
+                # LOUD: a silently-skipped matcher looks exactly like "no family claims this
+                # package" (measured — an arity mismatch here made EVERY family undetectable and
+                # the bare `continue` hid it). Keep going so the other families still get a turn.
+                logging.warning("[qf_native] family %s matcher raised on "
+                                "(pipeline_class=%r, transformer_class=%r): %r — skipping it for "
+                                "this package", fam, pipeline_class, transformer_class, exc)
+        return None, reported
 
     class QuantFuncNativeLoader:
         """ONE loader for every QuantFunc native family — the model dropdown picks which.
@@ -431,12 +451,30 @@ if _IMPORT_OK:
                  start_image=None, connector_ckpt="(none)"):
             model_dir = _resolve_package(model_name)
             detected, reported = _detect_family(model_dir)
-            family = detected if model_type == "auto" else model_type
-            if model_type != "auto" and family != detected:
-                logging.warning("[qf_native] model_type=%s overrides the package's own "
-                                "_class_name=%s (detected %s) — override honored, but a mismatch "
-                                "usually means the wrong package is selected.",
-                                model_type, reported, detected)
+            if model_type == "auto":
+                if detected is None:
+                    known = [f for f, _ in _FAMILY_MATCHERS]
+                    raise RuntimeError(
+                        f"qf_native: this package reports _class_name={reported}, which no "
+                        f"registered native family claims (registered: {known or 'NONE - a family '
+                        'module failed to import; check the startup log'}). Pick a different "
+                        f"package, or set model_type explicitly to force a family.")
+                family = detected
+            else:
+                # An EXPLICIT model_type WINS — including for a package whose metadata names a
+                # family we do not implement. That is exactly what the widget is for, and gating it
+                # behind a successful auto-detect made the override unreachable.
+                family = model_type
+                if detected is not None and detected != family:
+                    logging.warning("[qf_native] model_type=%s overrides the package's own "
+                                    "_class_name=%s (detected %s) — override honored, but a "
+                                    "mismatch usually means the wrong package is selected.",
+                                    model_type, reported, detected)
+                elif detected is None:
+                    logging.warning("[qf_native] model_type=%s forced for a package reporting "
+                                    "_class_name=%s, which no family claims — override honored; "
+                                    "the engine will refuse it if the layout does not match.",
+                                    model_type, reported)
             builder = _FAMILY_BUILDERS.get(family)
             if builder is None:
                 raise RuntimeError(
@@ -472,7 +510,9 @@ if _IMPORT_OK:
 
         RETURN_TYPES = ("MODEL",)
         FUNCTION = "apply"
-        CATEGORY = "loaders"
+        # comfy's own convention: file-LOADING nodes are "loaders", MODEL-PATCHING nodes (LoraLoader,
+        # LoraLoaderModelOnly, ModelSampling*) are "model/loaders" — this node patches a MODEL.
+        CATEGORY = "model/loaders"
         DESCRIPTION = ("Attaches a sidecar LoRA to a QuantFunc native MODEL (wire downstream of the "
                        "QuantFunc Native Loader; chain several to stack). The engine merges sidecar "
                        "LoRA at create time, so the pipeline is re-created for the new set.")

@@ -467,9 +467,13 @@ FAMILY = "minimax-h3"
 DISPLAY = "MiniMax-H3 joint audio+video"
 
 
-def matches(pipeline_class):
-    """The ENGINE's own detector (src/MiniMaxH3Pipeline.cpp mmh3_detect), transcribed so plugin and engine cannot disagree."""
-    return str(pipeline_class) in ("MiniMaxH3ModularPipeline", "MiniMaxH3Pipeline")
+def matches(pipeline_class, transformer_class=""):
+    """The ENGINE's own detector, BOTH halves (src/MiniMaxH3Pipeline.cpp
+    minimax_h3_pipeline_detect):
+        pipeline_class in {"MiniMaxH3ModularPipeline", "MiniMaxH3Pipeline"}
+        || transformer_class == "MiniMaxH3Transformer3DModel"."""
+    return (str(pipeline_class) in ("MiniMaxH3ModularPipeline", "MiniMaxH3Pipeline")
+            or str(transformer_class) == "MiniMaxH3Transformer3DModel")
 
 
 def register(deps):
@@ -514,10 +518,7 @@ def register(deps):
 
             unet_config = {"image_model": "minimax_h3", "disable_unet_model_creation": True}
             model_config = comfy.supported_models.MiniMaxH3(unet_config)
-            for attr, default in (("manual_cast_dtype", None), ("custom_operations", None),
-                                  ("optimizations", {}), ("scaled_fp8", None)):
-                if not hasattr(model_config, attr):
-                    setattr(model_config, attr, default)
+            qfmp.ensure_model_config_attrs(model_config)
 
             model = QFH3Model(model_config, engine, device=device,
                               resident_block_count=resident_block_count)

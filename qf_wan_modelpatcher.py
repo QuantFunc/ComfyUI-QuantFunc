@@ -38,11 +38,14 @@ FAMILY = "wan"
 DISPLAY = "Wan 2.x video (t2v / i2v, single- or dual-expert)"
 
 
-def matches(pipeline_class):
-    """The ENGINE's own detector (src/WanVideoPipeline.cpp wan_detect): the whole Wan family is
-    matched by the "Wan…Pipeline" _class_name PREFIX (WanPipeline for TI2V-5B,
-    WanImageToVideoPipeline for A14B i2v, …)."""
-    return str(pipeline_class).startswith("Wan")
+def matches(pipeline_class, transformer_class=""):
+    """The ENGINE's own detector, BOTH halves (src/WanVideoPipeline.cpp wan_detect):
+        pipeline_class.rfind("Wan", 0) == 0 || transformer_class == "WanTransformer3DModel"
+    The whole Wan family is matched by the "Wan…Pipeline" prefix (WanPipeline for TI2V-5B,
+    WanImageToVideoPipeline for A14B i2v, …); the transformer half catches a package whose
+    model_index carries no pipeline class."""
+    return (str(pipeline_class).startswith("Wan")
+            or str(transformer_class) == "WanTransformer3DModel")
 
 
 class QFWanModel(QFSessionModelMixin, comfy.model_base.WAN21):
@@ -461,10 +464,7 @@ def register(deps):
             unet_config = {"image_model": "wan2.1", "model_type": "i2v",
                            "disable_unet_model_creation": True}
             model_config = comfy.supported_models.WAN21_I2V(unet_config)
-            for attr, default in (("manual_cast_dtype", None), ("custom_operations", None),
-                                  ("optimizations", {}), ("scaled_fp8", None)):
-                if not hasattr(model_config, attr):
-                    setattr(model_config, attr, default)
+            qfmp.ensure_model_config_attrs(model_config)
 
             device = comfy.model_management.get_torch_device()
             offload = comfy.model_management.unet_offload_device()

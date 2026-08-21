@@ -1,0 +1,219 @@
+#!/usr/bin/env python3
+"""Behavioural tests for the SINGLE loader node's newest surfaces — the ones three independent
+reviewers flagged as having zero automated coverage:
+
+  1. family DISPATCH + auto-detect, including the engine's transformer_class fallback
+  2. the explicit model_type OVERRIDE (it must win even for a package no family claims — the
+     escape hatch the tooltip promises; it was measured UNREACHABLE once)
+  3. _resolve_package CONTAINMENT (workflow-serializable widget value = untrusted)
+  4. adopt_comfy_state_from — an upstream ModelSampling patch must SURVIVE a LoRA rebuild
+     (the silent-shift regression this contract exists to prevent)
+  5. HOST-RAM accounting honesty — a never-created engine must report 0, not its estimate
+
+Run:  python tests/loader_dispatch_test.py          (needs the ComfyUI env; SKIPs without it)
+"""
+import json
+import os
+import sys
+import tempfile
+import types
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_PLUGIN = os.path.dirname(_HERE)
+
+
+def _emit_skip(reason):
+    print(f"LOADER_DISPATCH: SKIP — {reason}")
+    return 0
+
+
+def _load_plugin():
+    """Import the plugin package the way ComfyUI does (by file path), with a real comfy on sys.path."""
+    comfy_root = os.environ.get("COMFY_ROOT")
+    if not comfy_root:
+        # the plugin normally lives at <comfy>/custom_nodes/<pkg>
+        guess = os.path.dirname(os.path.dirname(_PLUGIN))
+        comfy_root = guess if os.path.isfile(os.path.join(guess, "folder_paths.py")) else None
+    if not comfy_root:
+        return None, "ComfyUI root not found (set COMFY_ROOT)"
+    sys.path.insert(0, comfy_root)
+    try:
+        import importlib.util
+        import folder_paths  # noqa: F401 — proves the env is real
+        spec = importlib.util.spec_from_file_location("qfn_test_pkg",
+                                                      os.path.join(_PLUGIN, "__init__.py"))
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["qfn_test_pkg"] = mod
+        spec.loader.exec_module(mod)
+        return mod, None
+    except Exception as exc:  # noqa: BLE001
+        return None, f"plugin import failed: {type(exc).__name__}: {exc}"
+
+
+class _DummyEngine:
+    """Stands in for a created QFEngineHandle — no CUDA, no model files."""
+    lib = "LIB"
+    footprint_bytes = 1234 * 1024 * 1024
+    step_count = 0
+    sampler_step_count = 0
+
+    def __init__(self):
+        self.pipeline = object()
+        self.current_session = None
+        self.unloaded = False
+
+    def end_session_if_open(self):
+        return (False, True)
+
+    def unload_vram(self):
+        self.unloaded = True
+        return self.footprint_bytes
+
+    def destroy(self):
+        self.pipeline = None
+
+
+def _make_pkg(root, name, pipeline_class=None, transformer_class=None):
+    """Write a minimal model PACKAGE (what the loader's dropdown lists)."""
+    pkg = os.path.join(root, name)
+    os.makedirs(os.path.join(pkg, "transformer"), exist_ok=True)
+    body = {} if pipeline_class is None else {"_class_name": pipeline_class}
+    with open(os.path.join(pkg, "model_index.json"), "w") as f:
+        json.dump(body, f)
+    if transformer_class is not None:
+        with open(os.path.join(pkg, "transformer", "config.json"), "w") as f:
+            json.dump({"_class_name": transformer_class}, f)
+    return pkg
+
+
+def main():
+    qfn, why = _load_plugin()
+    if qfn is None:
+        return _emit_skip(why)
+    if not getattr(qfn, "_IMPORT_OK", False):
+        return _emit_skip("plugin imported but its comfy imports failed (_IMPORT_OK False)")
+
+    bad = 0
+
+    def check(label, ok, detail=""):
+        nonlocal bad
+        print(f"  [{'OK ' if ok else 'FAIL'}] {label}{(' ' + detail) if detail else ''}")
+        if not ok:
+            bad += 1
+
+    tmp = tempfile.mkdtemp(prefix="qf_loader_test_")
+    root = os.path.join(tmp, "models", "diffusion_models")
+    os.makedirs(root, exist_ok=True)
+    qfn._model_roots = lambda: [root]          # confine the scan to the fixture root
+
+    creates = []
+
+    def fake_get_engine(model_dir, create_cfg=None):
+        creates.append(len((create_cfg or {}).get("lora", [])))
+        return _DummyEngine(), ("ckey", len(creates))
+    qfn._get_engine = fake_get_engine
+    # The family builders CAPTURE their deps at registration time (deps["get_engine"]), so a module
+    # -attribute monkeypatch alone would leave them calling the real engine loader — which then
+    # fails on this box's CUDA-toolchain guard. Re-register so the stub is what they hold. (This is
+    # also the architecture working as intended: families receive their deps, they do not reach
+    # back into the package namespace.)
+    qfn._FAMILY_BUILDERS.clear()
+    qfn._FAMILY_MATCHERS.clear()
+    qfn._register_families()
+
+    # ── 1) dispatch + auto-detect, incl. the transformer_class fallback ────────────────────
+    _make_pkg(root, "wan_pkg", pipeline_class="WanImageToVideoPipeline")
+    _make_pkg(root, "ltx_pkg", pipeline_class="LTX2Pipeline")
+    _make_pkg(root, "h3_pkg", pipeline_class="MiniMaxH3Pipeline")
+    # a package with NO pipeline class but a wan transformer — the engine's own second detector half
+    _make_pkg(root, "xfm_only_pkg", pipeline_class=None,
+              transformer_class="WanTransformer3DModel")
+    _make_pkg(root, "alien_pkg", pipeline_class="Flux2KleinPipeline")
+
+    for name, want in (("wan_pkg", "wan"), ("ltx_pkg", "ltx2"), ("h3_pkg", "minimax-h3")):
+        got, _rep = qfn._detect_family(os.path.join(root, name))
+        check(f"auto-detect {name}", got == want, f"-> {got!r} (want {want!r})")
+    got, _rep = qfn._detect_family(os.path.join(root, "xfm_only_pkg"))
+    check("auto-detect via transformer_class fallback", got == "wan", f"-> {got!r}")
+    got, rep = qfn._detect_family(os.path.join(root, "alien_pkg"))
+    check("unknown family reports None (does NOT raise)", got is None and "Flux2Klein" in rep,
+          f"-> {got!r}, reported={rep!r}")
+
+    Loader = qfn.NODE_CLASS_MAPPINGS["QuantFuncNativeLoader"]()
+
+    # auto on a package no family claims -> refuse LOUD
+    try:
+        Loader.load("alien_pkg")
+        check("auto on an unclaimed package refuses", False, "-> no exception")
+    except RuntimeError as e:
+        check("auto on an unclaimed package refuses", "Flux2Klein" in str(e),
+              "-> names the reported class")
+
+    # ── 2) the explicit override must WIN (the escape hatch the tooltip promises) ──────────
+    if "wan" in qfn._FAMILY_BUILDERS:
+        try:
+            out = Loader.load("alien_pkg", model_type="wan")[0]
+            check("explicit model_type overrides an unclaimed package",
+                  type(out).__name__ == "QFModelPatcher", f"-> {type(out).__name__}")
+        except Exception as e:  # noqa: BLE001
+            check("explicit model_type overrides an unclaimed package", False, f"-> raised {e!r}")
+
+        # ── 3) containment of the untrusted widget value ──────────────────────────────────
+        for evil in ("../../../../etc", "/etc", "wan_pkg/../../..", ""):
+            try:
+                qfn._resolve_package(evil)
+                check(f"containment refuses {evil!r}", False, "-> resolved!")
+            except RuntimeError:
+                check(f"containment refuses {evil!r}", True)
+        try:
+            ok = qfn._resolve_package("wan_pkg") == os.path.realpath(os.path.join(root, "wan_pkg"))
+            check("containment still resolves a legit package", ok)
+        except Exception as e:  # noqa: BLE001
+            check("containment still resolves a legit package", False, f"-> {e!r}")
+
+        # ── 4) an upstream ModelSampling patch must survive a LoRA rebuild ────────────────
+        try:
+            from comfy_extras.nodes_model_advanced import ModelSamplingSD3
+            base = Loader.load("wan_pkg")[0]
+            patched = ModelSamplingSD3().patch(base, 11.0)[0]
+            patched.patch_model()
+            before = float(getattr(patched.model.model_sampling, "shift", -1))
+            rebuilt = patched.adopt_comfy_state_from(patched)   # same-shape transplant
+            rebuilt.patch_model()
+            after = float(getattr(rebuilt.model.model_sampling, "shift", -1))
+            check("ModelSampling patch survives a patcher rebuild",
+                  before == 11.0 and after == 11.0 and "model_sampling" in rebuilt.object_patches,
+                  f"-> {before} -> {after}")
+        except Exception as e:  # noqa: BLE001
+            check("ModelSampling patch survives a patcher rebuild", False, f"-> raised {e!r}")
+
+        # ── 5) HOST-RAM honesty: a never-created engine holds NOTHING ─────────────────────
+        try:
+            fresh = Loader.load("wan_pkg")[0]
+            eng = fresh.model._qf
+            never_ram = fresh.loaded_ram_size()
+            never_freed = fresh.partially_unload_ram(10 ** 12)
+            check("never-created engine reports 0 host RAM", never_ram == 0, f"-> {never_ram}")
+            check("never-created engine frees 0 host RAM", never_freed == 0, f"-> {never_freed}")
+            _ = eng.lib                      # materialize (what a session begin does)
+            fresh.detach(unpatch_all=False)  # comfy dropping the model -> VRAM released
+            held = fresh.loaded_ram_size()
+            check("evicted engine DOES report its CPU backup", held > 0, f"-> {held}")
+            freed = fresh.partially_unload_ram(10 ** 12)
+            check("partially_unload_ram frees the backup", freed == held, f"-> {freed}")
+            check("released handle re-creates on next use",
+                  getattr(eng, "materialized", True) is False)
+            # comfy's dynamic path passes a `subsets` kwarg — must not TypeError
+            fresh.partially_unload_ram(10 ** 12, subsets=["patches"])
+            check("partially_unload_ram accepts comfy's subsets kwarg", True)
+        except Exception as e:  # noqa: BLE001
+            check("host-RAM accounting", False, f"-> raised {type(e).__name__}: {e}")
+    else:
+        check("wan family registered", False, "-> builders: %s" % sorted(qfn._FAMILY_BUILDERS))
+
+    print("LOADER_DISPATCH:", "PASS" if bad == 0 else f"FAIL ({bad} wrong)")
+    return 0 if bad == 0 else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

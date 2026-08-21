@@ -382,6 +382,16 @@ QF_LORA_STACK_ATTR = "_qf_lora_stack"
 QF_LORA_REBUILD_ATTR = "_qf_rebuild"
 
 
+def ensure_model_config_attrs(model_config):
+    """comfy's model_config classes grow attributes over releases; a seam that builds one directly
+    must tolerate an older/newer comfy. ONE definition (was copy-pasted in every family builder)."""
+    for attr, default in (("manual_cast_dtype", None), ("custom_operations", None),
+                          ("optimizations", {}), ("scaled_fp8", None)):
+        if not hasattr(model_config, attr):
+            setattr(model_config, attr, default)
+    return model_config
+
+
 def tag_lora_rebuild(patcher, lora_entries, rebuild):
     """Mark a freshly built patcher's model with its LoRA set + how to re-create with a new one."""
     m = patcher.model
@@ -470,21 +480,46 @@ class QFModelPatcher(comfy.model_patcher.ModelPatcher):
                 pass
         return super().detach(unpatch_all=unpatch_all)
 
-    def loaded_ram_size(self):
-        """HOST-RAM pressure this model is responsible for. After a co-eviction the engine holds a
-        full CPU backup of the weights — invisible to comfy's RAM manager unless reported here."""
-        eng = self._engine()
-        if eng is not None and getattr(eng, "unloaded", False):
-            return max(0, int(getattr(eng, "footprint_bytes", 0)))
-        return 0
+    # ── HOST-RAM reporting ────────────────────────────────────────────────────────────────
+    # REACHABILITY, stated honestly (measured in this ComfyUI): comfy calls loaded_ram_size() and
+    # partially_unload_ram() ONLY behind `model.is_dynamic()` (model_management.py:665/1006/1451;
+    # base ModelPatcher.is_dynamic() returns False and comfy's own comment says "Loaded RAM
+    # pressure tracking is only implemented for DynamicVram loading"). This patcher is NOT dynamic
+    # — opting in would mean implementing comfy's whole DynamicVram surface (weight pinning, VBAR,
+    # backup restore) for an engine that owns its memory outside torch. So these two are correct
+    # but currently INERT: the live integration for this plugin is detach() + model_size() /
+    # loaded_size(), which comfy calls unconditionally. They are kept (not deleted) because they
+    # are the right answers if this patcher ever goes dynamic, and they carry comfy's dynamic-path
+    # signature so that switch cannot crash on an unexpected kwarg.
 
-    def partially_unload_ram(self, ram_to_unload):
-        """comfy's RAM manager asking for host memory back. Releasing the engine handle frees the
-        CPU backup; the lazy handle re-creates from disk on the next use, so this is a real
-        reclaim, not a leak — but only when nothing is in flight (an open session must not have
-        its pipeline pulled out from under it)."""
+    def _engine_holds_cpu_backup(self):
+        """True only for a pipeline that WAS created and then co-evicted (weights now in host RAM).
+        A never-materialized lazy handle holds NOTHING — `unloaded` alone cannot tell those apart
+        (it is True in both states), and reporting the footprint for a handle that never allocated
+        would be claiming memory we do not hold."""
         eng = self._engine()
         if eng is None or not getattr(eng, "unloaded", False):
+            return False, None
+        # A lazy handle exposes `materialized`; a plain handle always has a real pipeline.
+        if not getattr(eng, "materialized", True):
+            return False, eng
+        return True, eng
+
+    def loaded_ram_size(self):
+        """HOST-RAM this model is actually responsible for: the engine's CPU backup after a
+        co-eviction, else 0 (including for a handle that was never created)."""
+        holds, eng = self._engine_holds_cpu_backup()
+        return max(0, int(getattr(eng, "footprint_bytes", 0))) if holds else 0
+
+    def partially_unload_ram(self, ram_to_unload, subsets=None):
+        """comfy's RAM manager asking for host memory back. Releasing the engine handle frees the
+        CPU backup; the lazy handle re-creates from disk on the next use, so this is a real
+        reclaim, not a leak — but only when we genuinely hold one and nothing is in flight (an
+        open session must not have its pipeline pulled out from under it). `subsets` is comfy's
+        dynamic-path kwarg (it names weight subsets to drop); this engine's backup is all-or-
+        nothing, so it is accepted and ignored rather than crashing on an unexpected argument."""
+        holds, eng = self._engine_holds_cpu_backup()
+        if not holds:
             return 0
         if getattr(eng, "current_session", None) is not None:
             return 0
