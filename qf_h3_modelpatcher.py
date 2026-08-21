@@ -40,12 +40,30 @@ import comfy.nested_tensor
 from . import qf_engine as qfe
 from .qf_modelpatcher import (_qf_dtype, QFModelPatcher, _QFStub,
                               _interrupt_poll_end_session_on_raise,
-                              QFSessionModelMixin, parse_loras_widget)
+                              QFSessionModelMixin)
 
 import weakref
 
 # ── H3 geometry constants (comfy comfy_extras/nodes_minimax_h3.py + ldm/minimax/model.py) ──
 _H3_SPATIAL = 16          # video latent -> pixels (width = W_lat * 16)
+_H3_FPS = 24.0            # the H3 frame grid is defined at 24 fps (comfy_extras/nodes_minimax_h3.FPS)
+
+
+def _h3_frames_from_latent_t(latent_t):
+    """INVERT comfy's own video_latent_t (nodes_minimax_h3): latent_t = 2 for fc<=5, else
+    ((fc-5)//17)*5 + 2 on the 17k+5 frame grid. Ask comfy's module when importable so an
+    upstream grid change cannot silently drift this seam; fall back to the closed form."""
+    lt = int(latent_t)
+    try:
+        from comfy_extras import nodes_minimax_h3 as _h3n
+        fc = 5
+        while _h3n.video_latent_t(fc) < lt and fc < 100000:
+            fc += 17
+        if _h3n.video_latent_t(fc) == lt:
+            return fc
+    except Exception:  # noqa: BLE001 — fall through to the closed form
+        pass
+    return 5 if lt <= 2 else (lt - 2) // 5 * 17 + 5
 _H3_VIDEO_CHANNELS = 24   # video latent channels
 _H3_AUDIO_CHANNELS = 32   # audio_latents_dim (AutoencoderKLMiniMaxH3Audio) — kMmh3AudioLatentDim
 _H3_AUDIO_STEREO = 2      # K (stereo)
@@ -58,24 +76,18 @@ from comfy.ldm.minimax.model import pack_audio, unpack_audio, patchify_video, un
 class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
     """MiniMax-H3 svdq joint-AV pipeline exposed as a native comfy MODEL (native-KSampler seam), t2va."""
 
-    def __init__(self, model_config, engine, num_steps, num_frames, fps, width, height,
-                 sigma_shift, audio_shift, device=None, resident_block_count=999):
+    def __init__(self, model_config, engine, device=None, resident_block_count=999):
         super().__init__(model_config, device=device)     # disable_unet honored in BaseModel.__init__
         self.diffusion_model = _QFStub()
         self._resident_block_count = int(resident_block_count)   # [manual-residency] video begin knob
         self._qf = engine
-        self._num_steps = int(num_steps)
-        self._num_frames = int(num_frames)
-        self._fps = int(fps)
-        self._width = int(width)
-        self._height = int(height)
-        # The AV flow shifts drive the engine's audio schedule + the audio_scale carry. Set them on the
-        # ModelSamplingAV super().__init__ built from model_config (default), overridable by wiring the
-        # official ModelSamplingMiniMaxH3 (MiniMaxH3SigmaShift) which add_object_patch's model_sampling.
-        try:
-            self.model_sampling.set_parameters(shift=float(sigma_shift), audio_shift=float(audio_shift))
-        except Exception as e:
-            logging.warning("[qf_native] H3: could not set ModelSamplingAV shifts (%s); using model defaults", e)
+        self._num_steps = 0               # DERIVED per run from sample_sigmas (len-1) at _begin
+        self._num_frames = 0              # DERIVED per run from the video latent's T (see _derive_geometry)
+        self._fps = _H3_FPS               # the H3 grid is defined AT 24 fps (comfy nodes_minimax_h3.FPS)
+        # The AV flow shifts come from the model_sampling object — the stock
+        # ModelSamplingMiniMaxH3 (MiniMaxH3SigmaShift) patches it, and model_config supplies the
+        # defaults otherwise. They are read at _begin (getattr(ms, "shift"/"audio_shift")), so this
+        # loader carries NO shift widgets (official-workflow shape: that node owns them).
         self._step_i = 0
         self._sess_denoise = 0
         self._out_video = None            # reused velocity_out buffer [1,24,T,H,W]
@@ -153,6 +165,31 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
         raise RuntimeError(
             "qf_native H3: a denoise/inpaint mask (SetLatentNoiseMask) is wired, but the QuantFunc H3 "
             "native session does not support masked inpainting. Remove the mask node.")
+
+    def _derive_geometry(self, x_video, transformer_options):
+        """DERIVE the session geometry from the graph (official-loader shape — the loader has no
+        geometry/step/shift widgets). x_video=[1,24,T,H,W] from the stock empty-AV-latent /
+        MiniMaxH3ImageToVideo; the step count from the sampler's own sigma schedule."""
+        self._num_frames = _h3_frames_from_latent_t(int(x_video.shape[2]))
+        sigmas = transformer_options.get("sample_sigmas") if isinstance(transformer_options, dict) else None
+        if sigmas is None or len(sigmas) < 2:
+            raise RuntimeError(
+                "qf_native H3: the sampler did not publish a sigma schedule "
+                "(transformer_options['sample_sigmas']) — the engine session needs the step count. "
+                "Use a stock KSampler / SamplerCustom on this model.")
+        self._num_steps = len(sigmas) - 1
+        try:
+            s_first, s_last = float(sigmas[0]), float(sigmas[-1])
+        except Exception:  # noqa: BLE001
+            return
+        ms = getattr(self, "model_sampling", None)
+        s_max = float(getattr(ms, "sigma_max", s_first)) if ms is not None else s_first
+        if s_last > 1e-3 or (s_max > 0 and s_first < 0.98 * s_max):
+            raise RuntimeError(
+                f"qf_native H3: partial / trimmed denoise is NOT supported (sigmas run "
+                f"{s_first:.4f}→{s_last:.4f}, full range would be {s_max:.4f}→0). The engine session "
+                f"runs its OWN internal AV schedule keyed to the full step range. Use a single "
+                f"full-range KSampler (denoise=1.0, no start_step/last_step).")
 
     def _begin(self, x_video, x_audio, vemb, av_payload=None):
         """Open the joint-AV external denoise session. x_video=[1,24,T,H,W], x_audio=[1,32,2,audio_t],
@@ -299,6 +336,7 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
                                f"with cond_or_uncond={cou} — batch_size>1 latents are not supported")
         vemb = c_crossattn.to(dev, dtype=torch.bfloat16).contiguous()
         if self._qf.current_session is None:
+            self._derive_geometry(x_video, transformer_options)   # session geometry from the GRAPH
             self._begin(x_video[0:1].contiguous(), x_audio[0:1].contiguous(), vemb[0:1].contiguous(),
                         av_payload=kwargs.get("minimax_payload"))
         # [C2 ordering guard] the engine binds av_conds SESSION-WIDE from the FIRST-invoked cond
@@ -402,9 +440,11 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
         return super().process_latent_out(latent)
 
 
-def register(NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS, get_engine, pipeline_models):
-    """Register the H3 loader node (called from __init__.py). get_engine + pipeline_models are
-    __init__.py's shared helpers, threaded in to avoid a circular import (mirrors the LTX register)."""
+def register(NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS, get_engine, pipeline_models,
+             list_packages, resolve_package):
+    """Register the H3 loader node (called from __init__.py). get_engine, pipeline_models + the
+    models/quantfunc package helpers are __init__.py's shared helpers, threaded in to avoid a
+    circular import (mirrors the LTX register)."""
 
     class QuantFuncNativeH3Loader:
         """Create a MiniMax-H3 joint-AV svdq pipeline and expose it as a native comfy MODEL a STOCK
@@ -418,24 +458,13 @@ def register(NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS, get_engine, pipeli
         @classmethod
         def INPUT_TYPES(cls):
             return {"required": {
-                "model_dir": ("STRING", {"default": ""}),          # engine svdq H3 (AV) dir
-                "transformer_path": ("STRING", {"default": ""}),
-                "steps": ("INT", {"default": 20, "min": 1, "max": 100}),
-                # H3 frame grid is 17k+5; the empty-latent node snaps length to it (step 17 from min 5).
-                "num_frames": ("INT", {"default": 39, "min": 5, "max": 3600, "step": 17}),
-                "fps": ("INT", {"default": 24, "min": 1, "max": 60}),
-                "width": ("INT", {"default": 1344, "min": 32, "max": 2048, "step": 16}),
-                "height": ("INT", {"default": 768, "min": 32, "max": 2048, "step": 16}),
-                "sigma_shift": ("FLOAT", {"default": 12.0, "min": 0.1, "max": 100.0, "step": 0.1}),
-                "audio_shift": ("FLOAT", {"default": 3.0, "min": 0.1, "max": 100.0, "step": 0.1}),
-            }, "optional": {
-                # Sidecar multi-LoRA (create-time): one per line, /abs/path.safetensors[:scale].
-                # Applied engine-side onto the svdq slots' sidecar branches (base int4 untouched;
-                # blocks.N.attn.{qkv_proj,out_proj} + mlp.{fc1,fc2}; split q/k/v LoRAs fuse onto
-                # qkv_proj; model-level keys are skipped+logged).
-                "loras": ("STRING", {"default": "", "multiline": True}),
-                # [manual-residency] GPU-resident transformer blocks for the video session
+                "model_name": (list_packages(),),
+                # [manual-residency] GPU-resident transformer blocks (the native seam's ONLY
+                # residency mechanism; engine clamps to the model's block count).
                 "resident_block_count": ("INT", {"default": 999, "min": 1, "max": 1024}),
+            }, "optional": {
+                # Chained sidecar LoRA stack (QuantFuncNativeLoRA → this input).
+                "lora_stack": ("QF_LORA_STACK",),
             }}
 
         RETURN_TYPES = ("MODEL",)
@@ -445,23 +474,20 @@ def register(NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS, get_engine, pipeli
             "Loads a QuantFunc MiniMax-H3 svdq joint audio+video pipeline as a native comfy MODEL a STOCK "
             "KSampler drives (swap ONLY this loader in; keep the stock MiniMaxH3ImageToVideo prompt / "
             "ModelSamplingMiniMaxH3 / KSampler / H3 VAE decode / SaveVideo). model_dir = an engine svdq H3 "
-            "dir with transformer/ + vae/ + audio_vae/. t2va only (prompt -> video+audio); a wired first/last "
-            "fl2va keyframes (first/last frame) are forwarded via the engine av_conds bridge. sigma_shift/"
-            "audio_shift set the ModelSamplingAV flow schedule (defaults 12/3; a wired ModelSamplingMiniMaxH3 "
-            "overrides them).")
+            "package (models/quantfunc) with transformer/ + vae/ + audio_vae/. Geometry (length/size), "
+            "steps and the AV flow shifts all come from the STOCK nodes — MiniMaxH3ImageToVideo / "
+            "MiniMaxH3ReferenceToVideo, KSampler and ModelSamplingMiniMaxH3 — exactly as in the official "
+            "workflow; this loader only picks the model and the resident block count. LoRAs chain in via "
+            "QuantFuncNativeLoRA.")
 
-        def load(self, model_dir, transformer_path, steps, num_frames, fps, width, height,
-                 sigma_shift=12.0, audio_shift=3.0, loras="", resident_block_count=999):
-            if not model_dir or not transformer_path:
-                raise RuntimeError("QuantFuncNativeH3Loader: model_dir and transformer_path are required")
+        def load(self, model_name, resident_block_count=999, lora_stack=None):
+            model_dir = resolve_package(model_name)
             _lora_cfg = {}
-            _lora_entries = parse_loras_widget(loras)
-            if _lora_entries:
-                _lora_cfg["lora"] = _lora_entries   # engine svdq load: sidecar apply post-load
-            # H3 svdq is PRE-quantized: pass the MINIMUM to create (minimal=True). The svdquant metadata
-            # carries the layout/precision; anything on top competes + mis-resolves (LTX minimal note).
-            engine, ckey = get_engine(model_dir, transformer_path, width, height, minimal=True,
-                                      create_cfg=(_lora_cfg or None))
+            if lora_stack:
+                _lora_cfg["lora"] = list(lora_stack)   # engine svdq load: sidecar apply post-load
+            # H3 svdq is PRE-quantized: create is MINIMAL. The svdquant metadata carries the
+            # layout/precision; anything on top competes + mis-resolves (LTX minimal note).
+            engine, ckey = get_engine(model_dir, create_cfg=(_lora_cfg or None))
             device = comfy.model_management.get_torch_device()
             offload = comfy.model_management.unet_offload_device()
 
@@ -472,12 +498,12 @@ def register(NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS, get_engine, pipeli
                 if not hasattr(model_config, attr):
                     setattr(model_config, attr, default)
 
-            model = QFH3Model(model_config, engine, steps, num_frames, fps, width, height,
-                              sigma_shift, audio_shift, device=device, resident_block_count=resident_block_count)
+            model = QFH3Model(model_config, engine, device=device,
+                              resident_block_count=resident_block_count)
             pipeline_models[ckey] = weakref.ref(model)
             patcher = QFModelPatcher(model, load_device=device, offload_device=offload)
-            print(f"[qf_native] loaded QuantFuncNativeH3Loader (MiniMax-H3 svdq AV) steps={steps} "
-                  f"frames={num_frames} {width}x{height} shift={sigma_shift}/{audio_shift} "
+            print(f"[qf_native] loaded QuantFuncNativeH3Loader (MiniMax-H3 svdq AV) package={model_name} "
+                  f"resident_blocks={resident_block_count} "
                   f"footprint={engine.footprint_bytes // (1024*1024)}MB", flush=True)
             return (patcher,)
 

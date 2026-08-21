@@ -197,46 +197,6 @@ def cleanup_ref_tempfile(path):
             pass
 
 
-def parse_loras_widget(text):
-    """Parse the native loaders' multiline `loras` widget into the engine's create-time
-    comp_opts["lora"] entry list (sidecar multi-LoRA — wan/ltx/h3 mandate).
-
-    One LoRA per line: `path[:scale[:target]]`. `#` comments + blank lines skipped.
-    scale defaults 1.0; target (`all|high|low`) is the wan per-expert routing token —
-    parsed here generically, VALIDATED engine-side (non-wan pipelines fail loud on a
-    non-`all` target; that refusal is the engine's, not silently dropped here).
-    Right-side parsing keeps Windows drive-letter colons intact (`C:\\x.safetensors:0.5`
-    → the non-float tail is left on the path). Paths must be absolute + existing files —
-    a typo'd path fails HERE, at graph-validate time, not 40 GB into an engine load."""
-    entries = []
-    for raw in (text or "").splitlines():
-        ln = raw.strip()
-        if not ln or ln.startswith("#"):
-            continue
-        target = None
-        scale = 1.0
-        path = ln
-        head, sep, tail = path.rpartition(":")
-        if sep and tail in ("all", "high", "low"):
-            target, path = tail, head
-        head, sep, tail = path.rpartition(":")
-        if sep:
-            try:
-                scale = float(tail)
-                path = head
-            except ValueError:
-                pass  # not a scale — the colon belongs to the path (e.g. a drive letter)
-        if not os.path.isabs(path) or not os.path.isfile(path):
-            raise RuntimeError(
-                f"qf_native loras: '{path}' is not an absolute path to an existing file "
-                f"(line: '{raw.strip()}'). One LoRA per line: /abs/path.safetensors[:scale[:target]]")
-        e = {"path": path, "scale": scale}
-        if target is not None:
-            e["target"] = target
-        entries.append(e)
-    return entries
-
-
 class QFSessionModelMixin:
     """Shared base for every QuantFunc native-session model wrapper (Wan / LTX / — coming — H3).
 
@@ -316,20 +276,23 @@ class QFSessionModelMixin:
 
 
 class QFWanModel(QFSessionModelMixin, comfy.model_base.WAN21):
-    def __init__(self, model_config, engine, start_image, num_steps, num_frames, fps,
-                 width, height, device=None, resident_block_count=999):
+    # Wan VAE scale factors (AutoencoderKLWan): temporal 4, spatial 8. The session geometry is
+    # DERIVED from the latent the sampler hands us + the sampler's own sigma schedule — the loader
+    # carries NO geometry widgets (official-loader shape: length/size come from WanImageToVideo or
+    # EmptyHunyuanLatentVideo, steps from KSampler, fps from CreateVideo).
+    _VAE_T, _VAE_S = 4, 8
+    _DEFAULT_FPS = 16.0                   # wan 2.x training rate; only rides options_json (informational)
+
+    def __init__(self, model_config, engine, start_image, device=None, resident_block_count=999):
         # disable_unet_model_creation is honored inside BaseModel.__init__
         super().__init__(model_config, device=device)
         self.diffusion_model = _QFStub()
         self._resident_block_count = int(resident_block_count)   # [manual-residency] video begin knob
         self._qf = engine                 # QFEngineHandle (owns lib + pipeline + the open session)
         self._start_image = start_image   # comfy IMAGE tensor [B,H,W,C] float 0..1, or None (Option C)
-        self._num_steps = int(num_steps)
-        self._num_frames = int(num_frames)
-        self._fps = int(fps)
-        self._width = int(width)          # loader widgets — cross-checked vs the ACTUAL latent geometry
-        self._height = int(height)        # in _apply_model (they CREATE the pipeline + drive the session,
-        #                                   but the real latent comes from WanImageToVideo/KSampler)
+        self._num_steps = 0               # DERIVED per run from sample_sigmas (len-1) at _begin
+        self._num_frames = 0              # DERIVED per run from the latent: (Tlat-1)*4 + 1
+        self._fps = self._DEFAULT_FPS
         self._step_i = 0                  # SAMPLER step index (one _apply_model call = one sampler step)
         self._ctx_key_assigner = _CtxKeyAssigner()  # symbolic cfg_context_key from comfy uuids (#B3)
         self._sess_denoise = 0            # denoise_step calls THIS session (instrument; cfg>1 = 2/step)
@@ -441,39 +404,38 @@ class QFWanModel(QFSessionModelMixin, comfy.model_base.WAN21):
             "mask against the noise latent and corrupt the i2v result. Remove the mask / SetLatentNoiseMask "
             "node (the engine derives the reference from the loader's start_image, not a latent mask).")
 
-    def _check_geometry(self, xin, transformer_options):
-        """Loud-fail if the loader's own num_frames/steps/width/height widgets DISAGREE with the ACTUAL
-        graph geometry (WanImageToVideo.length + resolution, KSampler steps). They are INDEPENDENT
-        widgets: the loader's values CREATE the pipeline + drive the engine session, while the latent the
-        sampler denoises comes from WanImageToVideo/KSampler. A mismatch builds a session whose frame/
-        step/resolution geometry disagrees with the latent → wrong output or an opaque engine dims error,
-        so fail loud with the exact fix instead (CR generality — the loader widgets are not auto-derived).
-        xin: [B, C, Tlat, Hl, Wl]. Wan VAE scale: temporal 4 (num_frames→(n-1)//4+1 latent), spatial 8."""
+    def _derive_geometry(self, xin, transformer_options):
+        """DERIVE the session geometry from the graph (official-loader shape — the loader has no
+        geometry widgets). xin: [B,C,Tlat,Hl,Wl] from WanImageToVideo / EmptyHunyuanLatentVideo;
+        the step count from the sampler's own sigma schedule. The only refusal left is the one
+        that is a REAL incompatibility, not a widget disagreement: a TRIMMED sigma range
+        (KSamplerAdvanced start_step/last_step) would mis-time the engine's internal dual-expert
+        swap, which is keyed to a full-range schedule."""
         Tlat = int(xin.shape[2])
-        exp_Tlat = (self._num_frames - 1) // 4 + 1
-        if Tlat != exp_Tlat:
-            raise RuntimeError(
-                f"qf_native: geometry mismatch — the loader's num_frames={self._num_frames} implies "
-                f"{exp_Tlat} latent frames, but the latent has {Tlat} (≈ WanImageToVideo.length="
-                f"{(Tlat - 1) * 4 + 1}). Set the loader's num_frames to match WanImageToVideo.length.")
-        W, H = int(xin.shape[-1]) * 8, int(xin.shape[-2]) * 8
-        if (W, H) != (self._width, self._height):
-            raise RuntimeError(
-                f"qf_native: geometry mismatch — the loader's width×height={self._width}×{self._height} "
-                f"but the latent is {W}×{H}. Set the loader's width/height to match WanImageToVideo "
-                f"(the pipeline was VRAM-planned for the loader's size).")
+        self._num_frames = (Tlat - 1) * self._VAE_T + 1
         sigmas = transformer_options.get("sample_sigmas") if isinstance(transformer_options, dict) else None
-        if sigmas is not None and len(sigmas) >= 1:
-            ksteps = len(sigmas) - 1
-            if ksteps != self._num_steps:
-                raise RuntimeError(
-                    f"qf_native: schedule mismatch — the loader's steps={self._num_steps} but this sampler "
-                    f"runs {ksteps} steps. If this is a stock KSampler, set the loader's steps to match it. "
-                    f"If it is a KSamplerAdvanced two-stage / partial denoise (start_step/last_step trims the "
-                    f"sigma range), that is NOT supported: the engine session runs its OWN internal schedule "
-                    f"(including the dual-expert swap timing) keyed to the full step count, so a trimmed sub-"
-                    f"range would mis-time the swap and corrupt the output. Use a single full-range KSampler "
-                    f"with steps={self._num_steps}.")
+        if sigmas is None or len(sigmas) < 2:
+            raise RuntimeError(
+                "qf_native: the sampler did not publish a sigma schedule (transformer_options["
+                "'sample_sigmas']) — the engine session needs the step count. Use a stock KSampler / "
+                "SamplerCustom on this model.")
+        self._num_steps = len(sigmas) - 1
+        # A trimmed sub-range (denoise<1 / start_step>0 / last_step<steps) does not START at the
+        # schedule's first sigma or END at ~0 — the engine's dual-expert swap timing assumes the
+        # full range, so refuse LOUD instead of rendering a silently mis-timed result.
+        try:
+            s_first, s_last = float(sigmas[0]), float(sigmas[-1])
+        except Exception:  # noqa: BLE001 — non-tensor sigmas: skip the range check, keep the count
+            return
+        ms = getattr(self, "model_sampling", None)
+        s_max = float(getattr(ms, "sigma_max", s_first)) if ms is not None else s_first
+        if s_last > 1e-3 or (s_max > 0 and s_first < 0.98 * s_max):
+            raise RuntimeError(
+                f"qf_native: partial / trimmed denoise is NOT supported (sigmas run "
+                f"{s_first:.4f}→{s_last:.4f}, full range would be {s_max:.4f}→0). The engine session "
+                f"runs its OWN internal schedule (including the dual-expert swap timing) keyed to the "
+                f"full step range, so a trimmed sub-range would mis-time the swap and corrupt the "
+                f"output. Use a single full-range KSampler (denoise=1.0, no start_step/last_step).")
 
     # ---- session lifecycle -------------------------------------------------
     def _begin(self, x_group, ctx_group):
@@ -499,7 +461,7 @@ class QFWanModel(QFSessionModelMixin, comfy.model_base.WAN21):
         bpx.max_context_dims = (ctypes.c_int * 3)(int(ctx_group.shape[0]), _max_seq, int(ctx_group.shape[2]))
         self._max_ctx_seq = 0             # reset for the next run's extra_conds accumulation
         bpx.cond_dtype = _qf_dtype(ctx_group.dtype)
-        bpx._opts = json.dumps({"num_frames": self._num_frames, "fps": self._fps,
+        bpx._opts = json.dumps({"num_frames": self._num_frames, "fps": float(self._fps),
                                 "resident_block_count": self._resident_block_count}).encode()
         bpx.options_json = bpx._opts
         session = ctypes.c_void_p()
@@ -591,7 +553,7 @@ class QFWanModel(QFSessionModelMixin, comfy.model_base.WAN21):
                                f"with cond_or_uncond={cou} — batch_size>1 latents are not supported")
         self._max_batch = max(self._max_batch, B)   # 2 = comfy batched cond+uncond → the split fired
         if self._qf.current_session is None:
-            self._check_geometry(xin, transformer_options)   # loud-fail on loader-vs-graph divergence
+            self._derive_geometry(xin, transformer_options)  # session geometry from the GRAPH
             self._begin(xin[0:1].contiguous(), ctx[0:1].contiguous())
         if self._out is None or self._out.shape != xin.shape or self._out.dtype != xin.dtype:
             self._out = torch.empty_like(xin)

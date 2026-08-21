@@ -48,7 +48,7 @@ from . import qf_engine as qfe
 from .qf_modelpatcher import (_qf_dtype, QFModelPatcher, _QFStub,
                               _interrupt_poll_end_session_on_raise,
                               save_ref_tempfile, cleanup_ref_tempfile,
-                              QFSessionModelMixin, parse_loras_widget)
+                              QFSessionModelMixin)
 
 import weakref
 
@@ -150,6 +150,7 @@ def _accumulate_connector_footprint(budget, n_layers, num_heads, inner_dim, n_re
 # LTX VAE scale factors (engine kS=32 spatial, kT=8 temporal, kC=128 channels — LTX2VideoPipeline).
 _LTX_SPATIAL = 32
 _LTX_TEMPORAL = 8
+_LTX_DEFAULT_FPS = 25.0   # informational default; the sampler/graph owns real timing
 _LTX_CHANNELS = 128
 
 
@@ -366,9 +367,8 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
     """LTX-2 svdq pipeline exposed as a native comfy MODEL (native-KSampler seam), t2v + i2v
     (i2v = loader start_image → engine frame-0 conditioning via begin_edit)."""
 
-    def __init__(self, model_config, engine, connector, num_steps, num_frames, fps,
-                 width, height, device=None, audio_connector=None, start_image=None,
-                 resident_block_count=999):
+    def __init__(self, model_config, engine, connector, device=None, audio_connector=None,
+                 start_image=None, resident_block_count=999):
         super().__init__(model_config, device=device)   # disable_unet honored in BaseModel.__init__
         self.diffusion_model = _QFStub()
         self._resident_block_count = int(resident_block_count)   # [manual-residency] video begin knob
@@ -380,11 +380,9 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
         self._start_image = start_image
         self._connector = connector          # comfy Embeddings1DConnector (video), weights loaded
         self._audio_connector = audio_connector  # comfy audio_embeddings_connector (2048); None -> video-only 4096
-        self._num_steps = int(num_steps)
-        self._num_frames = int(num_frames)
-        self._fps = int(fps)
-        self._width = int(width)
-        self._height = int(height)
+        self._num_steps = 0                  # DERIVED per run from sample_sigmas (len-1) at _begin
+        self._num_frames = 0                 # DERIVED per run from the latent: (Tlat-1)*8 + 1
+        self._fps = _LTX_DEFAULT_FPS         # informational (rides options_json); LTX conditions on its own
         self._step_i = 0
         self._sess_denoise = 0
         self._out = None                     # reused packed velocity_out buffer [1,N,128]
@@ -409,9 +407,15 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
     # its completeness against THIS comfy is machine-checked by tests/reject_list_completeness.py (LTXV entry).
     _ENGINE_IGNORED_COND_KEYS = ("denoise_mask", "concat_mask", "keyframe_idxs", "guide_attention_entries",
                                  "noise_concat", "cross_attn_controlnet", "concat_latent_image",
-                                 # LTX-AV-era cond keys this comfy's LTXAV.extra_conds exposes
-                                 # (LTXVReferenceAudio / keyframe generators) — the native session
-                                 # consumes neither; a wired producer must fail loud, not be dropped.
+                                 # LTX-AV-era cond keys this comfy's LTXAV.extra_conds exposes —
+                                 # from LTXVReferenceAudio / the keyframe generators. The native
+                                 # session consumes neither; a wired producer must fail loud, not
+                                 # be silently dropped.
+                                 # ★ NEVER put a closing bracket in a comment INSIDE this tuple:
+                                 # the reject-list audit parses it with a  [^ closing-bracket ]*
+                                 # character class, so the first one TRUNCATES the parsed set and
+                                 # every key after it is reported UNCOVERED. Measured 2026-08-21:
+                                 # an aside in brackets hid ref_audio + generated_keyframes.
                                  "ref_audio", "generated_keyframes")
 
     def extra_conds(self, **kwargs):
@@ -479,35 +483,32 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
             "native session does not support masked inpainting — comfy's sampler would silently blend the mask "
             "against the noise latent and corrupt the video. Remove the mask / SetLatentNoiseMask node.")
 
-    def _check_geometry(self, xin, transformer_options):
-        """Loud-fail if the loader's own num_frames/steps/width/height widgets DISAGREE with the ACTUAL graph
-        geometry. They are INDEPENDENT widgets: the loader's values CREATE the pipeline + drive the engine
-        session, while the latent the sampler denoises comes from EmptyLTXVLatentVideo/KSampler. A mismatch
-        builds a session whose geometry disagrees with the latent → wrong output or an opaque engine dims error.
-        xin: [B,128,F_lat,H_lat,W_lat]. LTX VAE scale: temporal 8 (F_lat=(num_frames-1)//8+1, LTX2VideoPipeline
-        .cpp:467/:1282), spatial 32."""
+    def _derive_geometry(self, xin, transformer_options):
+        """DERIVE the session geometry from the graph (official-loader shape — the loader has no
+        geometry widgets). xin: [B,128,F_lat,H_lat,W_lat]; LTX VAE scale temporal 8 / spatial 32.
+        Step count from the sampler's own sigma schedule; a TRIMMED range is refused (the engine
+        session runs its OWN internal schedule keyed to the full range)."""
         Tlat = int(xin.shape[2])
-        exp_Tlat = (self._num_frames - 1) // _LTX_TEMPORAL + 1
-        if Tlat != exp_Tlat:
-            raise RuntimeError(
-                f"qf_native LTX: geometry mismatch — the loader's num_frames={self._num_frames} implies "
-                f"{exp_Tlat} latent frames, but the latent has {Tlat} (≈ length "
-                f"{(Tlat - 1) * _LTX_TEMPORAL + 1}). Set the loader's num_frames to match the latent length.")
-        W, H = int(xin.shape[-1]) * _LTX_SPATIAL, int(xin.shape[-2]) * _LTX_SPATIAL
-        if (W, H) != (self._width, self._height):
-            raise RuntimeError(
-                f"qf_native LTX: geometry mismatch — the loader's width×height={self._width}×{self._height} "
-                f"but the latent is {W}×{H}. Set the loader's width/height to match the latent (the pipeline "
-                f"was VRAM-planned for the loader's size).")
+        self._num_frames = (Tlat - 1) * _LTX_TEMPORAL + 1
         sigmas = transformer_options.get("sample_sigmas") if isinstance(transformer_options, dict) else None
-        if sigmas is not None and len(sigmas) >= 1:
-            ksteps = len(sigmas) - 1
-            if ksteps != self._num_steps:
-                raise RuntimeError(
-                    f"qf_native LTX: schedule mismatch — the loader's steps={self._num_steps} but this sampler "
-                    f"runs {ksteps} steps. Set the loader's steps to match the KSampler. A KSamplerAdvanced "
-                    f"partial-denoise sub-range (start_step/last_step) is NOT supported: the engine session runs "
-                    f"its OWN internal schedule keyed to the full step count. Use a single full-range KSampler.")
+        if sigmas is None or len(sigmas) < 2:
+            raise RuntimeError(
+                "qf_native LTX: the sampler did not publish a sigma schedule "
+                "(transformer_options['sample_sigmas']) — the engine session needs the step count. "
+                "Use a stock KSampler / SamplerCustom on this model.")
+        self._num_steps = len(sigmas) - 1
+        try:
+            s_first, s_last = float(sigmas[0]), float(sigmas[-1])
+        except Exception:  # noqa: BLE001 — non-tensor sigmas: keep the count, skip the range check
+            return
+        ms = getattr(self, "model_sampling", None)
+        s_max = float(getattr(ms, "sigma_max", s_first)) if ms is not None else s_first
+        if s_last > 1e-3 or (s_max > 0 and s_first < 0.98 * s_max):
+            raise RuntimeError(
+                f"qf_native LTX: partial / trimmed denoise is NOT supported (sigmas run "
+                f"{s_first:.4f}→{s_last:.4f}, full range would be {s_max:.4f}→0). The engine session "
+                f"runs its OWN internal schedule keyed to the full step range. Use a single "
+                f"full-range KSampler (denoise=1.0, no start_step/last_step).")
 
     # ── connector bridge: comfy pre-connector dual TE [B,S,6144] -> POST-connector [B,S,6144 | 4096] ──
     def _post_connector_seq(self, raw_s):
@@ -676,7 +677,7 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
             raise RuntimeError(f"qf_native LTX: engine forward is B==1 per cond group but got batch={B} "
                                f"with cond_or_uncond={cou} — batch_size>1 latents are not supported")
         # ★ loader-widget vs graph-latent geometry cross-check (CR conformance) — before any engine work.
-        self._check_geometry(xin, transformer_options)
+        self._derive_geometry(xin, transformer_options)
         # CONNECTOR BRIDGE: comfy pre-connector [B,S,6144] -> POST-connector video_embeds [B,S,4096].
         vemb = self._run_connector(c_crossattn, attention_mask=kwargs.get("attention_mask")
                                    ).to(dev, dtype=torch.bfloat16).contiguous()
@@ -800,13 +801,12 @@ class QFLTXAVModel(QFLTXModel):
     inner_model.latent_shapes); the only comfy isinstance on model_base.LTXAV
     (lora.py:371) tests (LTXV, LTXAV) — satisfied via the LTXV base."""
 
-    def __init__(self, model_config, engine, num_steps, num_frames, fps, width, height,
-                 device=None, start_image=None, resident_block_count=999):
+    def __init__(self, model_config, engine, device=None, start_image=None,
+                 resident_block_count=999):
         if start_image is not None:
             raise RuntimeError("qf_native LTX-AV: i2v (start_image) is not wired for the AV "
                                "session in this increment — t2av only; remove start_image.")
-        QFLTXModel.__init__(self, model_config, engine, connector=None, num_steps=num_steps,
-                            num_frames=num_frames, fps=fps, width=width, height=height,
+        QFLTXModel.__init__(self, model_config, engine, connector=None,
                             resident_block_count=resident_block_count,
                             device=device, audio_connector=None, start_image=None)
         self._out_audio = None            # reused packed audio velocity buffer [1,L,128] fp32
@@ -881,7 +881,7 @@ class QFLTXAVModel(QFLTXModel):
         if B > 1 and (cou is None or len(cou) != B):
             raise RuntimeError(f"qf_native LTX-AV: engine forward is B==1 per cond group but got "
                                f"batch={B} with cond_or_uncond={cou}")
-        self._check_geometry(xin, transformer_options)
+        self._derive_geometry(xin, transformer_options)
         La = int(x_audio.shape[2])
         self._audio_rows = La
         # RAW dual-proj ctx (no plugin connector — see _run_connector).
@@ -1003,9 +1003,11 @@ class QFLTXAVModel(QFLTXModel):
         return super(QFLTXModel, self).process_latent_out(latent)
 
 
-def register(NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS, get_engine, pipeline_models):
-    """Register the LTX loader node (called from __init__.py alongside the wan loader). get_engine +
-    pipeline_models are __init__.py's shared helpers, threaded in to avoid a circular import."""
+def register(NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS, get_engine, pipeline_models,
+             list_packages, resolve_package):
+    """Register the LTX loader node (called from __init__.py alongside the wan loader). get_engine,
+    pipeline_models + the models/quantfunc package helpers are __init__.py's shared helpers,
+    threaded in to avoid a circular import."""
 
     class QuantFuncNativeLTXLoader:
         """Create an LTX-2 svdq pipeline and expose it as a native comfy MODEL (native-KSampler seam, t2v).
@@ -1018,35 +1020,31 @@ def register(NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS, get_engine, pipeli
 
         @classmethod
         def INPUT_TYPES(cls):
+            _ckpts = []
+            try:
+                import folder_paths as _fp
+                _ckpts = _fp.get_filename_list("checkpoints")
+            except Exception:  # noqa: BLE001
+                _ckpts = []
             return {"required": {
-                "model_dir": ("STRING", {"default": ""}),          # engine svdq LTX-2 (video-only) dir
-                "transformer_path": ("STRING", {"default": ""}),
-                "connector_ckpt": ("STRING", {"default": ""}),     # comfy LTX-2.3 ckpt w/ video connector
-                "steps": ("INT", {"default": 30, "min": 1, "max": 100}),
-                # R5 (design seq-517): the engine refuses (num_frames-1)%8!=0 and width/height%32!=0
-                # with an opaque dims error — encode the constraints in the widgets (step 8 from min 9
-                # keeps F on the 8k+1 lattice; step 32 keeps the spatial grid legal).
-                "num_frames": ("INT", {"default": 49, "min": 9, "max": 257, "step": 8}),
-                "fps": ("INT", {"default": 24, "min": 1, "max": 60}),
-                "width": ("INT", {"default": 768, "min": 64, "max": 2048, "step": 32}),
-                "height": ("INT", {"default": 512, "min": 64, "max": 2048, "step": 32}),
+                "model_name": (list_packages(),),
+                # [manual-residency] GPU-resident transformer blocks (the native seam's ONLY
+                # residency mechanism; engine clamps to the model's block count).
+                "resident_block_count": ("INT", {"default": 999, "min": 1, "max": 1024}),
             }, "optional": {
+                # LTX-2.3 / 19B VIDEO-ONLY path ONLY: the comfy LTX checkpoint carrying
+                # model.diffusion_model.video_embeddings_connector.* (this seam runs that connector
+                # itself because it bypasses comfy's LTX diffusion model). UNUSED on the LTX-2.5
+                # JOINT-AV path (that package ships audio_vae/ and the engine runs its own connector).
+                "connector_ckpt": (["(none)"] + list(_ckpts),),
                 # i2v: wire a LoadImage here (frame-0 conditioning; the engine center-crop-fills the
-                # image to width x height — aspect mismatch = crop, never stretch — then VAE-encodes
-                # it and pins frame 0 at sigma=0 through denoise + finalize). Absent = t2v (unchanged).
+                # image to the latent's size — aspect mismatch = crop, never stretch — then VAE-encodes
+                # it and pins frame 0 through denoise + finalize). Absent = t2v.
                 # Do NOT use LTXVImgToVideo / LTXVAddGuide with this loader — their conditioning keys
                 # are rejected fail-loud (this seam runs the engine's own schedule).
                 "start_image": ("IMAGE",),
-                # OFF (default) = (b) engine audio-branch SKIP path: pass 4096 video-only (ltx's RULED path;
-                # a 6144 cond breaks the VIDEO captionProject even under the skip — dossier seq-242). ON = (a)
-                # split path: load the audio connector + pass 6144 (needs an engine external-step split; not (b)).
-                "join_audio_prompt": ("BOOLEAN", {"default": False}),
-                # Sidecar multi-LoRA (create-time): one per line, /abs/path.safetensors[:scale].
-                # Applied engine-side onto the svdq slots' sidecar branches (base int4 untouched;
-                # per-block attn/ff incl. audio streams; model-level LoRA keys are skipped+logged).
-                "loras": ("STRING", {"default": "", "multiline": True}),
-                # [manual-residency] GPU-resident transformer blocks for the video session
-                "resident_block_count": ("INT", {"default": 999, "min": 1, "max": 1024}),
+                # Chained sidecar LoRA stack (QuantFuncNativeLoRA → this input).
+                "lora_stack": ("QF_LORA_STACK",),
             }}
 
         RETURN_TYPES = ("MODEL",)
@@ -1063,14 +1061,18 @@ def register(NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS, get_engine, pipeli
             "LTXVSeparateAVLatent → VAEDecode + VAEDecodeAudio → CreateVideo(audio) on the way out; "
             "connector_ckpt is unused (the engine runs its own checkpoint connector).")
 
-        def load(self, model_dir, transformer_path, connector_ckpt, steps, num_frames, fps, width, height,
-                 join_audio_prompt=False, start_image=None, loras="", resident_block_count=999):
-            if not model_dir or not transformer_path:
-                raise RuntimeError("QuantFuncNativeLTXLoader: model_dir and transformer_path are required")
+        def load(self, model_name, resident_block_count=999, connector_ckpt="(none)",
+                 start_image=None, lora_stack=None):
+            model_dir = resolve_package(model_name)
+            join_audio_prompt = False            # a2v split not implemented in this seam (see below)
+            if connector_ckpt and connector_ckpt != "(none)":
+                import folder_paths as _fp
+                connector_ckpt = _fp.get_full_path_or_raise("checkpoints", connector_ckpt)
+            else:
+                connector_ckpt = ""
             _lora_cfg = {}
-            _lora_entries = parse_loras_widget(loras)
-            if _lora_entries:
-                _lora_cfg["lora"] = _lora_entries   # engine svdq factory: sidecar apply post-load
+            if lora_stack:
+                _lora_cfg["lora"] = list(lora_stack)   # engine svdq factory: sidecar apply post-load
             # ── LTX-2.5 JOINT-AV auto-detect (c5.8b): the SAME discriminant the engine's own
             # has_audio_ uses — the engine model_dir ships audio_vae/ weights (the video-only
             # 19B staging deliberately omits it) — so plugin and engine agree by construction.
@@ -1085,8 +1087,7 @@ def register(NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS, get_engine, pipeli
                         "QuantFuncNativeLTXLoader: join_audio_prompt belongs to the LEGACY 2.3 "
                         "plugin-connector split and is not used on the LTX-2.5 AV path — the AV "
                         "session derives BOTH modality embeds engine-side. Leave it False.")
-                engine, ckey = get_engine(model_dir, transformer_path, width, height, minimal=True,
-                                          create_cfg=(_lora_cfg or None))
+                engine, ckey = get_engine(model_dir, create_cfg=(_lora_cfg or None))
                 device = comfy.model_management.get_torch_device()
                 offload = comfy.model_management.unet_offload_device()
                 unet_config = {"image_model": "ltxav", "disable_unet_model_creation": True}
@@ -1095,12 +1096,13 @@ def register(NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS, get_engine, pipeli
                                       ("optimizations", {}), ("scaled_fp8", None)):
                     if not hasattr(model_config, attr):
                         setattr(model_config, attr, default)
-                model = QFLTXAVModel(model_config, engine, steps, num_frames, fps,
-                                     width, height, device=device, start_image=start_image, resident_block_count=resident_block_count)
+                model = QFLTXAVModel(model_config, engine, device=device,
+                                     start_image=start_image,
+                                     resident_block_count=resident_block_count)
                 pipeline_models[ckey] = weakref.ref(model)
                 patcher = QFModelPatcher(model, load_device=device, offload_device=offload)
                 print(f"[qf_native] loaded QuantFuncNativeLTXLoader (LTX-2.5 JOINT-AV svdq) "
-                      f"steps={steps} frames={num_frames} {width}x{height} "
+                      f"package={model_name} resident_blocks={resident_block_count} "
                       f"footprint={engine.footprint_bytes // (1024*1024)}MB", flush=True)
                 return (patcher,)
             if not connector_ckpt:
@@ -1132,8 +1134,7 @@ def register(NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS, get_engine, pipeli
             # it currently WORKS here because LTX's TE tiers accept the default — but if an LTX TE arch
             # without a wired 4-bit tier ever routes through this minimal create, it hits the same class.
             # No fix now (adding keys back defeats minimal=True's purpose); this note is the tripwire.
-            engine, ckey = get_engine(model_dir, transformer_path, width, height, minimal=True,
-                                          create_cfg=(_lora_cfg or None))
+            engine, ckey = get_engine(model_dir, create_cfg=(_lora_cfg or None))
             # [19B non-gated connector] authoritative head count from the ORIGINAL model dir\'s diffusers
             # LTX2TextConnectors config (the 19B family ships NON-gated connector weights; the head split
             # lives ONLY here). Absent/malformed -> None (gated checkpoints need nothing; a non-gated one
@@ -1177,13 +1178,13 @@ def register(NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS, get_engine, pipeli
                 if not hasattr(model_config, attr):
                     setattr(model_config, attr, default)
 
-            model = QFLTXModel(model_config, engine, connector, steps, num_frames, fps,
-                               width, height, device=device, audio_connector=audio_connector,
-                               start_image=start_image, resident_block_count=resident_block_count)
+            model = QFLTXModel(model_config, engine, connector, device=device,
+                               audio_connector=audio_connector, start_image=start_image,
+                               resident_block_count=resident_block_count)
             pipeline_models[ckey] = weakref.ref(model)
             patcher = QFModelPatcher(model, load_device=device, offload_device=offload)
-            print(f"[qf_native] loaded QuantFuncNativeLTXLoader (LTX-2 svdq) steps={steps} "
-                  f"frames={num_frames} {width}x{height} "
+            print(f"[qf_native] loaded QuantFuncNativeLTXLoader (LTX-2 svdq) package={model_name} "
+                  f"resident_blocks={resident_block_count} "
                   f"footprint={engine.footprint_bytes // (1024*1024)}MB", flush=True)
             return (patcher,)
 
