@@ -98,7 +98,7 @@ def main():
     tmp = tempfile.mkdtemp(prefix="qf_loader_test_")
     dm = os.path.join(tmp, "diffusion_models")
     os.makedirs(dm)
-    for f in ("wan-high.safetensors", "wan-low.safetensors", "other.safetensors",
+    for f in ("fx-t2v-4steps-high-quantfunc-int4.safetensors", "fx-t2v-4steps-low-quantfunc-int4.safetensors", "other.safetensors",
               "not-a-model.txt"):
         with open(os.path.join(dm, f), "wb") as fh:
             fh.write(b"\0" * 16)
@@ -153,39 +153,39 @@ def main():
           "wan2.2-a14b-t2v" in cfgs and "fx-ltx" in cfgs, f"-> {cfgs}")
     t1 = it["required"]["transformer1"][0]
     check("transformer1 lists .safetensors FILES (and only those)",
-          "wan-high.safetensors" in t1 and "not-a-model.txt" not in t1)
+          "fx-t2v-4steps-high-quantfunc-int4.safetensors" in t1 and "not-a-model.txt" not in t1)
     check("transformer2 leads with (none)", it["optional"]["transformer2"][0][0] == "(none)")
 
     # ── 2) dispatch by MANIFEST family: ltx2/minimax-h3 loud not-wired; unknown family loud;
     #      model_config traversal refused ──
     for preset in ("fx-ltx", "fx-h3"):
         try:
-            Loader.load("wan-high.safetensors", preset, 999)
+            Loader.load("fx-t2v-4steps-high-quantfunc-int4.safetensors", preset, 999)
             check(f"{preset} refuses loud (family not wired for file mode)", False, "-> no exception")
         except RuntimeError as e:
             check(f"{preset} refuses loud (family not wired for file mode)", "not" in str(e).lower())
     try:
-        Loader.load("wan-high.safetensors", "fx-alien", 999)
+        Loader.load("fx-t2v-4steps-high-quantfunc-int4.safetensors", "fx-alien", 999)
         check("unknown family refuses loud", False, "-> no exception")
     except RuntimeError as e:
         check("unknown family refuses loud", "no registered native seam" in str(e))
     for evil_cfg in ("../wan2.2-a14b-t2v", "a/b", "..", ""):
         try:
-            Loader.load("wan-high.safetensors", evil_cfg, 999)
+            Loader.load("fx-t2v-4steps-high-quantfunc-int4.safetensors", evil_cfg, 999)
             check(f"model_config refuses {evil_cfg!r}", False, "-> loaded!")
         except RuntimeError:
             check(f"model_config refuses {evil_cfg!r}", True)
     # manifest-driven SHAPE mismatches
     try:
-        Loader.load("wan-high.safetensors", "fx-single", 999, transformer2="wan-low.safetensors")
+        Loader.load("fx-t2v-4steps-high-quantfunc-int4.safetensors", "fx-single", 999, transformer2="fx-t2v-4steps-low-quantfunc-int4.safetensors")
         check("single-expert preset + transformer2 refused", False, "-> no exception")
     except RuntimeError as e:
         check("single-expert preset + transformer2 refused", "single-transformer" in str(e))
 
     # ── 3) wan dual-expert staging + denoise_only create cfg ──
     try:
-        out = Loader.load("wan-high.safetensors", "wan2.2-a14b-t2v", 999,
-                          transformer2="wan-low.safetensors")[0]
+        out = Loader.load("fx-t2v-4steps-high-quantfunc-int4.safetensors", "wan2.2-a14b-t2v", 999,
+                          transformer2="fx-t2v-4steps-low-quantfunc-int4.safetensors")[0]
         check("wan dual-expert returns a QFModelPatcher", type(out).__name__ == "QFModelPatcher")
         n0 = len(creates)
         _ = out.model._qf.lib          # first touch materializes
@@ -200,7 +200,7 @@ def main():
         r1 = os.path.realpath(os.path.join(md, "transformer", "model.safetensors"))
         r2 = os.path.realpath(os.path.join(md, "transformer_2", "model.safetensors"))
         check("expert weight links resolve to the PICKED files",
-              r1.endswith("wan-high.safetensors") and r2.endswith("wan-low.safetensors"))
+              r1.endswith("fx-t2v-4steps-high-quantfunc-int4.safetensors") and r2.endswith("fx-t2v-4steps-low-quantfunc-int4.safetensors"))
         mi = json.load(open(os.path.join(md, "model_index.json")))
         check("staged model_index is dual-expert (boundary_ratio>0)",
               float(mi.get("boundary_ratio", 0)) > 0)
@@ -210,9 +210,18 @@ def main():
     except Exception as e:  # noqa: BLE001
         check("wan dual-expert staging", False, f"-> raised {type(e).__name__}: {e}")
 
+    # a NON-conforming file name for the preset must be refused loud (file_hints mechanism)
+    try:
+        Loader.load("other.safetensors", "wan2.2-a14b-t2v", 999,
+                    transformer2="fx-t2v-4steps-low-quantfunc-int4.safetensors")
+        check("file_hints refuses a non-conforming transformer1", False, "-> loaded!")
+    except RuntimeError as e:
+        check("file_hints refuses a non-conforming transformer1",
+              "does not look like" in str(e))
+
     # wan single-file must refuse (A14B is dual-expert)
     try:
-        Loader.load("wan-high.safetensors", "wan2.2-a14b-t2v", 999)
+        Loader.load("fx-t2v-4steps-high-quantfunc-int4.safetensors", "wan2.2-a14b-t2v", 999)
         check("wan single-file refused (dual-expert required)", False, "-> no exception")
     except RuntimeError as e:
         check("wan single-file refused (dual-expert required)", "DUAL-expert" in str(e))
@@ -229,14 +238,14 @@ def main():
         check("single-expert staging", False, f"-> raised {type(e).__name__}: {e}")
 
     # ── 4) containment: traversal/absolute names cannot escape the model roots ──
-    for evil in ("../../../../etc/passwd", "/etc/passwd", "wan-high.safetensors/../../x"):
+    for evil in ("../../../../etc/passwd", "/etc/passwd", "fx-t2v-4steps-high-quantfunc-int4.safetensors/../../x"):
         try:
             qfn._resolve_transformer(evil)
             check(f"containment refuses {evil!r}", False, "-> resolved!")
         except Exception:  # noqa: BLE001 — comfy raises its own error type
             check(f"containment refuses {evil!r}", True)
     try:
-        ok = qfn._resolve_transformer("wan-high.safetensors") == os.path.join(dm, "wan-high.safetensors")
+        ok = qfn._resolve_transformer("fx-t2v-4steps-high-quantfunc-int4.safetensors") == os.path.join(dm, "fx-t2v-4steps-high-quantfunc-int4.safetensors")
         check("containment still resolves a legit file", ok)
     except Exception as e:  # noqa: BLE001
         check("containment still resolves a legit file", False, f"-> {e!r}")
@@ -254,8 +263,8 @@ def main():
         qfn._resolve_lora = lambda n: os.path.join(lora_dir, n)
         LoraNode = qfn.NODE_CLASS_MAPPINGS["QuantFuncNativeLoRA"]()
 
-        base = Loader.load("wan-high.safetensors", "wan2.2-a14b-t2v", 999,
-                           transformer2="wan-low.safetensors")[0]
+        base = Loader.load("fx-t2v-4steps-high-quantfunc-int4.safetensors", "wan2.2-a14b-t2v", 999,
+                           transformer2="fx-t2v-4steps-low-quantfunc-int4.safetensors")[0]
         shifted = ModelSamplingSD3().patch(base, 11.0)[0]     # upstream comfy patch
         n0 = len(creates)
         chained1 = LoraNode.apply(shifted, "a.safetensors", 0.8)[0]
@@ -284,9 +293,9 @@ def main():
 
     # ── 6) HOST-RAM honesty on a DEDICATED file pair (isolated ckey) ──
     try:
-        for f in ("ram-h.safetensors", "ram-l.safetensors"):
+        for f in ("ram-t2v-high-quantfunc-int4.safetensors", "ram-t2v-low-quantfunc-int4.safetensors"):
             open(os.path.join(dm, f), "wb").write(b"\0" * 16)
-        fresh = Loader.load("ram-h.safetensors", "wan2.2-a14b-t2v", 999, transformer2="ram-l.safetensors")[0]
+        fresh = Loader.load("ram-t2v-high-quantfunc-int4.safetensors", "wan2.2-a14b-t2v", 999, transformer2="ram-t2v-low-quantfunc-int4.safetensors")[0]
         eng = fresh.model._qf
         check("never-created engine reports 0 host RAM", fresh.loaded_ram_size() == 0)
         check("never-created engine frees 0 host RAM", fresh.partially_unload_ram(10 ** 12) == 0)
@@ -306,10 +315,10 @@ def main():
     # ── 7) SHARED-handle sibling safety on a DEDICATED pair ──
     try:
         import gc
-        for f in ("sh-h.safetensors", "sh-l.safetensors"):
+        for f in ("sh-t2v-high-quantfunc-int4.safetensors", "sh-t2v-low-quantfunc-int4.safetensors"):
             open(os.path.join(dm, f), "wb").write(b"\0" * 16)
-        pa = Loader.load("sh-h.safetensors", "wan2.2-a14b-t2v", 999, transformer2="sh-l.safetensors")[0]
-        pb = Loader.load("sh-h.safetensors", "wan2.2-a14b-t2v", 999, transformer2="sh-l.safetensors")[0]
+        pa = Loader.load("sh-t2v-high-quantfunc-int4.safetensors", "wan2.2-a14b-t2v", 999, transformer2="sh-t2v-low-quantfunc-int4.safetensors")[0]
+        pb = Loader.load("sh-t2v-high-quantfunc-int4.safetensors", "wan2.2-a14b-t2v", 999, transformer2="sh-t2v-low-quantfunc-int4.safetensors")[0]
         ra = pa.model._qf.ensure()
         rb = pb.model._qf.ensure()
         check("two loads of one file-pair share the real handle", ra is rb)
@@ -384,6 +393,40 @@ def main():
         del m4
     except Exception as e:  # noqa: BLE001
         check("sweep liveness coverage", False, f"-> raised {type(e).__name__}: {e}")
+
+    # ── 9) file_hints CONTRACT completeness (mechanism, not memory — mirrors the family-module
+    #       derivation arm): every SHIPPED preset must declare file_hints for its required arms,
+    #       and each hint set must DISCRIMINATE (a matching name passes; a non-matching name is
+    #       refused loud). A future preset landing without the contract turns the suite red HERE,
+    #       instead of a user meeting an uncorresponding dropdown. ──
+    try:
+        import fnmatch as _fn
+        real_cfg = os.path.join(_PLUGIN, "configs")
+        presets = [d for d in sorted(os.listdir(real_cfg))
+                   if os.path.isfile(os.path.join(real_cfg, d, "qf_native.json"))]
+        check("at least one shipped preset exists", bool(presets), f"-> {presets}")
+        for d in presets:
+            mf = json.load(open(os.path.join(real_cfg, d, "qf_native.json")))
+            hints = mf.get("file_hints")
+            need = ["transformer1"] + (["transformer2"] if mf.get("dual_expert") else [])
+            check(f"preset {d} declares file_hints for {need}",
+                  isinstance(hints, dict) and all(hints.get(a) for a in need),
+                  f"-> {hints and sorted(hints.keys())}")
+            if not isinstance(hints, dict):
+                continue
+            for arm in need:
+                pats = [str(x).lower() for x in (hints.get(arm) or [])]
+                if not pats:
+                    continue
+                # BOTH-WAYS: derive a matching name from the first pattern, and use an
+                # unmistakably-foreign name for the refusal direction.
+                match_name = pats[0].replace("*", "x") + ".safetensors"                     if not pats[0].endswith(".safetensors") else pats[0].replace("*", "x")
+                ok_match = any(_fn.fnmatch(match_name, p) for p in pats)
+                ok_refuse = not any(_fn.fnmatch("totally-unrelated-model.safetensors", p) for p in pats)
+                check(f"preset {d}/{arm} hints discriminate both ways", ok_match and ok_refuse,
+                      f"-> match({match_name})={ok_match} refuse(unrelated)={ok_refuse}")
+    except Exception as e:  # noqa: BLE001
+        check("file_hints contract scan", False, f"-> raised {type(e).__name__}: {e}")
 
     print("LOADER_DISPATCH:", "PASS" if bad == 0 else f"FAIL ({bad} wrong)")
     return 0 if bad == 0 else 1

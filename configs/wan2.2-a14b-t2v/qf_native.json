@@ -2,5 +2,15 @@
   "family": "wan",
   "display": "Wan2.2 A14B T2V (dual-expert, 4-step INT4)",
   "dual_expert": true,
-  "notes": "official Wan2.2-T2V-A14B configs; transformer1=high-noise, transformer2=low-noise; 4 steps, CFG 1.0, shift 5.0"
+  "notes": "official Wan2.2-T2V-A14B configs; transformer1=high-noise, transformer2=low-noise; 4 steps, CFG 1.0, shift 5.0; expected files: wan2.2-a14b-t2v-4steps-{high,low}-quantfunc-int4-r128.safetensors",
+  "file_hints": {
+    "transformer1": [
+      "*t2v*high*quantfunc*int4*",
+      "*t2v*high*quantfunc*fp4*"
+    ],
+    "transformer2": [
+      "*t2v*low*quantfunc*int4*",
+      "*t2v*low*quantfunc*fp4*"
+    ]
+  }
 }

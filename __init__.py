@@ -72,6 +72,22 @@ def _model_config_choices():
         return [_NO_CFG_HINT]
 
 
+def _preset_file_expectations():
+    """One line per shipped preset naming its expected transformer files (tooltip text)."""
+    out = []
+    try:
+        for d in _model_config_choices():
+            mf = os.path.join(_CONFIGS_DIR, d, "qf_native.json")
+            if os.path.isfile(mf):
+                notes = (json.load(open(mf)).get("notes") or "")
+                exp = notes.split("expected files:")[-1].strip() if "expected files:" in notes else ""
+                if exp:
+                    out.append(f"{d}: {exp}")
+    except Exception:  # noqa: BLE001
+        pass
+    return (" Expected files — " + "; ".join(out)) if out else ""
+
+
 def _load_model_config(name):
     """Resolve + read a preset's manifest. The name is a widget value (workflow-serializable =
     untrusted): it must be exactly one of the listed preset dirs — no separators, no traversal."""
@@ -109,6 +125,26 @@ def _transformer_choices():
                  if f.lower().endswith(".safetensors")]
     except Exception:  # noqa: BLE001
         files = []
+    # Exclude files that live INSIDE a model-PACKAGE directory (any ancestor dir carrying
+    # model_index.json): comfy's recursive listing otherwise surfaces package INTERNALS —
+    # k9b/vae/diffusion_pytorch_model.safetensors and friends — which are never valid
+    # transformer picks and drowned the dropdown (user-reported).
+    try:
+        roots = [r for r in _folder_paths.get_folder_paths("diffusion_models") if os.path.isdir(r)]
+    except Exception:  # noqa: BLE001
+        roots = []
+
+    def _inside_package(rel):
+        parts = rel.replace("\\", "/").split("/")[:-1]
+        for root in roots:
+            cur = root
+            for seg in parts:
+                cur = os.path.join(cur, seg)
+                if os.path.isfile(os.path.join(cur, "model_index.json")):
+                    return True
+        return False
+
+    files = [f for f in files if "/" not in f.replace("\\", "/") or not _inside_package(f)]
     return sorted(files) or [_NO_XFM_HINT]
 
 
@@ -410,9 +446,10 @@ if _IMPORT_OK:
                 "model_config": (_model_config_choices(),
                                  {"tooltip": "The OFFICIAL model config for this transformer "
                                              "(shipped with the plugin: arch + VAE geometry + "
-                                             "family routing). Pick the preset matching your "
-                                             "weights — a bare .safetensors has no metadata to "
-                                             "auto-detect from."}),
+                                             "family routing + expected-file naming). Pick the "
+                                             "preset matching your weights — a bare .safetensors "
+                                             "has no metadata to auto-detect from. "
+                                             + _preset_file_expectations()}),
                 "resident_block_count": ("INT", {"default": 999, "min": 1, "max": 1024,
                                                  "tooltip": "GPU-resident transformer blocks — the "
                                                             "native seam's ONLY residency knob. The "
@@ -463,6 +500,26 @@ if _IMPORT_OK:
                     f"qf_native: model_config '{model_config}' is DUAL-expert — transformer1 = the "
                     f"HIGH-noise expert AND transformer2 = the LOW-noise expert are both required "
                     f"(the export ships them as a *-high-* / *-low-* pair).")
+            # file_hints validation (DATA-driven; the manifest names what its transformers look
+            # like). DESIGN BOUNDARY, recorded deliberately: comfy combo values must be the REAL
+            # relative filenames (they resolve through folder_paths) and INPUT_TYPES is rendered
+            # statically — so the dropdown CANNOT dynamically filter by the sibling model_config
+            # widget without frontend JS. The correspondence contract is therefore enforced HERE,
+            # fail-loud at load, with the expected patterns named.
+            import fnmatch
+            hints = manifest.get("file_hints") or {}
+            for arm, val in (("transformer1", transformer1),
+                             ("transformer2", None if xfm2 is None else transformer2)):
+                pats = hints.get(arm) or []
+                if val is None or not pats:
+                    continue
+                base = os.path.basename(val).lower()
+                if not any(fnmatch.fnmatch(base, p.lower()) for p in pats):
+                    raise RuntimeError(
+                        f"qf_native: {arm}={val!r} does not look like a '{model_config}' "
+                        f"{arm} weight (expected a name matching {pats}). Pick the file the "
+                        f"preset names — see the model_config tooltip — or choose the preset "
+                        f"matching this file.")
             if not manifest.get("dual_expert") and xfm2 is not None:
                 raise RuntimeError(
                     f"qf_native: model_config '{model_config}' is single-transformer — leave "
