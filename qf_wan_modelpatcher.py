@@ -204,7 +204,7 @@ class QFWanModel(QFSessionModelMixin, comfy.model_base.WAN21):
         # that cannot occur under that mechanism; it blocked the official dual-sampler template
         # and is deliberately removed (sampler/scheduler are ComfyUI-owned — user directive).
 
-    def _begin(self, x_group, ctx_group):
+    def _begin(self, x_group, ctx_group, cond_tail=None):
         """Open the edit session. x_group/ctx_group are PER-COND-GROUP (B==1) slices — begin binds
         the geometry MAXIMA with B==1 (the engine + include/quantfunc.h require cond B==1)."""
         self._qf.end_session_if_open()    # clean any stale session from a prior failed run on this pipeline
@@ -231,6 +231,40 @@ class QFWanModel(QFSessionModelMixin, comfy.model_base.WAN21):
                                 "resident_block_count": self._resident_block_count}).encode()
         bpx.options_json = bpx._opts
         session = ctypes.c_void_p()
+        if cond_tail is not None:
+            # i2v COND-LATENT begin (cond-latent ABI): the workflow supplied the fixed tail -
+            # no engine-side ref encode (works on denoise_only). hasattr gate = the D-class
+            # step_multi precedent: an old .so lacks the export and refuses with guidance.
+            if not hasattr(lib, "quantfunc_denoise_begin_edit_cond"):
+                raise RuntimeError(
+                    "qf_native wan i2v: this workflow supplies image conditioning (c_concat), "
+                    "but the loaded engine .so predates the i2v cond-latent ABI (no "
+                    "quantfunc_denoise_begin_edit_cond export). Update the plugin's engine "
+                    "library (bin/linux/libquantfunc.so), or use a t2v checkpoint.")
+            cpx = qfe.DenoiseBeginEditCondParams()
+            ctypes.memset(ctypes.byref(cpx), 0, ctypes.sizeof(cpx))
+            cpx.struct_size = ctypes.sizeof(cpx)
+            cpx.base = bpx
+            cpx._bp = bpx                     # keep-alive: base's nested buffers (options_json)
+            cpx._tail_keep = cond_tail        # borrowed for the begin call - keep the tensor alive
+            cpx.cond_tail = ctypes.c_void_p(int(cond_tail.data_ptr()))
+            cpx.cond_tail_dims = (ctypes.c_int32 * 5)(*[int(d) for d in cond_tail.shape])
+            cpx.cond_tail_dtype = _qf_dtype(cond_tail.dtype)
+            st = lib.quantfunc_denoise_begin_edit_cond(self._qf.pipeline, ctypes.byref(cpx),
+                                                       ctypes.byref(session))
+            self._begin_keep = cpx
+            if st != qfe.QUANTFUNC_OK:
+                raise RuntimeError(f"denoise_begin_edit_cond (wan i2v) failed: {qfe.last_err(lib)}")
+            self._qf.current_session = session
+            self._qf.unloaded = False
+            self._step_i = 0
+            self._sess_denoise = 0
+            self._max_batch = 0
+            self._ctx_key_assigner.reset()
+            print(f"[qf_native] SESSION OPEN (i2v cond-latent) handle={session.value:#x} "
+                  f"steps={self._num_steps} tail={tuple(cond_tail.shape)} "
+                  f"cond={tuple(ctx_group.shape)}", flush=True)
+            return
         if self._start_image is None:
             # t2v — the A14B/Wan2.1 T2V checkpoints take no reference frame. The engine's own
             # E3 gate refuses an i2v checkpoint (in>out) without a ref fail-loud, so a user
@@ -318,9 +352,29 @@ class QFWanModel(QFSessionModelMixin, comfy.model_base.WAN21):
             raise RuntimeError(f"qf_native: engine forward is B==1 per cond group but got batch={B} "
                                f"with cond_or_uncond={cou} — batch_size>1 latents are not supported")
         self._max_batch = max(self._max_batch, B)   # 2 = comfy batched cond+uncond → the split fired
+        # i2v COND TAIL (cond-latent ABI): comfy's WanImageToVideo delivers the fixed
+        # [mask|cond] block as c_concat (the model's processed latent space — the same
+        # convention as x). The session takes ONE tail (per-session, fixed across steps);
+        # cond groups sharing a ref carry identical rows — verified ONCE at begin, a
+        # mismatch refuses loud (one tail per session is the ABI's contract).
+        tail = None
+        if c_concat is not None:
+            tail = c_concat.to(device=dev, dtype=xin.dtype).contiguous()
+            if tail.ndim != 5:
+                raise RuntimeError(
+                    f"qf_native wan i2v: c_concat must be 5D [B, in-z, Tlat, Hl, Wl], got "
+                    f"shape={tuple(tail.shape)}")
+            if int(tail.shape[0]) > 1:
+                for _r in range(1, int(tail.shape[0])):
+                    if not torch.equal(tail[_r], tail[0]):
+                        raise RuntimeError(
+                            "qf_native wan i2v: cond groups carry DIFFERENT concat conds - the "
+                            "session binds ONE fixed conditioning tail (one reference per "
+                            "generation). Per-group refs are not supported through this seam.")
+                tail = tail[0:1].contiguous()
         if self._qf.current_session is None:
             self._derive_geometry(xin, transformer_options)  # session geometry from the GRAPH
-            self._begin(xin[0:1].contiguous(), ctx[0:1].contiguous())
+            self._begin(xin[0:1].contiguous(), ctx[0:1].contiguous(), cond_tail=tail)
         if self._out is None or self._out.shape != xin.shape or self._out.dtype != xin.dtype:
             self._out = torch.empty_like(xin)
         sig_all = sigma.reshape(-1) if torch.is_tensor(sigma) else None

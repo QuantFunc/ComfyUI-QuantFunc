@@ -100,6 +100,22 @@ class DenoiseBeginEditParams(ctypes.Structure):
     ]
 
 
+class DenoiseBeginEditCondParams(ctypes.Structure):
+    # i2v cond-latent ABI (design GO 2026-08-21): begin with the WORKFLOW-supplied fixed
+    # conditioning tail ([1, in−z, Tlat, Hl, Wl], the model's processed latent space — comfy's
+    # WanImageToVideo c_concat verbatim) instead of engine-side ref encode. Field order/types
+    # mirror include/quantfunc.h VERBATIM. base = the PLAIN begin params (structural exclusivity
+    # with the path-based edit surface). Present only in cond-ABI engine builds — bind
+    # defensively (hasattr), exactly like quantfunc_denoise_step_multi.
+    _fields_ = [
+        ("struct_size", ctypes.c_size_t),
+        ("base", DenoiseBeginParams),
+        ("cond_tail", ctypes.c_void_p),
+        ("cond_tail_dims", ctypes.c_int32 * 5),
+        ("cond_tail_dtype", ctypes.c_int),
+    ]
+
+
 class DenoiseFinalizeParams(ctypes.Structure):
     _fields_ = [
         ("struct_size", ctypes.c_size_t),
@@ -153,6 +169,12 @@ def _bind(lib):
     if hasattr(lib, "quantfunc_denoise_step_multi"):
         lib.quantfunc_denoise_step_multi.restype = ctypes.c_int
         lib.quantfunc_denoise_step_multi.argtypes = [v, ctypes.POINTER(DenoiseStepMultiParams)]
+    # i2v cond-latent begin (cond-ABI builds only; hasattr-gated like step_multi — an old .so
+    # simply lacks the symbol and the wan i2v sampling path then refuses with guidance).
+    if hasattr(lib, "quantfunc_denoise_begin_edit_cond"):
+        lib.quantfunc_denoise_begin_edit_cond.restype = ctypes.c_int
+        lib.quantfunc_denoise_begin_edit_cond.argtypes = [
+            v, ctypes.POINTER(DenoiseBeginEditCondParams), ctypes.POINTER(v)]
     lib.quantfunc_denoise_finalize.restype = ctypes.c_int
     lib.quantfunc_denoise_finalize.argtypes = [v, ctypes.POINTER(DenoiseFinalizeParams)]
     lib.quantfunc_denoise_end.restype = ctypes.c_int
