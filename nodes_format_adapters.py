@@ -761,28 +761,55 @@ def _engine_lib_supports_taew(variant: str,
         return None
 
 
-def _apply_tiny_vae(options: dict, tiny_vae: bool, staging_model_dir: str,
+def _is_tiny_vae_weight(vae_src: str) -> bool:
+    """True iff the wired VAE weight the USER selected is a tiny (TAEHV) VAE.
+
+    Keys on the SELECTED weight's identity — a `taew*`/`taehv*` basename — NOT on
+    whether a taew file merely EXISTS in models/QuantFunc/taew/. This is the whole
+    point: wiring the FULL Wan VAE (wan2.2_vae.safetensors) must give full-quality
+    decode even when a taew file happens to sit in the taew dir; you only get the
+    lossy fast preview when you actually WIRE the tiny weight as your VAE.
+    """
+    base = os.path.basename(vae_src or "").lower()
+    return base.startswith("taew") or base.startswith("taehv") or "taehv" in base
+
+
+def _apply_tiny_vae(options: dict, staging_model_dir: str,
+                    wired_vae_src: str = "",
                     taew_dir: Optional[str] = None,
                     lib_path: Optional[str] = None) -> None:
-    """Inject the tiny-VAE comp_opts keys when `tiny_vae` is ON.
+    """Enable the tiny-VAE (TAEHV) fast preview decoder IFF the USER WIRED a tiny
+    VAE weight as their VAE input.
 
-    OFF (the default) is a strict no-op — NO key is added or touched, so the
-    engine comp_opts stay byte-identical to the full-VAE path. ON resolves the
-    taew variant + weights via `_resolve_tiny_vae_decoder` (fail-LOUD), verifies
-    the INSTALLED engine lib actually supports the variant (an engine that
-    predates tiny-VAE support would silently ignore the keys = silent full-VAE
-    fallback — refuse instead), and injects `vae_decoder` + `vae_decoder_weights`.
+    Trigger = the wired VAE weight's identity (`_is_tiny_vae_weight` — a taew/taehv
+    basename), NOT the mere presence of a taew file on disk. Wiring the full Wan
+    VAE → full-quality decode (strict no-op here, comp_opts byte-identical to the
+    full-VAE path) EVEN IF a taew file exists in the taew dir. Wiring a taew weight
+    → the lossy fast preview. This matches "detect that I USED the tiny weight",
+    and fixes the regression where a taew file merely present in the dir silently
+    forced the lossy decoder onto a full-VAE workflow.
+    NEVER fail-loud (the auto path must not crash a build): a non-Wan model,
+    a missing/absent weight, or an unreadable VAE config all just mean "use the
+    full VAE", logged at debug. An installed engine that predates tiny-VAE
+    support (weight wired but unsupported) also degrades to the full VAE with a
+    WARN rather than a hard error.
     """
-    if not tiny_vae:
+    # Gate on the user's SELECTED VAE identity — not on a taew file existing.
+    if not _is_tiny_vae_weight(wired_vae_src):
+        return  # full VAE wired (or none) → full-quality decode, byte-identical.
+    try:
+        variant, weights_path = _resolve_tiny_vae_decoder(staging_model_dir, taew_dir)
+    except RuntimeError as e:
+        # Not applicable (non-Wan / no taew weight / unreadable config) → full VAE.
+        logger.debug("[BuildPipeline] tiny VAE not applicable — using full VAE (%s)", e)
         return
-    variant, weights_path = _resolve_tiny_vae_decoder(staging_model_dir, taew_dir)
     supported = _engine_lib_supports_taew(variant, lib_path)
     if supported is False:
-        raise RuntimeError(
-            f"tiny_vae: the installed QuantFunc engine library predates "
-            f"tiny-VAE ({variant}) support and would silently ignore it "
-            f"(falling back to the full VAE). Update the engine library "
-            f"(plugin auto-update / matching release), or disable tiny_vae.")
+        logger.warning(
+            "[BuildPipeline] tiny VAE weight for %s is present but the installed "
+            "engine predates tiny-VAE support — using the full VAE. Update the "
+            "engine library to enable the fast preview.", variant)
+        return
     if supported is None:
         logger.warning(
             "[BuildPipeline] tiny_vae: could not verify engine support for %s "
@@ -791,8 +818,8 @@ def _apply_tiny_vae(options: dict, tiny_vae: bool, staging_model_dir: str,
     options["vae_decoder"] = variant
     options["vae_decoder_weights"] = weights_path
     logger.info(
-        "[BuildPipeline] tiny_vae ON → %s (%s) — lossy fast preview",
-        variant, weights_path)
+        "[BuildPipeline] tiny VAE auto-detected (taew weight present) → %s (%s) "
+        "— lossy fast preview", variant, weights_path)
 
 
 class QuantFuncBuildPipeline:
@@ -859,19 +886,6 @@ class QuantFuncBuildPipeline:
                                "Empty = falls back to api_key in config.json next to "
                                "libquantfunc.so. Explicit value here overrides that.",
                 }),
-                "tiny_vae": ("BOOLEAN", {
-                    "default": False,
-                    "tooltip": "Lossy FAST-preview VAE (Wan video only). Swaps the "
-                               "full Wan VAE decoder for the tiny TAEHV decoder — "
-                               "measured decode speedups range from ~5x (Wan2.1/A14B "
-                               "@384x384) to ~28x (Wan2.2-5B), varying with model and "
-                               "resolution. Output stays coherent but is SOFTER — "
-                               "use for draft/preview, DISABLE for final quality. "
-                               "The taew variant is auto-selected by model "
-                               "(Wan2.1/A14B = taew2_1, Wan2.2-5B = taew2_2); the "
-                               "weights must sit at "
-                               "<ComfyUI>/models/QuantFunc/taew/<variant>.safetensors.",
-                }),
             },
         }
 
@@ -882,8 +896,7 @@ class QuantFuncBuildPipeline:
 
     @classmethod
     def IS_CHANGED(cls, model=None, clip=None, vae=None, device=None,
-                    precision_config=None, pipeline_config=None, api_key="",
-                    tiny_vae=False):
+                    precision_config=None, pipeline_config=None, api_key=""):
         # Force re-execution every prompt: this node creates a fresh tmp
         # staging dir on each call, so caching the previous prompt's
         # output (which references a now-deleted staging dir) would crash
@@ -892,7 +905,7 @@ class QuantFuncBuildPipeline:
         return f"build@{time.time_ns()}"
 
     def build(self, model, clip, vae, device, precision_config,
-              pipeline_config=None, api_key="", tiny_vae=False):
+              pipeline_config=None, api_key=""):
         # P0 diagnostic — surface the exact `precision_config` arg ComfyUI
         # delivered. User reported wiring `Precision Config Loader` →
         # converted-to-input `precision_config` socket but generation came
@@ -1006,12 +1019,14 @@ class QuantFuncBuildPipeline:
         xfm_ref = _ref_from_path(xfm_path,
                                   force_kind="bundled_checkpoint" if is_ckpt else None)
         te_ref = vae_ref = None
+        wired_vae_src = ""  # the user's SELECTED VAE weight path (for tiny-VAE detect)
         if clip is not None:
             te_path = extract_qf_source_path(clip, "CLIP (CLIPLoader)")
             if not (is_ckpt and te_path == xfm_path):
                 te_ref = _ref_from_path(te_path)
         if vae is not None:
             vae_path = extract_qf_source_path(vae, "VAE (VAELoader)")
+            wired_vae_src = vae_path or ""
             if not (is_ckpt and vae_path == xfm_path):
                 vae_ref = _ref_from_path(vae_path)
 
@@ -1129,13 +1144,12 @@ class QuantFuncBuildPipeline:
         if act_quant_mode in ("absmax", "mse"):
             options["act_quant_mode"] = act_quant_mode
 
-        # tiny-VAE (TAEHV) fast-preview opt-in — Wan video only, default OFF.
-        # OFF injects NOTHING (comp_opts byte-identical to the full-VAE path);
-        # ON resolves the taew variant from the SAME latent channel count the
-        # engine's TinyVAEDecoder validates z against, so a non-Wan model /
-        # unsupported variant / missing weight file all fail LOUD here rather
-        # than silently mis-decoding. See _apply_tiny_vae/_resolve_tiny_vae_decoder.
-        _apply_tiny_vae(options, tiny_vae, staging.model_dir)
+        # tiny-VAE (TAEHV) fast-preview — enabled IFF the user WIRED a tiny (taew)
+        # VAE weight as their VAE input (detected from the wired VAE's identity,
+        # not from a taew file merely existing on disk). Wiring the full Wan VAE →
+        # full-quality decode, strict no-op (comp_opts byte-identical). See
+        # _apply_tiny_vae / _is_tiny_vae_weight.
+        _apply_tiny_vae(options, staging.model_dir, wired_vae_src=wired_vae_src)
 
         # Pick up QuantFunc-loader-only hints stashed on the `_QFPathStub`
         # by QuantFunc Model Loader / Auto Loader (no equivalent on stock

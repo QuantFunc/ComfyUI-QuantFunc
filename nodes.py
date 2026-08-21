@@ -1989,6 +1989,12 @@ class QuantFuncPipelineConfig:
                 "vae_tile_size": ("INT", {"default": 0, "min": 0, "max": 2048, "step": 64,
                                   "tooltip": "VAE tile size in pixels (0 = auto)"}),
                 "pinned_memory_limit": ("STRING", {"default": "", "tooltip": "Max pinned CPU memory: '60%', '48G', '48M', or empty for auto"}),
+                "cache_dir": ("STRING", {"default": "@models/QuantFunc/cache",
+                                          "tooltip": "Persistent VRAM/keymap cache directory. A leading '@' resolves to the ComfyUI root, "
+                                          "so the default '@models/QuantFunc/cache' = <ComfyUI>/models/QuantFunc/cache (alongside your "
+                                          "models). Persists warmup/VRAM probes + the encrypted keymap across restarts (metadata only, ~KB; "
+                                          "auto-created). Clear the field to disable persistent caching (engine uses the volatile staged "
+                                          "model dir, wiped each restart). An absolute path (no '@') is used verbatim."}),
             }
         }
 
@@ -1999,7 +2005,7 @@ class QuantFuncPipelineConfig:
 
     def build_config(self, tiled_vae, attention_backend, precision, text_precision,
                      vision_quant="int8", vae_precision="auto", act_quant_mode="absmax",
-                     vae_tile_size=0, pinned_memory_limit=""):
+                     vae_tile_size=0, pinned_memory_limit="", cache_dir="@models/QuantFunc/cache"):
         config = {
             "tiled_vae": tiled_vae,
             "attention_backend": attention_backend,
@@ -2016,6 +2022,26 @@ class QuantFuncPipelineConfig:
         pinned = pinned_memory_limit if isinstance(pinned_memory_limit, str) and pinned_memory_limit else ""
         if pinned:
             config["pinned_memory_limit"] = pinned
+
+        # Persistent VRAM/keymap cache dir → comp_opts["cache_dir"] (forwarded to
+        # the engine via options.update(cfg_dict) in nodes_format_adapters). A
+        # leading '@' resolves to the ComfyUI root, so the default
+        # '@models/QuantFunc/cache' = <ComfyUI>/models/QuantFunc/cache. The engine
+        # only understands a real path, so resolve '@' + auto-create here. Empty →
+        # key omitted → engine uses the volatile staged model_dir (no persistent cache).
+        cache = cache_dir.strip() if isinstance(cache_dir, str) else ""
+        if cache:
+            if cache.startswith("@"):
+                from .model_auto_loader import get_models_dir
+                comfy_root = os.path.dirname(os.path.dirname(get_models_dir()))
+                cache = os.path.join(comfy_root, cache[1:].lstrip("/\\"))
+            try:
+                os.makedirs(cache, exist_ok=True)
+            except OSError as e:
+                logging.getLogger("QuantFunc").warning(
+                    "[BuildPipeline] could not create cache_dir %s: %s "
+                    "(engine will fall back to the model dir)", cache, e)
+            config["cache_dir"] = cache
 
         return (config,)
 
