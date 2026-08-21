@@ -362,6 +362,26 @@ def main():
     mi_i2v = json.load(open(os.path.join(cfgroot, "wan2.2-a14b-i2v", "model_index.json")))
     check("i2v preset carries the official boundary 0.9",
           abs(float(mi_i2v.get("boundary_ratio", 0)) - 0.9) < 1e-6)
+    # i2v COND FLOW arm (the E2E-caught wiring gap, both ways): with the stub's shape carrier
+    # armed from the STAGED config, comfy's stock concat machinery must build the [mask|image]
+    # tail (20ch) for the i2v package — and must build NOTHING for a t2v package (in==16).
+    import torch as _t3
+    _kw = dict(noise=_t3.zeros(1, 16, 3, 8, 8), device="cpu",
+               concat_latent_image=_t3.randn(1, 16, 3, 8, 8),
+               concat_mask=_t3.cat([_t3.zeros(1, 1, 1, 8, 8), _t3.ones(1, 1, 2, 8, 8)], dim=2),
+               cross_attn=_t3.randn(1, 8, 4096))
+    _oc = pair_i2v[0].model.extra_conds(**_kw)
+    check("i2v package: extra_conds emits c_concat", "c_concat" in _oc, f"-> {sorted(_oc)}")
+    if "c_concat" in _oc:
+        _cc = _oc["c_concat"].cond
+        check("i2v tail is [mask|image] = 20 channels", int(_cc.shape[1]) == 20,
+              f"-> {tuple(_cc.shape)}")
+        # comfy inverts the mask (1-mask): our concat_mask frame0=0 -> tail mask frame0=1
+        check("i2v tail mask frame0==1 (engine frame0-known semantics)",
+              float(_cc[0, 0, 0].mean()) == 1.0 and float(_cc[0, 0, 1].mean()) == 0.0)
+    _ot = out.model.extra_conds(**_kw)
+    check("t2v package: NO c_concat (in==16, extra_channels 0)", "c_concat" not in _ot,
+          f"-> {sorted(_ot)}")
 
     # single-expert staging shape (direct helper call — no single-expert family is wired yet,
     # but the helper's contract must already hold for the one that will be)

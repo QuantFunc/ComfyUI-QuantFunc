@@ -55,10 +55,13 @@ class QFWanModel(QFSessionModelMixin, comfy.model_base.WAN21):
     _VAE_T, _VAE_S = 4, 8
     _DEFAULT_FPS = 16.0                   # wan 2.x training rate; only rides options_json (informational)
 
-    def __init__(self, model_config, engine, start_image, device=None, resident_block_count=999):
+    def __init__(self, model_config, engine, start_image, device=None, resident_block_count=999,
+                 xfm_in_channels=16):
         # disable_unet_model_creation is honored inside BaseModel.__init__
         super().__init__(model_config, device=device)
         self.diffusion_model = _QFStub()
+        # arm comfy's stock concat machinery with the checkpoint's input width (see _QFStub)
+        self.diffusion_model.arm_concat_shape(xfm_in_channels)
         self._resident_block_count = int(resident_block_count)   # [manual-residency] video begin knob
         self._qf = engine                 # QFEngineHandle (owns lib + pipeline + the open session)
         self._start_image = start_image   # comfy IMAGE tensor [B,H,W,C] float 0..1, or None (Option C)
@@ -128,17 +131,14 @@ class QFWanModel(QFSessionModelMixin, comfy.model_base.WAN21):
         if was_open:
             print("[qf_native] closed a pre-existing session at run start "
                   f"(prior run interrupted/uncleaned); end ok={ok}", flush=True)
-        # ★ HARD REQUIREMENT (CR): a wired-but-ignored WanImageToVideo.start_image shows up here as
-        # concat_latent_image. Silently discarding it is the exact defect the CR NO-GO'd — FAIL LOUD
-        # with the TRUE current limitation (the loader's start_image widget was REMOVED in the
-        # file-based redesign; i2v is not yet wired on the denoise_only file path).
-        if kwargs.get("concat_latent_image") is not None:
-            raise RuntimeError(
-                "qf_native: WanImageToVideo.start_image is wired, but i2v is NOT yet supported on the "
-                "file-based QuantFunc native loader (its denoise_only engine session cannot consume "
-                "comfy's encoded concat_latent_image, and the engine-side reference encode is "
-                "deliberately not loaded). Use the t2v preset/workflow for now — i2v arrives with its "
-                "own wan2.2-a14b-i2v preset. Silently ignoring your reference would be worse; refusing.")
+        # i2v (cond-latent ABI): a wired WanImageToVideo now FLOWS instead of refusing — comfy's
+        # STOCK concat machinery (super().extra_conds -> BaseModel.concat_cond, armed via the
+        # stub's shape carrier) builds the [mask|image] tail in the model's processed latent
+        # space; _apply_model receives it as c_concat and the session consumes it through
+        # quantfunc_denoise_begin_edit_cond. Layout+semantics verified equal to the engine's
+        # [noise|mask|cond] with frame0=1 (comfy: cat((mask,image)), mask=1-mask). A ref wired
+        # into a T2V checkpoint (in==16 -> extra_channels 0) yields NO c_concat; the engine's
+        # own E3 then refuses an i2v checkpoint missing its tail — no silent-discard remains.
         # ★ CLOSE THE SILENT-DISCARD CLASS: every OTHER image/reference channel WAN21.extra_conds consumes
         # that this bypass would drop (clip_fea / time_dim / reference / context / camera). The engine does
         # its OWN i2v conditioning from the loader's start_image, so any of these wired from a stock node
@@ -150,8 +150,10 @@ class QFWanModel(QFSessionModelMixin, comfy.model_base.WAN21):
                     f"cannot consume comfy's '{_k}' — it would be silently ignored, so it is refused. "
                     f"Remove the node feeding '{_k}'. (Reference/i2v conditioning is not yet supported "
                     f"on the file-based loader; it arrives with the wan2.2-a14b-i2v preset.)")
-        # We MIRROR WAN21's CONDRegular for cross_attn (the only channel the engine takes).
-        out = {}
+        # Delegate to comfy's OWN extra_conds (WAN21 -> BaseModel): c_concat (i2v tail, via the
+        # armed stub) + c_crossattn arrive with stock semantics/CONDNoiseShape batching. Every
+        # channel we cannot consume was already refused loud above, so super() sees them as None.
+        out = super().extra_conds(**kwargs)
         cross_attn = kwargs.get("cross_attn", None)
         if cross_attn is not None:
             # Track the MAX cross_attn seq length across this run's cond groups. extra_conds runs for BOTH
@@ -160,7 +162,6 @@ class QFWanModel(QFSessionModelMixin, comfy.model_base.WAN21):
             # own length — so the session's max_context_dims (set in _begin) must cover the LARGEST group, or
             # the engine rejects "context_dims <= the begin maxima" (measured: short-pos + >512-tok-neg cfg run).
             self._max_ctx_seq = max(self._max_ctx_seq, int(cross_attn.shape[1]))
-            out["c_crossattn"] = comfy.conds.CONDRegular(cross_attn)
         return out
 
     def scale_latent_inpaint(self, *args, **kwargs):
@@ -553,10 +554,17 @@ def register(deps):
             # correctly. model_low is the SHADOW (tiny ledger share, never drives the shared
             # engine's eviction — see QFModelPatcher._is_shadow); both models bind to the ckey so
             # handle destruction waits for both.
+            # the checkpoint's TOTAL input channels (t2v: == latent 16 -> stock concat machinery
+            # yields no c_concat; i2v channel-concat: 36 -> comfy builds the [mask|image] tail
+            # our cond-ABI session consumes). Read from the STAGED config — fail-loud absent.
+            with open(os.path.join(model_dir, "transformer", "config.json"), "r", encoding="utf-8") as _fh:
+                _xfm_in_channels = int(json.load(_fh).get("in_channels", 16))
             model_high = QFWanModel(model_config, engine, None, device=device,
-                                    resident_block_count=resident_block_count)
+                                    resident_block_count=resident_block_count,
+                                    xfm_in_channels=_xfm_in_channels)
             model_low = QFWanModel(model_config, engine, None, device=device,
-                                   resident_block_count=resident_block_count)
+                                   resident_block_count=resident_block_count,
+                                   xfm_in_channels=_xfm_in_channels)
             model_low._qf_shadow = True
             # Default the sampler to the CHECKPOINT'S OWN flow schedule when the staged package
             # declares one (no-op-safe when absent; a stock ModelSamplingSD3 downstream still wins).

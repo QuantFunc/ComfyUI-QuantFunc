@@ -162,6 +162,21 @@ class _QFStub(torch.nn.Module):
         super().__init__()
         self.dtype = dtype
 
+    def arm_concat_shape(self, in_channels):
+        """Give comfy's BaseModel.concat_cond the ONE attribute it introspects
+        (diffusion_model.patch_embedding.weight.shape[1] = the transformer's total input
+        channels) so the STOCK concat machinery works on this stub: a t2v checkpoint
+        (in == latent channels) yields extra_channels==0 -> c_concat None (byte-unchanged);
+        a channel-concat i2v checkpoint (in > latent) yields comfy's own [mask|image] tail —
+        the SAME layout+semantics the engine's cond-ABI consumes (verified against comfy
+        model_base.WAN21.concat_cond: cat((mask, image)) with mask = 1-mask -> frame0=1,
+        matching the engine's [noise|mask|cond] with frame0=1). The carrier is a ~0-byte
+        empty-data parameter whose SHAPE alone matters."""
+        pe = torch.nn.Module()
+        pe.weight = torch.nn.Parameter(
+            torch.empty(1, int(in_channels), 0, 0, 0, dtype=self.dtype), requires_grad=False)
+        self.patch_embedding = pe
+
     def forward(self, *a, **k):
         raise RuntimeError("QF stub diffusion_model must never be called — _apply_model is overridden; "
                            "a ComfyUI upgrade may have changed the apply-model dispatch")
