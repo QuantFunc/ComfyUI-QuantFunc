@@ -199,7 +199,7 @@ def cleanup_ref_tempfile(path):
 
 
 class QFSessionModelMixin:
-    """Shared base for every QuantFunc native-session model wrapper (Wan / LTX / — coming — H3).
+    """Shared base for every QuantFunc native-session model wrapper (wan / LTX-2 / MiniMax-H3).
 
     These wrappers all drive the SAME engine external-denoise seam (begin → per-sampler-step
     quantfunc_denoise_step → finalize) over comfy's stock KSampler, differing only in the
@@ -363,10 +363,10 @@ class QFLazyEngine:
     def unload_vram(self):
         return 0 if self._real is None else self._real.unload_vram()
 
-    def destroy(self):
-        if self._real is not None:
-            self._real.destroy()
-
+    # NOTE: deliberately NO destroy() on the wrapper. The raw ungated destroy was dead code with
+    # zero callers, and any future caller reaching for it would reproduce the shared-handle UAF the
+    # liveness gate exists to prevent — release(requester=...) is the one sanctioned teardown (the
+    # cache's _sweep_dead_pipelines destroys REAL handles, never wrappers). Fail-loud by absence.
     def release(self, requester=None):
         """Free the created pipeline (VRAM + the CPU backup) and go back to UNMATERIALIZED — the
         factory re-creates it from disk on the next use. Used by comfy's RAM manager

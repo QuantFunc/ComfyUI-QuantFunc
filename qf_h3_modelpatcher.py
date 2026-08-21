@@ -522,7 +522,7 @@ def register(deps):
             model = QFH3Model(model_config, engine, device=device,
                               resident_block_count=resident_block_count)
             patcher = QFModelPatcher(model, load_device=device, offload_device=offload)
-            print(f"[qf_native] loaded QuantFuncNativeH3Loader (MiniMax-H3 svdq AV) package={model_name} "
+            print(f"[qf_native] loaded QuantFuncNativeLoader (MiniMax-H3 svdq AV) package={model_name} "
                   f"resident_blocks={resident_block_count} "
                   f"footprint~{engine.footprint_bytes // (1024*1024)}MB (create deferred)", flush=True)
             return qfmp.tag_lora_rebuild(patcher, lora_entries, _build)

@@ -11,6 +11,7 @@ reviewers flagged as having zero automated coverage:
   5. HOST-RAM accounting honesty — a never-created engine must report 0, not its estimate
   6. SHARED-handle sibling safety — a release under a live sibling must refuse (measured UAF)
   7. the REAL LoRA-node chain — two-instance state transplant + N-chain -> ONE deferred create
+  8. the passive SWEEP path — spares a handle while ANY consumer lives, reclaims when all die
 
 Run:  python tests/loader_dispatch_test.py          (needs the ComfyUI env; SKIPs without it)
 """
@@ -303,6 +304,68 @@ def main():
                   f"-> {creates[-1]} loras in create_cfg")
         except Exception as e:  # noqa: BLE001
             check("real LoRA-node chain", False, f"-> raised {type(e).__name__}: {e}")
+
+        # ── 8) the passive SWEEP shares the liveness fix (round-3 review: this path had zero
+        #       committed coverage). One dead + one alive consumer on a ckey: the sweep must NOT
+        #       destroy (the round-2 blind spot — single last-load-wins ref did); all dead: must
+        #       destroy + drop the cache entry; keep_key + unbound entries are protected. Drives
+        #       the REAL _PIPELINE_CACHE/_bind_pipeline_model/_sweep_dead_pipelines directly ──
+        try:
+            import gc
+
+            class _M:                      # weakref-able stand-in for a family model
+                pass
+
+            ck = ("sweep_pkg", "{}")
+            other = ("sweep_other", "{}")
+            h = _DummyEngine()
+            qfn._PIPELINE_CACHE[ck] = h
+            m1, m2 = _M(), _M()
+            qfn._bind_pipeline_model(ck, m1)
+            qfn._bind_pipeline_model(ck, m2)
+            del m1
+            gc.collect()
+            qfn._sweep_dead_pipelines(other)          # one consumer dead, one ALIVE
+            check("sweep spares the handle while ANY consumer lives",
+                  h.pipeline is not None and ck in qfn._PIPELINE_CACHE)
+            del m2
+            gc.collect()
+            qfn._sweep_dead_pipelines(other)          # ALL consumers dead
+            check("sweep destroys once ALL consumers are dead",
+                  h.pipeline is None and ck not in qfn._PIPELINE_CACHE)
+            # keep_key protection: an all-dead entry passed as keep_key must survive
+            ck2 = ("sweep_keep", "{}")
+            h2 = _DummyEngine()
+            qfn._PIPELINE_CACHE[ck2] = h2
+            m3 = _M()
+            qfn._bind_pipeline_model(ck2, m3)
+            del m3
+            gc.collect()
+            qfn._sweep_dead_pipelines(ck2)
+            check("sweep never touches keep_key", h2.pipeline is not None
+                  and ck2 in qfn._PIPELINE_CACHE)
+            # unbound entry (load in flight): no liveness list yet -> protected
+            ck3 = ("sweep_unbound", "{}")
+            h3 = _DummyEngine()
+            qfn._PIPELINE_CACHE[ck3] = h3
+            qfn._sweep_dead_pipelines(other)
+            check("sweep never touches an unbound (in-flight) entry",
+                  h3.pipeline is not None and ck3 in qfn._PIPELINE_CACHE)
+            for k in (ck2, ck3):                       # leave no fixture state behind
+                qfn._PIPELINE_CACHE.pop(k, None)
+                qfn._PIPELINE_MODELS.pop(k, None)
+            # bind dedup: re-binding the SAME live model must not grow the consumer list
+            ck4 = ("sweep_dedup", "{}")
+            m4 = _M()
+            qfn._bind_pipeline_model(ck4, m4)
+            qfn._bind_pipeline_model(ck4, m4)
+            check("re-binding a live model does not accumulate refs",
+                  len(qfn._PIPELINE_MODELS.get(ck4, [])) == 1,
+                  f"-> {len(qfn._PIPELINE_MODELS.get(ck4, []))}")
+            qfn._PIPELINE_MODELS.pop(ck4, None)
+            del m4
+        except Exception as e:  # noqa: BLE001
+            check("sweep liveness coverage", False, f"-> raised {type(e).__name__}: {e}")
     else:
         check("wan family registered", False, "-> builders: %s" % sorted(qfn._FAMILY_BUILDERS))
 

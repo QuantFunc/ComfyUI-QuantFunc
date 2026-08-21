@@ -139,7 +139,7 @@ def _accumulate_connector_footprint(budget, n_layers, num_heads, inner_dim, n_re
     budget[0] += est
     if budget[0] > _MAX_CONNECTOR_TOTAL_BYTES:
         raise RuntimeError(
-            f"QuantFuncNativeLTXLoader: the COMBINED per-load connector footprint reached ~{budget[0] / 1024 ** 3:.1f} "
+            f"QuantFuncNativeLoader: the COMBINED per-load connector footprint reached ~{budget[0] / 1024 ** 3:.1f} "
             f"GiB at {desc} (each connector within its OWN bound, but load() holds video + audio CONCURRENTLY) -- "
             f"exceeds the {_MAX_CONNECTOR_TOTAL_BYTES // 1024 ** 3} GiB per-load ceiling. Refusing before the eager "
             f"__init__ (an all-max PAIR is a #543 host-RAM SIGKILL on the CPU/no-GPU path, reached via the shipped "
@@ -183,7 +183,7 @@ def _derive_connector_arch(sd, desc, authoritative_heads=None):
     # ^-anchored regex prevents a `not_transformer_1d_blocks.N.` decoy key from registering a phantom block.
     if not (1 <= n_layers <= _MAX_CONNECTOR_LAYERS):
         raise RuntimeError(
-            f"QuantFuncNativeLTXLoader: {desc} derived n_layers={n_layers} outside [1, {_MAX_CONNECTOR_LAYERS}] "
+            f"QuantFuncNativeLoader: {desc} derived n_layers={n_layers} outside [1, {_MAX_CONNECTOR_LAYERS}] "
             f"-- refusing to eagerly build the connector. A real LTX connector is depth-8; this is a corrupt/"
             f"hostile checkpoint (stray transformer_1d_blocks.<idx> key) or has zero block keys. If a genuine "
             f"future connector is deeper, RAISE _MAX_CONNECTOR_LAYERS deliberately.")
@@ -198,14 +198,14 @@ def _derive_connector_arch(sd, desc, authoritative_heads=None):
         # video_connector_num_attention_heads -- the LTX-2 19B family ships NON-gated connectors with the
         # head split declared THERE), REFUSE rather than guess.
         raise RuntimeError(
-            f"QuantFuncNativeLTXLoader: {desc} is NON-GATED (no attn1.to_gate_logits) and no authoritative "
+            f"QuantFuncNativeLoader: {desc} is NON-GATED (no attn1.to_gate_logits) and no authoritative "
             f"head count is available -- its attention head split is not derivable from the weights, and "
             f"guessing would silently mis-group attention. Provide a model_dir whose connectors/config.json "
             f"declares video_connector_num_attention_heads (the diffusers LTX2TextConnectors component), or "
             f"use a gated (LTX-2.3) connector checkpoint.")
     reg = sd.get('learnable_registers')
     if reg is None:
-        raise RuntimeError(f"QuantFuncNativeLTXLoader: {desc} has no learnable_registers -- cannot derive "
+        raise RuntimeError(f"QuantFuncNativeLoader: {desc} has no learnable_registers -- cannot derive "
                            "inner_dim / num_registers.")
     inner_dim = reg.shape[-1]
     n_registers = reg.shape[0]
@@ -213,7 +213,7 @@ def _derive_connector_arch(sd, desc, authoritative_heads=None):
     if has_gate and authoritative_heads is not None and int(authoritative_heads) != num_heads:
         # two authorities disagreeing is a wiring error, never silently pick one
         raise RuntimeError(
-            f"QuantFuncNativeLTXLoader: {desc} head-count authorities disagree -- gate weight says "
+            f"QuantFuncNativeLoader: {desc} head-count authorities disagree -- gate weight says "
             f"{num_heads}, connectors/config.json says {authoritative_heads}. Fix the mismatched "
             f"checkpoint/config pairing.")
     # ★ MAGNITUDE BOUNDS (vuln-CR + self-CR Reviewer A): inner_dim / num_heads / n_registers ALL feed the eager
@@ -221,16 +221,16 @@ def _derive_connector_arch(sd, desc, authoritative_heads=None):
     # load, so EACH is bounded HERE. n_layers was bounded above; this closes the WIDTH axis Reviewer A proved
     # open (a hostile in-bound-depth checkpoint with inner_dim=1M was accepted). REJECT, don't clamp.
     if not (1 <= num_heads <= _MAX_CONNECTOR_HEADS):
-        raise RuntimeError(f"QuantFuncNativeLTXLoader: {desc} derived num_heads={num_heads} outside "
+        raise RuntimeError(f"QuantFuncNativeLoader: {desc} derived num_heads={num_heads} outside "
                            f"[1, {_MAX_CONNECTOR_HEADS}] -- refusing (hostile to_gate_logits.bias width).")
     if not (1 <= inner_dim <= _MAX_CONNECTOR_INNER_DIM):
-        raise RuntimeError(f"QuantFuncNativeLTXLoader: {desc} derived inner_dim={inner_dim} outside "
+        raise RuntimeError(f"QuantFuncNativeLoader: {desc} derived inner_dim={inner_dim} outside "
                            f"[1, {_MAX_CONNECTOR_INNER_DIM}] -- refusing (block Linears are O(inner_dim^2)).")
     if not (1 <= n_registers <= _MAX_CONNECTOR_REGISTERS):
-        raise RuntimeError(f"QuantFuncNativeLTXLoader: {desc} derived num_registers={n_registers} outside "
+        raise RuntimeError(f"QuantFuncNativeLoader: {desc} derived num_registers={n_registers} outside "
                            f"[1, {_MAX_CONNECTOR_REGISTERS}] -- refusing (hostile learnable_registers height).")
     if inner_dim % num_heads != 0:
-        raise RuntimeError(f"QuantFuncNativeLTXLoader: {desc} head split inconsistent -- inner_dim {inner_dim} "
+        raise RuntimeError(f"QuantFuncNativeLoader: {desc} head split inconsistent -- inner_dim {inner_dim} "
                            f"not divisible by num_heads {num_heads}.")
     # ★ SINGLE-CONNECTOR footprint bound (native-connector-combined-footprint-ceiling): per-AXIS bounded != PRODUCT
     #   bounded, so also bound the product-estimated eager bf16 alloc, BEFORE the __init__, REJECT-not-clamp. This is
@@ -239,7 +239,7 @@ def _derive_connector_arch(sd, desc, authoritative_heads=None):
     est_bytes = _connector_est_bytes(n_layers, num_heads, inner_dim, n_registers)
     if est_bytes > _MAX_CONNECTOR_TOTAL_BYTES:
         raise RuntimeError(
-            f"QuantFuncNativeLTXLoader: {desc} arch (n_layers={n_layers}, inner_dim={inner_dim}, "
+            f"QuantFuncNativeLoader: {desc} arch (n_layers={n_layers}, inner_dim={inner_dim}, "
             f"num_heads={num_heads}, n_registers={n_registers}) is within EVERY per-axis bound but its SINGLE-connector "
             f"estimated eager footprint ~{est_bytes / 1024 ** 3:.1f} GiB exceeds the {_MAX_CONNECTOR_TOTAL_BYTES // 1024 ** 3} "
             f"GiB ceiling -- refusing (per-axis bounded != product bounded; an all-max product is a #543 host-RAM "
@@ -266,7 +266,7 @@ def _load_ltx_video_connector(connector_ckpt, device, dtype=torch.bfloat16, _bud
     sd = {k[len(prefix):]: v for k, v in sd_full.items() if k.startswith(prefix)}
     if not sd:
         raise RuntimeError(
-            f"QuantFuncNativeLTXLoader: no '{prefix}*' weights in {connector_ckpt} — this must be the "
+            f"QuantFuncNativeLoader: no '{prefix}*' weights in {connector_ckpt} — this must be the "
             "comfy LTX-2.3 checkpoint that carries the video_embeddings_connector (the engine svdq "
             "model_dir does NOT; see dossier seq-234).")
     # DERIVE + BOUND the connector ARCH from the checkpoint (num_layers / num_heads / head_dim / n_registers,
@@ -297,7 +297,7 @@ def _load_ltx_video_connector(connector_ckpt, device, dtype=torch.bfloat16, _bud
     # out_vid. The OLD guard only caught ALL-missing and let unexpected=100 through silently (the bug).
     if missing or unexpected:
         raise RuntimeError(
-            f"QuantFuncNativeLTXLoader: video connector load NOT CLEAN (missing={len(missing)} "
+            f"QuantFuncNativeLoader: video connector load NOT CLEAN (missing={len(missing)} "
             f"unexpected={len(unexpected)}; derived n_layers={n_layers} heads={num_heads}) -- arch mismatch. "
             f"unexpected(sample)={sorted(unexpected)[:4]} missing(sample)={sorted(missing)[:4]}")
     conn = conn.to(device=device, dtype=dtype).eval()
@@ -329,7 +329,7 @@ def _load_ltx_audio_connector(connector_ckpt, device, dtype=torch.bfloat16, _bud
     sd = {k[len(prefix):]: v for k, v in sd_full.items() if k.startswith(prefix)}
     if not sd:
         raise RuntimeError(
-            f"QuantFuncNativeLTXLoader: no '{prefix}*' weights in {connector_ckpt} — the comfy LTX-2.3 "
+            f"QuantFuncNativeLoader: no '{prefix}*' weights in {connector_ckpt} — the comfy LTX-2.3 "
             "checkpoint must carry the audio_embeddings_connector (dossier seq-241).")
     # DERIVE + BOUND the connector ARCH from the checkpoint (shared _derive_connector_arch: num_layers /
     # num_heads / head_dim / n_registers, each magnitude-bounded at the derivation site; non-gated refused).
@@ -356,7 +356,7 @@ def _load_ltx_audio_connector(connector_ckpt, device, dtype=torch.bfloat16, _bud
     # CLEAN load MANDATORY (0/0) — the old ALL-missing-only guard let unexpected through silently.
     if missing or unexpected:
         raise RuntimeError(
-            f"QuantFuncNativeLTXLoader: AUDIO connector load NOT CLEAN (missing={len(missing)} "
+            f"QuantFuncNativeLoader: AUDIO connector load NOT CLEAN (missing={len(missing)} "
             f"unexpected={len(unexpected)}; derived n_layers={n_layers} heads={num_heads}) -- arch mismatch. "
             f"unexpected(sample)={sorted(unexpected)[:4]} missing(sample)={sorted(missing)[:4]}")
     conn = conn.to(device=device, dtype=dtype).eval()
@@ -841,7 +841,7 @@ class QFLTXAVModel(QFLTXModel):
                 "unprocessed_ltxav_embeds — this loader needs the LTX-2.5 'with-proj' TE "
                 "(gemma4-12b-with-proj-*.safetensors through the comfy LTXAV clip), whose "
                 "connector runs ENGINE-side. A 19B/2.3 connector-file TE chain belongs on "
-                "the video-only QuantFuncNativeLTXLoader path.")
+                "the video-only QuantFuncNativeLoader path.")
         if self._audio_rows <= 0:
             raise RuntimeError("qf_native LTX-AV: audio latent rows unset at begin — wiring error")
         return {"audio_dims": [1, int(self._audio_rows), _LTXAV_AUDIO_PACK],
@@ -1073,12 +1073,12 @@ def register(deps):
                                      start_image=start_image,
                                      resident_block_count=resident_block_count)
                 patcher = QFModelPatcher(model, load_device=device, offload_device=offload)
-                print(f"[qf_native] loaded QuantFuncNativeLTXLoader (LTX-2.5 JOINT-AV svdq) "
+                print(f"[qf_native] loaded QuantFuncNativeLoader (LTX-2.5 JOINT-AV svdq) "
                       f"package={model_name} resident_blocks={resident_block_count} "
                       f"footprint~{engine.footprint_bytes // (1024*1024)}MB (create deferred)", flush=True)
                 return qfmp.tag_lora_rebuild(patcher, lora_entries, _build)
             if not connector_ckpt:
-                raise RuntimeError("QuantFuncNativeLTXLoader: connector_ckpt (comfy LTX-2.3 ckpt with the "
+                raise RuntimeError("QuantFuncNativeLoader: connector_ckpt (comfy LTX-2.3 ckpt with the "
                                    "video_embeddings_connector) is required")
             # NOTE: the plugin-side a2v (joint audio+video) connector split is NOT implemented — it
             # needs an engine external-step split (makeExternalStepFn). There is no widget for it, so
@@ -1153,7 +1153,7 @@ def register(deps):
                                audio_connector=audio_connector, start_image=start_image,
                                resident_block_count=resident_block_count)
             patcher = QFModelPatcher(model, load_device=device, offload_device=offload)
-            print(f"[qf_native] loaded QuantFuncNativeLTXLoader (LTX-2 svdq) package={model_name} "
+            print(f"[qf_native] loaded QuantFuncNativeLoader (LTX-2 svdq) package={model_name} "
                   f"resident_blocks={resident_block_count} "
                   f"footprint~{engine.footprint_bytes // (1024*1024)}MB (create deferred)", flush=True)
             return qfmp.tag_lora_rebuild(patcher, lora_entries, _build)

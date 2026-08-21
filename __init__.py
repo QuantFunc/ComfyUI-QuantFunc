@@ -255,7 +255,8 @@ def _bind_pipeline_model(ckey, model):
     """Register `model` as a live consumer of ckey's cached handle (called by every family builder
     after constructing its model). Prunes dead refs so the list tracks the true live set."""
     refs = [r for r in _PIPELINE_MODELS.get(ckey, []) if r() is not None]
-    refs.append(weakref.ref(model))
+    if not any(r() is model for r in refs):   # re-materialize of a live model must not accumulate
+        refs.append(weakref.ref(model))
     _PIPELINE_MODELS[ckey] = refs
 
 

@@ -133,7 +133,7 @@ class QFWanModel(QFSessionModelMixin, comfy.model_base.WAN21):
         if kwargs.get("concat_latent_image") is not None:
             raise RuntimeError(
                 "qf_native: WanImageToVideo.start_image is wired, but the QuantFunc engine takes the "
-                "reference frame through the QuantFuncNativeWanLoader's OWN 'start_image' IMAGE input "
+                "reference frame through the QuantFuncNativeLoader's OWN 'start_image' IMAGE input "
                 "(it VAE-encodes the pixels itself and cannot use comfy's encoded concat_latent_image). "
                 "Wire your LoadImage into the LOADER's start_image and leave WanImageToVideo.start_image "
                 "EMPTY — otherwise the reference frame would be silently ignored.")

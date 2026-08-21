@@ -402,9 +402,30 @@ def _selftest():
     finally:
         _PLUGIN_DIR = _real_plugin_dir
         shutil.rmtree(_d2, ignore_errors=True)
+    # (neg-3) FAMILY-MODULE completeness arm: a qf_<fam>_modelpatcher.py contributing NO recognized
+    # QF*Model seam class MUST be reported (round-3 CR: the arm existed but had no committed
+    # positive-trip proof — a guard that is never shown to fire proves nothing). The dir also
+    # carries one VALID seam so the vacuous-scan defect (neg-2) cannot mask this arm's message.
+    _d3 = tempfile.mkdtemp(prefix="qfrl_sel3_")
+    try:
+        with open(os.path.join(_d3, "qf_ok_modelpatcher.py"), "w") as _fh:
+            _fh.write("class QFOkModel(comfy.model_base.WAN21):\n    pass\n")
+        with open(os.path.join(_d3, "qf_bogus_modelpatcher.py"), "w") as _fh:
+            _fh.write("FAMILY = 'bogus'\n\nclass BogusSeam:\n    pass\n")   # drifted naming: no QF*Model
+        _PLUGIN_DIR = _d3
+        _defs3 = _derived_roster_defects()
+        if not any("qf_bogus_modelpatcher.py" in x and "NO recognized" in x for x in _defs3):
+            print("[FAIL] selftest: family-module arm did NOT flag a family module with no QF*Model seam "
+                  "(defs=%r)" % _defs3); bad += 1
+        if any("qf_ok_modelpatcher.py" in x and "NO recognized" in x for x in _defs3):
+            print("[FAIL] selftest: family-module arm FALSE-POSITIVED a module that has a seam"); bad += 1
+    finally:
+        _PLUGIN_DIR = _real_plugin_dir
+        shutil.rmtree(_d3, ignore_errors=True)
     print("REJECT_LIST_SELFTEST:",
           ("PASS — comfy-absent run is loud ([SKIP]+exit %d); audit model-agnostic (WAN21+LTXV); derived-roster "
-           "gate proven both ways (clean real dir → no defect; unaudited seam + vacuous scan → defect)" % _SKIP_EXIT)
+           "gate proven both ways (clean real dir → no defect; unaudited seam + vacuous scan + seamless family "
+           "module → defect)" % _SKIP_EXIT)
           if bad == 0 else "FAIL (%d wrong)" % bad)
     return 0 if bad == 0 else 1
 
