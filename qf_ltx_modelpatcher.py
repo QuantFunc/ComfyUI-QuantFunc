@@ -1006,11 +1006,23 @@ class QFLTXAVModel(QFLTXModel):
         return super(QFLTXModel, self).process_latent_out(latent)
 
 
-def register(get_engine, pipeline_models, estimate_footprint, QFLazyEngine):
-    """Return the LTX-2 family BUILDER for the single QuantFunc Native Loader node (the per-family
-    loader node is gone — one node with a model dropdown dispatches here). get_engine,
-    pipeline_models, estimate_footprint + QFLazyEngine are __init__.py's shared helpers, threaded
-    in to avoid a circular import."""
+FAMILY = "ltx2"
+DISPLAY = "LTX-2 video (2.3 video-only / 2.5 joint-AV)"
+
+
+def matches(pipeline_class):
+    """The ENGINE's own detector (src/LTX2VideoPipeline.cpp ltx2_detect), transcribed so plugin and engine cannot disagree."""
+    return str(pipeline_class) == "LTX2Pipeline"
+
+
+def register(deps):
+    """Return the ltx2 family BUILDER. `deps` gives the package-level helpers (engine cache,
+    liveness registry, footprint estimator, lazy-engine class) without importing __init__."""
+    get_engine = deps["get_engine"]
+    pipeline_models = deps["pipeline_models"]
+    estimate_footprint = deps["estimate_footprint"]
+    QFLazyEngine = deps["QFLazyEngine"]
+
 
     def build(model_dir, model_name, resident_block_count, start_image=None,
               connector_ckpt="(none)", lora_entries=()):

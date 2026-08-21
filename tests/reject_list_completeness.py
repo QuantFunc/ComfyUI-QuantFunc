@@ -57,7 +57,7 @@ _AUDITED_MODELS = (
     #    concat_latent_image (WanImageToVideo sets them together) — which QFWanModel.extra_conds loud-fails.
     #  • denoise_mask reaches the SAMPLER (KSamplerX0Inpaint), NOT extra_conds; the scale_latent_inpaint
     #    override loud-fails it (the correct hook — fires only when a mask is set).
-    _Model("WAN21", "qf_modelpatcher.py",
+    _Model("WAN21", "qf_wan_modelpatcher.py",
            {"concat_latent_image", "concat_mask", "concat_mask_index", "denoise_mask"},
            ("concat_cond", "encode_adm")),
     # LTX-2 t2v (QFLTXModel) — the seam the CR generality NO-GO found was NEVER audited. Its reject-list is a

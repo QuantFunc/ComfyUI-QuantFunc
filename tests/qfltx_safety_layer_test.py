@@ -42,7 +42,11 @@ def _extract_method(src_text, cls, meth):
     raise AssertionError(f"method {cls}.{meth} not found in {_SRC}")
 
 
-_WAN_SRC = os.path.join(_HERE, "..", "qf_modelpatcher.py")
+# One module per model family: the WAN seam (its comfy model subclass + _apply_model) lives in
+# qf_wan_modelpatcher.py, while qf_modelpatcher.py is the family-AGNOSTIC substrate that owns the
+# SHARED interrupt helper. Both paths are pinned so this test keeps checking the real split.
+_WAN_SRC = os.path.join(_HERE, "..", "qf_wan_modelpatcher.py")
+_SHARED_SRC = os.path.join(_HERE, "..", "qf_modelpatcher.py")
 
 
 def _wan_src_text():
@@ -54,13 +58,18 @@ def _extract_module_fn(src_text, name):
     for node in ast.parse(src_text).body:
         if isinstance(node, ast.FunctionDef) and node.name == name:
             return textwrap.dedent(ast.get_source_segment(src_text, node))
-    raise AssertionError(f"module fn {name} not found in {_WAN_SRC}")
+    raise AssertionError(f"module fn {name} not found in the given source")
+
+
+def _shared_src_text():
+    return open(_SHARED_SRC, errors="replace").read()
 
 
 def _bind_wan_helper(comfy):
-    """Exec the REAL shared interrupt helper from qf_modelpatcher.py with the given comfy stub."""
+    """Exec the REAL shared interrupt helper — it lives in the family-AGNOSTIC substrate
+    (qf_modelpatcher.py), NOT in a family module; that separation is what this arm pins."""
     ns = {"comfy": comfy}
-    exec(_extract_module_fn(_wan_src_text(), "_interrupt_poll_end_session_on_raise"), ns)  # noqa: S102
+    exec(_extract_module_fn(_shared_src_text(), "_interrupt_poll_end_session_on_raise"), ns)  # noqa: S102
     return ns["_interrupt_poll_end_session_on_raise"]
 
 
@@ -344,14 +353,19 @@ def _t_shared_interrupt_helper(src):
     def _code_lines(text):
         return [ln for ln in text.splitlines() if not ln.lstrip().startswith("#")]
     raw_call = "comfy.model_management.throw_exception_if_processing_interrupted()"
-    wan_raw = sum(raw_call in ln for ln in _code_lines(wan_src))
-    ltx_raw = sum(raw_call in ln for ln in _code_lines(src))
-    if wan_raw != 1:
-        print(f"  [FAIL] qf_modelpatcher.py has {wan_raw} raw interrupt-poll call lines, expected exactly 1 "
-              "(inside _interrupt_poll_end_session_on_raise)"); bad += 1
-    if ltx_raw != 0:
-        print(f"  [FAIL] qf_ltx_modelpatcher.py has {ltx_raw} raw interrupt-poll call lines, expected 0 "
-              "(must route through the shared helper)"); bad += 1
+    # ONE raw poll site, and it must be in the family-AGNOSTIC substrate — every FAMILY module
+    # routes through the shared helper. (Scanning all three files is what makes a family module
+    # re-introducing its own poll a FAILURE rather than an invisible drift.)
+    raws = {"qf_modelpatcher.py (shared)": sum(raw_call in ln for ln in _code_lines(_shared_src_text())),
+            "qf_wan_modelpatcher.py": sum(raw_call in ln for ln in _code_lines(wan_src)),
+            "qf_ltx_modelpatcher.py": sum(raw_call in ln for ln in _code_lines(src))}
+    if raws["qf_modelpatcher.py (shared)"] != 1:
+        print(f"  [FAIL] the shared substrate has {raws['qf_modelpatcher.py (shared)']} raw interrupt-poll "
+              "call lines, expected exactly 1 (inside _interrupt_poll_end_session_on_raise)"); bad += 1
+    for fam_file in ("qf_wan_modelpatcher.py", "qf_ltx_modelpatcher.py"):
+        if raws[fam_file] != 0:
+            print(f"  [FAIL] {fam_file} has {raws[fam_file]} raw interrupt-poll call lines, expected 0 "
+                  "(a family module must route through the shared helper)"); bad += 1
     helper_call = "_interrupt_poll_end_session_on_raise(self._qf)"
     if sum(helper_call in ln for ln in _code_lines(wan_src)) < 1:
         print("  [FAIL] QFWanModel does not call the shared interrupt helper"); bad += 1

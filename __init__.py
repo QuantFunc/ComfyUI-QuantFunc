@@ -18,7 +18,7 @@ try:
     import comfy.supported_models
     from . import qf_engine as qfe
     from . import qf_modelpatcher as qfmp
-    from .qf_modelpatcher import QFWanModel, QFModelPatcher, QFLazyEngine
+    from .qf_modelpatcher import QFModelPatcher, QFLazyEngine
     _IMPORT_OK = True
 except Exception as _exc:  # noqa: BLE001 — never break registration; report loudly
     logging.warning("[qf_native] disabled — a required import failed (ComfyUI API drift?): %r", _exc)
@@ -311,66 +311,40 @@ def _get_engine(model_dir, create_cfg=None):
 
 
 if _IMPORT_OK:
-    def _build_wan(model_dir, model_name, resident_block_count, start_image=None,
-                   connector_ckpt="(none)", lora_entries=()):
-        """wan svdq family builder (called by the single loader node + by a LoRA rebuild)."""
-        def _build(entries):
-            # text_precision pinned to int8 (#329-verified W8A16). WHY (mechanism traced to source
-            # after a §6.5 round caught an earlier wrong explanation here): with NO text_precision the
-            # engine's resolve-at-entry falls to its SM-DEFAULT tier (est::smDefaultTextPrecision = fp4
-            # on SM120+, int4 below) and WAN's UMT5 factory REJECTS both 4-bit tiers fail-loud. The
-            # engine TE is not even used by this seam (conditioning comes from comfy's NATIVE CLIP),
-            # but create still builds it; int8 is the verified quantized-UMT5 tier.
-            cfg = {"text_precision": "int8"}
-            if entries:
-                cfg["lora"] = list(entries)   # WanVideoPipeline splits target-tagged entries per expert
+    # ── family REGISTRY: assembled from the per-family modules, nothing family-specific here ──
+    # Each module owns ONE model family end to end (its comfy model subclass, its builder, and its
+    # detection rule) and exposes exactly three names: FAMILY / matches() / register(deps).
+    # Adding a family = write qf_<name>_modelpatcher.py + add it to _FAMILY_MODULES. No edit to the
+    # node, the dispatch or the detection lives here, so families cannot bleed into each other.
+    _FAMILY_MODULES = ("qf_wan_modelpatcher", "qf_ltx_modelpatcher", "qf_h3_modelpatcher")
+    _FAMILY_BUILDERS = {}     # family key -> build(...)
+    _FAMILY_MATCHERS = []     # (family key, matches(pipeline_class)) in registration order
 
-            def _factory():
-                eng, ckey = _get_engine(model_dir, create_cfg=cfg)
-                # Liveness tracker for the host-RAM sweep: when comfy GC's this patcher's model the
-                # weakref goes dead → _sweep_dead_pipelines may destroy the (unreferenced) handle.
-                _PIPELINE_MODELS[ckey] = weakref.ref(model)
-                return eng, ckey
+    def _register_families():
+        """Import each family module and register its builder. A family whose module fails to
+        import is SKIPPED WITH A LOUD WARNING (its models then say 'no registered native seam')
+        — one broken family must not take the whole plugin's registration down."""
+        import importlib
+        deps = {"get_engine": _get_engine, "pipeline_models": _PIPELINE_MODELS,
+                "estimate_footprint": _estimate_package_footprint,
+                "QFLazyEngine": QFLazyEngine,
+                "apply_checkpoint_flow_shift": _apply_checkpoint_flow_shift}
+        for mod_name in _FAMILY_MODULES:
+            try:
+                mod = importlib.import_module("." + mod_name, __name__)
+                _FAMILY_BUILDERS[mod.FAMILY] = mod.register(deps)
+                _FAMILY_MATCHERS.append((mod.FAMILY, mod.matches))
+            except Exception as exc:  # noqa: BLE001 — never break plugin import
+                logging.warning("[qf_native] family module %s not registered: %r", mod_name, exc)
 
-            # DEFERRED create (QFLazyEngine): a chained QuantFuncNativeLoRA rebuilds for its
-            # accumulated set, so an eager create here would build ONE PIPELINE PER CHAIN LINK.
-            engine = QFLazyEngine(_factory, _estimate_package_footprint(model_dir))
-
-            # Wan A14B uses the Wan 2.1 VAE (16-ch AutoencoderKLWan) → WAN21_I2V latent_format
-            # (Wan21, 16-ch). NOT WAN22_T2V (48-ch, that is the 5B TI2V VAE). UNet build DISABLED
-            # (no 14B torch weights — _apply_model is overridden to drive the engine).
-            unet_config = {"image_model": "wan2.1", "model_type": "i2v",
-                           "disable_unet_model_creation": True}
-            model_config = comfy.supported_models.WAN21_I2V(unet_config)
-            for attr, default in (("manual_cast_dtype", None), ("custom_operations", None),
-                                  ("optimizations", {}), ("scaled_fp8", None)):
-                if not hasattr(model_config, attr):
-                    setattr(model_config, attr, default)
-
-            device = comfy.model_management.get_torch_device()
-            offload = comfy.model_management.unet_offload_device()
-            model = QFWanModel(model_config, engine, start_image, device=device,
-                               resident_block_count=resident_block_count)
-            # Default the sampler to the CHECKPOINT'S OWN flow schedule when the package declares
-            # one (a stock ModelSamplingSD3 downstream still overrides it — as on any comfy model).
-            _apply_checkpoint_flow_shift(model, model_dir)
-            patcher = QFModelPatcher(model, load_device=device, offload_device=offload)
-            print(f"[qf_native] loaded QuantFunc Native Loader (wan svdq) package={model_name} "
-                  f"resident_blocks={resident_block_count} loras={len(entries)} "
-                  f"footprint~{engine.footprint_bytes // (1024*1024)}MB (create deferred)")
-            return qfmp.tag_lora_rebuild(patcher, entries, _build)
-
-        return _build(list(lora_entries))
-
-    # ── family detection: the ENGINE's OWN detector strings, transcribed from its registered
-    #    predicates so plugin and engine cannot disagree (WanVideoPipeline.cpp wan_detect =
-    #    pipeline_class prefix "Wan"; LTX2VideoPipeline.cpp = "LTX2Pipeline"; MiniMaxH3Pipeline.cpp
-    #    = "MiniMaxH3ModularPipeline"/"MiniMaxH3Pipeline"). A package whose model_index.json names
-    #    a family the native seam does not implement is refused LOUD with the class it reported —
-    #    never silently routed to the wrong seam.
-    _FAMILY_LABELS = ["auto", "wan", "ltx2", "minimax-h3"]
+    _register_families()
+    _FAMILY_LABELS = ["auto"] + [f for f, _ in _FAMILY_MATCHERS]
 
     def _detect_family(model_dir):
+        """Ask each registered family whether the package's declared pipeline class is theirs.
+        The predicates are the ENGINE's own detector strings (each transcribed in its family
+        module), so plugin and engine cannot disagree; an unimplemented family is refused LOUD
+        with the class it reported — never silently routed to the wrong seam."""
         try:
             with open(os.path.join(model_dir, "model_index.json"), "r") as f:
                 cls = str(json.load(f).get("_class_name", ""))
@@ -378,16 +352,18 @@ if _IMPORT_OK:
             raise RuntimeError(
                 f"qf_native: cannot read model_index.json in {model_dir} ({exc}) — a QuantFunc "
                 f"model package must contain it (it is what names the pipeline family).")
-        if cls.startswith("Wan"):
-            return "wan", cls
-        if cls == "LTX2Pipeline":
-            return "ltx2", cls
-        if cls in ("MiniMaxH3ModularPipeline", "MiniMaxH3Pipeline"):
-            return "minimax-h3", cls
+        for fam, matches in _FAMILY_MATCHERS:
+            try:
+                if matches(cls):
+                    return fam, cls
+            except Exception:  # noqa: BLE001 — a broken predicate must not mask the others
+                continue
+        known = [f for f, _ in _FAMILY_MATCHERS]
         raise RuntimeError(
-            f"qf_native: model_index.json reports _class_name='{cls}', which the native loader "
-            f"does not implement (supported: Wan*, LTX2Pipeline, MiniMaxH3[Modular]Pipeline). "
-            f"Pick a different package, or set model_type explicitly if the metadata is wrong.")
+            f"qf_native: model_index.json reports _class_name='{cls}', which no registered native "
+            f"family claims (registered: {known if known else 'NONE - a family module failed to '
+            'import; check the startup log'}). Pick a different package, or set model_type "
+            f"explicitly if the metadata is wrong.")
 
     class QuantFuncNativeLoader:
         """ONE loader for every QuantFunc native family — the model dropdown picks which.
@@ -518,7 +494,6 @@ if _IMPORT_OK:
             return (rebuilt.adopt_comfy_state_from(model),)
 
     # merge into (not replace) the mappings — matches the real plugin's multi-file NODE_CLASS_MAPPINGS.update
-    _FAMILY_BUILDERS = {"wan": _build_wan}     # LTX / H3 register theirs below
     NODE_CLASS_MAPPINGS.update({"QuantFuncNativeLoader": QuantFuncNativeLoader,
                                 "QuantFuncNativeLoRA": QuantFuncNativeLoRA})
 
@@ -539,21 +514,4 @@ if _IMPORT_OK:
     NODE_DISPLAY_NAME_MAPPINGS.update({"QuantFuncNativeLoader": "QuantFunc Native Loader",
                                        "QuantFuncNativeLoRA": "QuantFunc Native LoRA"})
 
-    # LTX-2 native seam (qf_ltx_modelpatcher). Additive + defensively guarded: a bug in the LTX file
-    # must NEVER break the wan loader's registration. _get_engine + _PIPELINE_MODELS are threaded in
-    # (they live here, not in qf_modelpatcher) to avoid a circular import.
-    try:
-        from . import qf_ltx_modelpatcher as _qf_ltx
-        _FAMILY_BUILDERS["ltx2"] = _qf_ltx.register(
-            _get_engine, _PIPELINE_MODELS, _estimate_package_footprint, QFLazyEngine)
-    except Exception as _ltx_exc:  # noqa: BLE001 — LTX registration must never break plugin import
-        logging.warning("[qf_native] LTX loader registration skipped: %r", _ltx_exc)
 
-    # MiniMax-H3 native joint-AV seam (qf_h3_modelpatcher). Same additive + defensively-guarded pattern:
-    # a bug in the H3 file must NEVER break the wan/LTX loaders' registration.
-    try:
-        from . import qf_h3_modelpatcher as _qf_h3
-        _FAMILY_BUILDERS["minimax-h3"] = _qf_h3.register(
-            _get_engine, _PIPELINE_MODELS, _estimate_package_footprint, QFLazyEngine)
-    except Exception as _h3_exc:  # noqa: BLE001 — H3 registration must never break plugin import
-        logging.warning("[qf_native] H3 loader registration skipped: %r", _h3_exc)

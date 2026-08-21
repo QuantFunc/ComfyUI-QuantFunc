@@ -33,7 +33,10 @@ import uuid as _uuidmod
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _PLUGIN = os.path.dirname(_HERE)
+# One module per model family: _CtxKeyAssigner is SHARED substrate (qf_modelpatcher.py) while
+# the call site that uses it lives in the WAN family module — pin both.
 _SRC_PATH = os.path.join(_PLUGIN, "qf_modelpatcher.py")
+_WAN_SRC_PATH = os.path.join(_PLUGIN, "qf_wan_modelpatcher.py")
 
 
 def _read_src():
@@ -310,7 +313,10 @@ def main():
     #          affine i/len keys for the UNCOND role too — exactly as A + B1 + B2 do for cond. That closes the
     #          a250211 NO-GO and its whole AFFINE family (K=a*i+b*len+c per role; non-affine is OUT OF SCOPE
     #          by the M5 reachability argument at the ★ SCOPE note below), not just the literal `else i` spelling.
-    callsite = _extract_callsite_key_derivation(src)   # loud-fails if the call-site derivation vanished
+    # The CALL SITE lives in the WAN family module (one module per family); the assigner class it
+    # uses is shared substrate. Read the family module for this arm.
+    callsite = _extract_callsite_key_derivation(
+        open(_WAN_SRC_PATH, encoding='utf-8').read())   # loud-fails if the derivation vanished
     try:
         import torch
     except ImportError:
@@ -532,9 +538,14 @@ def main():
             bad += 1
 
     # (8) WIRING (a cheap SYNTACTIC tripwire — NOT the content-hash coverage; arm (7) covers that by behaviour).
-    wired = ('transformer_options.get("uuids")' in src and "self._ctx_key_assigner.key(" in src)
-    no_hash = ("content_ctx_key" not in src) and ("hashlib" not in src)
-    reset_wired = "self._ctx_key_assigner.reset()" in src
+    # One module per model family: the assigner CLASS + its kNoCtxKey constant are shared substrate
+    # (`src`), while the CALL SITE that reads uuids / keys / resets lives in the WAN family module.
+    # Each half is checked against the file that actually owns it — checking the wiring against the
+    # shared file would silently pass on an EMPTY match once the seam moved out of it.
+    wan_src = open(_WAN_SRC_PATH, encoding="utf-8").read()
+    wired = ('transformer_options.get("uuids")' in wan_src and "self._ctx_key_assigner.key(" in wan_src)
+    no_hash = all(("content_ctx_key" not in t) and ("hashlib" not in t) for t in (src, wan_src))
+    reset_wired = "self._ctx_key_assigner.reset()" in wan_src
     kno_wired = "_KNO_CTX_KEY" in src
     if wired and no_hash and reset_wired and kno_wired:
         print("  [OK ] wiring: _apply_model reads uuids + keys via the assigner; per-gen reset + kNoCtxKey present; no content hash")
