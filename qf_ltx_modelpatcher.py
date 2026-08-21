@@ -48,7 +48,7 @@ from . import qf_engine as qfe
 from .qf_modelpatcher import (_qf_dtype, QFModelPatcher, _QFStub,
                               _interrupt_poll_end_session_on_raise,
                               save_ref_tempfile, cleanup_ref_tempfile,
-                              QFSessionModelMixin)
+                              QFSessionModelMixin, QFLazyEngine)
 
 import weakref
 
@@ -1004,7 +1004,7 @@ class QFLTXAVModel(QFLTXModel):
 
 
 def register(NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS, get_engine, pipeline_models,
-             list_packages, resolve_package):
+             list_packages, resolve_package, estimate_footprint):
     """Register the LTX loader node (called from __init__.py alongside the wan loader). get_engine,
     pipeline_models + the models/quantfunc package helpers are __init__.py's shared helpers,
     threaded in to avoid a circular import."""
@@ -1096,7 +1096,16 @@ def register(NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS, get_engine, pipeli
                             "QuantFuncNativeLTXLoader: join_audio_prompt belongs to the LEGACY 2.3 "
                             "plugin-connector split and is not used on the LTX-2.5 AV path — the AV "
                             "session derives BOTH modality embeds engine-side. Leave it False.")
-                    engine, ckey = get_engine(model_dir, create_cfg=(_lora_cfg or None))
+                    def _factory():
+                        eng, ckey = get_engine(model_dir, create_cfg=(_lora_cfg or None))
+                        pipeline_models[ckey] = weakref.ref(model)
+                        return eng, ckey
+
+                    # DEFERRED create (QFLazyEngine): a chained QuantFuncNativeLoRA rebuilds for its
+                    # accumulated LoRA set, so an eager create here would build ONE PIPELINE PER
+                    # CHAIN LINK (and comfy's node-output cache would pin every intermediate's
+                    # multi-GB CPU backup). Only the model the sampler touches is ever created.
+                    engine = QFLazyEngine(_factory, estimate_footprint(model_dir))
                     device = comfy.model_management.get_torch_device()
                     offload = comfy.model_management.unet_offload_device()
                     unet_config = {"image_model": "ltxav", "disable_unet_model_creation": True}
@@ -1108,11 +1117,10 @@ def register(NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS, get_engine, pipeli
                     model = QFLTXAVModel(model_config, engine, device=device,
                                          start_image=start_image,
                                          resident_block_count=resident_block_count)
-                    pipeline_models[ckey] = weakref.ref(model)
                     patcher = QFModelPatcher(model, load_device=device, offload_device=offload)
                     print(f"[qf_native] loaded QuantFuncNativeLTXLoader (LTX-2.5 JOINT-AV svdq) "
                           f"package={model_name} resident_blocks={resident_block_count} "
-                          f"footprint={engine.footprint_bytes // (1024*1024)}MB", flush=True)
+                          f"footprint~{engine.footprint_bytes // (1024*1024)}MB (create deferred)", flush=True)
                     return _tag(patcher, lora_entries)
                 if not connector_ckpt:
                     raise RuntimeError("QuantFuncNativeLTXLoader: connector_ckpt (comfy LTX-2.3 ckpt with the "
@@ -1143,7 +1151,16 @@ def register(NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS, get_engine, pipeli
                 # it currently WORKS here because LTX's TE tiers accept the default — but if an LTX TE arch
                 # without a wired 4-bit tier ever routes through this minimal create, it hits the same class.
                 # No fix now (adding keys back defeats minimal=True's purpose); this note is the tripwire.
-                engine, ckey = get_engine(model_dir, create_cfg=(_lora_cfg or None))
+                def _factory():
+                    eng, ckey = get_engine(model_dir, create_cfg=(_lora_cfg or None))
+                    pipeline_models[ckey] = weakref.ref(model)
+                    return eng, ckey
+
+                # DEFERRED create (QFLazyEngine): a chained QuantFuncNativeLoRA rebuilds for its
+                # accumulated LoRA set, so an eager create here would build ONE PIPELINE PER
+                # CHAIN LINK (and comfy's node-output cache would pin every intermediate's
+                # multi-GB CPU backup). Only the model the sampler touches is ever created.
+                engine = QFLazyEngine(_factory, estimate_footprint(model_dir))
                 # [19B non-gated connector] authoritative head count from the ORIGINAL model dir\'s diffusers
                 # LTX2TextConnectors config (the 19B family ships NON-gated connector weights; the head split
                 # lives ONLY here). Absent/malformed -> None (gated checkpoints need nothing; a non-gated one
@@ -1190,11 +1207,10 @@ def register(NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS, get_engine, pipeli
                 model = QFLTXModel(model_config, engine, connector, device=device,
                                    audio_connector=audio_connector, start_image=start_image,
                                    resident_block_count=resident_block_count)
-                pipeline_models[ckey] = weakref.ref(model)
                 patcher = QFModelPatcher(model, load_device=device, offload_device=offload)
                 print(f"[qf_native] loaded QuantFuncNativeLTXLoader (LTX-2 svdq) package={model_name} "
                       f"resident_blocks={resident_block_count} "
-                      f"footprint={engine.footprint_bytes // (1024*1024)}MB", flush=True)
+                      f"footprint~{engine.footprint_bytes // (1024*1024)}MB (create deferred)", flush=True)
                 return _tag(patcher, lora_entries)
 
             return (_build([]),)

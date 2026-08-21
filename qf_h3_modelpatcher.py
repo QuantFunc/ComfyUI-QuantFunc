@@ -40,7 +40,7 @@ import comfy.nested_tensor
 from . import qf_engine as qfe
 from .qf_modelpatcher import (_qf_dtype, QFModelPatcher, _QFStub,
                               _interrupt_poll_end_session_on_raise,
-                              QFSessionModelMixin)
+                              QFSessionModelMixin, QFLazyEngine)
 
 import weakref
 
@@ -455,7 +455,7 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
 
 
 def register(NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS, get_engine, pipeline_models,
-             list_packages, resolve_package):
+             list_packages, resolve_package, estimate_footprint):
     """Register the H3 loader node (called from __init__.py). get_engine, pipeline_models + the
     models/quantfunc package helpers are __init__.py's shared helpers, threaded in to avoid a
     circular import (mirrors the LTX register)."""
@@ -509,7 +509,16 @@ def register(NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS, get_engine, pipeli
                     _lora_cfg["lora"] = list(lora_entries)   # engine svdq load: sidecar apply post-load
                 # H3 svdq is PRE-quantized: create is MINIMAL. The svdquant metadata carries the
                 # layout/precision; anything on top competes + mis-resolves (LTX minimal note).
-                engine, ckey = get_engine(model_dir, create_cfg=(_lora_cfg or None))
+                def _factory():
+                    eng, ckey = get_engine(model_dir, create_cfg=(_lora_cfg or None))
+                    pipeline_models[ckey] = weakref.ref(model)
+                    return eng, ckey
+
+                # DEFERRED create (QFLazyEngine): a chained QuantFuncNativeLoRA rebuilds for its
+                # accumulated LoRA set, so an eager create here would build ONE PIPELINE PER
+                # CHAIN LINK (and comfy's node-output cache would pin every intermediate's
+                # multi-GB CPU backup). Only the model the sampler touches is ever created.
+                engine = QFLazyEngine(_factory, estimate_footprint(model_dir))
                 device = comfy.model_management.get_torch_device()
                 offload = comfy.model_management.unet_offload_device()
 
@@ -522,11 +531,10 @@ def register(NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS, get_engine, pipeli
 
                 model = QFH3Model(model_config, engine, device=device,
                                   resident_block_count=resident_block_count)
-                pipeline_models[ckey] = weakref.ref(model)
                 patcher = QFModelPatcher(model, load_device=device, offload_device=offload)
                 print(f"[qf_native] loaded QuantFuncNativeH3Loader (MiniMax-H3 svdq AV) package={model_name} "
                       f"resident_blocks={resident_block_count} "
-                      f"footprint={engine.footprint_bytes // (1024*1024)}MB", flush=True)
+                      f"footprint~{engine.footprint_bytes // (1024*1024)}MB (create deferred)", flush=True)
                 return _tag(patcher, lora_entries)
 
             return (_build([]),)

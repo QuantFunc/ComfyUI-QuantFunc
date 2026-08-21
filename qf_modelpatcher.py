@@ -647,6 +647,88 @@ class QFWanModel(QFSessionModelMixin, comfy.model_base.WAN21):
         return super().process_latent_out(latent)
 
 
+class QFLazyEngine:
+    """A QFEngineHandle that materializes ON FIRST REAL USE.
+
+    WHY (measured): sidecar LoRA is applied at pipeline CREATE time, so a chained
+    QuantFuncNativeLoRA node has to build a pipeline for its accumulated LoRA set. Doing that
+    EAGERLY in the node makes an N-node chain create N+1 pipelines — and comfy's node-output
+    cache pins every intermediate model, so each intermediate ALSO pins a multi-GB CPU backup.
+    Deferring means only the model the sampler actually touches is ever created.
+
+    The proxy answers the CHEAP part of the handle surface locally while unmaterialized (an
+    engine that does not exist holds no VRAM and has no session), and materializes only for
+    the members that genuinely need a live pipeline (`lib`, `pipeline`). Explicit members, no
+    __getattr__ magic: a typo must fail loud, not silently forward.
+    """
+
+    def __init__(self, factory, footprint_bytes):
+        self._factory = factory          # () -> (QFEngineHandle, ckey)
+        self._real = None
+        self.footprint_bytes = int(footprint_bytes)   # from the package weights: no create needed
+        # Nothing created yet => nothing resident. Reporting "unloaded" keeps comfy's ledger
+        # HONEST (loaded_size -> 0) for a chain link the sampler never touches.
+        self._unloaded = True
+        self.step_count = 0
+        self.sampler_step_count = 0
+
+    # ---- materialization ----
+    def ensure(self):
+        if self._real is None:
+            self._real, _ckey = self._factory()
+            self._real.step_count = self.step_count
+            self._real.sampler_step_count = self.sampler_step_count
+            self.footprint_bytes = int(self._real.footprint_bytes)
+        return self._real
+
+    @property
+    def materialized(self):
+        return self._real is not None
+
+    # ---- members that NEED a live pipeline ----
+    @property
+    def lib(self):
+        return self.ensure().lib
+
+    @property
+    def pipeline(self):
+        # Unmaterialized = "no pipeline yet", which is what every caller's `is not None` guard
+        # means. Materializing here would defeat the deferral (comfy probes this while planning).
+        return None if self._real is None else self._real.pipeline
+
+    # ---- state that is meaningful WITHOUT a pipeline ----
+    @property
+    def current_session(self):
+        return None if self._real is None else self._real.current_session
+
+    @current_session.setter
+    def current_session(self, v):
+        self.ensure().current_session = v
+
+    @property
+    def unloaded(self):
+        # Nothing created => nothing resident. Honest for comfy's ledger (loaded_size -> 0).
+        return self._unloaded if self._real is None else self._real.unloaded
+
+    @unloaded.setter
+    def unloaded(self, v):
+        if self._real is None:
+            self._unloaded = bool(v)
+        else:
+            self._real.unloaded = bool(v)
+
+    # ---- lifecycle: all no-ops while unmaterialized (nothing exists to close/free/destroy) ----
+    def end_session_if_open(self):
+        return (False, True) if self._real is None else self._real.end_session_if_open()
+
+    def unload_vram(self):
+        return 0 if self._real is None else self._real.unload_vram()
+
+    def destroy(self):
+        if self._real is not None:
+            self._real.destroy()
+
+
 class QFModelPatcher(comfy.model_patcher.ModelPatcher):
     """ModelPatcher over an engine-managed pipeline. The engine owns + moves its own VRAM, so the
     weight-move overrides are no-ops — but model_size/loaded_size REPORT the engine's real footprint

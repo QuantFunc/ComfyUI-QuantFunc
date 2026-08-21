@@ -17,7 +17,7 @@ try:
     import comfy.model_management
     import comfy.supported_models
     from . import qf_engine as qfe
-    from .qf_modelpatcher import QFWanModel, QFModelPatcher
+    from .qf_modelpatcher import QFWanModel, QFModelPatcher, QFLazyEngine
     _IMPORT_OK = True
 except Exception as _exc:  # noqa: BLE001 — never break registration; report loudly
     logging.warning("[qf_native] disabled — a required import failed (ComfyUI API drift?): %r", _exc)
@@ -85,6 +85,15 @@ def _package_weight_paths(pkg):
                 if f.endswith(".safetensors"):
                     outs.append(os.path.join(d, f))
     return outs
+
+
+def _estimate_package_footprint(pkg):
+    """Engine-resident transformer weight bytes for a package — computed from the FILES, so the
+    memory ledger has a real number before the pipeline is created (QFLazyEngine)."""
+    try:
+        return qfe.estimate_footprint_bytes(*_package_weight_paths(pkg))
+    except Exception:  # noqa: BLE001 — a bad estimate must not break loading
+        return 1
 
 
 def _lora_choices():
@@ -262,7 +271,7 @@ def _get_engine(model_dir, create_cfg=None):
     # Footprint = the ENGINE-RESIDENT transformer weight bytes only (dual-expert). VAE + text_encoder
     # stay NATIVE comfy nodes (comfy already accounts for them), so they must NOT be added here — an
     # over-report would make comfy's ledger evict siblings that actually fit.
-    footprint = qfe.estimate_footprint_bytes(*_package_weight_paths(model_dir))
+    footprint = _estimate_package_footprint(model_dir)
     eng = qfe.QFEngineHandle(lib, pipeline, footprint_bytes=footprint)
     _PIPELINE_CACHE[ckey] = eng
     return eng, ckey
@@ -334,7 +343,17 @@ if _IMPORT_OK:
                 cfg = {"text_precision": "int8"}
                 if lora_entries:
                     cfg["lora"] = list(lora_entries)   # WanVideoPipeline splits target-tagged entries per expert
-                engine, ckey = _get_engine(model_dir, create_cfg=cfg)
+
+                def _factory():
+                    eng, ckey = _get_engine(model_dir, create_cfg=cfg)
+                    # Liveness tracker for the host-RAM cache sweep: when comfy GC's this patcher's
+                    # model, the weakref goes dead → _sweep_dead_pipelines may destroy the handle.
+                    _PIPELINE_MODELS[ckey] = weakref.ref(model)
+                    return eng, ckey
+
+                # DEFERRED create (QFLazyEngine): a chained QuantFuncNativeLoRA rebuilds for its
+                # accumulated set, so an eager create here would build a pipeline per chain link.
+                engine = QFLazyEngine(_factory, _estimate_package_footprint(model_dir))
 
                 # Wan A14B uses the Wan 2.1 VAE (16-ch AutoencoderKLWan) → WAN21_I2V latent_format
                 # (Wan21, 16-ch). NOT WAN22_T2V (48-ch, that is the 5B TI2V VAE). UNet build DISABLED
@@ -351,9 +370,6 @@ if _IMPORT_OK:
                 offload = comfy.model_management.unet_offload_device()
                 model = QFWanModel(model_config, engine, start_image, device=device,
                                    resident_block_count=resident_block_count)
-                # Liveness tracker for the host-RAM cache sweep: when comfy GC's this patcher's model,
-                # the weakref goes dead → _sweep_dead_pipelines may safely destroy the handle.
-                _PIPELINE_MODELS[ckey] = weakref.ref(model)
                 # Default the sampler to the CHECKPOINT'S OWN flow schedule when the package declares
                 # one (a stock ModelSamplingSD3 downstream still overrides it — as on any comfy model).
                 _apply_checkpoint_flow_shift(model, model_dir)
@@ -362,7 +378,7 @@ if _IMPORT_OK:
                 patcher = QFModelPatcher(model, load_device=device, offload_device=offload)
                 print(f"[qf_native] loaded QuantFuncNativeWanLoader (wan svdq) package={model_name} "
                       f"resident_blocks={resident_block_count} loras={len(lora_entries)} "
-                      f"footprint={engine.footprint_bytes // (1024*1024)}MB")
+                      f"footprint~{engine.footprint_bytes // (1024*1024)}MB (create deferred to first use)")
                 return patcher
 
             return (_build([]),)
@@ -437,7 +453,8 @@ if _IMPORT_OK:
     try:
         from . import qf_ltx_modelpatcher as _qf_ltx
         _qf_ltx.register(NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS, _get_engine, _PIPELINE_MODELS,
-                         _list_quantfunc_packages, _resolve_package)
+                         _list_quantfunc_packages, _resolve_package,
+                         _estimate_package_footprint)
     except Exception as _ltx_exc:  # noqa: BLE001 — LTX registration must never break plugin import
         logging.warning("[qf_native] LTX loader registration skipped: %r", _ltx_exc)
 
@@ -446,6 +463,7 @@ if _IMPORT_OK:
     try:
         from . import qf_h3_modelpatcher as _qf_h3
         _qf_h3.register(NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS, _get_engine, _PIPELINE_MODELS,
-                        _list_quantfunc_packages, _resolve_package)
+                        _list_quantfunc_packages, _resolve_package,
+                         _estimate_package_footprint)
     except Exception as _h3_exc:  # noqa: BLE001 — H3 registration must never break plugin import
         logging.warning("[qf_native] H3 loader registration skipped: %r", _h3_exc)
