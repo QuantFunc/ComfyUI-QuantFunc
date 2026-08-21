@@ -354,9 +354,38 @@ def load_lib():
         # from the already-loaded image, no RPATH surgery / LD_LIBRARY_PATH needed. Absent file =
         # no-op (an OFF-build engine has no such dependency); a PRESENT-but-broken qfa .so fails
         # loud here rather than as an opaque dlopen error on the engine line below.
-        qfa_sidecar = os.path.join(os.path.dirname(so_path), "libquantfunc_attention.so")
-        if os.path.exists(qfa_sidecar):
-            ctypes.CDLL(qfa_sidecar, mode=ctypes.RTLD_GLOBAL)
+        # Sidecar dependency preloads: a deployed engine .so may carry NEEDED libs whose
+        # build-box versions differ from this machine's (measured: a scratch engine linked the
+        # build box's dynamic OpenCV 4.5d; this box ships 4.6 -> dlopen refused — the SS7.5
+        # portability class). Every lib*.so* placed NEXT TO the engine .so is preloaded; the
+        # dynamic linker then satisfies the engine's NEEDED sonames from the already-loaded
+        # images. A generic retry loop discovers dependency order (a lib whose own deps are not
+        # loaded yet fails this pass and succeeds on a later one) — no hand-maintained list.
+        # Modes: libquantfunc_attention.so keeps RTLD_GLOBAL (qfa symbol export — the proven
+        # in-ComfyUI arm); everything else loads RTLD_LOCAL. LOCAL is deliberate: soname-based
+        # NEEDED resolution does not require GLOBAL, and a GLOBAL OpenCV would inject cv::*
+        # into the process global scope where it can hijack symbol binding of ComfyUI's own
+        # bundled cv2 (different OpenCV version -> ABI-mismatch crashes in unrelated code).
+        # A sidecar that never loads is skipped silently HERE — the engine dlopen below then
+        # fails LOUD with the true unresolved soname, which is the honest error.
+        so_dir = os.path.dirname(so_path)
+        base = os.path.basename(so_path)
+        pending = sorted(
+            f for f in os.listdir(so_dir)
+            if f.startswith("lib") and ".so" in f and f != base
+            and not f.startswith(base + ".") and ".bak" not in f
+        )
+        for _ in range(max(1, len(pending))):
+            still = []
+            for f in pending:
+                mode = ctypes.RTLD_GLOBAL if f == "libquantfunc_attention.so" else ctypes.RTLD_LOCAL
+                try:
+                    ctypes.CDLL(os.path.join(so_dir, f), mode=mode)
+                except OSError:
+                    still.append(f)
+            if not still:
+                break
+            pending = still
         _LIB = _bind(ctypes.CDLL(so_path, mode=ctypes.RTLD_GLOBAL))
     return _LIB
 
