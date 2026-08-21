@@ -503,7 +503,16 @@ def register(deps):
             # the engine still reads the staged vae/config.json for session geometry. The old
             # text_precision=int8 pin existed only because create used to BUILD the TE; with
             # denoise_only it is obsolete and deliberately gone.
-            cfg = {"denoise_only": True}
+            cfg = {"denoise_only": True,
+                   # HOTFIX (measured 2026-08-22, cu12 4090, engine-direct three-arm A/B at the
+                   # user's 640x640x81f geometry, seq_len=33600, same .so/weights/seed): sage2
+                   # i8f8 NUMERICALLY COLLAPSES at this seq_len (pure-white frames, run b68d —
+                   # the known 'sage2 long-sequence collapse' class re-manifesting on wan);
+                   # flash renders perfectly at 65s/gen (a747); qfa (tile INT8-QK) renders
+                   # perfectly at 51s/gen (9d33) — CORRECT **and** the FASTEST correct arm
+                   # (23% over flash). Until the engine's seq-aware routing lands (sage2 only
+                   # below its measured-healthy bound), the seam pins qfa.
+                   "attention_backend": "qfa"}
             if entries:
                 cfg["lora"] = list(entries)   # WanVideoPipeline splits target-tagged entries per expert
 
