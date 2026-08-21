@@ -283,6 +283,40 @@ def main():
             # only the guard's own message would mean the guard misfired on nonzero input.
             check("noised latent passes the guard (reaches _begin)",
                   "ALL ZEROS" not in str(e), f"-> {type(e).__name__}: {str(e)[:60]}")
+
+        # N3: the guard is ONE mechanism, N users — wan is exercised through _apply_model above;
+        # LTX2/H3 file-mode is not wired (build() refuses) so their models can't be instantiated
+        # here, but their EXACT call is behavior-tested via the shared helper per family tag, AND
+        # the call-before-engine wiring is asserted structurally for all three modules.
+        import torch as _t2, re as _re2
+        _zero5 = _t2.zeros(1, 16, 3, 8, 8)
+        _noise5 = _t2.randn(1, 16, 3, 8, 8)
+        for _tag in ("LTX", "LTX-AV", "H3", "wan"):
+            try:
+                qfn.qfmp.refuse_all_zero_initial_latent(_zero5, _tag)
+                check(f"shared guard fires for {_tag}", False, "-> no exception")
+            except RuntimeError as _e:
+                check(f"shared guard fires for {_tag} with its tag",
+                      f"qf_native {_tag}:" in str(_e) and "ALL ZEROS" in str(_e), f"-> {str(_e)[:50]}")
+            try:
+                qfn.qfmp.refuse_all_zero_initial_latent(_noise5, _tag)
+                check(f"shared guard passes a noised latent for {_tag}", True)
+            except Exception as _e:  # noqa: BLE001
+                check(f"shared guard passes a noised latent for {_tag}", False, f"-> {_e!r}")
+        # structural: each family module calls the guard BEFORE it opens the session (self._begin).
+        import os as _os
+        for _mod, _tags in (("qf_wan_modelpatcher.py", 1), ("qf_ltx_modelpatcher.py", 2),
+                            ("qf_h3_modelpatcher.py", 1)):
+            _src = open(_os.path.join(_PLUGIN, _mod)).read()
+            _n_guard = _src.count("refuse_all_zero_initial_latent(")
+            # every guard call must be followed (in source) by a self._begin( before the next guard
+            _ok = _n_guard == _tags
+            for _m in _re2.finditer("refuse_all_zero_initial_latent", _src):
+                _after = _src[_m.end():_m.end() + 400]
+                if "self._begin(" not in _after:
+                    _ok = False
+            check(f"{_mod}: {_tags} guard call(s), each before self._begin", _ok,
+                  f"-> found {_n_guard}")
     except Exception as e:  # noqa: BLE001
         check("wan dual-expert staging", False, f"-> raised {type(e).__name__}: {e}")
 

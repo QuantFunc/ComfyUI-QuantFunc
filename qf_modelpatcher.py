@@ -478,8 +478,8 @@ def stage_denoise_only_package(bundle_dir, transformer1_path, transformer2_path=
     return stage
 
 
-def refuse_all_zero_initial_latent(xin, family):
-    """ALL-ZERO INITIAL LATENT GUARD — SHARED across every family seam (wan/ltx2/minimax-h3;
+def refuse_all_zero_initial_latent(xin, tag):
+    """ALL-ZERO INITIAL LATENT GUARD — SHARED across every family seam (wan/LTX/LTX-AV/H3;
     one mechanism, N users). An Empty latent whose first sampler stage has add_noise=disable
     hands the engine a pure-zero tensor at sigma_max: int4 per-token quantization divides by
     amax=0 (0/0 = NaN), the NaN propagates silently through every step, and VAEDecode writes
@@ -490,7 +490,7 @@ def refuse_all_zero_initial_latent(xin, family):
     latent-input flow is nonzero and never trips this."""
     if float(xin.abs().max()) == 0.0:
         raise RuntimeError(
-            f"qf_native {family}: the initial latent is ALL ZEROS — denoising pure zeros "
+            f"qf_native {tag}: the initial latent is ALL ZEROS — denoising pure zeros "
             f"produces NaN through int4 quantization (amax=0) and renders a BLACK video. "
             f"Almost always this means the FIRST sampler stage has add_noise=disable on an "
             f"Empty latent: set add_noise=enable on the first stage (official templates ship "

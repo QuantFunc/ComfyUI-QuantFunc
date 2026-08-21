@@ -361,7 +361,7 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
             self._derive_geometry(x_video, transformer_options)   # session geometry from the GRAPH
             # shared black-video guard (see qf_modelpatcher.refuse_all_zero_initial_latent);
             # H3 is joint AV — the VIDEO lane's zero-latent is the same int4 NaN factory.
-            qfmp.refuse_all_zero_initial_latent(x_video, FAMILY)
+            qfmp.refuse_all_zero_initial_latent(x_video, "H3")
             self._begin(x_video[0:1].contiguous(), x_audio[0:1].contiguous(), vemb[0:1].contiguous(),
                         av_payload=kwargs.get("minimax_payload"))
         # [C2 ordering guard] the engine binds av_conds SESSION-WIDE from the FIRST-invoked cond

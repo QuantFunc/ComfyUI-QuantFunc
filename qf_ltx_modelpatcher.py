@@ -685,7 +685,7 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
                                    ).to(dev, dtype=torch.bfloat16).contiguous()
         if self._qf.current_session is None:
             # shared black-video guard (see qf_modelpatcher.refuse_all_zero_initial_latent).
-            qfmp.refuse_all_zero_initial_latent(xin, FAMILY)
+            qfmp.refuse_all_zero_initial_latent(xin, "LTX")
             self._begin(xin[0:1].contiguous(), vemb[0:1].contiguous())
         # packed velocity_out buffer [1, N, 128]
         _, C, F, H, W = xin.shape
@@ -893,7 +893,7 @@ class QFLTXAVModel(QFLTXModel):
                                    ).to(dev, dtype=torch.bfloat16).contiguous()
         if self._qf.current_session is None:
             # shared black-video guard (see qf_modelpatcher.refuse_all_zero_initial_latent).
-            qfmp.refuse_all_zero_initial_latent(xin, FAMILY)
+            qfmp.refuse_all_zero_initial_latent(xin, "LTX-AV")
             self._begin(xin[0:1].contiguous(), vemb[0:1].contiguous())
         _, C, F, H, W = xin.shape
         N = F * H * W
