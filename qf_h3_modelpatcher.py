@@ -210,11 +210,25 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
         audio_dims = [int(x_audio.shape[0]), int(x_audio.shape[1]),
                       int(x_audio.shape[2]), int(x_audio.shape[3])]   # [B,32,2,audio_t]
         ms = self.model_sampling
+        # The AV flow shifts come from the model_sampling object the graph installed — the stock
+        # ModelSamplingMiniMaxH3 (MiniMaxH3SigmaShift) add_object_patch'es a ModelSamplingAV, and
+        # model_config supplies an AV default when no node is wired. A NON-AV sampling object means
+        # a generic model-sampling node (ModelSamplingSD3/Flux/…) replaced it and DROPPED the audio
+        # schedule: MEASURED — ModelSamplingSD3 on an H3 model yields ModelSamplingAdvanced with no
+        # audio_shift, so a silent getattr default would run the audio branch at 3.0 while the user
+        # believes they set the schedule. Refuse LOUD instead of rendering a silently mis-scheduled AV.
+        if not hasattr(ms, "audio_shift"):
+            raise RuntimeError(
+                f"qf_native H3: the model_sampling object is {type(ms).__name__}, which carries no "
+                f"audio_shift — a GENERIC model-sampling node (ModelSamplingSD3 / ModelSamplingFlux / "
+                f"similar) replaced MiniMax-H3's ModelSamplingAV and dropped the AUDIO schedule. Use "
+                f"the stock ModelSamplingMiniMaxH3 node (shift_video + shift_audio) for H3, or wire no "
+                f"sampling node at all to keep the checkpoint defaults.")
         _opts = {
             "resident_block_count": self._resident_block_count,   # [manual-residency]
             "audio_dims": audio_dims,
             "av_sigma_shift_video": float(getattr(ms, "shift", 12.0)),
-            "av_sigma_shift_audio": float(getattr(ms, "audio_shift", 3.0) or 3.0),
+            "av_sigma_shift_audio": float(ms.audio_shift or 3.0),
             "num_frames": self._num_frames,
             "fps": float(self._fps),
         }
