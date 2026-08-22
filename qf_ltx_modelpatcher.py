@@ -1126,6 +1126,23 @@ class QFLTXAVModel(QFLTXModel):
 
 FAMILY = "ltx2"
 
+def _file_has_prefix(path, prefix):
+    """Cheap safetensors HEADER probe: does any key start with `prefix`? Unreadable/not a
+    safetensors => False. Module-level: used by the AV discriminant (vocoder.*) AND the
+    [ltx25-allin] te_file relaxation (text_embedding_projection.*)."""
+    import struct as _st
+    try:
+        with open(path, "rb") as fh:
+            n = _st.unpack("<Q", fh.read(8))[0]
+            if n > (1 << 31):
+                return False
+            hdr = json.loads(fh.read(n))
+        return any(k.startswith(prefix) for k in hdr)
+    except Exception:  # noqa: BLE001 — unreadable = no keys
+        return False
+
+
+
 
 def matches(pipeline_class, transformer_class=""):
     """The ENGINE's own detector (src/LTX2VideoPipeline.cpp ltx2_pipeline_detect):
@@ -1162,11 +1179,18 @@ def register(deps):
         Engine create runs denoise_only=True (VAE decode weights skipped; TE lazy)."""
         if transformer2_path:
             raise RuntimeError("qf_native ltx2: single-expert family — transformer2 must be empty")
-        if not te_path:
+        # [ltx25-allin] te_file is needed ONLY when the connector text projections
+        # (text_embedding_projection.*_aggregate_embed) are NOT in the transformer file: the
+        # ALL-IN single file packs them (engine loads them from the same file, single-file
+        # first); a transformer-only export still needs the gemma with-proj TE file. Cheap
+        # header probe — same mechanism as the connector-key detection below.
+        if not te_path and not _file_has_prefix(transformer1_path, "text_embedding_projection."):
             raise RuntimeError(
-                "qf_native ltx2: te_file is REQUIRED for the 2.5 single-file layout — the "
-                "connector text projections (aggregate_embed) live in the gemma with-proj TE "
-                "file (the same file comfy's CLIPLoader uses), not in the transformer export.")
+                "qf_native ltx2: te_file is REQUIRED for this transformer file — the connector "
+                "text projections (aggregate_embed) live in the gemma with-proj TE file (the "
+                "same file comfy's CLIPLoader uses), and this transformer export does not pack "
+                "them. Pick the TE file, or use an ALL-IN single file (which packs "
+                "text_embedding_projection + connectors — then te_file may stay (none)).")
         # CONNECTOR WEIGHT SOURCE (measured 2026-08-22): the QuantFunc int4 single-file export
         # carries the TRANSFORMER only — 0 embeddings_connector keys (the OFFICIAL bf16/fp8
         # ComfyUI single-file packs them inside, #565). The engine loads connectors from the
@@ -1223,7 +1247,9 @@ def register(deps):
                 "and no valid connectors_file was supplied. Pick the ltx-2.5 connectors file "
                 "(e.g. ltx-2.5-connectors-bf16.safetensors under models/diffusion_models) in "
                 "the loader's connectors_file input.")
-        extra = {"connectors": connectors_src, "text_encoder": te_path}
+        extra = {"connectors": connectors_src}
+        if te_path:
+            extra["text_encoder"] = te_path   # split layout; the ALL-IN file needs no TE staging
         if audio_vae_path:
             extra["audio_vae"] = audio_vae_path
         if video_vae_path:
@@ -1275,17 +1301,6 @@ def register(deps):
             # audio_vae-without-vocoder would make the plugin pick the AV model while the
             # engine says video-only -> the begin-time audio-lane mismatch refusal (loud,
             # but confusing); agreeing by construction avoids it.
-            def _file_has_prefix(path, prefix):
-                import struct as _st
-                try:
-                    with open(path, "rb") as fh:
-                        n = _st.unpack("<Q", fh.read(8))[0]
-                        if n > (1 << 31):
-                            return False
-                        hdr = json.loads(fh.read(n))
-                    return any(k.startswith(prefix) for k in hdr)
-                except Exception:  # noqa: BLE001
-                    return False
             _avae_dir = os.path.join(model_dir, "audio_vae")
             _avae_files = ([os.path.join(_avae_dir, f) for f in os.listdir(_avae_dir)
                             if f.endswith(".safetensors")]

@@ -633,15 +633,16 @@ if _IMPORT_OK:
                 "model_config": (_model_config_choices(family="ltx2"),
                                  {"tooltip": "The OFFICIAL LTX-2 model config preset. "
                                              + _preset_file_expectations()}),
-                "te_file": (_text_encoder_choices(),
-                            {"tooltip": "The gemma with-proj TE .safetensors under "
-                                        "models/text_encoders (official LTX-2.5 comfy "
-                                        "distribution; the connector text projections "
-                                        "live in it — REQUIRED for the single-file "
-                                        "layout). Pick the SAME file your CLIPLoader "
-                                        "uses."}),
                 "resident_block_count": _RESIDENT_BLOCKS_INPUT,
             }, "optional": {
+                "te_file": (["(none)"] + _text_encoder_choices(),
+                            {"tooltip": "The gemma with-proj TE .safetensors under "
+                                        "models/text_encoders — needed ONLY for a "
+                                        "transformer-ONLY export (the connector text "
+                                        "projections live in it). An ALL-IN single file "
+                                        "packs text_embedding_projection itself: leave "
+                                        "(none). A transformer-only file with (none) "
+                                        "fails loud at load."}),
                 "audio_vae": (_vae_file_choices(),
                               {"tooltip": "The official ltx-2.5 audio VAE .safetensors "
                                           "under models/vae (vocoder bundled inside). "

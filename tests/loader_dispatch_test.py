@@ -223,6 +223,30 @@ def main():
         check("ltx2 without te_file refuses loud", False, "-> no exception")
     except RuntimeError as e:
         check("ltx2 without te_file refuses loud", "te_file" in str(e), f"-> {str(e)[:80]}")
+    # [ltx25-allin] BOTH-WAYS complement: a transformer that PACKS text_embedding_projection
+    # (+ connector keys — the all-in single file) must pass the te_file guard with
+    # te_file="(none)". A deeper failure (staging etc. on the tiny fixture) is fine — it
+    # just must NOT be the te_file refusal (that would prove the guard ignored the packing).
+    import struct as _st2
+    _allin_name = "fx-ltx-2.5-allin-quantfunc-4bit.safetensors"
+    _hdr2 = json.dumps({
+        "text_embedding_projection.video_aggregate_embed.weight":
+            {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
+        "model.diffusion_model.video_embeddings_connector.learnable_registers":
+            {"dtype": "F32", "shape": [1], "data_offsets": [4, 8]},
+    }).encode()
+    _pad2 = (8 - (len(_hdr2) % 8)) % 8
+    _hdr2 += b" " * _pad2
+    with open(os.path.join(dm, _allin_name), "wb") as _fh:
+        _fh.write(_st2.pack("<Q", len(_hdr2))); _fh.write(_hdr2); _fh.write(b"\0" * 8)
+    try:
+        LtxL.load(_allin_name, "ltx2-2.5-22b", 999, te_file="(none)")
+        _te_ok, _msg = True, "(loaded)"
+    except Exception as _e:  # noqa: BLE001 — deeper failure OK; the te GUARD must not fire
+        _te_ok = "te_file is REQUIRED" not in str(_e)
+        _msg = str(_e)[:90]
+    check("[allin] transformer packing text_embedding_projection passes the te_file guard",
+          _te_ok, f"-> {_msg}")
     # keyless transformer, NO connectors_file, NO sibling candidates -> loud source refusal
     try:
         LtxL.load("fx-iso-ltx-2.5-quantfunc-4bit.safetensors", "ltx2-2.5-22b", 999,
