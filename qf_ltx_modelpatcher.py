@@ -600,6 +600,15 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
         av_unprocessed_ctx). Video-only base: none."""
         return {}
 
+    @staticmethod
+    def _cond_latent_capable(lib, pipeline):
+        """CR A-1b capability probe, FACTORED for direct unit-testing (CR B-r2 (b): the
+        dispatch suite's fake lib never reaches _begin, so the inline check had no test).
+        True iff the engine exports the per-pipeline capability query AND it answers 1
+        for THIS pipeline — NOT the wan-era begin_edit_cond symbol."""
+        return (hasattr(lib, "quantfunc_denoise_cond_tail_supported")
+                and lib.quantfunc_denoise_cond_tail_supported(pipeline) == 1)
+
     def _begin(self, x_group, vemb_group):
         """Open the t2v external denoise session. x_group = [1,128,F,H,W] latent; vemb_group =
         [1,S,4096] POST-connector video_embeds. Geometry: engine derives F_lat/H_lat/W_lat from
@@ -642,9 +651,7 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
             # begin_edit_cond frame-0 cond latent (identity latent scale; engine packs ->
             # per-step impose + velocity pin + finalize pin — the c5.8g chain; no engine
             # VAE). LEGACY (no video_vae): temp PNG -> begin_edit engine-encode.
-            _cond_cap = (hasattr(lib, "quantfunc_denoise_cond_tail_supported")
-                         and lib.quantfunc_denoise_cond_tail_supported(self._qf.pipeline) == 1)
-            if self._video_vae_path and not _cond_cap:
+            if self._video_vae_path and not self._cond_latent_capable(lib, self._qf.pipeline):
                 # Wan-precedent fail-loud (CR minor-1): the user asked for the cond-latent
                 # route (video_vae wired) but the loaded .so predates the ABI — a SILENT
                 # fall-through to the legacy engine-encode route would run a materially

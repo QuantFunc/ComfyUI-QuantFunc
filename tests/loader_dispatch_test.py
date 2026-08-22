@@ -288,6 +288,21 @@ def main():
           os.path.realpath(os.path.join(_imd, "vae", "model.safetensors"))
           .endswith("fx-ltx25-audio-vae.safetensors"))
 
+    # (CR B-r2 (b)) capability-probe truth table — the factored _cond_latent_capable
+    # is directly testable (the fake engine lib never reaches _begin):
+    from qfn_test_pkg import qf_ltx_modelpatcher as _qlm
+    class _NoSym:                     # old .so: no capability query symbol
+        pass
+    class _SymYes:
+        @staticmethod
+        def quantfunc_denoise_cond_tail_supported(p): return 1
+    class _SymNo:                     # mid-window: symbol present, pipeline answers 0
+        @staticmethod
+        def quantfunc_denoise_cond_tail_supported(p): return 0
+    _cap = _qlm.QFLTXModel._cond_latent_capable
+    check("cond-latent capability probe truth table",
+          _cap(_NoSym(), None) is False and _cap(_SymNo(), None) is False
+          and _cap(_SymYes(), None) is True)
     # EXPLICITLY-picked but INVALID connectors_file -> REFUSE (no silent auto-probe; CR minor-2)
     try:
         LtxL.load("fx-ltx-2.5-quantfunc-4bit.safetensors", "ltx2-2.5-22b", 999,
