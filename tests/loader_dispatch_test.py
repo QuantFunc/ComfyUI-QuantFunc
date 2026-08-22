@@ -124,6 +124,13 @@ def main():
         fh.write(_st.pack("<Q", len(_hdr))); fh.write(_hdr); fh.write(b"\0" * 4)
     folder_paths.add_model_folder_path("text_encoders", te_root)
     folder_paths.add_model_folder_path("vae", vae_root)
+    # an ISOLATED diffusion_models dir with NO connectors sibling — the auto-probe fallback
+    # scans the transformer's OWN dir, so the loud-refusal arm needs a keyless transformer
+    # with no probe candidates next to it.
+    dm2 = os.path.join(tmp, "diffusion_models_iso"); os.makedirs(dm2)
+    with open(os.path.join(dm2, "fx-iso-ltx-2.5-quantfunc-4bit.safetensors"), "wb") as fh:
+        fh.write(b"\0" * 16)
+    folder_paths.add_model_folder_path("diffusion_models", dm2)
 
     # OFFICIAL-CONFIG presets under a FIXTURE configs dir: the real shipped wan preset copied in,
     # plus synthetic manifests that exercise routing (ltx2/h3 not-wired, unknown family,
@@ -209,14 +216,14 @@ def main():
         check("ltx2 without te_file refuses loud", False, "-> no exception")
     except RuntimeError as e:
         check("ltx2 without te_file refuses loud", "te_file" in str(e), f"-> {str(e)[:80]}")
-    # quantized-export transformer (keyless) WITHOUT connectors_file -> loud source refusal
+    # keyless transformer, NO connectors_file, NO sibling candidates -> loud source refusal
     try:
-        LtxL.load("fx-ltx-2.5-quantfunc-4bit.safetensors", "ltx2-2.5-22b", 999,
+        LtxL.load("fx-iso-ltx-2.5-quantfunc-4bit.safetensors", "ltx2-2.5-22b", 999,
                   te_file="fx-gemma4-with-proj.safetensors",
                   audio_vae="fx-ltx25-audio-vae.safetensors")
-        check("ltx2 keyless transformer without connectors_file refuses loud", False, "-> no exception")
+        check("ltx2 keyless transformer with no connectors source refuses loud", False, "-> no exception")
     except RuntimeError as e:
-        check("ltx2 keyless transformer without connectors_file refuses loud",
+        check("ltx2 keyless transformer with no connectors source refuses loud",
               "connector blocks" in str(e), f"-> {str(e)[:80]}")
     out_ltx = LtxL.load("fx-ltx-2.5-quantfunc-4bit.safetensors", "ltx2-2.5-22b", 999,
                         te_file="fx-gemma4-with-proj.safetensors",
@@ -246,6 +253,19 @@ def main():
               ("model_index.json", "transformer/config.json", "vae/config.json",
                "connectors/config.json", "audio_vae/config.json"))
           and not os.path.exists(os.path.join(_lmd, "transformer_2")))
+    # keyless transformer, NO connectors_file, valid sibling IN THE SAME DIR -> AUTO-PROBE picks it
+    out_probe = LtxL.load("fx-ltx-2.5-quantfunc-4bit.safetensors", "ltx2-2.5-22b", 999,
+                          te_file="fx-gemma4-with-proj.safetensors",
+                          audio_vae="fx-ltx25-audio-vae.safetensors")[0]
+    _pmd = None
+    try:
+        _ = out_probe.model._qf.lib
+    except Exception:  # noqa: BLE001 — fake lib; the staged dir is set regardless
+        pass
+    _pmd = out_probe.model._qf._ckey[0]
+    check("ltx2 same-dir connectors AUTO-PROBE stages the sibling",
+          os.path.realpath(os.path.join(_pmd, "connectors", "model.safetensors"))
+          .endswith("fx-ltx25-connectors.safetensors"))
     # minimax-h3 file-mode: minimal staging (configs + single xfm; no extra links)
     out_h3 = H3L.load("fx-minimax-h3-quantfunc-int4.safetensors", "minimax-h3-fl2va", 999)[0]
     check("h3 file-mode returns a QFModelPatcher + QFH3Model",

@@ -1076,6 +1076,23 @@ def register(deps):
         elif connectors_path and _has_connector_keys(connectors_path):
             connectors_src = connectors_path
         else:
+            # SAME-DIR auto-probe (UX fallback, tests-eb-aligned): a *connector*.safetensors
+            # sibling of the picked transformer with REAL connector keys is unambiguous —
+            # pick it without a widget. Anything else falls through to the loud guidance.
+            connectors_src = None
+            try:
+                _d = os.path.dirname(transformer1_path)
+                for _f in sorted(os.listdir(_d)):
+                    if "connector" in _f.lower() and _f.endswith(".safetensors"):
+                        _cand = os.path.join(_d, _f)
+                        if _has_connector_keys(_cand):
+                            connectors_src = _cand
+                            print(f"[qf_native] ltx2: connectors auto-detected next to the "
+                                  f"transformer: {_f}", flush=True)
+                            break
+            except OSError:
+                pass
+        if connectors_src is None:
             raise RuntimeError(
                 "qf_native ltx2: the picked transformer file carries NO connector blocks "
                 "(embeddings_connector keys — the QuantFunc int4 export is transformer-only), "
