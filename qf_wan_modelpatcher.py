@@ -524,7 +524,12 @@ def register(deps):
             # the engine still reads the staged vae/config.json for session geometry. The old
             # text_precision=int8 pin existed only because create used to BUILD the TE; with
             # denoise_only it is obsolete and deliberately gone.
-            cfg = {"denoise_only": True}
+            cfg = {"denoise_only": True,
+                   # use_pinned_memory: same eviction economics as LTX (measured 5.4s->1.16s
+                   # reload on 18GB); wan pins 2x expert sets — boxes running A14B carry
+                   # >=60GB RAM (fleet standard), and the engine falls back loudly if the
+                   # pinned pool cannot be established.
+                   "use_pinned_memory": True}
             # OLD-.so COMPAT PIN, SM-GATED (B1: the unconditional pin was a generality NO-GO —
             # explicit "qfa" bypasses the engine's auto gate, and on the SM80 tier (A100/A800)
             # the qfa forward is KNOWN-FAULTY (engine kQfaForwardFaultsOnSm): the fwd entry
