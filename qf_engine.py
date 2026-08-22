@@ -13,6 +13,13 @@ QUANTFUNC_OK = 0
 # quantfunc_dtype_t: FP32=0, FP16=1, BF16=2 (matches QF_DTYPE in the harness)
 QF_FP32, QF_FP16, QF_BF16 = 0, 1, 2
 
+
+def _dbg_prof(msg):
+    """QF_NATIVE_PROF-gated diagnostic line (the [qf_prof] channel the perf probes use)."""
+    import os as _os
+    if _os.environ.get("QF_NATIVE_PROF") == "1":
+        print(f"[qf_prof] {msg}", flush=True)
+
 # Platform dispatch — the bundled native library lives in bin/<subdir>/<basename>, so a Windows install
 # finds bin/windows/quantfunc.dll and a Linux install finds bin/linux/libquantfunc.so. The Windows/Linux
 # split follows the production plugin's lib_setup.py (_IS_WINDOWS / bin/<subdir>/); the Darwin branch
@@ -581,15 +588,20 @@ class QFEngineHandle:
         # "shed all sheddable").
         bytes_requested = min(int(bytes_requested), (1 << 63) - 1)
         if self.current_session is not None:
+            _dbg_prof("partial_unload refused: session open")
             return 0                        # mid-session: refuse (lease would too)
         freed = ctypes.c_int64(0)
         try:
             st = self.lib.quantfunc_partial_unload(self.pipeline,
                                                    ctypes.c_uint64(int(bytes_requested)),
                                                    ctypes.byref(freed))
-        except Exception:  # noqa: BLE001
+        except Exception as ex:  # noqa: BLE001
+            _dbg_prof(f"partial_unload EXCEPTION: {ex!r}")
             return 0
-        return int(freed.value) if st == QUANTFUNC_OK else 0
+        if st != QUANTFUNC_OK:
+            _dbg_prof(f"partial_unload engine status={st}: {last_err(self.lib)}")
+            return 0
+        return int(freed.value)
 
     def unload_vram(self):
         """Co-eviction (#4): free the engine's VRAM (quantfunc_unload_sync — GPU->CPU, keeps the CPU

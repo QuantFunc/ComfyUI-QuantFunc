@@ -846,6 +846,8 @@ class QFModelPatcher(comfy.model_patcher.ModelPatcher):
                       f"{want // (1024*1024)} MB request (weights stay live)", flush=True)
                 return freed
             # partial insufficient — full fallback keeps the honest-ledger guarantee
+            print(f"[qf_prof] partial shed INSUFFICIENT: freed={freed // (1024*1024)} MB < "
+                  f"want={want // (1024*1024)} MB -> full-unload fallback", flush=True)
         return eng.unload_vram()
 
 
