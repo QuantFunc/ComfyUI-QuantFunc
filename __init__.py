@@ -179,30 +179,10 @@ def _resolve_transformer(name):
     return _folder_paths.get_full_path_or_raise("diffusion_models", name)
 
 
-def _text_encoder_choices():
-    """.safetensors under comfy's models/text_encoders — the ltx2 loader's te_file input
-    (the gemma with-proj file the OFFICIAL LTX-2.5 comfy distribution ships; the connector
-    aggregate_embed projections live in it). Same folder_paths surface CLIPLoader uses."""
-    if _folder_paths is None:
-        return ["(comfy folder_paths unavailable)"]
-    try:
-        return (_folder_paths.get_filename_list("text_encoders")
-                or ["(no files under models/text_encoders)"])
-    except Exception:  # noqa: BLE001
-        return ["(no files under models/text_encoders)"]
-
-
-def _vae_file_choices(optional=True):
-    """.safetensors under comfy's models/vae — the ltx2 loader's audio_vae input (the
-    OFFICIAL ltx-2.5-audio-vae file; its PRESENCE in the staged package is the engine's
-    has_audio_ discriminant). '(none)' = video-only staging."""
-    base = ["(none)"] if optional else []
-    if _folder_paths is None:
-        return base + ["(comfy folder_paths unavailable)"]
-    try:
-        return base + (_folder_paths.get_filename_list("vae") or [])
-    except Exception:  # noqa: BLE001
-        return base
+# (the te_file/audio_vae dropdown helpers died with the aux widgets — the comfy seam
+#  owns ONLY the denoise stage; listing workflow-stage surfaces here was full-pipeline
+#  thinking. RED LINE, user 2026-08-22: ctypes full-pipeline logic must NEVER enter the
+#  comfy seam.)
 
 
 def _lora_choices():
