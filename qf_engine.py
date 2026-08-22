@@ -574,6 +574,12 @@ class QFEngineHandle:
             return 0
         if not hasattr(self.lib, "quantfunc_partial_unload"):
             return 0
+        # Y vuln fix: comfy's free_memory sweep passes a HUGE "free everything" sentinel
+        # (measured 1e32 as float) — int(1e32) overflows c_uint64 (OverflowError swallowed
+        # -> silent 0 -> full-unload fallback worked only by coincidence). Clamp into the
+        # engine's saturating range explicitly (the engine treats >= total weight bytes as
+        # "shed all sheddable").
+        bytes_requested = min(int(bytes_requested), (1 << 63) - 1)
         if self.current_session is not None:
             return 0                        # mid-session: refuse (lease would too)
         freed = ctypes.c_int64(0)
