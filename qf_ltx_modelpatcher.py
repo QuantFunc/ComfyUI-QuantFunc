@@ -1029,7 +1029,8 @@ def register(deps):
 
 
     def build(transformer1_path, transformer2_path, resident_block_count, bundle_dir=None,
-              lora_entries=(), te_path=None, audio_vae_path=None, start_image=None):
+              lora_entries=(), te_path=None, audio_vae_path=None, start_image=None,
+              connectors_path=None):
         """File-based (ComfyUI single-file) loading for LTX-2.5 — the wan staging pattern
         with the family's extra weight links:
         - transformer/  <- the single int4 export (transformer + connector + audio blocks);
@@ -1051,7 +1052,37 @@ def register(deps):
                 "qf_native ltx2: te_file is REQUIRED for the 2.5 single-file layout — the "
                 "connector text projections (aggregate_embed) live in the gemma with-proj TE "
                 "file (the same file comfy's CLIPLoader uses), not in the transformer export.")
-        extra = {"connectors": transformer1_path, "text_encoder": te_path}
+        # CONNECTOR WEIGHT SOURCE (measured 2026-08-22): the QuantFunc int4 single-file export
+        # carries the TRANSFORMER only — 0 embeddings_connector keys (the OFFICIAL bf16/fp8
+        # ComfyUI single-file packs them inside, #565). The engine loads connectors from the
+        # staged connectors/ link, so that link must point at a file that ACTUALLY has the
+        # blocks: the transformer file itself when it carries them, else the ltx-2.5 connectors
+        # file (shipped separately — ~4 GB, reused across int4/fp4 variants). Detected by a
+        # cheap safetensors HEADER read; a wrong source fails loud HERE, not as a mid-denoise
+        # empty-weight throw.
+        def _has_connector_keys(path):
+            import struct as _st
+            try:
+                with open(path, "rb") as f:
+                    n = _st.unpack("<Q", f.read(8))[0]
+                    if n > (1 << 31):
+                        return False
+                    hdr = json.loads(f.read(n))
+                return any("embeddings_connector" in k for k in hdr)
+            except Exception:  # noqa: BLE001 — unreadable/not-safetensors = no keys
+                return False
+        if _has_connector_keys(transformer1_path):
+            connectors_src = transformer1_path
+        elif connectors_path and _has_connector_keys(connectors_path):
+            connectors_src = connectors_path
+        else:
+            raise RuntimeError(
+                "qf_native ltx2: the picked transformer file carries NO connector blocks "
+                "(embeddings_connector keys — the QuantFunc int4 export is transformer-only), "
+                "and no valid connectors_file was supplied. Pick the ltx-2.5 connectors file "
+                "(e.g. ltx-2.5-connectors-bf16.safetensors under models/diffusion_models) in "
+                "the loader's connectors_file input.")
+        extra = {"connectors": connectors_src, "text_encoder": te_path}
         if audio_vae_path:
             extra["audio_vae"] = audio_vae_path
         model_dir = qfmp.stage_denoise_only_package(bundle_dir, transformer1_path, None,

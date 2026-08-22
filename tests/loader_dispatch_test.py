@@ -114,6 +114,14 @@ def main():
                     (vae_root, "fx-ltx25-audio-vae.safetensors")):
         with open(os.path.join(root, f), "wb") as fh:
             fh.write(b"\0" * 16)
+    # a VALID-header connectors fixture (the ltx2 build does a real safetensors header read to
+    # detect embeddings_connector keys — a 16-byte dummy reads as keyless):
+    import struct as _st
+    _hdr = json.dumps({"model.diffusion_model.video_embeddings_connector.learnable_registers":
+                       {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]}}).encode()
+    _pad = (8 - (len(_hdr) % 8)) % 8; _hdr += b" " * _pad
+    with open(os.path.join(dm, "fx-ltx25-connectors.safetensors"), "wb") as fh:
+        fh.write(_st.pack("<Q", len(_hdr))); fh.write(_hdr); fh.write(b"\0" * 4)
     folder_paths.add_model_folder_path("text_encoders", te_root)
     folder_paths.add_model_folder_path("vae", vae_root)
 
@@ -201,9 +209,19 @@ def main():
         check("ltx2 without te_file refuses loud", False, "-> no exception")
     except RuntimeError as e:
         check("ltx2 without te_file refuses loud", "te_file" in str(e), f"-> {str(e)[:80]}")
+    # quantized-export transformer (keyless) WITHOUT connectors_file -> loud source refusal
+    try:
+        LtxL.load("fx-ltx-2.5-quantfunc-4bit.safetensors", "ltx2-2.5-22b", 999,
+                  te_file="fx-gemma4-with-proj.safetensors",
+                  audio_vae="fx-ltx25-audio-vae.safetensors")
+        check("ltx2 keyless transformer without connectors_file refuses loud", False, "-> no exception")
+    except RuntimeError as e:
+        check("ltx2 keyless transformer without connectors_file refuses loud",
+              "connector blocks" in str(e), f"-> {str(e)[:80]}")
     out_ltx = LtxL.load("fx-ltx-2.5-quantfunc-4bit.safetensors", "ltx2-2.5-22b", 999,
                         te_file="fx-gemma4-with-proj.safetensors",
-                        audio_vae="fx-ltx25-audio-vae.safetensors")[0]
+                        audio_vae="fx-ltx25-audio-vae.safetensors",
+                        connectors_file="fx-ltx25-connectors.safetensors")[0]
     check("ltx2 AV file-mode returns a QFModelPatcher",
           type(out_ltx).__name__ == "QFModelPatcher")
     check("ltx2 AV model is QFLTXAVModel (audio_vae present -> AV path)",
@@ -216,8 +234,10 @@ def main():
     _lmd = out_ltx.model._qf._ckey[0]
     _rx = os.path.realpath(os.path.join(_lmd, "transformer", "model.safetensors"))
     _rc2 = os.path.realpath(os.path.join(_lmd, "connectors", "model.safetensors"))
-    check("ltx2 staged: transformer/ and connectors/ link the SAME single file (#565)",
-          _rx == _rc2 and _rx.endswith("fx-ltx-2.5-quantfunc-4bit.safetensors"))
+    check("ltx2 staged: transformer -> the int4 export; connectors -> the CONNECTORS file "
+          "(source detection: keyless quantized export must NOT self-link, #565 header read)",
+          _rx.endswith("fx-ltx-2.5-quantfunc-4bit.safetensors")
+          and _rc2.endswith("fx-ltx25-connectors.safetensors"))
     check("ltx2 staged: te + audio_vae links resolve to the picked files",
           os.path.realpath(os.path.join(_lmd, "text_encoder", "model.safetensors")).endswith("fx-gemma4-with-proj.safetensors")
           and os.path.realpath(os.path.join(_lmd, "audio_vae", "model.safetensors")).endswith("fx-ltx25-audio-vae.safetensors"))
