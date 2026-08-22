@@ -492,9 +492,7 @@ if _IMPORT_OK:
 
 
     def _run_family_load(expect_family, transformer1, model_config,
-                         resident_block_count, transformer2,
-                         te_file=None, audio_vae=None, start_image=None,
-                         connectors_file=None, video_vae=None):
+                         resident_block_count, transformer2):
         """The SHARED loader core behind the per-family nodes (user 2026-08-21 pivot). All
         validation is preserved verbatim from the original single-node load(); the per-family
         nodes add only (a) a family-filtered preset dropdown and (b) this family guard —
@@ -549,19 +547,40 @@ if _IMPORT_OK:
                 f"transformer2 = \"(none)\" (a second expert here would be silently ignored "
                 f"at best; refused instead).")
         kw = {}
-        # family-specific EXTRA weight inputs (ltx2 today): resolved through the SAME
-        # folder_paths surfaces their comfy-native consumers use; only forwarded when the
-        # node supplied them, so the wan/h3 builder signatures stay untouched.
-        if te_file and not str(te_file).startswith("("):
-            kw["te_path"] = _folder_paths.get_full_path_or_raise("text_encoders", te_file)
-        if audio_vae and audio_vae != "(none)" and not str(audio_vae).startswith("("):
-            kw["audio_vae_path"] = _folder_paths.get_full_path_or_raise("vae", audio_vae)
-        if start_image is not None:
-            kw["start_image"] = start_image
-        if connectors_file and not str(connectors_file).startswith("("):
-            kw["connectors_path"] = _resolve_transformer(connectors_file)
-        if video_vae and video_vae != "(none)" and not str(video_vae).startswith("("):
-            kw["video_vae_path"] = _folder_paths.get_full_path_or_raise("vae", video_vae)
+        # [aux-auto] preset-declared auxiliary weights (user 2026-08-22: the loader node
+        # carries NO aux file widgets — ONE file is the whole pick; i2v rides the workflow's
+        # OWN latent path (LTXVImgToVideoInplace), wan-aligned, so there is no image input
+        # either). DATA-driven from the manifest's aux_files: each category lists
+        # conventional filenames, resolved from the standard comfy folders. A
+        # declared-but-ABSENT audio VAE fails loud HERE (an AV preset silently downgrading
+        # to video-only would surface later as a confusing mid-graph audio-lane mismatch);
+        # te/connectors stay lazy — their own guards fire only on the layouts/paths that
+        # actually need them.
+        _aux = manifest.get("aux_files") or {}
+
+        def _resolve_aux(cat, folder):
+            for _cand in (_aux.get(cat) or []):
+                try:
+                    return _folder_paths.get_full_path_or_raise(folder, _cand)
+                except Exception:  # noqa: BLE001 — try the next declared candidate
+                    continue
+            return None
+        if _aux.get("te") and "te_path" not in kw:
+            _p = _resolve_aux("te", "text_encoders")
+            if _p:
+                kw["te_path"] = _p
+        if _aux.get("audio_vae") and "audio_vae_path" not in kw:
+            _p = _resolve_aux("audio_vae", "vae")
+            if _p is None:
+                raise RuntimeError(
+                    f"qf_native: preset '{model_config}' declares its audio VAE as "
+                    f"{_aux['audio_vae']} but none exist under models/vae — place the official "
+                    f"file there (the same one the workflow's audio VAELoader uses).")
+            kw["audio_vae_path"] = _p
+        if _aux.get("connectors") and "connectors_path" not in kw:
+            _p = _resolve_aux("connectors", "diffusion_models")
+            if _p:
+                kw["connectors_path"] = _p
         return builder(transformer1_path=xfm1, transformer2_path=xfm2,
                        resident_block_count=int(resident_block_count),
                        bundle_dir=bundle_dir, **kw)
@@ -634,62 +653,25 @@ if _IMPORT_OK:
                                  {"tooltip": "The OFFICIAL LTX-2 model config preset. "
                                              + _preset_file_expectations()}),
                 "resident_block_count": _RESIDENT_BLOCKS_INPUT,
-            }, "optional": {
-                "te_file": (["(none)"] + _text_encoder_choices(),
-                            {"tooltip": "The gemma with-proj TE .safetensors under "
-                                        "models/text_encoders — needed ONLY for a "
-                                        "transformer-ONLY export (the connector text "
-                                        "projections live in it). An ALL-IN single file "
-                                        "packs text_embedding_projection itself: leave "
-                                        "(none). A transformer-only file with (none) "
-                                        "fails loud at load."}),
-                "audio_vae": (_vae_file_choices(),
-                              {"tooltip": "The official ltx-2.5 audio VAE .safetensors "
-                                          "under models/vae (vocoder bundled inside). "
-                                          "Present -> joint audio+video session (the "
-                                          "engine's has_audio_ discriminant is this "
-                                          "file's presence); '(none)' -> video-only, "
-                                          "which a 2.5 AV checkpoint refuses fail-loud "
-                                          "at begin rather than silently dropping "
-                                          "audio."}),
-                "start_image": ("IMAGE",
-                                {"tooltip": "Optional i2v: a comfy IMAGE conditioning "
-                                            "frame 0 (engine-side begin_edit frame-0 "
-                                            "conditioning — the QFLTX model class's "
-                                            "existing channel). Disconnect for t2v/t2av."}),
-                "video_vae": (_vae_file_choices(),
-                              {"tooltip": "The official ltx-2.5 VIDEO VAE .safetensors "
-                                          "under models/vae — REQUIRED when start_image "
-                                          "(i2v) is wired: the engine encodes the "
-                                          "reference frame on its side, so the encode "
-                                          "weights must be staged. Not needed for "
-                                          "t2v/t2av."}),
-                "connectors_file": (_transformer_choices(),
-                                    {"tooltip": "The ltx-2.5 CONNECTOR weights file "
-                                                "(models/diffusion_models). REQUIRED when "
-                                                "the picked transformer is a QuantFunc "
-                                                "quantized export (transformer-only — no "
-                                                "connector blocks inside); the OFFICIAL "
-                                                "bf16/fp8 single-file carries them and "
-                                                "needs no extra pick (auto-detected by a "
-                                                "header read)."}),
             }}
 
         RETURN_TYPES = ("MODEL",)
         FUNCTION = "load"
         CATEGORY = "loaders"
         DESCRIPTION = ("QuantFunc LTX-2 loader (svdq, denoise_only): one native MODEL a stock "
-                       "sampler drives with latents. " + _COMMON_LIMITS)
+                       "sampler drives with latents. i2v: wire the official "
+                       "LTXVImgToVideoInplace into the LATENT path (wan-aligned — the model "
+                       "only consumes latents; comfy's sampler applies the frame-0 mask). "
+                       + _COMMON_LIMITS)
 
-        def load(self, transformer, model_config, resident_block_count=999,
-                 te_file=None, audio_vae="(none)", start_image=None,
-                 connectors_file=None, video_vae="(none)"):
+        def load(self, transformer, model_config, resident_block_count=999):
+            # [aux-auto] NO aux file widgets and NO image socket (user 2026-08-22 "只保留
+            # transformer/block/model_config … 只关注latent"): te/audio-vae/connectors
+            # resolve from the preset manifest's aux_files inside _run_family_load; i2v is
+            # the workflow's own latent conditioning (LTXVImgToVideoInplace), exactly like
+            # wan's cond-latent shape.
             return (_run_family_load("ltx2", transformer, model_config,
-                                     resident_block_count, None,
-                                     te_file=te_file, audio_vae=audio_vae,
-                                     start_image=start_image,
-                                     connectors_file=connectors_file,
-                                     video_vae=video_vae),)
+                                     resident_block_count, None),)
 
     class QuantFuncH3Loader:
         """MiniMax-H3 loader — single MODEL output (single-expert AV family)."""

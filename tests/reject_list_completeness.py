@@ -72,8 +72,14 @@ _AUDITED_MODELS = (
     #    shows the reference connector masks padding, attention_mask must become a HANDLED channel (an LTX
     #    follow-up) — it is NOT a NEW silent-drop introduced here (the shipped _run_connector already ignored
     #    it). Listing it here makes the acceptance EXPLICIT + auditable, not silent.
+    #  • denoise_mask — ACCEPTED BY INHERITANCE (wan-align 2026-08-22 "只关注latent"): the Inplace
+    #    i2v latent route rides it. It reaches the SAMPLER (KSamplerX0Inpaint), not extra_conds, and
+    #    QFLTXModel deliberately INHERITS BaseModel.scale_latent_inpaint (no loud-fail override) so
+    #    comfy blends x against the clean latent per step OUTSIDE the model — exact for this seam
+    #    because the engine step is stateless in x. Unlike WAN (whose override loud-fails), LTX
+    #    consumes the mask through comfy's own machinery.
     _Model("LTXV", "qf_ltx_modelpatcher.py",
-           {"attention_mask", "frame_rate"},
+           {"attention_mask", "frame_rate", "denoise_mask"},
            ("concat_cond", "encode_adm")),
     # MiniMax-H3 joint-AV (QFH3Model) — this seam was UNAUDITED until the roster scan was repaired
     # (the class pattern stopped matching once the shared mixin was introduced, so the check

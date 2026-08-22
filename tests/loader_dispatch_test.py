@@ -117,18 +117,35 @@ def main():
     # a VALID-header connectors fixture (the ltx2 build does a real safetensors header read to
     # detect embeddings_connector keys — a 16-byte dummy reads as keyless):
     import struct as _st
-    def _mini_st(path, key):
-        hdr = json.dumps({key: {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]}}).encode()
+    def _mini_st(path, *keys):
+        hdr = json.dumps({k: {"dtype": "F32", "shape": [1],
+                              "data_offsets": [4 * i, 4 * i + 4]}
+                          for i, k in enumerate(keys)}).encode()
         pad = (8 - (len(hdr) % 8)) % 8; hdr += b" " * pad
         with open(path, "wb") as fh:
-            fh.write(_st.pack("<Q", len(hdr))); fh.write(hdr); fh.write(b"\0" * 4)
+            fh.write(_st.pack("<Q", len(hdr))); fh.write(hdr); fh.write(b"\0" * (4 * len(keys)))
+    # connectors fixtures carry BOTH modality connector blocks (like the real file):
+    # the AUDIO one is the wan-align AV discriminant (audio_vae staging no longer required).
     _mini_st(os.path.join(dm, "fx-ltx25-connectors.safetensors"),
-             "model.diffusion_model.video_embeddings_connector.learnable_registers")
+             "model.diffusion_model.video_embeddings_connector.learnable_registers",
+             "model.diffusion_model.audio_embeddings_connector.learnable_registers")
     # conf-1: the AV discriminant now mirrors the ENGINE's (audio_vae weights AND a
     # vocoder — 2.5 bundles vocoder.* inside the audio_vae file), so the audio-vae
     # fixture must carry a vocoder key to arm the AV path.
     _mini_st(os.path.join(vae_root, "fx-ltx25-audio-vae.safetensors"),
              "vocoder.bwe_generator.conv_pre.weight")
+    # [aux-auto] manifest-named aux fixtures: the ltx2-2.5-22b preset's aux_files resolve
+    # against these (audio_vae must carry a vocoder key for the AV discriminant; connectors
+    # must carry a connector key for the explicit-source validation).
+    _mini_st(os.path.join(vae_root, "ltx-2.5-audio-vae-bf16.safetensors"),
+             "vocoder.bwe_generator.conv_pre.weight")
+    _mini_st(os.path.join(vae_root, "ltx-2.5-video-vae-bf16.safetensors"),
+             "decoder.conv_in.weight")
+    _mini_st(os.path.join(te_root, "gemma4-12b-with-proj-ltx-2.5-bf16.safetensors"),
+             "text_embedding_projection.video_aggregate_embed.weight")
+    _mini_st(os.path.join(dm, "ltx25-connectors-bf16.safetensors"),
+             "model.diffusion_model.video_embeddings_connector.learnable_registers",
+             "model.diffusion_model.audio_embeddings_connector.learnable_registers")
     folder_paths.add_model_folder_path("text_encoders", te_root)
     folder_paths.add_model_folder_path("vae", vae_root)
     # an ISOLATED diffusion_models dir with NO connectors sibling — the auto-probe fallback
@@ -218,11 +235,73 @@ def main():
     # into transformer/ AND connectors/ [#565 comfy25 branch], te + audio_vae links, cfg
     # carries denoise_only). The synthetic fx-ltx manifest (no file_hints) keeps exercising
     # bare routing; the REAL preset exercises the full staged shape.
+    # [aux-auto] the te for a transformer-ONLY export now AUTO-resolves from the preset's
+    # aux_files (no widget). Both ways: with the manifest-named gemma present the load gets
+    # PAST the te guard (deeper failure is fine, it must not be the te refusal); with it
+    # renamed away, the guard still refuses loud.
     try:
         LtxL.load("fx-ltx-2.5-quantfunc-4bit.safetensors", "ltx2-2.5-22b", 999)
-        check("ltx2 without te_file refuses loud", False, "-> no exception")
+        _te_auto_ok, _m1 = True, "(loaded)"
+    except Exception as e:  # noqa: BLE001
+        _te_auto_ok = "te_file is REQUIRED" not in str(e)
+        _m1 = str(e)[:80]
+    check("ltx2 transformer-only: te AUTO-resolves from aux_files (no refusal)", _te_auto_ok,
+          f"-> {_m1}")
+    # Negative arms hide files at the RESOLVER SEAM (monkeypatch), NOT by renaming the
+    # fixture: the REAL install's models/vae + models/text_encoders carry the same
+    # manifest-named files, so a rename of the fixture copy still resolved through the
+    # other registered root (the measured false-green of the rename design).
+    import folder_paths as _fp_mod
+    _orig_gfpor = _fp_mod.get_full_path_or_raise
+
+    def _hide_files(names):
+        def _wrapped(folder, fname, *a, **k):
+            if fname in names:
+                raise FileNotFoundError(f"hidden by test: {fname}")
+            return _orig_gfpor(folder, fname, *a, **k)
+        return _wrapped
+
+    _fp_mod.get_full_path_or_raise = _hide_files({"gemma4-12b-with-proj-ltx-2.5-bf16.safetensors"})
+    try:
+        LtxL.load("fx-ltx-2.5-quantfunc-4bit.safetensors", "ltx2-2.5-22b", 999)
+        check("ltx2 transformer-only WITHOUT resolvable te refuses loud", False, "-> no exception")
     except RuntimeError as e:
-        check("ltx2 without te_file refuses loud", "te_file" in str(e), f"-> {str(e)[:80]}")
+        check("ltx2 transformer-only WITHOUT resolvable te refuses loud",
+              "te_file" in str(e) or "te " in str(e), f"-> {str(e)[:80]}")
+    finally:
+        _fp_mod.get_full_path_or_raise = _orig_gfpor
+    # declared-but-absent AUDIO VAE fails loud at resolve — the GENERIC [aux-auto] guard.
+    # The shipped ltx2 preset no longer declares audio_vae (wan-align: comfy owns audio
+    # decode; AV detected from the packed audio connector), so this arm exercises the
+    # mechanism through a SYNTHETIC preset that does declare one (with no resolvable file).
+    import shutil as _sh, tempfile as _tf
+    import qfn_test_pkg as _qfnmod
+    _cfg_orig = _qfnmod._CONFIGS_DIR
+    _cfg_tmp = _tf.mkdtemp(prefix="qfcfg-avdecl-")
+    try:
+        _sh.copytree(os.path.join(_cfg_orig, "ltx2-2.5-22b"),
+                     os.path.join(_cfg_tmp, "ltx2-2.5-22b"))
+        _mf_p = os.path.join(_cfg_tmp, "ltx2-2.5-22b", "qf_native.json")
+        _mf = json.load(open(_mf_p))
+        _mf.setdefault("aux_files", {})["audio_vae"] = ["zz-nonexistent-audio-vae.safetensors"]
+        json.dump(_mf, open(_mf_p, "w"))
+        _qfnmod._CONFIGS_DIR = _cfg_tmp
+        try:
+            LtxL.load("fx-ltx-2.5-quantfunc-4bit.safetensors", "ltx2-2.5-22b", 999)
+            check("declared-but-absent audio VAE refuses loud", False, "-> no exception")
+        except RuntimeError as e:
+            check("declared-but-absent audio VAE refuses loud",
+                  "audio VAE" in str(e), f"-> {str(e)[:80]}")
+    finally:
+        _qfnmod._CONFIGS_DIR = _cfg_orig
+        _sh.rmtree(_cfg_tmp, ignore_errors=True)
+    # trimmed node surface (user 2026-08-22 "只保留transformer/block/model_config…只关注latent"):
+    # NO optional sockets either — i2v rides the workflow's own latent path (Inplace).
+    _lit = LtxL.INPUT_TYPES()
+    check("ltx node surface = transformer/model_config/resident_block_count ONLY",
+          list(_lit["required"].keys()) == ["transformer", "model_config", "resident_block_count"]
+          and not _lit.get("optional"),
+          f"-> req={list(_lit['required'].keys())} opt={list(_lit.get('optional', {}).keys())}")
     # [ltx25-allin] BOTH-WAYS complement: a transformer that PACKS text_embedding_projection
     # (+ connector keys — the all-in single file) must pass the te_file guard with
     # te_file="(none)". A deeper failure (staging etc. on the tiny fixture) is fine — it
@@ -240,29 +319,27 @@ def main():
     with open(os.path.join(dm, _allin_name), "wb") as _fh:
         _fh.write(_st2.pack("<Q", len(_hdr2))); _fh.write(_hdr2); _fh.write(b"\0" * 8)
     try:
-        LtxL.load(_allin_name, "ltx2-2.5-22b", 999, te_file="(none)")
+        LtxL.load(_allin_name, "ltx2-2.5-22b", 999)
         _te_ok, _msg = True, "(loaded)"
     except Exception as _e:  # noqa: BLE001 — deeper failure OK; the te GUARD must not fire
         _te_ok = "te_file is REQUIRED" not in str(_e)
         _msg = str(_e)[:90]
     check("[allin] transformer packing text_embedding_projection passes the te_file guard",
           _te_ok, f"-> {_msg}")
-    # keyless transformer, NO connectors_file, NO sibling candidates -> loud source refusal
+    # keyless transformer, manifest connectors HIDDEN, NO sibling candidates -> loud source refusal
+    _fp_mod.get_full_path_or_raise = _hide_files({"ltx25-connectors-bf16.safetensors"})
     try:
-        LtxL.load("fx-iso-ltx-2.5-quantfunc-4bit.safetensors", "ltx2-2.5-22b", 999,
-                  te_file="fx-gemma4-with-proj.safetensors",
-                  audio_vae="fx-ltx25-audio-vae.safetensors")
+        LtxL.load("fx-iso-ltx-2.5-quantfunc-4bit.safetensors", "ltx2-2.5-22b", 999)
         check("ltx2 keyless transformer with no connectors source refuses loud", False, "-> no exception")
     except RuntimeError as e:
         check("ltx2 keyless transformer with no connectors source refuses loud",
               "connector blocks" in str(e), f"-> {str(e)[:80]}")
-    out_ltx = LtxL.load("fx-ltx-2.5-quantfunc-4bit.safetensors", "ltx2-2.5-22b", 999,
-                        te_file="fx-gemma4-with-proj.safetensors",
-                        audio_vae="fx-ltx25-audio-vae.safetensors",
-                        connectors_file="fx-ltx25-connectors.safetensors")[0]
+    finally:
+        _fp_mod.get_full_path_or_raise = _orig_gfpor
+    out_ltx = LtxL.load("fx-ltx-2.5-quantfunc-4bit.safetensors", "ltx2-2.5-22b", 999)[0]
     check("ltx2 AV file-mode returns a QFModelPatcher",
           type(out_ltx).__name__ == "QFModelPatcher")
-    check("ltx2 AV model is QFLTXAVModel (audio_vae present -> AV path)",
+    check("ltx2 AV model is QFLTXAVModel (packed audio connector -> AV path)",
           type(out_ltx.model).__name__ == "QFLTXAVModel", f"-> {type(out_ltx.model).__name__}")
     _n0 = len(creates)
     _ = out_ltx.model._qf.lib
@@ -272,75 +349,71 @@ def main():
     _lmd = out_ltx.model._qf._ckey[0]
     _rx = os.path.realpath(os.path.join(_lmd, "transformer", "model.safetensors"))
     _rc2 = os.path.realpath(os.path.join(_lmd, "connectors", "model.safetensors"))
-    check("ltx2 staged: transformer -> the int4 export; connectors -> the CONNECTORS file "
+    check("ltx2 staged: transformer -> the int4 export; connectors -> the manifest aux file "
           "(source detection: keyless quantized export must NOT self-link, #565 header read)",
           _rx.endswith("fx-ltx-2.5-quantfunc-4bit.safetensors")
-          and _rc2.endswith("fx-ltx25-connectors.safetensors"))
-    check("ltx2 staged: te + audio_vae links resolve to the picked files",
-          os.path.realpath(os.path.join(_lmd, "text_encoder", "model.safetensors")).endswith("fx-gemma4-with-proj.safetensors")
-          and os.path.realpath(os.path.join(_lmd, "audio_vae", "model.safetensors")).endswith("fx-ltx25-audio-vae.safetensors"))
+          and _rc2.endswith("ltx25-connectors-bf16.safetensors"))
+    check("ltx2 staged: te link resolves to the manifest aux file; audio_vae NOT staged "
+          "(wan-align: AV detected from the packed audio connector, comfy owns audio decode)",
+          os.path.realpath(os.path.join(_lmd, "text_encoder", "model.safetensors")).endswith("gemma4-12b-with-proj-ltx-2.5-bf16.safetensors")
+          and not os.path.exists(os.path.join(_lmd, "audio_vae", "model.safetensors")))
     check("ltx2 staged: config-complete + transformer_2 pruned (single-expert)",
           all(os.path.isfile(os.path.join(_lmd, q)) for q in
               ("model_index.json", "transformer/config.json", "vae/config.json",
                "connectors/config.json", "audio_vae/config.json"))
           and not os.path.exists(os.path.join(_lmd, "transformer_2")))
-    # i2v-AV (user goal): start_image without the video VAE -> loud staging requirement
-    import torch as _t2
-    _img = _t2.zeros(1, 8, 8, 3)
-    try:
-        LtxL.load("fx-ltx-2.5-quantfunc-4bit.safetensors", "ltx2-2.5-22b", 999,
-                  te_file="fx-gemma4-with-proj.safetensors",
-                  audio_vae="fx-ltx25-audio-vae.safetensors",
-                  connectors_file="fx-ltx25-connectors.safetensors",
-                  start_image=_img)
-        check("ltx2 i2v without video_vae refuses loud", False, "-> no exception")
-    except RuntimeError as e:
-        check("ltx2 i2v without video_vae refuses loud", "video VAE" in str(e), f"-> {str(e)[:70]}")
-    # with video_vae -> AV model carries start_image + the vae weights get staged
-    out_i2v = LtxL.load("fx-ltx-2.5-quantfunc-4bit.safetensors", "ltx2-2.5-22b", 999,
-                        te_file="fx-gemma4-with-proj.safetensors",
-                        audio_vae="fx-ltx25-audio-vae.safetensors",
-                        connectors_file="fx-ltx25-connectors.safetensors",
-                        video_vae="fx-ltx25-audio-vae.safetensors",  # any vae-list file works for staging shape
-                        start_image=_img)[0]
-    check("ltx2 i2v-AV model is QFLTXAVModel with start_image set",
-          type(out_i2v.model).__name__ == "QFLTXAVModel"
-          and getattr(out_i2v.model, "_start_image", None) is not None)
-    _ = out_i2v.model._qf.lib
-    _imd = out_i2v.model._qf._ckey[0]
-    check("ltx2 i2v staged: video VAE weights linked into vae/",
-          os.path.realpath(os.path.join(_imd, "vae", "model.safetensors"))
-          .endswith("fx-ltx25-audio-vae.safetensors"))
-
-    # (CR B-r2 (b)) capability-probe truth table — the factored _cond_latent_capable
-    # is directly testable (the fake engine lib never reaches _begin):
+    # wan-align (user 2026-08-22 "只关注latent"): NO image socket, NO plugin/engine i2v
+    # plumbing. The i2v mechanism is comfy's own Inplace latent + noise_mask ->
+    # KSamplerX0Inpaint -> the INHERITED BaseModel.scale_latent_inpaint. Assert the
+    # mechanism BOTH ways, on the live class + live model:
     from qfn_test_pkg import qf_ltx_modelpatcher as _qlm
-    class _NoSym:                     # old .so: no capability query symbol
-        pass
-    class _SymYes:
-        @staticmethod
-        def quantfunc_denoise_cond_tail_supported(p): return 1
-    class _SymNo:                     # mid-window: symbol present, pipeline answers 0
-        @staticmethod
-        def quantfunc_denoise_cond_tail_supported(p): return 0
-    _cap = _qlm.QFLTXModel._cond_latent_capable
-    check("cond-latent capability probe truth table",
-          _cap(_NoSym(), None) is False and _cap(_SymNo(), None) is False
-          and _cap(_SymYes(), None) is True)
-    # EXPLICITLY-picked but INVALID connectors_file -> REFUSE (no silent auto-probe; CR minor-2)
+    import comfy.model_base as _mb
+    check("ltx scale_latent_inpaint is INHERITED (comfy's OWN LTXV mask semantics), not loud-failed",
+          "scale_latent_inpaint" not in _qlm.QFLTXModel.__dict__
+          and "scale_latent_inpaint" not in _qlm.QFLTXAVModel.__dict__
+          and _qlm.QFLTXModel.scale_latent_inpaint is _mb.LTXV.scale_latent_inpaint)
+    check("denoise_mask is NOT in the LTX reject list (Inplace latent route rides it)",
+          "denoise_mask" not in _qlm.QFLTXModel._ENGINE_IGNORED_COND_KEYS)
+    import torch as _t2
+    _mdl = out_ltx.model
     try:
-        LtxL.load("fx-ltx-2.5-quantfunc-4bit.safetensors", "ltx2-2.5-22b", 999,
-                  te_file="fx-gemma4-with-proj.safetensors",
-                  audio_vae="fx-ltx25-audio-vae.safetensors",
-                  connectors_file="fx-minimax-h3-quantfunc-int4.safetensors")  # keyless dummy
-        check("ltx2 explicit-invalid connectors_file refuses (no probe fallback)", False, "-> no exception")
+        _ = _mdl.extra_conds(denoise_mask=_t2.ones(1, 1, 2, 2, 2))
+        _dm_ok, _dm_msg = True, "(accepted)"
+    except Exception as _e:  # noqa: BLE001
+        _dm_ok, _dm_msg = False, str(_e)[:80]
+    check("extra_conds ACCEPTS denoise_mask (comfy consumes it outside the model)",
+          _dm_ok, f"-> {_dm_msg}")
+    try:
+        _mdl.extra_conds(keyframe_idxs=_t2.zeros(1, 1))
+        check("extra_conds still REJECTS keyframe_idxs loud", False, "-> no exception")
+    except RuntimeError as _e:
+        check("extra_conds still REJECTS keyframe_idxs loud",
+              "keyframe_idxs" in str(_e), f"-> {str(_e)[:70]}")
+    # EXPLICITLY-picked but INVALID connectors_file -> REFUSE (no silent auto-probe; CR minor-2)
+    def _redirect(mapping):
+        def _wrapped(folder, fname, *a, **k):
+            if fname in mapping:
+                return _orig_gfpor(folder if mapping[fname][0] is None else mapping[fname][0],
+                                   mapping[fname][1], *a, **k)
+            return _orig_gfpor(folder, fname, *a, **k)
+        return _wrapped
+    # manifest connectors resolving to a KEYLESS file (bad install) -> refuse, no silent probe fallback
+    _fp_mod.get_full_path_or_raise = _redirect(
+        {"ltx25-connectors-bf16.safetensors": ("diffusion_models", "fx-minimax-h3-quantfunc-int4.safetensors")})
+    try:
+        LtxL.load("fx-ltx-2.5-quantfunc-4bit.safetensors", "ltx2-2.5-22b", 999)
+        check("ltx2 invalid (keyless) connectors source refuses (no probe fallback)", False, "-> no exception")
     except RuntimeError as e:
-        check("ltx2 explicit-invalid connectors_file refuses (no probe fallback)",
+        check("ltx2 invalid (keyless) connectors source refuses (no probe fallback)",
               "no" in str(e) and "connector" in str(e).lower(), f"-> {str(e)[:80]}")
+    finally:
+        _fp_mod.get_full_path_or_raise = _orig_gfpor
     # keyless transformer, NO connectors_file, valid sibling IN THE SAME DIR -> AUTO-PROBE picks it
-    out_probe = LtxL.load("fx-ltx-2.5-quantfunc-4bit.safetensors", "ltx2-2.5-22b", 999,
-                          te_file="fx-gemma4-with-proj.safetensors",
-                          audio_vae="fx-ltx25-audio-vae.safetensors")[0]
+    _fp_mod.get_full_path_or_raise = _hide_files({"ltx25-connectors-bf16.safetensors"})
+    try:
+        out_probe = LtxL.load("fx-ltx-2.5-quantfunc-4bit.safetensors", "ltx2-2.5-22b", 999)[0]
+    finally:
+        _fp_mod.get_full_path_or_raise = _orig_gfpor
     _pmd = None
     try:
         _ = out_probe.model._qf.lib
