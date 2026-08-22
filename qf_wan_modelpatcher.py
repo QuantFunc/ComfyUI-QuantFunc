@@ -212,6 +212,7 @@ class QFWanModel(QFSessionModelMixin, comfy.model_base.WAN21):
     def _begin(self, x_group, ctx_group, cond_tail=None):
         """Open the edit session. x_group/ctx_group are PER-COND-GROUP (B==1) slices — begin binds
         the geometry MAXIMA with B==1 (the engine + include/quantfunc.h require cond B==1)."""
+        qfmp._qf_cancel_pending_detach(self._qf)   # session begin supersedes a lazy-detach window
         self._qf.end_session_if_open()    # clean any stale session from a prior failed run on this pipeline
         # ([wiring-lora] the LoRA drift-retire needs NO call here: it runs inside
         #  QFLazyEngine.ensure() itself — the lib access below triggers it.)

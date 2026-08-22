@@ -666,6 +666,7 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
         """Open the t2v external denoise session. x_group = [1,128,F,H,W] latent; vemb_group =
         [1,S,4096] POST-connector video_embeds. Geometry: engine derives F_lat/H_lat/W_lat from
         num_frames + width/height (spatial 32, temporal 8)."""
+        qfmp._qf_cancel_pending_detach(self._qf)   # session begin supersedes a lazy-detach window
         self._qf.end_session_if_open()
         lib = self._qf.lib
         bpx = qfe.DenoiseBeginParams()
@@ -699,7 +700,14 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
         # ONE begin path (wan-align 2026-08-22): the session is ALWAYS a plain t2v-shape begin.
         # i2v conditioning is entirely comfy-side (LTXVImgToVideoInplace latent + noise_mask via
         # KSamplerX0Inpaint) — the engine never sees an image or a cond latent.
+        import os as _os
+        _prof = _os.environ.get("QF_NATIVE_PROF") == "1"
+        if _prof:
+            import time as _time
+            _t0 = _time.perf_counter()
         st = lib.quantfunc_denoise_begin(self._qf.pipeline, ctypes.byref(bpx), ctypes.byref(session))
+        if _prof:
+            print(f"[qf_prof] begin_call {(_time.perf_counter()-_t0)*1000:.0f} ms", flush=True)
         self._begin_keep = bpx
         if st != qfe.QUANTFUNC_OK:
             raise RuntimeError(f"denoise_begin (LTX) failed: {qfe.last_err(lib)}")
@@ -895,6 +903,25 @@ class QFLTXAVModel(QFLTXModel):
                 "av_unprocessed_ctx": True}
 
     def _apply_model(self, x, t, c_concat=None, c_crossattn=None, control=None,
+                     transformer_options={}, **kwargs):
+        # [qf_prof] per-step wall probe (diagnostic, QF_NATIVE_PROF=1 gated print only —
+        # not a production-path switch): total wall per sampler step incl. all comfy-side
+        # conversion; the engine-internal share rides the engine's own logs.
+        import os as _os
+        if _os.environ.get("QF_NATIVE_PROF") != "1":
+            return self._apply_model_timed(x, t, c_concat=c_concat, c_crossattn=c_crossattn,
+                                           control=control, transformer_options=transformer_options,
+                                           **kwargs)
+        import time as _time
+        _t0 = _time.perf_counter()
+        try:
+            return self._apply_model_timed(x, t, c_concat=c_concat, c_crossattn=c_crossattn,
+                                           control=control, transformer_options=transformer_options,
+                                           **kwargs)
+        finally:
+            print(f"[qf_prof] step wall {(_time.perf_counter()-_t0)*1000:.0f} ms", flush=True)
+
+    def _apply_model_timed(self, x, t, c_concat=None, c_crossattn=None, control=None,
                      transformer_options={}, **kwargs):
         sigma = t
         if c_crossattn is None:

@@ -61,6 +61,36 @@ def _qf_dtype(torch_dtype):
             torch.bfloat16: qfe.QF_BF16}[torch_dtype]
 
 
+# Lazy-detach reclaim window. comfy's unload_model_clones detaches the OLD clone of this
+# SAME model milliseconds before loading the NEW clone (measured on the LTX two-stage
+# workflow: the reload began 27 ms after the full offload finished) — a bureaucratic clone
+# swap, not memory pressure. A full engine unload there costs the whole weight set round-trip
+# (measured: ~8.4 s extra in the next stage's first step). So detach() keeps the engine
+# RESIDENT and arms this one-shot window: a successor clone's load/step RECLAIMS the engine
+# (zero reload); no successor within the window ⇒ the real unload runs, so a workflow switch
+# still frees VRAM within seconds. 15 s = 500x the measured 27 ms swap gap, small enough that
+# a genuine drop frees before a human notices.
+_QF_LAZY_DETACH_SECONDS = 15.0
+
+
+def _qf_cancel_pending_detach(eng):
+    """Reclaim a lazily-detached engine (a successor clone took over): cancel the one-shot
+    unload timer. Safe no-op when nothing is pending."""
+    if eng is None or not getattr(eng, "pending_detach", False):
+        return
+    lock = getattr(eng, "_qf_detach_lock", None)
+    if lock is None:
+        return   # pending without a lock cannot happen (detach creates the lock first)
+    with lock:
+        eng.pending_detach = False
+        t = getattr(eng, "_qf_detach_timer", None)
+        if t is not None:
+            t.cancel()
+            eng._qf_detach_timer = None
+    if os.environ.get("QF_NATIVE_PROF") == "1":
+        print("[qf_prof] lazy-detach RECLAIMED (engine stayed resident, zero reload)", flush=True)
+
+
 def _interrupt_poll_end_session_on_raise(qf):
     """SHARED per-cond-group interrupt poll that never strands an open engine session (ONE copy for
     QFWanModel + QFLTXModel — §6.5 simplicity: the session-clearing hardening was added to LTX and had
@@ -346,6 +376,7 @@ class QFSessionModelMixin:
         mid-sample error never strands a stale session. `fail_prefix` is the model-specific
         message head (e.g. 'denoise_step[step=..,group=..,key=..]' for WAN, 'LTX denoise_step[..]'
         for LTX). Verbatim-shared by QFWanModel + QFLTXModel."""
+        _qf_cancel_pending_detach(self._qf)   # an active step supersedes any lazy-detach window
         try:
             st = self._qf.lib.quantfunc_denoise_step(self._qf.current_session, ctypes.byref(p))
         except Exception:
@@ -361,17 +392,25 @@ class QFSessionModelMixin:
         session on ANY failure — the AV twin of _call_denoise_step. Shared by QFH3Model (H3
         joint AV) and QFLTXAVModel (LTX-2.5 joint AV); hoisted here from qf_h3_modelpatcher
         so the second AV consumer does not copy it (polymorphism-over-copy mandate)."""
+        _qf_cancel_pending_detach(self._qf)   # an active step supersedes any lazy-detach window
         lib = self._qf.lib
         if not hasattr(lib, "quantfunc_denoise_step_multi"):
             self._qf.end_session_if_open()
             raise RuntimeError(f"{fail_prefix}: the loaded engine .so has no "
                                "quantfunc_denoise_step_multi (D-class AV step) — rebuild/point "
                                "the engine lib at an AV-capable build.")
+        import os as _os
+        _prof = _os.environ.get("QF_NATIVE_PROF") == "1"
+        if _prof:
+            import time as _time
+            _t0 = _time.perf_counter()
         try:
             st = lib.quantfunc_denoise_step_multi(self._qf.current_session, ctypes.byref(mp))
         except Exception:
             self._qf.end_session_if_open()
             raise
+        if _prof:
+            print(f"[qf_prof] engine_call {(_time.perf_counter()-_t0)*1000:.0f} ms", flush=True)
         if st != qfe.QUANTFUNC_OK:
             err = qfe.last_err(lib)
             self._qf.end_session_if_open()
@@ -774,6 +813,7 @@ class QFModelPatcher(comfy.model_patcher.ModelPatcher):
         # the flag lets model_size/loaded_size report the footprint again; no proactive torch load.
         eng = self._engine()
         if eng is not None:
+            _qf_cancel_pending_detach(eng)   # successor clone loading — reclaim a lazy detach
             eng.unloaded = False
         return 0
 
@@ -796,6 +836,9 @@ class QFModelPatcher(comfy.model_patcher.ModelPatcher):
         if eng is None:
             return 0
         want = int(memory_to_free or 0)
+        _qf_cancel_pending_detach(eng)   # real pressure supersedes a lazy-detach window
+        print(f"[qf_prof] partially_unload asked={want // (1024*1024)} MB "
+              f"(loaded={self.loaded_size() // (1024*1024)} MB)", flush=True)
         if want > 0 and hasattr(eng, "partial_unload_vram"):
             freed = eng.partial_unload_vram(want)
             if freed >= want:
@@ -824,15 +867,44 @@ class QFModelPatcher(comfy.model_patcher.ModelPatcher):
         return src.clone(model_override=override)
 
     def detach(self, unpatch_all=True):
-        """comfy is dropping this model — release the engine's VRAM NOW instead of waiting for a
-        GC sweep. unload_vram keeps the CPU backup, so a later run reloads lazily (no destroy =
-        no use-after-free against a model comfy may still hold)."""
+        """comfy is dropping this model. LAZY: keep the engine resident and arm a short one-shot
+        unload window (see _QF_LAZY_DETACH_SECONDS — the measured common caller is comfy's
+        unload_model_clones swapping clones of this SAME model between two samplers, where an
+        eager full unload costs a pointless whole-weight-set round-trip). A successor clone's
+        load/step reclaims the engine with zero reload; window expiry runs the REAL unload
+        (unload_vram keeps the CPU backup, so a later run reloads lazily; no destroy = no
+        use-after-free against a model comfy may still hold)."""
         eng = self._engine()
         if eng is not None and not getattr(eng, "unloaded", False):
-            try:
-                eng.unload_vram()
-            except Exception:  # noqa: BLE001 — detach must never raise
-                pass
+            import threading
+            if getattr(eng, "_qf_detach_lock", None) is None:
+                eng._qf_detach_lock = threading.Lock()
+            with eng._qf_detach_lock:
+                eng.pending_detach = True
+                old = getattr(eng, "_qf_detach_timer", None)
+                if old is not None:
+                    old.cancel()
+
+                def _materialize():
+                    try:
+                        with eng._qf_detach_lock:
+                            if not getattr(eng, "pending_detach", False) or \
+                                    getattr(eng, "unloaded", False):
+                                return
+                            eng.pending_detach = False
+                            eng._qf_detach_timer = None
+                            print("[qf_prof] lazy-detach window expired -> real engine unload",
+                                  flush=True)
+                            eng.unload_vram()
+                    except Exception:  # noqa: BLE001 — a timer thread must never raise
+                        pass
+
+                t = threading.Timer(_QF_LAZY_DETACH_SECONDS, _materialize)
+                t.daemon = True
+                eng._qf_detach_timer = t
+                t.start()
+            print(f"[qf_prof] detach -> LAZY (engine resident; {_QF_LAZY_DETACH_SECONDS:.0f}s "
+                  f"reclaim window)", flush=True)
         return super().detach(unpatch_all=unpatch_all)
 
     # ── HOST-RAM reporting ────────────────────────────────────────────────────────────────
