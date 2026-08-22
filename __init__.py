@@ -546,44 +546,14 @@ if _IMPORT_OK:
                 f"qf_native: model_config '{model_config}' is single-transformer — leave "
                 f"transformer2 = \"(none)\" (a second expert here would be silently ignored "
                 f"at best; refused instead).")
-        kw = {}
-        # [aux-auto] preset-declared auxiliary weights (user 2026-08-22: the loader node
-        # carries NO aux file widgets — ONE file is the whole pick; i2v rides the workflow's
-        # OWN latent path (LTXVImgToVideoInplace), wan-aligned, so there is no image input
-        # either). DATA-driven from the manifest's aux_files: each category lists
-        # conventional filenames, resolved from the standard comfy folders. A
-        # declared-but-ABSENT audio VAE fails loud HERE (an AV preset silently downgrading
-        # to video-only would surface later as a confusing mid-graph audio-lane mismatch);
-        # te/connectors stay lazy — their own guards fire only on the layouts/paths that
-        # actually need them.
-        _aux = manifest.get("aux_files") or {}
-
-        def _resolve_aux(cat, folder):
-            for _cand in (_aux.get(cat) or []):
-                try:
-                    return _folder_paths.get_full_path_or_raise(folder, _cand)
-                except Exception:  # noqa: BLE001 — try the next declared candidate
-                    continue
-            return None
-        if _aux.get("te") and "te_path" not in kw:
-            _p = _resolve_aux("te", "text_encoders")
-            if _p:
-                kw["te_path"] = _p
-        if _aux.get("audio_vae") and "audio_vae_path" not in kw:
-            _p = _resolve_aux("audio_vae", "vae")
-            if _p is None:
-                raise RuntimeError(
-                    f"qf_native: preset '{model_config}' declares its audio VAE as "
-                    f"{_aux['audio_vae']} but none exist under models/vae — place the official "
-                    f"file there (the same one the workflow's audio VAELoader uses).")
-            kw["audio_vae_path"] = _p
-        if _aux.get("connectors") and "connectors_path" not in kw:
-            _p = _resolve_aux("connectors", "diffusion_models")
-            if _p:
-                kw["connectors_path"] = _p
+        # NO aux resolution (user 2026-08-22 "引擎层不应该依赖这个"): the loader depends on
+        # nothing but the transformer file(s) themselves. The retired [aux-auto] manifest
+        # fallback layer (te/audio_vae/connectors conventional-filename resolution) served
+        # only the transitional split exports; an incomplete single-file export is refused
+        # loud by the family builder instead of being silently completed.
         return builder(transformer1_path=xfm1, transformer2_path=xfm2,
                        resident_block_count=int(resident_block_count),
-                       bundle_dir=bundle_dir, **kw)
+                       bundle_dir=bundle_dir)
 
     _RESIDENT_BLOCKS_INPUT = ("INT", {"default": 999, "min": 1, "max": 1024,
                                       "tooltip": "GPU-resident transformer blocks — the native "
