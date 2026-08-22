@@ -253,6 +253,34 @@ def main():
               ("model_index.json", "transformer/config.json", "vae/config.json",
                "connectors/config.json", "audio_vae/config.json"))
           and not os.path.exists(os.path.join(_lmd, "transformer_2")))
+    # i2v-AV (user goal): start_image without the video VAE -> loud staging requirement
+    import torch as _t2
+    _img = _t2.zeros(1, 8, 8, 3)
+    try:
+        LtxL.load("fx-ltx-2.5-quantfunc-4bit.safetensors", "ltx2-2.5-22b", 999,
+                  te_file="fx-gemma4-with-proj.safetensors",
+                  audio_vae="fx-ltx25-audio-vae.safetensors",
+                  connectors_file="fx-ltx25-connectors.safetensors",
+                  start_image=_img)
+        check("ltx2 i2v without video_vae refuses loud", False, "-> no exception")
+    except RuntimeError as e:
+        check("ltx2 i2v without video_vae refuses loud", "video VAE" in str(e), f"-> {str(e)[:70]}")
+    # with video_vae -> AV model carries start_image + the vae weights get staged
+    out_i2v = LtxL.load("fx-ltx-2.5-quantfunc-4bit.safetensors", "ltx2-2.5-22b", 999,
+                        te_file="fx-gemma4-with-proj.safetensors",
+                        audio_vae="fx-ltx25-audio-vae.safetensors",
+                        connectors_file="fx-ltx25-connectors.safetensors",
+                        video_vae="fx-ltx25-audio-vae.safetensors",  # any vae-list file works for staging shape
+                        start_image=_img)[0]
+    check("ltx2 i2v-AV model is QFLTXAVModel with start_image set",
+          type(out_i2v.model).__name__ == "QFLTXAVModel"
+          and getattr(out_i2v.model, "_start_image", None) is not None)
+    _ = out_i2v.model._qf.lib
+    _imd = out_i2v.model._qf._ckey[0]
+    check("ltx2 i2v staged: video VAE weights linked into vae/",
+          os.path.realpath(os.path.join(_imd, "vae", "model.safetensors"))
+          .endswith("fx-ltx25-audio-vae.safetensors"))
+
     # keyless transformer, NO connectors_file, valid sibling IN THE SAME DIR -> AUTO-PROBE picks it
     out_probe = LtxL.load("fx-ltx-2.5-quantfunc-4bit.safetensors", "ltx2-2.5-22b", 999,
                           te_file="fx-gemma4-with-proj.safetensors",

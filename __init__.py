@@ -482,7 +482,7 @@ if _IMPORT_OK:
     def _run_family_load(expect_family, transformer1, model_config,
                          resident_block_count, transformer2,
                          te_file=None, audio_vae=None, start_image=None,
-                         connectors_file=None):
+                         connectors_file=None, video_vae=None):
         """The SHARED loader core behind the per-family nodes (user 2026-08-21 pivot). All
         validation is preserved verbatim from the original single-node load(); the per-family
         nodes add only (a) a family-filtered preset dropdown and (b) this family guard —
@@ -548,6 +548,8 @@ if _IMPORT_OK:
             kw["start_image"] = start_image
         if connectors_file and not str(connectors_file).startswith("("):
             kw["connectors_path"] = _resolve_transformer(connectors_file)
+        if video_vae and video_vae != "(none)" and not str(video_vae).startswith("("):
+            kw["video_vae_path"] = _folder_paths.get_full_path_or_raise("vae", video_vae)
         return builder(transformer1_path=xfm1, transformer2_path=xfm2,
                        resident_block_count=int(resident_block_count),
                        bundle_dir=bundle_dir, **kw)
@@ -641,6 +643,13 @@ if _IMPORT_OK:
                                             "frame 0 (engine-side begin_edit frame-0 "
                                             "conditioning — the QFLTX model class's "
                                             "existing channel). Disconnect for t2v/t2av."}),
+                "video_vae": (_vae_file_choices(),
+                              {"tooltip": "The official ltx-2.5 VIDEO VAE .safetensors "
+                                          "under models/vae — REQUIRED when start_image "
+                                          "(i2v) is wired: the engine encodes the "
+                                          "reference frame on its side, so the encode "
+                                          "weights must be staged. Not needed for "
+                                          "t2v/t2av."}),
                 "connectors_file": (_transformer_choices(),
                                     {"tooltip": "The ltx-2.5 CONNECTOR weights file "
                                                 "(models/diffusion_models). REQUIRED when "
@@ -660,12 +669,13 @@ if _IMPORT_OK:
 
         def load(self, transformer, model_config, resident_block_count=999,
                  te_file=None, audio_vae="(none)", start_image=None,
-                 connectors_file=None):
+                 connectors_file=None, video_vae="(none)"):
             return (_run_family_load("ltx2", transformer, model_config,
                                      resident_block_count, None,
                                      te_file=te_file, audio_vae=audio_vae,
                                      start_image=start_image,
-                                     connectors_file=connectors_file),)
+                                     connectors_file=connectors_file,
+                                     video_vae=video_vae),)
 
     class QuantFuncH3Loader:
         """MiniMax-H3 loader — single MODEL output (single-expert AV family)."""

@@ -370,7 +370,7 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
     (i2v = loader start_image → engine frame-0 conditioning via begin_edit)."""
 
     def __init__(self, model_config, engine, connector, device=None, audio_connector=None,
-                 start_image=None, resident_block_count=999):
+                 start_image=None, resident_block_count=999, video_vae_path=None):
         super().__init__(model_config, device=device)   # disable_unet honored in BaseModel.__init__
         self.diffusion_model = _QFStub()
         self._resident_block_count = int(resident_block_count)   # [manual-residency] video begin knob
@@ -380,6 +380,13 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
         # encodes it — LTX2VideoPipeline::encodeI2vRefCondition) and gates process_latent_out's
         # unpack-back of the finalize frame-0 pin.
         self._start_image = start_image
+        # i2v COND-LATENT route (preferred when the loader supplies the official video-VAE
+        # file): comfy-side encode -> quantfunc_denoise_begin_edit_cond (frame-0 latent;
+        # LTXV latent_format is IDENTITY scale so the raw encode IS the x-space) — no
+        # engine VAE at all (file-mode denoise_only clean). Absent -> the legacy temp-PNG
+        # engine-encode route (full packages).
+        self._video_vae_path = video_vae_path
+        self._i2v_vae = None                 # lazily constructed comfy VAE (cached)
         self._connector = connector          # comfy Embeddings1DConnector (video), weights loaded
         self._audio_connector = audio_connector  # comfy audio_embeddings_connector (2048); None -> video-only 4096
         self._num_steps = 0                  # DERIVED per run from sample_sigmas (len-1) at _begin
@@ -631,6 +638,59 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
             if st != qfe.QUANTFUNC_OK:
                 raise RuntimeError(f"denoise_begin (LTX t2v) failed: {qfe.last_err(lib)}")
         else:
+            # i2v — TWO routes. PREFERRED (video_vae supplied): comfy-side encode ->
+            # begin_edit_cond frame-0 cond latent (identity latent scale; engine packs ->
+            # per-step impose + velocity pin + finalize pin — the c5.8g chain; no engine
+            # VAE). LEGACY (no video_vae): temp PNG -> begin_edit engine-encode.
+            if self._video_vae_path and hasattr(lib, "quantfunc_denoise_begin_edit_cond"):
+                if self._i2v_vae is None:
+                    import comfy.sd as _csd
+                    import comfy.utils as _cutils
+                    _sd, _meta = _cutils.load_torch_file(self._video_vae_path, return_metadata=True)
+                    self._i2v_vae = _csd.VAE(sd=_sd, metadata=_meta)
+                    self._i2v_vae.throw_exception_if_invalid()
+                img = self._start_image
+                if img.ndim == 3:
+                    img = img.unsqueeze(0)
+                img = img[:1, :, :, :3]
+                _W, _H = bpx.width, bpx.height
+                import comfy.utils as _cu2
+                px = _cu2.common_upscale(img.movedim(-1, 1), _W, _H, "bilinear",
+                                          "disabled").movedim(1, -1)
+                lat = self._i2v_vae.encode(px)          # [1,128,1,H_lat,W_lat]
+                lat = lat.to(device=x_group.device, dtype=torch.bfloat16).contiguous()
+                # kept for the COMFY-SIDE frame-0 pin at process_latent_out: with the driver
+                # owning decode, the final latent's frame-0 is overwritten with this clean
+                # encoded latent BEFORE the VAE decode (the engine's finalize hard-pin is
+                # skipped in cond-latent mode — MEASURED: velocity-zeroing keeps comfy's x
+                # frame-0 at its initial noise, so without a driver-side pin f0 decodes mush).
+                self._i2v_cond_latent = lat
+                if lat.ndim != 5 or int(lat.shape[2]) != 1:
+                    raise RuntimeError(f"qf_native LTX i2v: encoded frame-0 latent shape "
+                                       f"{tuple(lat.shape)} — expected [1,128,1,H_lat,W_lat]")
+                cpx = qfe.DenoiseBeginEditCondParams()
+                ctypes.memset(ctypes.byref(cpx), 0, ctypes.sizeof(cpx))
+                cpx.struct_size = ctypes.sizeof(cpx)
+                cpx.base = bpx
+                cpx._bp = bpx
+                cpx._lat_keep = lat
+                cpx.cond_tail = ctypes.c_void_p(int(lat.data_ptr()))
+                cpx.cond_tail_dims = (ctypes.c_int32 * 5)(*[int(d) for d in lat.shape])
+                cpx.cond_tail_dtype = _qf_dtype(lat.dtype)
+                cpx.cond_tail_bytes = int(lat.numel()) * int(lat.element_size())
+                st = lib.quantfunc_denoise_begin_edit_cond(self._qf.pipeline, ctypes.byref(cpx),
+                                                           ctypes.byref(session))
+                self._begin_keep = cpx
+                if st != qfe.QUANTFUNC_OK:
+                    raise RuntimeError(f"denoise_begin_edit_cond (LTX i2v) failed: {qfe.last_err(lib)}")
+                self._qf.current_session = session
+                self._qf.unloaded = False
+                self._step_i = 0
+                self._sess_denoise = 0
+                print(f"[qf_native] LTX SESSION OPEN handle={session.value:#x} steps={self._num_steps} "
+                      f"cond={tuple(vemb_group.shape)} frames={self._num_frames} "
+                      f"mode=i2v(cond-latent, comfy-encoded frame-0)", flush=True)
+                return
             # i2v — mirror QFWanModel's Option C: temp PNG → begin_edit; the engine loads +
             # center-crop-fills + VAE-encodes it under the begin mutation lease
             # (LTX2VideoPipeline::prepareExternalDenoise i2v branch: exactly ONE ref,
@@ -806,13 +866,17 @@ class QFLTXAVModel(QFLTXModel):
     (lora.py:371) tests (LTXV, LTXAV) — satisfied via the LTXV base."""
 
     def __init__(self, model_config, engine, device=None, start_image=None,
-                 resident_block_count=999):
-        if start_image is not None:
-            raise RuntimeError("qf_native LTX-AV: i2v (start_image) is not wired for the AV "
-                               "session in this increment — t2av only; remove start_image.")
+                 resident_block_count=999, video_vae_path=None):
+        # i2v-AV (user goal 2026-08-22 "LTX 图片文字输入 -> 视频带音频"): start_image rides the
+        # BASE _begin — PREFERRED route (video_vae_path set): comfy-side encode ->
+        # begin_edit_cond frame-0 cond latent (no engine VAE; file-mode clean); legacy route:
+        # temp PNG -> begin_edit engine-encode (full packages / staged vae weights). Either
+        # way the engine chain is the c5.8g one (pack -> per-step impose + velocity pin +
+        # finalize pin), COMPOSED with this subclass's _begin_extra_opts audio lane.
         QFLTXModel.__init__(self, model_config, engine, connector=None,
                             resident_block_count=resident_block_count,
-                            device=device, audio_connector=None, start_image=None)
+                            device=device, audio_connector=None, start_image=start_image,
+                            video_vae_path=video_vae_path)
         self._out_audio = None            # reused packed audio velocity buffer [1,L,128] fp32
         self._ctx_unprocessed = False     # set per run by extra_conds from the TE's marker
         self._audio_rows = 0              # L, set from the actual audio latent at _apply_model
@@ -1004,8 +1068,35 @@ class QFLTXAVModel(QFLTXModel):
                       f"{self._sess_denoise} denoise_step_multi calls, finalize=OK", flush=True)
             finally:
                 self._qf.end_session_if_open()
-        # Skip QFLTXModel.process_latent_out (its finalize expects the 5D video-only latent);
-        # resolve the NEXT base after it in the MRO (mixin → comfy LTXAV latent-format path).
+        # i2v COMFY-SIDE frame-0 pin (cond-latent mode): rebuild the joint latent with the
+        # video half's frame-0 replaced by the clean encoded reference latent. Done HERE —
+        # the last point before comfy's VAE decode — because the step fn zeroes frame-0
+        # velocity (comfy's x frame-0 never leaves its initial noise) and the engine's
+        # finalize hard-pin is skipped in cond-latent mode (driver owns decode).
+        cond_lat = getattr(self, "_i2v_cond_latent", None)
+        if cond_lat is not None:
+            pin = cond_lat.to(dtype=torch.float32)
+            if getattr(latent, "is_nested", False):
+                sv, sa = latent.unbind()[0], latent.unbind()[1]
+                sv = sv.clone()
+                sv[:, :, :1] = pin.to(sv.dtype, copy=False)
+                import comfy.nested_tensor as _nt
+                latent = _nt.NestedTensor((sv, sa))
+            elif latent.ndim == 5:
+                latent = latent.clone()
+                latent[:, :, :1] = pin.to(latent.dtype)
+            else:
+                ls = getattr(self, "latent_shapes", None)
+                if ls and len(ls) >= 2:
+                    # sampler-PACKED flat form: flatten-first exactly like the finalize
+                    # extraction above, pin the video half's frame-0, restore the shape.
+                    n = int(math.prod(ls[0][1:]))
+                    orig_shape = list(latent.shape)
+                    flat = latent.reshape(int(latent.shape[0]), -1).clone()
+                    v = flat[:, :n].reshape(list(ls[0]))   # VIEW into flat (contiguous slice)
+                    v[:, :, :1] = pin.to(v.dtype)          # writes through the view
+                    latent = flat.reshape(orig_shape)
+            print("[qf_native] LTX i2v: frame-0 pinned comfy-side before decode", flush=True)
         return super(QFLTXModel, self).process_latent_out(latent)
 
 
@@ -1030,7 +1121,7 @@ def register(deps):
 
     def build(transformer1_path, transformer2_path, resident_block_count, bundle_dir=None,
               lora_entries=(), te_path=None, audio_vae_path=None, start_image=None,
-              connectors_path=None):
+              connectors_path=None, video_vae_path=None):
         """File-based (ComfyUI single-file) loading for LTX-2.5 — the wan staging pattern
         with the family's extra weight links:
         - transformer/  <- the single int4 export (transformer + connector + audio blocks);
@@ -1102,15 +1193,25 @@ def register(deps):
         extra = {"connectors": connectors_src, "text_encoder": te_path}
         if audio_vae_path:
             extra["audio_vae"] = audio_vae_path
+        if video_vae_path:
+            extra["vae"] = video_vae_path
+        if start_image is not None and not video_vae_path:
+            raise RuntimeError(
+                "qf_native ltx2: start_image (i2v) needs the video VAE weights staged — pick "
+                "the official ltx-2.5 video VAE (models/vae, e.g. "
+                "ltx-2.5-video-vae-bf16.safetensors) in the loader's video_vae input; the "
+                "engine encodes the reference on its side (frame-0 conditioning).")
         model_dir = qfmp.stage_denoise_only_package(bundle_dir, transformer1_path, None,
                                                     extra_links=extra)
         return _build_from_package(model_dir, os.path.basename(transformer1_path),
                                    resident_block_count, start_image=start_image,
                                    lora_entries=lora_entries,
-                                   create_extra={"denoise_only": True})
+                                   create_extra={"denoise_only": True},
+                                   video_vae_path=video_vae_path)
 
     def _build_from_package(model_dir, model_name, resident_block_count, start_image=None,
-              connector_ckpt="(none)", lora_entries=(), create_extra=None):
+              connector_ckpt="(none)", lora_entries=(), create_extra=None,
+              video_vae_path=None):
         if connector_ckpt and connector_ckpt != "(none)":
             import folder_paths as _fp
             connector_ckpt = _fp.get_full_path_or_raise("checkpoints", connector_ckpt)
@@ -1156,7 +1257,8 @@ def register(deps):
                 qfmp.ensure_model_config_attrs(model_config)
                 model = QFLTXAVModel(model_config, engine, device=device,
                                      start_image=start_image,
-                                     resident_block_count=resident_block_count)
+                                     resident_block_count=resident_block_count,
+                                     video_vae_path=video_vae_path)
                 patcher = QFModelPatcher(model, load_device=device, offload_device=offload)
                 print(f"[qf_native] loaded QuantFuncNativeLoader (LTX-2.5 JOINT-AV svdq) "
                       f"package={model_name} resident_blocks={resident_block_count} "
