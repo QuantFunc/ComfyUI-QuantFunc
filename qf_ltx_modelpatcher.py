@@ -436,6 +436,19 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
         if was_open:
             print("[qf_native] LTX: closed a pre-existing session at run start "
                   f"(prior run interrupted/uncleaned); end ok={ok}", flush=True)
+        # masked-latent i2v (comfy LTXVImgToVideoInplace): capture the run's denoise_mask
+        # as PER-LATENT-FRAME sigma scales for the engine session. This is the comfy
+        # LTXV.process_timestep mechanism (conditioned tokens run at mask*t) — without it
+        # the engine reads the outer-blended near-clean conditioned frames at the GLOBAL
+        # sigma and emits corrupt velocities (measured: red-speckle degeneration, run
+        # b16cbc7f). Cleared per run here; pos+neg extra_conds set identical values.
+        self._pending_frame_t_scale = None
+        _dm = kwargs.get("denoise_mask")
+        if _dm is not None:
+            _scales = self._frame_scales_from_mask(_dm)
+            # all-1.0 = no conditioning anywhere -> omit (keeps the engine's t2v scalar
+            # path byte-identical instead of a mathematically-equal per-token pass).
+            self._pending_frame_t_scale = None if all(v >= 0.9999 for v in _scales) else _scales
         # ★ CLOSE THE SILENT-DISCARD CLASS: a wired keyframe / guide-attention / concat node reaches here
         # as one of these keys and would be dropped — fail loud. (denoise_mask is NOT here: the Inplace
         # latent route rides it and comfy's sampler consumes it entirely outside this model.)
@@ -478,6 +491,56 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
             # _post_connector_seq MEASURES the length from the real loaded connector (cached).
             self._max_ctx_seq = max(self._max_ctx_seq, self._post_connector_seq(int(cross_attn.shape[1])))
         return out
+
+    def _frame_scales_from_mask(self, dm):
+        """denoise_mask -> per-LATENT-frame sigma scales (comfy process_timestep parity).
+
+        Two shapes reach this seam (MEASURED):
+        - video-only 5D [B,1,F,H,W] (plain latent path);
+        - joint-AV FLAT [B,1,total] — comfy packs the nested (video, audio) latent and
+          flattens the mask alike (total = video_elems + audio_elems; measured
+          1,818,368 = 128*16*22*40 + 8*126*16). Split via self.latent_shapes.
+        Inplace masks are FRAME-uniform; a mask varying within a frame (spatial inpaint)
+        or masking the AUDIO lane is refused loud — the engine scales per FRAME only."""
+        import math as _m
+        m = dm
+        if m.ndim == 3:
+            ls = getattr(self, "latent_shapes", None)
+            if not ls or len(ls) < 1:
+                raise RuntimeError(
+                    "qf_native LTX: flat denoise_mask but the model carries no "
+                    "latent_shapes to split it — unsupported mask source.")
+            n_video = int(_m.prod(ls[0][1:]))
+            flat = m.reshape(-1)
+            if int(flat.shape[0]) < n_video:
+                raise RuntimeError(
+                    f"qf_native LTX: flat denoise_mask has {int(flat.shape[0])} elements "
+                    f"but the video latent needs {n_video} — geometry mismatch.")
+            audio_part = flat[n_video:]
+            if audio_part.numel() and float(audio_part.min()) < 0.9999:
+                raise RuntimeError(
+                    "qf_native LTX: the denoise_mask masks the AUDIO lane — audio "
+                    "conditioning is not supported on this seam (video Inplace only).")
+            m = flat[:n_video].reshape(list(ls[0]))[0]      # [C,F,H,W]
+            m = m.movedim(1, 0)                             # [F,C,H,W]
+        elif m.ndim == 5:
+            m = m[0, 0]                                     # [F,H,W]
+        else:
+            raise RuntimeError(
+                f"qf_native LTX: denoise_mask with shape {tuple(dm.shape)} is not a "
+                f"[B,1,F,H,W] latent mask nor the packed AV flat form — unsupported "
+                f"mask source.")
+        per_frame = []
+        for f in range(int(m.shape[0])):
+            mf = m[f]
+            lo, hi = float(mf.min()), float(mf.max())
+            if hi - lo > 1e-4:
+                raise RuntimeError(
+                    "qf_native LTX: denoise_mask varies WITHIN a latent frame — the "
+                    "engine session scales the timestep per FRAME (Inplace-style masks "
+                    "only); spatial inpaint masks are not supported on this seam.")
+            per_frame.append(max(0.0, min(1.0, hi)))
+        return per_frame
 
     # scale_latent_inpaint is deliberately INHERITED (comfy BaseModel), NOT loud-failed (2026-08-22
     # wan-align pivot): comfy's KSamplerX0Inpaint calls it only when a denoise/noise mask is wired
@@ -620,8 +683,11 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
         # LTX takes NO pooled cond.
         bpx.max_pooled_dims = (ctypes.c_int * 2)(0, 0)
         bpx.cond_dtype = _qf_dtype(vemb_group.dtype)
+        _mask_opt = ({"video_frame_t_scale": self._pending_frame_t_scale}
+                     if getattr(self, "_pending_frame_t_scale", None) else {})
         bpx._opts = json.dumps({**{"num_frames": self._num_frames, "fps": float(self._fps)},
                                 **self.residency_opts(),
+                                **_mask_opt,
                                 **self._begin_extra_opts()}).encode()
         bpx.options_json = bpx._opts
         session = ctypes.c_void_p()
