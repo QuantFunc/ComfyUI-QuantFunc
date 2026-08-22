@@ -509,11 +509,7 @@ def register(deps):
         model_dir = qfmp.stage_denoise_only_package(bundle_dir, transformer1_path, None)
         return _build_from_package(model_dir, os.path.basename(transformer1_path),
                                    resident_block_count, lora_entries=lora_entries,
-                                   # use_pinned_memory: same inter-stage eviction economics as
-                                   # LTX (comfy evicts around VAE loads; pinned cuts every
-                                   # offload/reload 3-6x — measured 5.4s -> 1.16s on LTX 18GB).
-                                   create_extra={"denoise_only": True,
-                                                 "use_pinned_memory": True})
+                                   create_extra={"denoise_only": True})
 
     def _build_from_package(model_dir, model_name, resident_block_count, start_image=None,
               connector_ckpt="(none)", lora_entries=(), create_extra=None):
