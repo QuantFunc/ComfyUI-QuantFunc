@@ -1029,18 +1029,39 @@ def register(deps):
 
 
     def build(transformer1_path, transformer2_path, resident_block_count, bundle_dir=None,
-              lora_entries=()):
-        """File-based loading for this family is NOT WIRED YET (loud, not silent): the
-        engine's denoise_only create exists only for wan today. This family still needs
-        its engine-side flag + a shipped config bundle — tracked follow-up; wan is the
-        validation vehicle. The old package-dir builder below is kept for that wiring."""
-        raise RuntimeError(
-            "qf_native ltx2: file-based (transformer .safetensors) loading is not "
-            "wired for this family yet — wan2.2 A14B is the first; ltx2 follows once "
-            "its engine denoise_only create + config bundle land.")
+              lora_entries=(), te_path=None, audio_vae_path=None):
+        """File-based (ComfyUI single-file) loading for LTX-2.5 — the wan staging pattern
+        with the family's extra weight links:
+        - transformer/  <- the single int4 export (transformer + connector + audio blocks);
+        - connectors/   <- the SAME file (engine #565 comfy25 branch detects the
+          model.diffusion_model.*_embeddings_connector.* prefix, renames + strips);
+        - text_encoder/ <- the gemma with-proj TE file (the connector loader ADDITIVELY
+          reads text_embedding_projection.* aggregate_embed from it; the TE itself stays
+          lazy and is never touched by an external session);
+        - audio_vae/    <- the LTX-2.5 audio VAE (vocoder bundled inside per #565); its
+          PRESENCE is the engine's has_audio_ discriminant AND this builder's AV detect —
+          same weights-presence test on both sides by construction. Absent -> video-only,
+          which for a 2.5 AV checkpoint the engine refuses fail-loud at begin (audio lane
+          mismatch), never a silent audio drop.
+        Engine create runs denoise_only=True (VAE decode weights skipped; TE lazy)."""
+        if transformer2_path:
+            raise RuntimeError("qf_native ltx2: single-expert family — transformer2 must be empty")
+        if not te_path:
+            raise RuntimeError(
+                "qf_native ltx2: te_file is REQUIRED for the 2.5 single-file layout — the "
+                "connector text projections (aggregate_embed) live in the gemma with-proj TE "
+                "file (the same file comfy's CLIPLoader uses), not in the transformer export.")
+        extra = {"connectors": transformer1_path, "text_encoder": te_path}
+        if audio_vae_path:
+            extra["audio_vae"] = audio_vae_path
+        model_dir = qfmp.stage_denoise_only_package(bundle_dir, transformer1_path, None,
+                                                    extra_links=extra)
+        return _build_from_package(model_dir, os.path.basename(transformer1_path),
+                                   resident_block_count, lora_entries=lora_entries,
+                                   create_extra={"denoise_only": True})
 
     def _build_from_package(model_dir, model_name, resident_block_count, start_image=None,
-              connector_ckpt="(none)", lora_entries=()):
+              connector_ckpt="(none)", lora_entries=(), create_extra=None):
         if connector_ckpt and connector_ckpt != "(none)":
             import folder_paths as _fp
             connector_ckpt = _fp.get_full_path_or_raise("checkpoints", connector_ckpt)
@@ -1056,7 +1077,7 @@ def register(deps):
             # removed there is no way to request it — so the old join_audio_prompt flag and its two
             # refusal branches are GONE (structurally unreachable code is not a guard). The AV path
             # below is LTX-2.5's own engine-side joint AV, which is a different mechanism.
-            _lora_cfg = {}
+            _lora_cfg = dict(create_extra or {})   # file-mode: {"denoise_only": True}
             if lora_entries:
                 _lora_cfg["lora"] = list(lora_entries)   # engine svdq factory: sidecar apply post-load
             # ── LTX-2.5 JOINT-AV auto-detect (c5.8b): the SAME discriminant the engine's own

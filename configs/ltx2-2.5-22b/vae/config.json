@@ -1,0 +1,116 @@
+{
+  "_class_name": "AutoencoderKLLTX2Video",
+  "latent_channels": 128,
+  "res_per_stage": [
+    2,
+    2,
+    4,
+    6,
+    4
+  ],
+  "stage_out_channels": [
+    1024,
+    512,
+    512,
+    256,
+    128
+  ],
+  "sample_factors": [
+    8,
+    8,
+    2,
+    4
+  ],
+  "sample_stride_t": [
+    2,
+    2,
+    2,
+    1
+  ],
+  "sample_stride_hw": [
+    2,
+    2,
+    1,
+    2
+  ],
+  "conv_out_channels": 48,
+  "out_channels": 3,
+  "patch_size": 4,
+  "latent_stats_key_style": "per_channel_statistics",
+  "has_mid_block": false,
+  "resnet_key_name": "res_blocks",
+  "flat_alternating_stages": true,
+  "upsample_residual": [
+    false,
+    false,
+    false,
+    false
+  ],
+  "resnet_norm_eps": 1e-06,
+  "_encoder_derived": {
+    "latent_channels": 128,
+    "res_per_stage": [
+      4,
+      6,
+      4,
+      2,
+      2
+    ],
+    "stage_out_channels": [
+      128,
+      256,
+      512,
+      1024,
+      1024
+    ],
+    "sample_factors": [
+      4,
+      2,
+      8,
+      8
+    ],
+    "sample_stride_t": [
+      1,
+      2,
+      2,
+      2
+    ],
+    "sample_stride_hw": [
+      2,
+      1,
+      2,
+      2
+    ],
+    "conv_out_channels": 129,
+    "out_channels": 3,
+    "patch_size": 7,
+    "latent_stats_key_style": "per_channel_statistics",
+    "has_mid_block": false,
+    "resnet_key_name": "res_blocks",
+    "flat_alternating_stages": true,
+    "upsample_residual": [
+      false,
+      false,
+      false,
+      false
+    ],
+    "resnet_norm_eps": 1e-06,
+    "_provenance": {
+      "latent_channels": "DERIVED: encoder.conv_out.conv.weight.shape[0] - 1 (the +1 channel is the extra/logvar lane)",
+      "res_per_stage": "DERIVED: count of DISTINCT down_blocks.<stage>.res_blocks.<i> indices; res-stage slots [0, 2, 4, 6, 8]",
+      "stage_out_channels": "DERIVED: down_blocks.<stage>.res_blocks.0.conv1.conv.weight.shape[0]",
+      "sample_factors": "DERIVED: down_blocks.<slot>.conv.conv.weight.shape[0] inverted, next / this (space-to-depth); sampler slots [1, 3, 5, 7]",
+      "sample_stride_t/hw": "DERIVED from sample_factors via the UNIQUE factorization f = stride_t * stride_hw^2 with strides in {1,2} (8=2x2^2, 4=1x2^2, 2=2x1^2); a factor that does not factor that way raises rather than guessing",
+      "conv_out_channels": "DERIVED: encoder.conv_out.conv.weight.shape[0]",
+      "out_channels": "NOT derivable from THIS slice alone -- conv_out_channels is AMBIGUOUS (48 = 3x4^2 = 12x2^2 = 48x1^2), which is why it used to be labelled a bare domain assumption. It is now REFERENCE-CONFIRMED: ltx_core/model/video_vae/video_vae.py sets out_channels = in_channels with in_channels=3, and the 19B vae/config.json declares out_channels=3 / in_channels=3. Still not a measurement OF THIS ARTIFACT -- the run-time latent:frame ratio check below is what actually measures it.",
+      "patch_size": "THREE INDEPENDENT SOURCES, deliberately listed separately because they are different KINDS of evidence and must not be collapsed into one \"verified\": (1) this slice: sqrt(conv_out_channels/out_channels) = sqrt(129/3) = 7 -- inherits out_channels; (2) REFERENCE: ltx_core video_vae.py declares patch_size: int = 4 and documents \"patchify: H -> H/4, W -> W/4\"; (3) ARITHMETIC on the sibling 19B config, which declares spatial_compression_ratio=32 while this slice yields an upsampler hw product of 8 -- 32 = 8 * patch_size back-solves to 4, and temporal_compression_ratio=8 matches the t product 8 exactly. NONE of these is a measurement of THIS run: the latent:frame ratio printed at the first successful decode is (ratio 32 => patch_size 4 and out_channels can only be 3; ratio 16 => patch_size 2, out_channels 12).",
+      "latent_stats_key_style": "DERIVED: presence of per_channel_statistics.* (2 keys); 19B uses latents_mean/latents_std",
+      "latent_channels_crosscheck": "per_channel_statistics.mean-of-means.shape[0] = 128 vs latent_channels 128 -> AGREE. This IS a genuine cross-check: a DIFFERENT tensor, not an echo of conv_in.",
+      "has_mid_block": "DERIVED: any encoder.mid_block.* key present. 2.3 has none; 19B has 20 (decoder) / 8 (encoder).",
+      "resnet_key_name": "DERIVED: the sub-path the real keys use (2.3 res_blocks / 19B resnets)",
+      "flat_alternating_stages": "DERIVED: sampler slots occupy their OWN (odd) stage indices [1, 3, 5, 7] instead of living inside a res-stage as 19B upsamplers.0 does",
+      "upsample_residual": "REFERENCE-CONFIRMED default False (ltx_core sampling.py DepthToSpaceUpsample residual: bool = False; 2 of 3 decoder sites omit it, the 3rd defaults False). NOT artifact-derivable -- residual is a behaviour, invisible in keys and shapes. NOT inherited from 19B: 19B has 3 entries vs 2.3's 4 sampler slots, so no inheritable value exists. UNRESOLVED SLIVER: the 22B instance block_config is not visible to us, so an explicit override there cannot be excluded. This is MEASURABLE at runtime, not silent -- the residual branch repeats the input and, when stride_t == 2, drops the first temporal frame, so it participates in the temporal length; the latent:frame ratio printed by the decoder is a live discriminator on it.",
+      "resnet_norm_eps": "NOT ARTIFACT-DERIVABLE (eps is not a stored tensor), but NOT a guess either: CONFIRMED against the official reference implementation ltx_core/model/video_vae/video_vae.py, which sets resnet_eps=1e-6 / eps=1e-6 at every construction site (grep resnet_eps / eps= there; symbols, not line numbers). The 19B vae/config.json independently declares resnet_norm_eps=1e-06 as well. The earlier \"if 2.3 uses a different eps this is a silent numerical difference\" FLAG is therefore WITHDRAWN -- it was read, not assumed."
+    }
+  }
+}

@@ -4,7 +4,7 @@ liveness/LoRA substrate:
 
   1. UI surface — transformer1/transformer2 FILE dropdowns + model_config (official presets,
      data-driven from configs/), nothing else
-  2. dispatch by the preset MANIFEST's family; ltx2/minimax-h3 refuse LOUD (not wired yet);
+  2. dispatch by the preset MANIFEST's family; ltx2/minimax-h3 FILE-MODE staging shape;
      traversal/shape-mismatch presets refused
   3. wan dual-expert STAGING — configs copied from the shipped bundle, weights SYMLINKED,
      denoise_only in the create cfg; single-file wan refused (A14B is dual-expert)
@@ -103,6 +103,19 @@ def main():
         with open(os.path.join(dm, f), "wb") as fh:
             fh.write(b"\0" * 16)
     folder_paths.add_model_folder_path("diffusion_models", dm)
+    # ltx2/h3 file-mode fixtures: extra weight surfaces the LTX loader resolves through
+    # (text_encoders: the gemma with-proj file; vae: the ltx-2.5 audio vae) + single-file
+    # transformer fixtures matching the shipped presets' file_hints.
+    te_root = os.path.join(tmp, "text_encoders"); os.makedirs(te_root)
+    vae_root = os.path.join(tmp, "vae"); os.makedirs(vae_root)
+    for root, f in ((dm, "fx-ltx-2.5-quantfunc-4bit.safetensors"),
+                    (dm, "fx-minimax-h3-quantfunc-int4.safetensors"),
+                    (te_root, "fx-gemma4-with-proj.safetensors"),
+                    (vae_root, "fx-ltx25-audio-vae.safetensors")):
+        with open(os.path.join(root, f), "wb") as fh:
+            fh.write(b"\0" * 16)
+    folder_paths.add_model_folder_path("text_encoders", te_root)
+    folder_paths.add_model_folder_path("vae", vae_root)
 
     # OFFICIAL-CONFIG presets under a FIXTURE configs dir: the real shipped wan preset copied in,
     # plus synthetic manifests that exercise routing (ltx2/h3 not-wired, unknown family,
@@ -113,6 +126,10 @@ def main():
                     os.path.join(cfgroot, "wan2.2-a14b-t2v"))
     shutil.copytree(os.path.join(_PLUGIN, "configs", "wan2.2-a14b-i2v"),
                     os.path.join(cfgroot, "wan2.2-a14b-i2v"))
+    shutil.copytree(os.path.join(_PLUGIN, "configs", "ltx2-2.5-22b"),
+                    os.path.join(cfgroot, "ltx2-2.5-22b"))
+    shutil.copytree(os.path.join(_PLUGIN, "configs", "minimax-h3-fl2va"),
+                    os.path.join(cfgroot, "minimax-h3-fl2va"))
     for name, mf in (("fx-ltx", {"family": "ltx2"}),
                      ("fx-h3", {"family": "minimax-h3"}),
                      ("fx-alien", {"family": "no-such-family"}),
@@ -172,14 +189,58 @@ def main():
     check("transformer1 lists .safetensors FILES (and only those)",
           "fx-t2v-4steps-high-quantfunc-int4.safetensors" in t1 and "not-a-model.txt" not in t1)
 
-    # ── 2) dispatch: family-node guard; ltx2/minimax-h3 loud not-wired via THEIR nodes;
+    # ── 2) dispatch: family-node guard + ltx2/minimax-h3 FILE-MODE staging (wired now —
+    #      the old not-wired refusal arms flipped into layout-shape arms);
     #      cross-family preset refused; model_config traversal refused ──
-    for node, preset in ((LtxL, "fx-ltx"), (H3L, "fx-h3")):
-        try:
-            node.load("fx-t2v-4steps-high-quantfunc-int4.safetensors", preset, 999)
-            check(f"{preset} refuses loud (family not wired for file mode)", False, "-> no exception")
-        except RuntimeError as e:
-            check(f"{preset} refuses loud (family not wired for file mode)", "not" in str(e).lower())
+    # ltx2 file-mode: te_file REQUIRED; with audio_vae -> AV staging (same-target xfm links
+    # into transformer/ AND connectors/ [#565 comfy25 branch], te + audio_vae links, cfg
+    # carries denoise_only). The synthetic fx-ltx manifest (no file_hints) keeps exercising
+    # bare routing; the REAL preset exercises the full staged shape.
+    try:
+        LtxL.load("fx-ltx-2.5-quantfunc-4bit.safetensors", "ltx2-2.5-22b", 999)
+        check("ltx2 without te_file refuses loud", False, "-> no exception")
+    except RuntimeError as e:
+        check("ltx2 without te_file refuses loud", "te_file" in str(e), f"-> {str(e)[:80]}")
+    out_ltx = LtxL.load("fx-ltx-2.5-quantfunc-4bit.safetensors", "ltx2-2.5-22b", 999,
+                        te_file="fx-gemma4-with-proj.safetensors",
+                        audio_vae="fx-ltx25-audio-vae.safetensors")[0]
+    check("ltx2 AV file-mode returns a QFModelPatcher",
+          type(out_ltx).__name__ == "QFModelPatcher")
+    check("ltx2 AV model is QFLTXAVModel (audio_vae present -> AV path)",
+          type(out_ltx.model).__name__ == "QFLTXAVModel", f"-> {type(out_ltx.model).__name__}")
+    _n0 = len(creates)
+    _ = out_ltx.model._qf.lib
+    check("ltx2 create deferred until first touch", len(creates) == _n0 + 1)
+    _lcfg = creates[-1]
+    check("ltx2 create cfg carries denoise_only", _lcfg.get("denoise_only") is True, f"-> {_lcfg}")
+    _lmd = out_ltx.model._qf._ckey[0]
+    _rx = os.path.realpath(os.path.join(_lmd, "transformer", "model.safetensors"))
+    _rc2 = os.path.realpath(os.path.join(_lmd, "connectors", "model.safetensors"))
+    check("ltx2 staged: transformer/ and connectors/ link the SAME single file (#565)",
+          _rx == _rc2 and _rx.endswith("fx-ltx-2.5-quantfunc-4bit.safetensors"))
+    check("ltx2 staged: te + audio_vae links resolve to the picked files",
+          os.path.realpath(os.path.join(_lmd, "text_encoder", "model.safetensors")).endswith("fx-gemma4-with-proj.safetensors")
+          and os.path.realpath(os.path.join(_lmd, "audio_vae", "model.safetensors")).endswith("fx-ltx25-audio-vae.safetensors"))
+    check("ltx2 staged: config-complete + transformer_2 pruned (single-expert)",
+          all(os.path.isfile(os.path.join(_lmd, q)) for q in
+              ("model_index.json", "transformer/config.json", "vae/config.json",
+               "connectors/config.json", "audio_vae/config.json"))
+          and not os.path.exists(os.path.join(_lmd, "transformer_2")))
+    # minimax-h3 file-mode: minimal staging (configs + single xfm; no extra links)
+    out_h3 = H3L.load("fx-minimax-h3-quantfunc-int4.safetensors", "minimax-h3-fl2va", 999)[0]
+    check("h3 file-mode returns a QFModelPatcher + QFH3Model",
+          type(out_h3).__name__ == "QFModelPatcher"
+          and type(out_h3.model).__name__ == "QFH3Model", f"-> {type(out_h3.model).__name__}")
+    _n0 = len(creates)
+    _ = out_h3.model._qf.lib
+    _hcfg = creates[-1] if len(creates) > _n0 else json.loads(out_h3.model._qf._ckey[-1])
+    check("h3 create cfg carries denoise_only", _hcfg.get("denoise_only") is True, f"-> {_hcfg}")
+    _hmd = out_h3.model._qf._ckey[0]
+    check("h3 staged: config-complete + xfm linked + transformer_2 pruned",
+          all(os.path.isfile(os.path.join(_hmd, q)) for q in
+              ("model_index.json", "transformer/config.json", "vae/config.json"))
+          and os.path.realpath(os.path.join(_hmd, "transformer", "model.safetensors")).endswith("fx-minimax-h3-quantfunc-int4.safetensors")
+          and not os.path.exists(os.path.join(_hmd, "transformer_2")))
     # a preset whose manifest family does not match the NODE's family → the defense-in-depth guard
     try:
         WanL.load("fx-t2v-4steps-high-quantfunc-int4.safetensors",

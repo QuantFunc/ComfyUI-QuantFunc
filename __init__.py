@@ -179,6 +179,32 @@ def _resolve_transformer(name):
     return _folder_paths.get_full_path_or_raise("diffusion_models", name)
 
 
+def _text_encoder_choices():
+    """.safetensors under comfy's models/text_encoders — the ltx2 loader's te_file input
+    (the gemma with-proj file the OFFICIAL LTX-2.5 comfy distribution ships; the connector
+    aggregate_embed projections live in it). Same folder_paths surface CLIPLoader uses."""
+    if _folder_paths is None:
+        return ["(comfy folder_paths unavailable)"]
+    try:
+        return (_folder_paths.get_filename_list("text_encoders")
+                or ["(no files under models/text_encoders)"])
+    except Exception:  # noqa: BLE001
+        return ["(no files under models/text_encoders)"]
+
+
+def _vae_file_choices(optional=True):
+    """.safetensors under comfy's models/vae — the ltx2 loader's audio_vae input (the
+    OFFICIAL ltx-2.5-audio-vae file; its PRESENCE in the staged package is the engine's
+    has_audio_ discriminant). '(none)' = video-only staging."""
+    base = ["(none)"] if optional else []
+    if _folder_paths is None:
+        return base + ["(comfy folder_paths unavailable)"]
+    try:
+        return base + (_folder_paths.get_filename_list("vae") or [])
+    except Exception:  # noqa: BLE001
+        return base
+
+
 def _lora_choices():
     if _folder_paths is None:
         return [_NO_LORA_HINT]
@@ -454,7 +480,8 @@ if _IMPORT_OK:
 
 
     def _run_family_load(expect_family, transformer1, model_config,
-                         resident_block_count, transformer2):
+                         resident_block_count, transformer2,
+                         te_file=None, audio_vae=None):
         """The SHARED loader core behind the per-family nodes (user 2026-08-21 pivot). All
         validation is preserved verbatim from the original single-node load(); the per-family
         nodes add only (a) a family-filtered preset dropdown and (b) this family guard —
@@ -508,9 +535,17 @@ if _IMPORT_OK:
                 f"qf_native: model_config '{model_config}' is single-transformer — leave "
                 f"transformer2 = \"(none)\" (a second expert here would be silently ignored "
                 f"at best; refused instead).")
+        kw = {}
+        # family-specific EXTRA weight inputs (ltx2 today): resolved through the SAME
+        # folder_paths surfaces their comfy-native consumers use; only forwarded when the
+        # node supplied them, so the wan/h3 builder signatures stay untouched.
+        if te_file and not str(te_file).startswith("("):
+            kw["te_path"] = _folder_paths.get_full_path_or_raise("text_encoders", te_file)
+        if audio_vae and audio_vae != "(none)" and not str(audio_vae).startswith("("):
+            kw["audio_vae_path"] = _folder_paths.get_full_path_or_raise("vae", audio_vae)
         return builder(transformer1_path=xfm1, transformer2_path=xfm2,
                        resident_block_count=int(resident_block_count),
-                       bundle_dir=bundle_dir)
+                       bundle_dir=bundle_dir, **kw)
 
     _RESIDENT_BLOCKS_INPUT = ("INT", {"default": 999, "min": 1, "max": 1024,
                                       "tooltip": "GPU-resident transformer blocks — the native "
@@ -572,11 +607,30 @@ if _IMPORT_OK:
             return {"required": {
                 "transformer": (_transformer_choices(),
                                 {"tooltip": "The LTX-2 transformer .safetensors under "
-                                            "models/diffusion_models."}),
+                                            "models/diffusion_models (the QuantFunc int4 "
+                                            "single-file export — connector + audio blocks "
+                                            "packed inside)."}),
                 "model_config": (_model_config_choices(family="ltx2"),
                                  {"tooltip": "The OFFICIAL LTX-2 model config preset. "
                                              + _preset_file_expectations()}),
+                "te_file": (_text_encoder_choices(),
+                            {"tooltip": "The gemma with-proj TE .safetensors under "
+                                        "models/text_encoders (official LTX-2.5 comfy "
+                                        "distribution; the connector text projections "
+                                        "live in it — REQUIRED for the single-file "
+                                        "layout). Pick the SAME file your CLIPLoader "
+                                        "uses."}),
                 "resident_block_count": _RESIDENT_BLOCKS_INPUT,
+            }, "optional": {
+                "audio_vae": (_vae_file_choices(),
+                              {"tooltip": "The official ltx-2.5 audio VAE .safetensors "
+                                          "under models/vae (vocoder bundled inside). "
+                                          "Present -> joint audio+video session (the "
+                                          "engine's has_audio_ discriminant is this "
+                                          "file's presence); '(none)' -> video-only, "
+                                          "which a 2.5 AV checkpoint refuses fail-loud "
+                                          "at begin rather than silently dropping "
+                                          "audio."}),
             }}
 
         RETURN_TYPES = ("MODEL",)
@@ -585,9 +639,11 @@ if _IMPORT_OK:
         DESCRIPTION = ("QuantFunc LTX-2 loader (svdq, denoise_only): one native MODEL a stock "
                        "sampler drives with latents. " + _COMMON_LIMITS)
 
-        def load(self, transformer, model_config, resident_block_count=999):
+        def load(self, transformer, model_config, resident_block_count=999,
+                 te_file=None, audio_vae="(none)"):
             return (_run_family_load("ltx2", transformer, model_config,
-                                     resident_block_count, None),)
+                                     resident_block_count, None,
+                                     te_file=te_file, audio_vae=audio_vae),)
 
     class QuantFuncH3Loader:
         """MiniMax-H3 loader — single MODEL output (single-expert AV family)."""

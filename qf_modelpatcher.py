@@ -478,7 +478,8 @@ def ensure_model_config_attrs(model_config):
     return model_config
 
 
-def stage_denoise_only_package(bundle_dir, transformer1_path, transformer2_path=None):
+def stage_denoise_only_package(bundle_dir, transformer1_path, transformer2_path=None,
+                               extra_links=None):
     """Build a config-complete PACKAGE dir the engine's `denoise_only` create can read WITHOUT
     copying the multi-GB weights.
 
@@ -501,7 +502,15 @@ def stage_denoise_only_package(bundle_dir, transformer1_path, transformer2_path=
             f"not shipped in the plugin (configs/<family>/). Cannot stage a denoise_only package.")
     real1 = os.path.realpath(transformer1_path)
     real2 = os.path.realpath(transformer2_path) if transformer2_path else None
-    key = hashlib.sha1(("|".join([bundle_dir, real1, real2 or ""])).encode()).hexdigest()[:16]
+    # extra_links: {subdir: target_path} — single-expert AV families link MORE weight files
+    # into the staged package (ltx2: the SAME single xfm file into connectors/ [#565 comfy25
+    # prefix branch], the gemma with-proj TE into text_encoder/ [connector aggregate_embed],
+    # the audio_vae file [engine has_audio_ discriminant = weights presence]). Deterministic
+    # key covers them so a re-pick restages.
+    extra_links = {k: os.path.realpath(v) for k, v in (extra_links or {}).items() if v}
+    key_src = "|".join([bundle_dir, real1, real2 or ""] +
+                       [f"{k}={v}" for k, v in sorted(extra_links.items())])
+    key = hashlib.sha1(key_src.encode()).hexdigest()[:16]
     root = os.path.join(folder_paths.get_temp_directory(), "qf_native_stage")
     os.makedirs(root, exist_ok=True)
     stage = os.path.join(root, key)
@@ -530,6 +539,8 @@ def stage_denoise_only_package(bundle_dir, transformer1_path, transformer2_path=
                     f"symlinks (Windows: Developer Mode) or keep the weights on the same volume "
                     f"as ComfyUI's temp directory.") from exc
     _link_expert("transformer", real1)
+    for sub, target in sorted(extra_links.items()):
+        _link_expert(sub, target)
     if real2:
         _link_expert("transformer_2", real2)
     else:

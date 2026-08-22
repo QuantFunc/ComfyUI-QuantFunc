@@ -1,0 +1,13 @@
+{
+  "family": "ltx2",
+  "display": "LTX-2.5 22B (single-expert, INT4, ComfyUI single-file)",
+  "dual_expert": false,
+  "notes": "official LTX-2.5 22B configs (staged-shared provenance); single ComfyUI-export transformer file (connector blocks packed inside, #565 mapping); engine denoise_only skips TE/VAE/connector weights — comfy owns conditioning + decode; expected file: LTX-2.5 QuantFunc 4bit single-file export",
+  "file_hints": {
+    "transformer1": [
+      "*ltx*2.5*quantfunc*4bit*",
+      "*ltx*2.5*quantfunc*int4*",
+      "*ltx25*quantfunc*"
+    ]
+  }
+}

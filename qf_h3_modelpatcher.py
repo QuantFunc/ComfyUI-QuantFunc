@@ -23,6 +23,7 @@ SCOPE (fork recommended order): t2va (prompt -> video+audio) works on the CURREN
 latent to the engine seam-v2 (spec.av_keyframes) — it is NOT yet bound, so this loader REJECTS a wired
 keyframe (minimax_keyframes) fail-loud until begin_av lands. ref2va is likewise deferred.
 """
+import os
 import ctypes
 import json
 import logging
@@ -488,17 +489,22 @@ def register(deps):
 
     def build(transformer1_path, transformer2_path, resident_block_count, bundle_dir=None,
               lora_entries=()):
-        """File-based loading for this family is NOT WIRED YET (loud, not silent): the
-        engine's denoise_only create exists only for wan today. This family still needs
-        its engine-side flag + a shipped config bundle — tracked follow-up; wan is the
-        validation vehicle. The old package-dir builder below is kept for that wiring."""
-        raise RuntimeError(
-            "qf_native minimax-h3: file-based (transformer .safetensors) loading is not "
-            "wired for this family yet — wan2.2 A14B is the first; minimax-h3 follows once "
-            "its engine denoise_only create + config bundle land.")
+        """File-based loading for MiniMax-H3 — the wan staging pattern, single-expert:
+        stage the shipped config bundle (configs/minimax-h3-*/, official configs) + symlink
+        the single transformer file; engine create runs denoise_only=True (TE + VAE weights
+        skipped — comfy's stock MiniMaxH3 nodes own conditioning/refs and comfy decodes;
+        the engine reads the staged configs for session geometry only). No extra weight
+        links: unlike ltx2 the H3 external session needs no engine-side connector/projection
+        weights (refs arrive as av_conds latents from comfy)."""
+        if transformer2_path:
+            raise RuntimeError("qf_native minimax-h3: single-expert family — transformer2 must be empty")
+        model_dir = qfmp.stage_denoise_only_package(bundle_dir, transformer1_path, None)
+        return _build_from_package(model_dir, os.path.basename(transformer1_path),
+                                   resident_block_count, lora_entries=lora_entries,
+                                   create_extra={"denoise_only": True})
 
     def _build_from_package(model_dir, model_name, resident_block_count, start_image=None,
-              connector_ckpt="(none)", lora_entries=()):
+              connector_ckpt="(none)", lora_entries=(), create_extra=None):
         if start_image is not None:
             raise RuntimeError(
                 "qf_native H3: start_image is not an H3 input — the H3 seam takes its image/audio "
@@ -510,7 +516,7 @@ def register(deps):
 
         def _build(lora_entries):
             """Create (or reuse) the pipeline for THIS lora set + wrap it in a patcher."""
-            _lora_cfg = {}
+            _lora_cfg = dict(create_extra or {})   # file-mode: {"denoise_only": True}
             if lora_entries:
                 _lora_cfg["lora"] = list(lora_entries)   # engine svdq load: sidecar apply post-load
             # H3 svdq is PRE-quantized: create is MINIMAL. The svdquant metadata carries the
