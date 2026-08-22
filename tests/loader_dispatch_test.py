@@ -347,6 +347,58 @@ def main():
     except RuntimeError as _e:
         check("extra_conds still REJECTS keyframe_idxs loud",
               "keyframe_idxs" in str(_e), f"-> {str(_e)[:70]}")
+    # ── masked-latent i2v: _frame_scales_from_mask unit arms (Z review: pure-fn, no e2e) ──
+    import types as _types
+    _red = _qlm.QFLTXModel._frame_scales_from_mask
+    _stub = _types.SimpleNamespace(latent_shapes=[[1, 4, 2, 2, 2], [1, 8, 3, 16]])
+    # (a) 5D channel-repeated [B,C,F,H,W]: frame0=0.3, frame1=1.0
+    _m5 = _t2.ones(1, 4, 2, 2, 2)
+    _m5[:, :, 0] = 0.3
+    check("mask->scales: 5D per-frame reduce",
+          [round(v, 4) for v in _red(_stub, _m5)] == [0.3, 1.0],
+          f"-> {_red(_stub, _m5)}")
+    # (b) packed AV flat [B,1,total]: video part frame0=0.3, audio part all-1.0
+    _nv = 4 * 2 * 2 * 2
+    _na = 8 * 3 * 16
+    _flat = _t2.ones(1, 1, _nv + _na)
+    _v = _flat[0, 0, :_nv].reshape(1, 4, 2, 2, 2)
+    _v[:, :, 0] = 0.3
+    check("mask->scales: packed AV flat split via latent_shapes",
+          [round(v, 4) for v in _red(_stub, _flat)] == [0.3, 1.0],
+          f"-> {_red(_stub, _flat)}")
+    # (c) AUDIO-lane masking refused loud
+    _flat_am = _flat.clone()
+    _flat_am[0, 0, _nv:] = 0.5
+    try:
+        _red(_stub, _flat_am)
+        check("mask->scales: audio-lane mask refused loud", False, "-> no exception")
+    except RuntimeError as _e:
+        check("mask->scales: audio-lane mask refused loud", "AUDIO" in str(_e),
+              f"-> {str(_e)[:60]}")
+    # (d) frame-INTERNAL variation (spatial inpaint) refused loud
+    _m5v = _t2.ones(1, 4, 2, 2, 2)
+    _m5v[0, 0, 0, 0, 0] = 0.2
+    try:
+        _red(_stub, _m5v)
+        check("mask->scales: spatial (within-frame) mask refused loud", False, "-> no exception")
+    except RuntimeError as _e:
+        check("mask->scales: spatial (within-frame) mask refused loud",
+              "WITHIN a latent frame" in str(_e), f"-> {str(_e)[:60]}")
+    # (e) unknown rank refused loud
+    try:
+        _red(_stub, _t2.ones(2, 2))
+        check("mask->scales: unknown mask rank refused loud", False, "-> no exception")
+    except RuntimeError as _e:
+        check("mask->scales: unknown mask rank refused loud", "unsupported mask source" in str(_e),
+              f"-> {str(_e)[:60]}")
+    # (f) integration: all-ones mask -> omitted (scalar path); conditioned mask -> stashed
+    _ = _mdl.extra_conds(denoise_mask=_t2.ones(1, 4, 2, 2, 2))
+    check("extra_conds: all-ones mask omits the begin key (scalar path kept)",
+          getattr(_mdl, "_pending_frame_t_scale", "MISSING") is None)
+    _ = _mdl.extra_conds(denoise_mask=_m5)
+    check("extra_conds: conditioned mask stashed as per-frame scales",
+          [round(v, 4) for v in (_mdl._pending_frame_t_scale or [])] == [0.3, 1.0],
+          f"-> {_mdl._pending_frame_t_scale}")
     # minimax-h3 file-mode: minimal staging (configs + single xfm; no extra links)
     out_h3 = H3L.load("fx-minimax-h3-quantfunc-int4.safetensors", "minimax-h3-fl2va", 999)[0]
     check("h3 file-mode returns a QFModelPatcher + QFH3Model",

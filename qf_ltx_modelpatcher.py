@@ -496,7 +496,8 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
         """denoise_mask -> per-LATENT-frame sigma scales (comfy process_timestep parity).
 
         Two shapes reach this seam (MEASURED):
-        - video-only 5D [B,1,F,H,W] (plain latent path);
+        - video-only 5D channel-repeated [B,C,F,H,W] (plain latent path; the mask is
+          channel-uniform so channel 0 is representative);
         - joint-AV FLAT [B,1,total] — comfy packs the nested (video, audio) latent and
           flattens the mask alike (total = video_elems + audio_elems; measured
           1,818,368 = 128*16*22*40 + 8*126*16). Split via self.latent_shapes.
@@ -528,7 +529,7 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
         else:
             raise RuntimeError(
                 f"qf_native LTX: denoise_mask with shape {tuple(dm.shape)} is not a "
-                f"[B,1,F,H,W] latent mask nor the packed AV flat form — unsupported "
+                f"[B,C,F,H,W] latent mask nor the packed AV flat form — unsupported "
                 f"mask source.")
         per_frame = []
         for f in range(int(m.shape[0])):
