@@ -481,7 +481,7 @@ if _IMPORT_OK:
 
     def _run_family_load(expect_family, transformer1, model_config,
                          resident_block_count, transformer2,
-                         te_file=None, audio_vae=None):
+                         te_file=None, audio_vae=None, start_image=None):
         """The SHARED loader core behind the per-family nodes (user 2026-08-21 pivot). All
         validation is preserved verbatim from the original single-node load(); the per-family
         nodes add only (a) a family-filtered preset dropdown and (b) this family guard —
@@ -543,6 +543,8 @@ if _IMPORT_OK:
             kw["te_path"] = _folder_paths.get_full_path_or_raise("text_encoders", te_file)
         if audio_vae and audio_vae != "(none)" and not str(audio_vae).startswith("("):
             kw["audio_vae_path"] = _folder_paths.get_full_path_or_raise("vae", audio_vae)
+        if start_image is not None:
+            kw["start_image"] = start_image
         return builder(transformer1_path=xfm1, transformer2_path=xfm2,
                        resident_block_count=int(resident_block_count),
                        bundle_dir=bundle_dir, **kw)
@@ -631,6 +633,11 @@ if _IMPORT_OK:
                                           "which a 2.5 AV checkpoint refuses fail-loud "
                                           "at begin rather than silently dropping "
                                           "audio."}),
+                "start_image": ("IMAGE",
+                                {"tooltip": "Optional i2v: a comfy IMAGE conditioning "
+                                            "frame 0 (engine-side begin_edit frame-0 "
+                                            "conditioning — the QFLTX model class's "
+                                            "existing channel). Disconnect for t2v/t2av."}),
             }}
 
         RETURN_TYPES = ("MODEL",)
@@ -640,10 +647,11 @@ if _IMPORT_OK:
                        "sampler drives with latents. " + _COMMON_LIMITS)
 
         def load(self, transformer, model_config, resident_block_count=999,
-                 te_file=None, audio_vae="(none)"):
+                 te_file=None, audio_vae="(none)", start_image=None):
             return (_run_family_load("ltx2", transformer, model_config,
                                      resident_block_count, None,
-                                     te_file=te_file, audio_vae=audio_vae),)
+                                     te_file=te_file, audio_vae=audio_vae,
+                                     start_image=start_image),)
 
     class QuantFuncH3Loader:
         """MiniMax-H3 loader — single MODEL output (single-expert AV family)."""

@@ -1029,7 +1029,7 @@ def register(deps):
 
 
     def build(transformer1_path, transformer2_path, resident_block_count, bundle_dir=None,
-              lora_entries=(), te_path=None, audio_vae_path=None):
+              lora_entries=(), te_path=None, audio_vae_path=None, start_image=None):
         """File-based (ComfyUI single-file) loading for LTX-2.5 — the wan staging pattern
         with the family's extra weight links:
         - transformer/  <- the single int4 export (transformer + connector + audio blocks);
@@ -1057,7 +1057,8 @@ def register(deps):
         model_dir = qfmp.stage_denoise_only_package(bundle_dir, transformer1_path, None,
                                                     extra_links=extra)
         return _build_from_package(model_dir, os.path.basename(transformer1_path),
-                                   resident_block_count, lora_entries=lora_entries,
+                                   resident_block_count, start_image=start_image,
+                                   lora_entries=lora_entries,
                                    create_extra={"denoise_only": True})
 
     def _build_from_package(model_dir, model_name, resident_block_count, start_image=None,

@@ -18,10 +18,12 @@ WHY H3 is DIFFERENT from the LTX/WAN seams (fork blueprint + engine seam-v2 grou
 - NO CONNECTOR. H3 conditions DIRECTLY on Qwen3-VL hidden states (c_crossattn) — no LTX-style
   video_embeddings_connector.
 
-SCOPE (fork recommended order): t2va (prompt -> video+audio) works on the CURRENT engine C-API. fl2va
-(first/last keyframe) needs a NEW quantfunc_denoise_begin_av that carries the pre-encoded keyframe
-latent to the engine seam-v2 (spec.av_keyframes) — it is NOT yet bound, so this loader REJECTS a wired
-keyframe (minimax_keyframes) fail-loud until begin_av lands. ref2va is likewise deferred.
+SCOPE (2026-08-22, user goal "H3 支持图/视频/音频输入,输出视频带音频"): t2va + fl2va keyframes +
+ref2va references ALL ride the begin options av_conds bridge (_begin forwards kind/latent/audio_latent
+verbatim; the engine seam binds spec.av_keyframes / spec.av_refs). Reference kinds: image (single-frame
+latent), audio (soundtrack, must pair with a visual ref — official rule), video / video_audio
+(MULTI-FRAME latent blocks — engine buildRef2VABlocksDenoiseInputs, the official _video_grid cursor
+math, parity+official-value death rules in test_minimax_h3_pack.cpp).
 """
 import os
 import ctypes
@@ -135,19 +137,24 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
         if refs is not None:
             for r in refs:
                 kind = r.get("kind")
-                if kind in ("video", "video_audio"):
-                    raise RuntimeError(
-                        "qf_native H3: a VIDEO reference block (ref_videos on MiniMaxH3ReferenceToVideo) "
-                        "is wired — video reference blocks are NOT yet supported through this native "
-                        "loader (image + audio references ARE). Remove the ref_video input, or use the "
-                        "stock H3 model for video references.")
-                if kind == "image":
-                    if r.get("latent") is None or getattr(r["latent"], "ndim", 0) != 5:
-                        raise RuntimeError("qf_native H3: minimax_refs image entry lacks a 5-D latent")
-                elif kind == "audio":
-                    if r.get("audio_latent") is None or getattr(r["audio_latent"], "ndim", 0) != 4:
-                        raise RuntimeError("qf_native H3: minimax_refs audio entry lacks a 4-D audio latent")
-                else:
+                if kind in ("image", "video", "video_audio"):
+                    lat = r.get("latent")
+                    if lat is None or getattr(lat, "ndim", 0) != 5:
+                        raise RuntimeError(
+                            f"qf_native H3: minimax_refs {kind} entry lacks a 5-D latent "
+                            f"(got {type(lat).__name__}{getattr(lat, 'shape', '')})")
+                    if kind == "image" and int(lat.shape[2]) != 1:
+                        raise RuntimeError(
+                            "qf_native H3: minimax_refs image entry must be single-frame "
+                            f"[1,24,1,h,w] (got T={int(lat.shape[2])})")
+                    if kind in ("video", "video_audio") and int(lat.shape[2]) < 1:
+                        raise RuntimeError("qf_native H3: minimax_refs video entry has no frames")
+                if kind in ("audio", "video_audio"):
+                    alat = r.get("audio_latent")
+                    if alat is None or getattr(alat, "ndim", 0) != 4:
+                        raise RuntimeError(
+                            f"qf_native H3: minimax_refs {kind} entry lacks a 4-D audio latent")
+                if kind not in ("image", "audio", "video", "video_audio"):
                     raise RuntimeError(f"qf_native H3: unknown minimax_refs kind '{kind}'")
             payload["refs"] = refs
         tags = kwargs.get("minimax_token_tags")
