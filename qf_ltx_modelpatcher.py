@@ -1144,7 +1144,14 @@ def register(deps):
         return _build_from_package(model_dir, os.path.basename(transformer1_path),
                                    resident_block_count,
                                    lora_entries=lora_entries,
-                                   create_extra={"denoise_only": True})
+                                   # use_pinned_memory (perf, 2026-08-23): the two-stage flow
+                                   # round-trips the 18.3GB weight set between stages (comfy
+                                   # evicts for the VAE/upsampler) — pageable copies ran at
+                                   # ~2-4GB/s (nsys: memcpy = 86% of API time). Pinned host
+                                   # backups cut every offload/reload 3-6x. RAM budget: one
+                                   # model's footprint, freed with the backup.
+                                   create_extra={"denoise_only": True,
+                                                 "use_pinned_memory": True})
 
     def _build_from_package(model_dir, model_name, resident_block_count,
               connector_ckpt="(none)", lora_entries=(), create_extra=None):

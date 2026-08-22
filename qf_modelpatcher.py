@@ -778,10 +778,16 @@ class QFModelPatcher(comfy.model_patcher.ModelPatcher):
         return 0
 
     def partially_unload(self, device_to, memory_to_free=0, force_patch_weights=False):
-        # Co-eviction (#4): comfy needs VRAM for a sibling → ACTUALLY free the engine's VRAM
-        # (unload_sync → GPU->CPU, reloads on next generate) and return the REAL freed bytes so comfy's
-        # ledger is honest. The old 0-return let comfy pop us + believe multi-GB was free while the
-        # engine stayed fully resident → the next model loaded into that "freed" space OOM'd.
+        # Co-eviction (#4) + PARTIAL shed (2026-08-23 inter-stage eviction fix, ALL families —
+        # this patcher is shared by wan/ltx2/h3): comfy asks to free `memory_to_free` (a few GB
+        # for a sibling VAE/upsampler between a two-stage workflow's samplers). The old
+        # all-or-nothing path offloaded the ENTIRE weight set for that small ask (measured LTX:
+        # 18.3 GB round-tripped over pageable copies = ~10-15 s/prompt; nsys cudaMemcpyAsync =
+        # 86% of API time). Now: shed only enough trailing transformer blocks
+        # (engine quantfunc_partial_unload; backups already exist so the shed itself copies
+        # NOTHING, and the next session begin reloads just those blocks). SAFETY LADDER: if the
+        # partial shed cannot cover ~the request (old .so / monolith / refused), fall back to
+        # the full unload so comfy's ledger never over-credits.
         if self._is_shadow():
             # A shadow never drives the SHARED engine's eviction (the primary output owns it);
             # its ledger share is the tiny constant, so comfy loses nothing by this 0.
@@ -789,6 +795,14 @@ class QFModelPatcher(comfy.model_patcher.ModelPatcher):
         eng = self._engine()
         if eng is None:
             return 0
+        want = int(memory_to_free or 0)
+        if want > 0 and hasattr(eng, "partial_unload_vram"):
+            freed = eng.partial_unload_vram(want)
+            if freed >= want:
+                print(f"[qf_native] partial VRAM shed: {freed // (1024*1024)} MB freed for a "
+                      f"{want // (1024*1024)} MB request (weights stay live)", flush=True)
+                return freed
+            # partial insufficient — full fallback keeps the honest-ledger guarantee
         return eng.unload_vram()
 
 

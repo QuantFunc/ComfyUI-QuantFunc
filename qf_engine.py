@@ -194,6 +194,11 @@ def _bind(lib):
     lib.quantfunc_unload.argtypes = [v]
     lib.quantfunc_unload_sync.restype = ctypes.c_int
     lib.quantfunc_unload_sync.argtypes = [v]
+    # partial VRAM shed (inter-stage eviction fix; absent on older .so -> hasattr-guarded)
+    if hasattr(lib, "quantfunc_partial_unload"):
+        lib.quantfunc_partial_unload.restype = ctypes.c_int
+        lib.quantfunc_partial_unload.argtypes = [v, ctypes.c_uint64,
+                                                 ctypes.POINTER(ctypes.c_int64)]
     return lib
 
 
@@ -557,6 +562,28 @@ class QFEngineHandle:
         # is surfaced above, not swallowed into a false "closed".
         self.current_session = None
         return (True, ok)
+
+    def partial_unload_vram(self, bytes_requested):
+        """Shed ONLY ~bytes_requested of trailing transformer blocks (engine
+        quantfunc_partial_unload; family-generic Pipeline base — LTX/H3 single
+        transformer, wan main expert). Returns the engine-reported freed bytes
+        (0 = unsupported / nothing shed / old .so — caller falls back to
+        unload_vram). Never marks the handle `unloaded`: the model stays LIVE
+        with a smaller resident prefix; the next session begin restores it."""
+        if self.pipeline is None or self.unloaded or bytes_requested <= 0:
+            return 0
+        if not hasattr(self.lib, "quantfunc_partial_unload"):
+            return 0
+        if self.current_session is not None:
+            return 0                        # mid-session: refuse (lease would too)
+        freed = ctypes.c_int64(0)
+        try:
+            st = self.lib.quantfunc_partial_unload(self.pipeline,
+                                                   ctypes.c_uint64(int(bytes_requested)),
+                                                   ctypes.byref(freed))
+        except Exception:  # noqa: BLE001
+            return 0
+        return int(freed.value) if st == QUANTFUNC_OK else 0
 
     def unload_vram(self):
         """Co-eviction (#4): free the engine's VRAM (quantfunc_unload_sync — GPU->CPU, keeps the CPU
