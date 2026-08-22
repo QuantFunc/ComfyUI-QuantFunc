@@ -553,8 +553,15 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
     def _derive_geometry(self, xin, transformer_options):
         """DERIVE the session geometry from the graph (official-loader shape — the loader has no
         geometry widgets). xin: [B,128,F_lat,H_lat,W_lat]; LTX VAE scale temporal 8 / spatial 32.
-        Step count from the sampler's own sigma schedule; a TRIMMED range is refused (the engine
-        session runs its OWN internal schedule keyed to the full range)."""
+        Step count from the sampler's own sigma schedule. PARTIAL / TRIMMED ranges are
+        ACCEPTED (two-stage official workflows: stage-A 1.0->0.975 low-res, stage-B
+        0.85->0 refine after the x2 latent upsample): the external session is PURELY
+        sigma-driven — the engine's session step consumes the driver's sigma each call
+        and its session path has ZERO num_steps / step-index consumption (verified by
+        source sweep + c5.8 legC bit-identical under a full external Euler drive). The
+        old refusal's rationale ("engine runs its OWN internal schedule") described the
+        INTERNAL generate_video loop, not this seam. Only pathological schedules
+        (fewer than 2 sigmas / non-decreasing) are refused."""
         Tlat = int(xin.shape[2])
         self._num_frames = (Tlat - 1) * _LTX_TEMPORAL + 1
         sigmas = transformer_options.get("sample_sigmas") if isinstance(transformer_options, dict) else None
@@ -568,14 +575,11 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
             s_first, s_last = float(sigmas[0]), float(sigmas[-1])
         except Exception:  # noqa: BLE001 — non-tensor sigmas: keep the count, skip the range check
             return
-        ms = getattr(self, "model_sampling", None)
-        s_max = float(getattr(ms, "sigma_max", s_first)) if ms is not None else s_first
-        if s_last > 1e-3 or (s_max > 0 and s_first < 0.98 * s_max):
+        if s_first <= s_last:
             raise RuntimeError(
-                f"qf_native LTX: partial / trimmed denoise is NOT supported (sigmas run "
-                f"{s_first:.4f}→{s_last:.4f}, full range would be {s_max:.4f}→0). The engine session "
-                f"runs its OWN internal schedule keyed to the full step range. Use a single "
-                f"full-range KSampler (denoise=1.0, no start_step/last_step).")
+                f"qf_native LTX: sigma schedule must be strictly DECREASING (got "
+                f"{s_first:.4f}->{s_last:.4f}) — a non-decreasing schedule would drive the "
+                f"session backwards.")
 
     # ── connector bridge: comfy pre-connector dual TE [B,S,6144] -> POST-connector [B,S,6144 | 4096] ──
     def _post_connector_seq(self, raw_s):
