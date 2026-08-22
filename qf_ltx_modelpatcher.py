@@ -642,7 +642,9 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
             # begin_edit_cond frame-0 cond latent (identity latent scale; engine packs ->
             # per-step impose + velocity pin + finalize pin — the c5.8g chain; no engine
             # VAE). LEGACY (no video_vae): temp PNG -> begin_edit engine-encode.
-            if self._video_vae_path and not hasattr(lib, "quantfunc_denoise_begin_edit_cond"):
+            _cond_cap = (hasattr(lib, "quantfunc_denoise_cond_tail_supported")
+                         and lib.quantfunc_denoise_cond_tail_supported(self._qf.pipeline) == 1)
+            if self._video_vae_path and not _cond_cap:
                 # Wan-precedent fail-loud (CR minor-1): the user asked for the cond-latent
                 # route (video_vae wired) but the loaded .so predates the ABI — a SILENT
                 # fall-through to the legacy engine-encode route would run a materially
@@ -650,10 +652,13 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
                 # packages that carry no engine VAE weights).
                 raise RuntimeError(
                     "qf_native ltx2 i2v: video_vae is wired (cond-latent route), but the "
-                    "loaded engine .so predates the i2v cond-latent ABI (no "
-                    "quantfunc_denoise_begin_edit_cond export). Update the plugin's engine "
-                    "library, or disconnect video_vae to use the legacy engine-encode route "
-                    "(full packages only).")
+                    "loaded engine does not support the LTX cond-latent (the "
+                    "quantfunc_denoise_cond_tail_supported capability query is absent or "
+                    "answers 0 for this pipeline — engines in the [754d..f1c9) window "
+                    "export begin_edit_cond for Wan only and would SILENTLY ignore the "
+                    "LTX tail; the engine-side E3 guard now also refuses it loudly). "
+                    "Update the plugin's engine library, or disconnect video_vae to use "
+                    "the legacy engine-encode route (full packages only).")
             if self._video_vae_path:
                 if self._i2v_vae is None:
                     import comfy.sd as _csd
@@ -1256,9 +1261,34 @@ def register(deps):
             # 19B staging deliberately omits it) — so plugin and engine agree by construction.
             # AV → QFLTXAVModel (t2av; engine-side connector via av_unprocessed_ctx; NO
             # connector_ckpt needed). Video-only → the existing path, byte-unchanged.
+            # CR conf-1: mirror the engine's FULL has_audio_ discriminant (LTX2VideoPipeline
+            # :440): audio_vae WEIGHTS present AND a vocoder — either a vocoder/ dir with
+            # weights (2.3 layout) or vocoder.* keys BUNDLED inside the audio_vae file
+            # (2.5 layout; cheap safetensors header read, the _has_connector_keys idiom).
+            # audio_vae-without-vocoder would make the plugin pick the AV model while the
+            # engine says video-only -> the begin-time audio-lane mismatch refusal (loud,
+            # but confusing); agreeing by construction avoids it.
+            def _file_has_prefix(path, prefix):
+                import struct as _st
+                try:
+                    with open(path, "rb") as fh:
+                        n = _st.unpack("<Q", fh.read(8))[0]
+                        if n > (1 << 31):
+                            return False
+                        hdr = json.loads(fh.read(n))
+                    return any(k.startswith(prefix) for k in hdr)
+                except Exception:  # noqa: BLE001
+                    return False
             _avae_dir = os.path.join(model_dir, "audio_vae")
-            _is_av = os.path.isdir(_avae_dir) and any(
-                f.endswith(".safetensors") for f in os.listdir(_avae_dir))
+            _avae_files = ([os.path.join(_avae_dir, f) for f in os.listdir(_avae_dir)
+                            if f.endswith(".safetensors")]
+                           if os.path.isdir(_avae_dir) else [])
+            _voc_dir = os.path.join(model_dir, "vocoder")
+            _voc_ok = os.path.isdir(_voc_dir) and any(
+                f.endswith(".safetensors") for f in os.listdir(_voc_dir))
+            _voc_bundled = (not _voc_ok) and any(
+                _file_has_prefix(f, "vocoder.") for f in _avae_files)
+            _is_av = bool(_avae_files) and (_voc_ok or _voc_bundled)
             if _is_av:
                 def _factory():
                     eng, ckey = get_engine(model_dir, create_cfg=(_lora_cfg or None))
@@ -1359,7 +1389,10 @@ def register(deps):
 
             model = QFLTXModel(model_config, engine, connector, device=device,
                                audio_connector=audio_connector, start_image=start_image,
-                               resident_block_count=resident_block_count)
+                               resident_block_count=resident_block_count,
+                               video_vae_path=video_vae_path)   # CR A-3: the cond-latent
+                               # route must reach the video-only class too — omitting it
+                               # silently degraded i2v to the legacy temp-PNG engine-encode
             patcher = QFModelPatcher(model, load_device=device, offload_device=offload)
             print(f"[qf_native] loaded QuantFuncNativeLoader (LTX-2 svdq) package={model_name} "
                   f"resident_blocks={resident_block_count} "

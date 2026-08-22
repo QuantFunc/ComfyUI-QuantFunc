@@ -117,11 +117,18 @@ def main():
     # a VALID-header connectors fixture (the ltx2 build does a real safetensors header read to
     # detect embeddings_connector keys — a 16-byte dummy reads as keyless):
     import struct as _st
-    _hdr = json.dumps({"model.diffusion_model.video_embeddings_connector.learnable_registers":
-                       {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]}}).encode()
-    _pad = (8 - (len(_hdr) % 8)) % 8; _hdr += b" " * _pad
-    with open(os.path.join(dm, "fx-ltx25-connectors.safetensors"), "wb") as fh:
-        fh.write(_st.pack("<Q", len(_hdr))); fh.write(_hdr); fh.write(b"\0" * 4)
+    def _mini_st(path, key):
+        hdr = json.dumps({key: {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]}}).encode()
+        pad = (8 - (len(hdr) % 8)) % 8; hdr += b" " * pad
+        with open(path, "wb") as fh:
+            fh.write(_st.pack("<Q", len(hdr))); fh.write(hdr); fh.write(b"\0" * 4)
+    _mini_st(os.path.join(dm, "fx-ltx25-connectors.safetensors"),
+             "model.diffusion_model.video_embeddings_connector.learnable_registers")
+    # conf-1: the AV discriminant now mirrors the ENGINE's (audio_vae weights AND a
+    # vocoder — 2.5 bundles vocoder.* inside the audio_vae file), so the audio-vae
+    # fixture must carry a vocoder key to arm the AV path.
+    _mini_st(os.path.join(vae_root, "fx-ltx25-audio-vae.safetensors"),
+             "vocoder.bwe_generator.conv_pre.weight")
     folder_paths.add_model_folder_path("text_encoders", te_root)
     folder_paths.add_model_folder_path("vae", vae_root)
     # an ISOLATED diffusion_models dir with NO connectors sibling — the auto-probe fallback

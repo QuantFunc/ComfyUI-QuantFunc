@@ -174,6 +174,12 @@ def _bind(lib):
         lib.quantfunc_denoise_step_multi.argtypes = [v, ctypes.POINTER(DenoiseStepMultiParams)]
     # i2v cond-latent begin (cond-ABI builds only; hasattr-gated like step_multi — an old .so
     # simply lacks the symbol and the wan i2v sampling path then refuses with guidance).
+    if hasattr(lib, "quantfunc_denoise_cond_tail_supported"):
+        # CR A-1 capability query (per-pipeline): 1 = this pipeline consumes a
+        # begin_edit_cond cond-latent. Probe THIS (presence + answer), not the wan-era
+        # begin_edit_cond symbol.
+        lib.quantfunc_denoise_cond_tail_supported.restype = ctypes.c_int
+        lib.quantfunc_denoise_cond_tail_supported.argtypes = [v]
     if hasattr(lib, "quantfunc_denoise_begin_edit_cond"):
         lib.quantfunc_denoise_begin_edit_cond.restype = ctypes.c_int
         lib.quantfunc_denoise_begin_edit_cond.argtypes = [
