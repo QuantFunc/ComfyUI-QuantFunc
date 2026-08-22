@@ -346,28 +346,41 @@ def _live_pipeline_models(ckey):
     return [r() for r in refs]
 
 
-def _may_release_handle(ckey, requester):
-    """May `requester`'s wrapper DESTROY ckey's shared handle? Only when no OTHER live model is
-    bound to it — a sibling loader node on the same package would otherwise be left holding a
-    destroyed handle (NULL pipeline at its next denoise) while still reporting its backup to
-    comfy's ledger. On grant, the cache entry is dropped (the caller destroys the handle; the
-    next load re-creates from disk). The requester itself STAYS bound: if it re-materializes
-    later it becomes a live consumer of the ckey's NEXT handle.
+def _retire_handle(ckey, eng, requester=None, *, keep_binding=False, reason=""):
+    """THE ONLY place in this plugin allowed to call .destroy() on an engine handle — enforced
+    as a real AST property by the dispatch suite (attribute calls AND getattr-alias forms,
+    file set derived from the package; reviewer-F: the previous per-site hand-written gates +
+    a substring scan were the hollow-lint shape, and the unconditional-destroy class had
+    already recurred twice).
 
-    PAIR-MATE EXEMPTION (dual-output pivot): the wan loader emits model_high + model_low sharing
-    ONE QFLazyEngine INSTANCE. A pair-mate is NOT "another consumer" for release purposes — both
-    models see the SAME lazy wrapper, which re-materializes coherently for both on the next
-    touch, so releasing under a live pair-mate strands nothing (unlike a SEPARATE load's sibling,
-    whose OWN wrapper would be left holding the destroyed handle). Discriminator: identity of the
-    model's `_qf` wrapper object — pair-mates share it; separate loads never do."""
-    req_qf = getattr(requester, "_qf", None)
+    GATE (the one liveness discriminator, ex-_may_release_handle): retire is REFUSED while any
+    live FOREIGN consumer is bound to ckey — a model that is neither `requester` itself nor
+    sharing its `_qf` wrapper (pair-mates share ONE QFLazyEngine instance and re-materialize
+    coherently; a SEPARATE load's sibling would be left holding a destroyed handle = the
+    measured friendly-fire class). requester=None means ANY live consumer refuses (the sweep's
+    only-all-dead semantics). `requester` accepts either the QFLazyEngine wrapper or a bound
+    model (its `_qf` is used).
+
+    ON GRANT: pop the cache entry, pop the binding list unless keep_binding (release() keeps it
+    — the SAME ckey's next handle re-binds its surviving consumers; the LoRA reconcile re-creates
+    under a NEW ckey and the sweep retires dead entries, so both drop it), then destroy."""
+    req_qf = getattr(requester, "_qf", requester)   # model -> wrapper; wrapper -> itself; None -> None
+    foreign = []
     for m in _live_pipeline_models(ckey):
-        if m is requester:
+        if requester is not None and (m is requester or getattr(m, "_qf", None) is req_qf):
             continue
-        if req_qf is not None and getattr(m, "_qf", None) is req_qf:
-            continue    # pair-mate on the SAME lazy wrapper: coherent re-create, not stranded
+        foreign.append(m)
+    if foreign:
+        print(f"[qf_native] retire refused ({reason or 'unspecified'}): {len(foreign)} live "
+              "foreign consumer(s) still bound to this cache entry", flush=True)
         return False
     _PIPELINE_CACHE.pop(ckey, None)
+    if not keep_binding:
+        _PIPELINE_MODELS.pop(ckey, None)
+    try:
+        eng.destroy()   # idempotent (pipeline→None); closes any session first
+    except Exception:  # noqa: BLE001 — retire must never mask the caller's continuation
+        pass
     return True
 
 
@@ -388,18 +401,13 @@ def _sweep_dead_pipelines(keep_key):
     for k in list(_PIPELINE_CACHE.keys()):
         if k == keep_key:
             continue
-        refs = _PIPELINE_MODELS.get(k)
-        if not refs or any(r() is not None for r in refs):
-            continue   # unbound (load in flight) or ANY consumer still live → do NOT destroy (UAF-safe)
-        eng = _PIPELINE_CACHE.pop(k, None)
-        _PIPELINE_MODELS.pop(k, None)
-        if eng is not None:
-            try:
-                eng.destroy()   # closes any session + quantfunc_destroy; idempotent (pipeline→None)
-                print("[qf_native] host-RAM sweep: destroyed a cached pipeline whose QFWanModel was GC'd "
-                      "(comfy dropped its patcher) — freed its CPU backup", flush=True)
-            except Exception:  # noqa: BLE001
-                pass
+        if not _PIPELINE_MODELS.get(k):
+            continue   # UNBOUND (load may be in flight) → never touch; only ever-bound entries sweep
+        eng = _PIPELINE_CACHE.get(k)
+        # requester=None ⇒ _retire_handle refuses while ANY consumer is live (only-all-dead sweeps)
+        if eng is not None and _retire_handle(k, eng, None, reason="host-RAM sweep"):
+            print("[qf_native] host-RAM sweep: destroyed a cached pipeline whose QFWanModel was GC'd "
+                  "(comfy dropped its patcher) — freed its CPU backup", flush=True)
 
 
 def _get_engine(model_dir, create_cfg=None, device_idx=0):
@@ -410,6 +418,9 @@ def _get_engine(model_dir, create_cfg=None, device_idx=0):
     package (engine loads model_dir/transformer[_2]/ directly — no path override).
     create_cfg carries the per-family create keys (e.g. wan text_precision) + the
     declarative lora stack from chained QuantFuncNativeLoRA nodes."""
+    # [manual-residency] the session-knob-≠-create-key guard is sealed INSIDE
+    # qf_engine.create_pipeline (the real quantfunc_create boundary — construction-enforced,
+    # unbypassable by a future direct caller), not duplicated here (one truth source).
     lib = qfe.load_lib()
     # device_idx follows COMFY's torch device (the builders pass get_torch_device().index), so
     # a ComfyUI started on a different GPU — or an in-process device choice — drives the engine
@@ -441,7 +452,8 @@ def _get_engine(model_dir, create_cfg=None, device_idx=0):
 if _IMPORT_OK:
     # ── family REGISTRY: assembled from the per-family modules. Family LOGIC lives in the family
     #    modules; what remains here is the shared NODE SURFACE — transformer1/transformer2 FILE
-    #    dropdowns + model_type + resident_block_count (+ the LoRA node's target combo). That
+    #    dropdowns + model_type + resident_block_count (the LoRA node's target is WIRE-derived,
+    #    no combo — chaining on the high output acts on the high expert). That
     #    surface is family-neutral as long as a new family fits the "1-2 transformer files +
     #    shipped config bundle" shape; one needing a NEW input must extend INPUT_TYPES here, so
     #    "add a family = one module + one _FAMILY_MODULES line" holds for the common case, not
@@ -464,7 +476,7 @@ if _IMPORT_OK:
         — one broken family must not take the whole plugin's registration down."""
         import importlib
         deps = {"get_engine": _get_engine, "bind_pipeline_model": _bind_pipeline_model,
-                "may_release_handle": _may_release_handle,
+                "retire_handle": _retire_handle,
                 "estimate_footprint": _estimate_package_footprint,
                 "apply_checkpoint_flow_shift": _apply_checkpoint_flow_shift}
         for mod_name in _FAMILY_MODULES:
@@ -598,8 +610,9 @@ if _IMPORT_OK:
             "QuantFunc Wan loader (svdq, denoise_only): TWO MODEL outputs (high/low-noise expert) "
             "over ONE shared engine — a drop-in for the official wan2.2 A14B dual-UNETLoader "
             "workflow (dual KSamplerAdvanced stages + trimmed step ranges fully supported; the "
-            "engine picks the expert per step by sigma). LoRA: use checkpoints with the LoRA "
-            "baked in — chaining QuantFuncNativeLoRA onto these outputs is refused loud. "
+            "engine picks the expert per step by sigma). LoRA: chain QuantFuncNativeLoRA on an "
+            "output — the wire IS the target (high output ⇒ high expert, low ⇒ low), no target "
+            "widget; both wires keep sharing the one engine. "
             + _COMMON_LIMITS)
 
         def load(self, transformer1, transformer2, model_config, resident_block_count=999):
@@ -714,15 +727,13 @@ if _IMPORT_OK:
         """
         @classmethod
         def INPUT_TYPES(cls):
+            # NO target widget (user directive 2026-08-22): the target is derived from WIRING —
+            # chaining this node on the wan loader's high output MEANS it acts on the high
+            # expert (low likewise); single-expert families derive "all".
             return {"required": {
                 "model": ("MODEL",),
                 "lora_name": (_lora_choices(),),
                 "strength": ("FLOAT", {"default": 1.0, "min": -100.0, "max": 100.0, "step": 0.01}),
-            }, "optional": {
-                "target": (["all", "high", "low"],
-                           {"tooltip": "wan A14B per-expert routing. Single-transformer families "
-                                       "(LTX / H3) take 'all'; an explicit high/low there is "
-                                       "refused engine-side rather than silently mis-routed."}),
             }}
 
         RETURN_TYPES = ("MODEL",)
@@ -735,7 +746,7 @@ if _IMPORT_OK:
                        "QuantFunc Native Loader; chain several to stack). The engine merges sidecar "
                        "LoRA at create time, so the pipeline is re-created for the new set.")
 
-        def apply(self, model, lora_name, strength, target="all"):
+        def apply(self, model, lora_name, strength):
             rebuild = qfmp.rebuild_of(model)
             if rebuild is None:
                 raise RuntimeError(
@@ -744,7 +755,7 @@ if _IMPORT_OK:
                     "built-in LoraLoaderModelOnly instead.)")
             stack = qfmp.lora_stack_of(model)
             stack.append({"path": _resolve_lora(lora_name), "scale": float(strength),
-                          "target": target})
+                          "target": qfmp.expert_of(model)})   # [wiring-lora] wire-derived side
             rebuilt = rebuild(stack)
             # CR regression fix: carry the UPSTREAM comfy state (ModelSampling* object patches,
             # set_model_* options, callbacks/wrappers/hooks) onto the re-created patcher, so a

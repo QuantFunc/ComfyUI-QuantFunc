@@ -241,6 +241,45 @@ class QFSessionModelMixin:
     deferred until a GPU box is available (same gate as the H3 fl2va proof).
     """
 
+    # ── [manual-residency] runtime-adjustable resident block count (GENERIC layer) ──
+    # The native seam's ONLY residency knob is a SESSION parameter, not a pipeline-identity
+    # parameter: every family merges residency_opts() into its denoise_begin options_json, and
+    # the engine re-applies it at EVERY session begin (applyManualResidentBlocks →
+    # setResidentBlockPrefix — bidirectional: shrink frees blocks [tgt,current), grow reloads
+    # [current,tgt) from backups, never-OOM-guarded). A widget change therefore takes effect on
+    # the NEXT run with NO pipeline rebuild. MEASURED (3090, wan A14B dual-expert, one resident
+    # comfy process, 2026-08-22): rb30→rb10 second run success in 88.6s (pure gen time, no
+    # create) with "MANUAL residency — 10 → target 10 of 40 (achieved 10)" on both experts and
+    # GPU used 16322 → 11806 MiB (the shed blocks really freed). The STRUCTURAL half of the
+    # guarantee — the knob never entering create_cfg/ckey (which would rebuild the pipeline on
+    # every widget change) — is enforced fail-loud by _refuse_session_knobs_in_create() at the
+    # single engine-create chokepoint (__init__._get_engine).
+    _resident_block_count = 999   # class default; families set the widget value in __init__
+
+    def set_resident_block_count(self, n):
+        self._resident_block_count = int(n)
+
+    def residency_opts(self):
+        """The begin-options fragment EVERY family merges into its options_json (the one
+        injection point of the runtime-adjustable residency knob)."""
+        return {"resident_block_count": int(self._resident_block_count)}
+
+    def _assert_wire_lora(self):
+        """[wiring-lora] RUN-START side assert (reviewer-C correctness fix): THIS model's wire
+        is the AUTHORITY for its side — write its own QF_LORA_STACK_ATTR (the wire's stack;
+        [] on a raw loader output) into the shared engine's side registry at every run, so a
+        registry entry can never OUTLIVE the node that authored it. Deleting a LoRA node and
+        rewiring the sampler to the raw output therefore resets that side to [] on the next
+        run (no silent LoRA pollution — the defect reviewer C executed). Idempotent for
+        unchanged wiring; models without a high/low wire tag (single-expert families) no-op."""
+        side = getattr(self, QF_EXPERT_ATTR, "all")
+        if side not in ("high", "low"):
+            return
+        eng = getattr(self, "_qf", None)
+        if eng is None or not hasattr(eng, "set_lora_side"):
+            return
+        eng.set_lora_side(side, list(getattr(self, QF_LORA_STACK_ATTR, []) or []))
+
     # ── comfy inference-memory estimate override (inter-stage thrash fix, 2026-08-22) ──
     # comfy's load_models_gpu decides evictions from BaseModel.memory_required(input_shape),
     # which for a torch WAN at seq_len 33600 estimates GBs of activation memory. Our engine
@@ -354,14 +393,24 @@ class QFLazyEngine:
     __getattr__ magic: a typo must fail loud, not silently forward.
     """
 
-    def __init__(self, factory, footprint_bytes, may_release=None):
+    def __init__(self, factory, footprint_bytes, retire=None):
         self._factory = factory          # () -> (QFEngineHandle, ckey)
         self._real = None
-        self._ckey = None                # the materialized handle's cache key (for may_release)
-        # may_release(ckey, requester_model) -> bool: the CACHE layer's verdict on whether this
-        # wrapper may DESTROY the (possibly shared) real handle. None => NEVER destroy (fail-safe:
-        # a wrapper that cannot prove exclusivity must not free a handle a sibling may hold).
-        self._may_release = may_release
+        self._ckey = None                # the materialized handle's cache key (for retire)
+        # [wiring-lora] per-SIDE declarative LoRA registry (dual-expert, ONE shared engine).
+        # Each chained LoRA node REPLACES its wire-side's whole cumulative stack, and EVERY
+        # wire re-writes its own truth at run start via _assert_wire_lora (a raw loader
+        # output writes []) — so re-execution converges by construction and a DELETED node's
+        # side is reset by the raw wire's next run. Loader-cached state is never appended to.
+        # The factory reads lora_union() at CREATE; reconcile_lora() retires a handle whose
+        # created union no longer matches.
+        self._lora_sides = {}
+        self._created_lora_sig = None
+        # retire(ckey, eng, requester, *, keep_binding=False, reason="") -> bool: the cache
+        # layer's SINGLE liveness-gated retire chokepoint (the only .destroy() site in the
+        # plugin). None => this wrapper can NEVER destroy (fail-safe: a wrapper that cannot
+        # prove exclusivity must not free a handle a sibling may hold).
+        self._retire = retire
         self.footprint_bytes = int(footprint_bytes)   # from the package weights: no create needed
         # Nothing created yet => nothing resident. Reporting "unloaded" keeps comfy's ledger
         # HONEST (loaded_size -> 0) for a chain link the sampler never touches.
@@ -375,16 +424,97 @@ class QFLazyEngine:
             # The real handle was DESTROYED under us (a sibling's lifecycle path, or any future
             # one). Never hand a NULL pipeline to denoise_begin — drop it and re-create from disk.
             self._real = None
+        # [wiring-lora] drift-retire lives HERE, at the ONE materialization chokepoint (CR
+        # generality fix): a family cannot forget a per-begin hook that does not exist. Cheap
+        # (a small json sig compare); sides only mutate during node execution (sequential,
+        # pre-sampling), so an open mid-generation session never sees a drift.
+        self.reconcile_lora()
         if self._real is None:
             self._real, self._ckey = self._factory()
             self._real.step_count = self.step_count
             self._real.sampler_step_count = self.sampler_step_count
             self.footprint_bytes = int(self._real.footprint_bytes)
+            self._created_lora_sig = self._lora_sig()   # [wiring-lora] union this create embeds
         return self._real
 
     @property
     def materialized(self):
         return self._real is not None
+
+    # ---- [wiring-lora] per-side LoRA registry (see __init__ docblock) ----
+    # DUAL-OUTPUT FAMILY ONBOARDING (wan = the reference implementation): a new multi-output
+    # family needs exactly FOUR wirings — (1) tag each output model with QF_EXPERT_ATTR at
+    # build AND tag the raw pair's wire stacks EMPTY (loader-level entries live only in the
+    # "loader" side), (2) construct the shared QFLazyEngine with
+    # retire=deps["retire_handle"] (the single liveness-gated destroy chokepoint),
+    # (3) route its LoRA rebuild through set_lora_side + return a fresh same-side patcher
+    # (see wan _lora_rebuild_dual), (4) call self._assert_wire_lora() at the model's
+    # RUN-START hook (wan: extra_conds) so a side entry can never outlive its author node.
+    # DELETION SEMANTICS (the honest claim, reviewers C+E): deleting a LoRA node on EITHER
+    # wire converges at the next run — both wires re-assert their truth at their run hooks
+    # before the next session opens (reviewer-E measured: under comfy's sequential
+    # single-worker execution the mid-generation drift guard in reconcile_lora is NOT
+    # reachable — it is DEFENSIVE, kept for any future concurrent/out-of-band mutation
+    # path). Never a silent stale-LoRA output.
+    # Single-expert families deliberately keep the OTHER architecture — a fresh _build per
+    # LoRA set (one consumer, no shared engine to keep coherent) — do not migrate them
+    # without need. Half-adoption fails LOUD: set_lora_side refuses without a retire chokepoint
+    # (else a superseded handle would silently leak its host backup), and the drift-retire
+    # runs inside ensure() itself (no per-family hook to forget).
+    def set_lora_side(self, side, entries):
+        """REPLACE one wire-side's cumulative LoRA stack ('high'/'low'/'all')."""
+        if self._retire is None:
+            raise RuntimeError(
+                "QFLazyEngine.set_lora_side: this engine was constructed WITHOUT retire — "
+                "the per-side LoRA registry would silently orphan superseded handles (host-RAM "
+                "leak). Pass retire=deps['retire_handle'] at the family's QFLazyEngine(...) "
+                "construction (see the onboarding note above).")
+        self._lora_sides[str(side)] = [dict(e) for e in (entries or [])]
+
+    def lora_union(self):
+        """The engine-create 'lora' list: every side's entries, side-sorted for determinism
+        ('high' < 'loader' < 'low'). The SORT is for signature stability only — sidecar LoRA
+        entries are per-layer ADDITIVE low-rank columns applied per their own target, so the
+        relative order of sides is mathematically inert (within one wire the user's chain
+        order is preserved). A future NON-additive merge semantic would need a real order
+        contract here."""
+        out = []
+        for side in sorted(self._lora_sides):
+            out.extend(dict(e) for e in self._lora_sides[side])
+        return out
+
+    def _lora_sig(self):
+        return json.dumps(self.lora_union(), sort_keys=True)
+
+    def reconcile_lora(self):
+        """Session-BEGIN hook: LoRA merges at pipeline CREATE, so a materialized handle whose
+        created union no longer matches the current side registry is RETIRED here (session
+        closed, retired via the retire chokepoint) and the next ensure() re-creates
+        with the current union. Unmaterialized (the common deferred path) or unchanged union
+        => no-op. Returns True when a retire happened (observable for tests/logs)."""
+        if self._real is None or self._created_lora_sig == self._lora_sig():
+            return False
+        if getattr(self._real, "current_session", None):
+            # A wire changed its LoRA truth MID-GENERATION (e.g. the OTHER expert's wire
+            # asserted a different stack at its stage — a LoRA node deleted there). The
+            # running session was created under the old union and cannot be retargeted
+            # mid-run; fail LOUD instead of silently finishing with the wrong weights. The
+            # next queue re-creates with the current wiring (the side registry is already
+            # correct). The stranded session is closed by the run-start end_session_if_open.
+            raise RuntimeError(
+                "qf_native: LoRA wiring changed MID-GENERATION (a wire's LoRA set no longer "
+                "matches the running session's union — e.g. a LoRA node was added/removed on "
+                "the other expert's wire). Re-queue the prompt: the next run re-creates the "
+                "engine with the current wiring.")
+        self.end_session_if_open()
+        old, old_ck = self._real, self._ckey
+        self._real, self._ckey = None, None
+        self._created_lora_sig = None
+        if old is not None and self._retire is not None:
+            # identity-gated single chokepoint: refuses if a FOREIGN wrapper still shares the
+            # entry (the new union creates under a NEW ckey, so both handles coexist then)
+            self._retire(old_ck, old, self, reason="lora reconcile (union drift)")
+        return True
 
     # ---- members that NEED a live pipeline ----
     @property
@@ -436,7 +566,7 @@ class QFLazyEngine:
 
         SHARED-HANDLE SAFETY (measured defect this closes): the real handle may be SHARED by
         other live models (two loader nodes on the same package hit one cache entry), so destroy
-        is gated on the cache layer's may_release(ckey, requester) — destroying under a live
+        is gated on the cache layer's retire chokepoint (liveness registry) — destroying under a live
         sibling left it a NULL pipeline for its next denoise while its ledger kept reporting the
         destroyed backup. No callback wired => refuse (fail-safe; better an unreclaimed backup
         than a use-after-destroy). Returns True iff the handle was actually destroyed."""
@@ -449,13 +579,16 @@ class QFLazyEngine:
             return False
         if getattr(self._real, "current_session", None) is not None:
             return False
-        if self._may_release is None or not self._may_release(self._ckey, requester):
+        # keep_binding=True: the SAME ckey's next handle re-binds this entry's surviving
+        # consumers (release does not change the create recipe). requester rides through so
+        # the retire chokepoint applies the pair-mate discriminator (a bound MODEL is
+        # accepted — its _qf wrapper is used).
+        if self._retire is None or not self._retire(self._ckey, self._real,
+                                                    requester if requester is not None else self,
+                                                    keep_binding=True, reason="comfy RAM release"):
             return False
-        try:
-            self._real.destroy()
-        finally:
-            self._real = None
-            self._unloaded = True
+        self._real = None
+        self._unloaded = True
         return True
 
 
@@ -466,6 +599,16 @@ class QFLazyEngine:
 # rebuild_of(). Names live here so the three seams cannot drift apart.
 QF_LORA_STACK_ATTR = "_qf_lora_stack"
 QF_LORA_REBUILD_ATTR = "_qf_rebuild"
+QF_EXPERT_ATTR = "_qf_expert"   # "high"/"low" on the wan dual pair; absent => "all" (single-expert)
+
+
+def expert_of(patcher):
+    """[wiring-lora] WIRING-derived LoRA target: which loader output this MODEL came from
+    ('high'/'low' — the wan builder tags its pair), 'all' for single-expert families. User
+    directive 2026-08-22: the LoRA node carries NO target widget — chaining it on the loader's
+    high output MEANS it acts on the high expert. Reads the MODEL (clones share .model), so a
+    comfy patcher clone keeps its wire identity."""
+    return getattr(getattr(patcher, "model", None), QF_EXPERT_ATTR, "all")
 
 
 def ensure_model_config_attrs(model_config):

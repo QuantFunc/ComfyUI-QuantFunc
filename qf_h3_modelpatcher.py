@@ -82,7 +82,7 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
     def __init__(self, model_config, engine, device=None, resident_block_count=999):
         super().__init__(model_config, device=device)     # disable_unet honored in BaseModel.__init__
         self.diffusion_model = _QFStub()
-        self._resident_block_count = int(resident_block_count)   # [manual-residency] video begin knob
+        self.set_resident_block_count(resident_block_count)     # [manual-residency] generic knob (QFSessionModelMixin)
         self._qf = engine
         self._num_steps = 0               # DERIVED per run from sample_sigmas (len-1) at _begin
         self._num_frames = 0              # DERIVED per run from the video latent's T (see _derive_geometry)
@@ -241,7 +241,7 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
                 f"the stock ModelSamplingMiniMaxH3 node (shift_video + shift_audio) for H3, or wire no "
                 f"sampling node at all to keep the checkpoint defaults.")
         _opts = {
-            "resident_block_count": self._resident_block_count,   # [manual-residency]
+            **self.residency_opts(),                              # [manual-residency] generic knob
             "audio_dims": audio_dims,
             "av_sigma_shift_video": float(ms.shift),
             "av_sigma_shift_audio": float(ms.audio_shift or 3.0),
@@ -490,7 +490,7 @@ def register(deps):
     liveness registry, footprint estimator, lazy-engine class) without importing __init__."""
     get_engine = deps["get_engine"]
     bind_pipeline_model = deps["bind_pipeline_model"]
-    may_release_handle = deps["may_release_handle"]
+    retire_handle = deps["retire_handle"]
     estimate_footprint = deps["estimate_footprint"]
 
 
@@ -538,7 +538,7 @@ def register(deps):
             # CHAIN LINK (and comfy's node-output cache would pin every intermediate's
             # multi-GB CPU backup). Only the model the sampler touches is ever created.
             engine = qfmp.QFLazyEngine(_factory, estimate_footprint(model_dir),
-                                      may_release=may_release_handle)
+                                      retire=retire_handle)
             device = comfy.model_management.get_torch_device()
             offload = comfy.model_management.unet_offload_device()
 

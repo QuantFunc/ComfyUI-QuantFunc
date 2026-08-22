@@ -651,18 +651,180 @@ def main():
         shifted = ModelSamplingSD3().patch(base, 11.0)[0]     # upstream comfy patch on the pair's high
         check("comfy patches still apply to the dual outputs (clone path intact)",
               "model_sampling" in shifted.object_patches)
-        # v1 pivot contract: chaining the LoRA node onto EITHER dual output must refuse LOUD
-        # (a rebuild would fork the shared engine — see _lora_rebuild_dual). Both directions:
-        for tag, target in (("high", shifted), ("low", base_low)):
+        # [wiring-lora] v2 (retires the v1 refusal): chaining on the dual outputs WORKS with the
+        # target derived from the WIRE (no widget), over ONE shared engine object.
+        from qfn_test_pkg import qf_modelpatcher as _qmp2
+        outH = LoraNode.apply(shifted, "a.safetensors", 0.8)[0]
+        stH = _qmp2.lora_stack_of(outH)
+        check("LoRA on the HIGH wire derives target=high (no widget)",
+              len(stH) == 1 and stH[0]["target"] == "high" and stH[0]["scale"] == 0.8,
+              f"-> {stH}")
+        check("high-wire rebuild keeps the upstream comfy patch (adopt)",
+              "model_sampling" in outH.object_patches)
+        outL = LoraNode.apply(base_low, "b.safetensors", 0.5)[0]
+        stL = _qmp2.lora_stack_of(outL)
+        check("LoRA on the LOW wire derives target=low",
+              len(stL) == 1 and stL[0]["target"] == "low", f"-> {stL}")
+        engH, engL = outH.model._qf, outL.model._qf
+        check("both wires share ONE engine object (no fork), union holds both sides",
+              engH is engL and engH is base.model._qf
+              and [e["target"] for e in engH.lora_union()] == ["high", "low"],
+              f"-> same={engH is engL} union={engH.lora_union()}")
+        outH2 = LoraNode.apply(outH, "b.safetensors", 0.3)[0]
+        stH2 = _qmp2.lora_stack_of(outH2)
+        check("second node on the same wire accumulates FUNCTIONALLY (no loader-cache mutation)",
+              [(e["target"], e["scale"]) for e in stH2] == [("high", 0.8), ("high", 0.3)]
+              and [e["target"] for e in engH.lora_union()] == ["high", "high", "low"]
+              and _qmp2.lora_stack_of(base) == [],
+              f"-> wire={stH2} union={engH.lora_union()} loader_stack={_qmp2.lora_stack_of(base)}")
+        # DEAD-AUTHOR convergence (reviewer-C death rule): a registry side must never outlive
+        # the node that authored it. Simulate "user deleted the LoRA nodes and rewired the
+        # sampler to the RAW loader outputs": the raw models' run-start assert resets their
+        # sides. Both directions: re-asserting the rebuilt wire restores it.
+        base.model._assert_wire_lora()            # raw HIGH wire => high side reset to []
+        _u1 = [e["target"] for e in engH.lora_union()]
+        base_low.model._assert_wire_lora()        # raw LOW wire => low side reset too
+        _u2 = [e["target"] for e in engH.lora_union()]
+        outH2.model._assert_wire_lora()           # rebuilt wire re-asserts its stack
+        _u3 = [e["target"] for e in engH.lora_union()]
+        check("registry side never outlives its author node (raw assert resets; both ways)",
+              _u1 == ["low"] and _u2 == [] and _u3 == ["high", "high"],
+              f"-> after-raw-high={_u1} after-raw-low={_u2} re-asserted={_u3}")
+        # RECONCILE unit, both ways: a materialized engine retires ONLY on a union change —
+        # and the retire fires from inside ensure() itself (the chokepoint; no per-family
+        # begin hook exists to forget).
+        _drops = []
+
+        class _FakeReal:
+            pipeline = object()
+            current_session = None
+            step_count = 0
+            sampler_step_count = 0
+            footprint_bytes = 0
+
+            def end_session_if_open(self):
+                return (False, True)
+        _le = _qmp2.QFLazyEngine(lambda: (_FakeReal(), "new-ck"), 0,
+                                 retire=lambda _ck, _e, _req=None, **_kw: _drops.append(_ck) or True)
+        _le.set_lora_side("high", [{"path": "x", "scale": 1.0, "target": "high"}])
+        _le._real, _le._ckey = _FakeReal(), "old-ck"
+        _le._created_lora_sig = _le._lora_sig()
+        _same = _le.reconcile_lora()          # unchanged union -> no retire
+        _le.set_lora_side("low", [{"path": "y", "scale": 1.0, "target": "low"}])
+        _r2 = _le.ensure()                    # ensure() itself must drift-retire + re-create
+        check("ensure() drift-retires ONLY on a union change (both ways) + re-creates",
+              _same is False and _drops == ["old-ck"] and _le._ckey == "new-ck"
+              and _r2 is not None and _le._created_lora_sig == _le._lora_sig(),
+              f"-> same={_same} drops={_drops} ckey={_le._ckey}")
+        # MID-SESSION drift must refuse LOUD (never retarget under a running generation) —
+        # both ways: same union with an open session passes silently.
+        _le._real.current_session = object()
+        _mid_ok = True
+        try:
+            _le.reconcile_lora()              # sig == created sig -> no-op even mid-session
+        except RuntimeError:
+            _mid_ok = False
+        _le.set_lora_side("high", [])         # drift while session open
+        _mid_raised = False
+        try:
+            _le.reconcile_lora()
+        except RuntimeError as _e:
+            _mid_raised = "MID-GENERATION" in str(_e)
+        check("mid-session drift refuses LOUD (both ways)", _mid_ok and _mid_raised,
+              f"-> same-sig-ok={_mid_ok} drift-raised={_mid_raised}")
+        # set_lora_side without retire must refuse LOUD (half-adoption leak guard):
+        _naked = _qmp2.QFLazyEngine(lambda: (None, None), 0)
+        try:
+            _naked.set_lora_side("high", [])
+            check("set_lora_side refuses without retire (half-adoption guard)", False,
+                  "-> accepted!")
+        except RuntimeError as _e:
+            check("set_lora_side refuses without retire (half-adoption guard)",
+                  "retire" in str(_e), f"-> {_e}")
+        # identity-gated retire: a FOREIGN live consumer on the same ckey must SKIP the destroy.
+        class _W:                       # two distinct wrapper identities
+            pass
+        _w1, _w2 = _W(), _W()
+
+        class _M:                       # a bound model pinning the cache entry
+            def __init__(self, w):
+                self._qf = w
+        import weakref as _wr
+        _mine, _theirs = _M(_w1), _M(_w2)
+        _destroyed = []
+
+        class _Eng:
+            def destroy(self):
+                _destroyed.append(True)
+        qfn._PIPELINE_CACHE["shared-ck"] = "sentinel"
+        qfn._PIPELINE_MODELS["shared-ck"] = [_wr.ref(_mine), _wr.ref(_theirs)]
+        _r1 = qfn._retire_handle("shared-ck", _Eng(), _w1, reason="arm")
+        _kept = (_r1 is False and qfn._PIPELINE_CACHE.get("shared-ck") == "sentinel"
+                 and not _destroyed)
+        qfn._PIPELINE_MODELS["shared-ck"] = [_wr.ref(_mine)]          # only OUR consumer left
+        _r2 = qfn._retire_handle("shared-ck", _Eng(), _w1, reason="arm")
+        _dropped = (_r2 is True and "shared-ck" not in qfn._PIPELINE_CACHE
+                    and _destroyed == [True])
+        # keep_binding semantics (release path): binding list survives a granted retire
+        qfn._PIPELINE_CACHE["kb-ck"] = "sentinel2"
+        qfn._PIPELINE_MODELS["kb-ck"] = [_wr.ref(_mine)]
+        _r3 = qfn._retire_handle("kb-ck", _Eng(), _w1, keep_binding=True, reason="arm")
+        _kb = _r3 is True and "kb-ck" not in qfn._PIPELINE_CACHE and "kb-ck" in qfn._PIPELINE_MODELS
+        qfn._PIPELINE_MODELS.pop("kb-ck", None)
+        check("retire is identity-gated (foreign keeps; own-only destroys; keep_binding honored)",
+              _kept and _dropped and _kb, f"-> kept={_kept} dropped={_dropped} kb={_kb}")
+        # RETIRE-CHOKEPOINT property (reviewer-F: the substring scan was hollow — it matched
+        # 'the word appeared', not 'a gate was applied'; an unconditional destroy containing a
+        # .pop() passed it). REAL property: a `.destroy` CALL — attribute form OR the
+        # getattr-alias form — may appear ONLY inside _retire_handle's own subtree. File set
+        # DERIVED from the package (top modules + _FAMILY_MODULES), not a hand-written tuple.
+        # Mutation-proven: reverting any path to a direct eng.destroy() turns this arm RED.
+        import ast as _ast
+        import os as _os
+        import qfn_test_pkg as _pkg
+        _viol = []
+        _pkg_dir = _os.path.dirname(_qmp2.__file__)
+        _scan_files = ["__init__.py", "qf_modelpatcher.py", "qf_engine.py"] + \
+                      [_m + ".py" for _m in _pkg._FAMILY_MODULES]
+        for _fn in _scan_files:
+            _p = _os.path.join(_pkg_dir, _fn)
+            if not _os.path.exists(_p):
+                _viol.append(f"{_fn}:MISSING")
+                continue
+            _src = open(_p).read()
+            _tree = _ast.parse(_src)
+            _allowed = set()
+            for _n in _ast.walk(_tree):
+                if isinstance(_n, _ast.FunctionDef) and _n.name == "_retire_handle":
+                    _allowed = {id(_c) for _c in _ast.walk(_n)}
+            for _n in _ast.walk(_tree):
+                if not isinstance(_n, _ast.Call):
+                    continue
+                _is_destroy = isinstance(_n.func, _ast.Attribute) and _n.func.attr == "destroy"
+                _is_alias = (isinstance(_n.func, _ast.Name) and _n.func.id == "getattr"
+                             and len(_n.args) >= 2 and isinstance(_n.args[1], _ast.Constant)
+                             and _n.args[1].value == "destroy")
+                if (_is_destroy or _is_alias) and id(_n) not in _allowed:
+                    _viol.append(f"{_fn}:{_n.lineno}")
+        check("destroy() is callable ONLY inside _retire_handle (AST call+alias, derived files)",
+              not _viol, f"-> violations={_viol}")
+        # recursive create-guard (reviewer-D LOW): the knob nested at any depth refuses.
+        from qfn_test_pkg import qf_engine as _rqe
+        _nr = 0
+        for _bad in ({"a": {"resident_block_count": 1}}, {"lora": [{"resident_block_count": 2}]}):
             try:
-                LoraNode.apply(target, "a.safetensors", 0.8)
-                check(f"LoRA chain on the dual wan {tag} output refuses loud", False,
-                      "-> applied!")
-            except RuntimeError as e:
-                check(f"LoRA chain on the dual wan {tag} output refuses loud",
-                      "cannot chain onto the dual-output wan loader" in str(e), f"-> {e}")
+                _rqe._refuse_session_knobs_in_create(_bad)
+            except RuntimeError:
+                _nr += 1
+        _nok = True
+        try:
+            _rqe._refuse_session_knobs_in_create({"a": {"b": 1}, "lora": [{"path": "x"}]})
+        except RuntimeError:
+            _nok = False
+        check("create guard refuses the knob at ANY depth (both ways)", _nr == 2 and _nok,
+              f"-> nested-raised={_nr}/2 clean-passed={_nok}")
     except Exception as e:  # noqa: BLE001
-        check("dual-output LoRA refusal arm", False, f"-> raised {type(e).__name__}: {e}")
+        check("wiring-derived dual LoRA arm", False, f"-> raised {type(e).__name__}: {e}")
 
     # ── 6) HOST-RAM honesty on a DEDICATED file pair (isolated ckey) ──
     try:
@@ -804,6 +966,66 @@ def main():
                       f"-> match({match_name})={ok_match} refuse(unrelated)={ok_refuse}")
     except Exception as e:  # noqa: BLE001
         check("file_hints contract scan", False, f"-> raised {type(e).__name__}: {e}")
+
+    # ── [manual-residency] runtime-adjustable resident_block_count = GENERIC-layer capability ──
+    # (a) mixin owns knob + the ONE injection point (default + set both reflected);
+    # (b) the structural guard refuses the knob in create_cfg (both ways);
+    # (c) no family re-inlines a per-family copy (the regression that would fork the knob
+    #     back out of the generic layer) — every family references residency_opts().
+    try:
+        from qfn_test_pkg import qf_modelpatcher as _qmp
+
+        class _RBProbe(_qmp.QFSessionModelMixin):
+            pass
+        _pr = _RBProbe()
+        _d0 = _pr.residency_opts()
+        _pr.set_resident_block_count(12)
+        _d1 = _pr.residency_opts()
+        check("mixin residency knob: default + set both reflected",
+              _d0 == {"resident_block_count": 999} and _d1 == {"resident_block_count": 12},
+              f"-> default={_d0} set={_d1}")
+        import qfn_test_pkg as _pkg
+        from qfn_test_pkg import qf_engine as _rqe
+        # Guard now sealed at the REAL create boundary (qf_engine.create_pipeline — reviewer-B
+        # hard-seal): both the dict and the pre-serialized-string config forms must refuse the
+        # session knob; both without-key forms + None must pass.
+        _raised = 0
+        for _badcfg in ({"denoise_only": True, "resident_block_count": 30},
+                        '{"denoise_only": true, "resident_block_count": 30}'):
+            try:
+                _rqe._refuse_session_knobs_in_create(_badcfg)
+            except RuntimeError:
+                _raised += 1
+        _passed = True
+        try:
+            _rqe._refuse_session_knobs_in_create({"denoise_only": True})
+            _rqe._refuse_session_knobs_in_create('{"denoise_only": true}')
+            _rqe._refuse_session_knobs_in_create(None)
+        except RuntimeError:
+            _passed = False
+        check("create-boundary session-knob guard discriminates both ways (dict + string forms)",
+              _raised == 2 and _passed,
+              f"-> with-key raised={_raised}/2 without-key passed={_passed}")
+        import inspect as _insp
+        import importlib as _implib
+        # AUTO-COVER every REGISTERED family (reviewer-B generality fix): derive the module list
+        # from the package's OWN _FAMILY_MODULES registry — a future 4th family added per the
+        # documented contract is scanned automatically; a hardcoded 3-tuple would stay green
+        # while the new family forked the knob back out of the generic layer. Floor >=3 so a
+        # registry shrink can't silently shrink coverage either.
+        _fam_mods = [(_n, _implib.import_module("." + _n, "qfn_test_pkg"))
+                     for _n in _pkg._FAMILY_MODULES]
+        _bad_inline, _uses = [], []
+        for _tag, _m in _fam_mods:
+            _src = _insp.getsource(_m)
+            if '"resident_block_count": self._resident_block_count' in _src:
+                _bad_inline.append(_tag)
+            _uses.append("self.residency_opts()" in _src)
+        check("ALL REGISTERED families use the generic injection (auto-covers future families)",
+              not _bad_inline and all(_uses) and len(_fam_mods) >= 3,
+              f"-> families={[t for t, _ in _fam_mods]} re-inlined={_bad_inline} uses={_uses}")
+    except Exception as e:  # noqa: BLE001
+        check("manual-residency generic-layer arm", False, f"-> raised {type(e).__name__}: {e}")
 
     print("LOADER_DISPATCH:", "PASS" if bad == 0 else f"FAIL ({bad} wrong)")
     return 0 if bad == 0 else 1

@@ -439,8 +439,43 @@ def _enc(s):
     return s.encode("utf-8") if isinstance(s, str) else s
 
 
+def _refuse_session_knobs_in_create(config_json):
+    """[manual-residency] STRUCTURAL half of the runtime-adjustable residency guarantee, sealed
+    at the REAL create boundary (every quantfunc_create goes through create_pipeline, so a
+    caller cannot bypass it by skipping the package's _get_engine cache wrapper — reviewer-B
+    hard-seal). resident_block_count is a SESSION knob: QFSessionModelMixin.residency_opts()
+    injects it into every denoise_begin and the engine re-plans residency bidirectionally per
+    session (measured: rb-swap with no rebuild). In a create config it would enter the pipeline
+    cache identity upstream and silently reintroduce a full model rebuild on every widget
+    change — refuse loud, both the dict and the pre-serialized-string form."""
+    cfg = config_json
+    if isinstance(cfg, str):
+        try:
+            cfg = json.loads(cfg)
+        except Exception:  # noqa: BLE001 — unparseable JSON: the engine's own create refuses it loudly
+            return
+
+    def _scan(obj):
+        # RECURSIVE (reviewer-D LOW): the knob nested anywhere in the config tree would
+        # equally enter the json-hashed cache identity — refuse it at any depth.
+        if isinstance(obj, dict):
+            if "resident_block_count" in obj:
+                return True
+            return any(_scan(v) for v in obj.values())
+        if isinstance(obj, list):
+            return any(_scan(v) for v in obj)
+        return False
+    if _scan(cfg):
+        raise RuntimeError(
+            "qf_native: resident_block_count is a runtime SESSION knob (it rides every "
+            "denoise_begin via QFSessionModelMixin.residency_opts) and must never appear "
+            "anywhere in a create config — that would bake it into the pipeline cache "
+            "identity and rebuild the whole pipeline on every widget change.")
+
+
 def create_pipeline(lib, *, model_dir, transformer_path=None, model_backend="svdq",
                     device_idx=0, config_json=None):
+    _refuse_session_knobs_in_create(config_json)   # [manual-residency] session knob ≠ create key
     p = InitParams()
     p._keep = [_enc(model_dir), _enc(transformer_path), _enc(model_backend)]
     p.model_dir = p._keep[0]

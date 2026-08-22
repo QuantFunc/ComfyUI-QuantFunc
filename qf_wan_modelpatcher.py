@@ -62,7 +62,7 @@ class QFWanModel(QFSessionModelMixin, comfy.model_base.WAN21):
         self.diffusion_model = _QFStub()
         # arm comfy's stock concat machinery with the checkpoint's input width (see _QFStub)
         self.diffusion_model.arm_concat_shape(xfm_in_channels)
-        self._resident_block_count = int(resident_block_count)   # [manual-residency] video begin knob
+        self.set_resident_block_count(resident_block_count)     # [manual-residency] generic knob (QFSessionModelMixin)
         self._qf = engine                 # QFEngineHandle (owns lib + pipeline + the open session)
         self._start_image = start_image   # comfy IMAGE tensor [B,H,W,C] float 0..1, or None (Option C)
         self._num_steps = 0               # DERIVED per run from sample_sigmas (len-1) at _begin
@@ -117,6 +117,10 @@ class QFWanModel(QFSessionModelMixin, comfy.model_base.WAN21):
                                  "camera_conditions")
 
     def extra_conds(self, **kwargs):
+        # [wiring-lora] RUN-START wire-truth assert FIRST (reviewer-C): this wire's stack is
+        # written to its side registry every run, so a side entry never outlives its author
+        # node (raw loader output ⇒ side reset to []). See QFSessionModelMixin._assert_wire_lora.
+        self._assert_wire_lora()
         # Option C: the engine does its OWN i2v channel-concat internally from THIS loader's start_image
         # (a file-path begin_edit) — it CANNOT consume comfy's VAE-encoded concat_latent_image (no
         # ref-latent field in the denoise ABI), so comfy's concat_cond path is deliberately NOT used.
@@ -209,6 +213,8 @@ class QFWanModel(QFSessionModelMixin, comfy.model_base.WAN21):
         """Open the edit session. x_group/ctx_group are PER-COND-GROUP (B==1) slices — begin binds
         the geometry MAXIMA with B==1 (the engine + include/quantfunc.h require cond B==1)."""
         self._qf.end_session_if_open()    # clean any stale session from a prior failed run on this pipeline
+        # ([wiring-lora] the LoRA drift-retire needs NO call here: it runs inside
+        #  QFLazyEngine.ensure() itself — the lib access below triggers it.)
         # start_image=None = t2v (branch below). The ENGINE refuses an i2v checkpoint
         # (in>out) without a ref fail-loud at begin — no silent t2v on an i2v model.
         lib = self._qf.lib
@@ -229,7 +235,7 @@ class QFWanModel(QFSessionModelMixin, comfy.model_base.WAN21):
         self._max_ctx_seq = 0             # reset for the next run's extra_conds accumulation
         bpx.cond_dtype = _qf_dtype(ctx_group.dtype)
         bpx._opts = json.dumps({"num_frames": self._num_frames, "fps": float(self._fps),
-                                "resident_block_count": self._resident_block_count}).encode()
+                                **self.residency_opts()}).encode()
         bpx.options_json = bpx._opts
         session = ctypes.c_void_p()
         if cond_tail is not None:
@@ -491,7 +497,7 @@ def register(deps):
     liveness registry, footprint estimator, lazy-engine class) without importing __init__."""
     get_engine = deps["get_engine"]
     bind_pipeline_model = deps["bind_pipeline_model"]
-    may_release_handle = deps["may_release_handle"]
+    retire_handle = deps["retire_handle"]
     estimate_footprint = deps["estimate_footprint"]
     apply_checkpoint_flow_shift = deps["apply_checkpoint_flow_shift"]
 
@@ -535,27 +541,45 @@ def register(deps):
             _sm = _wan_device_sm()
             if _sm in (86, 89):
                 cfg["attention_backend"] = "qfa"
-            if entries:
-                cfg["lora"] = list(entries)   # WanVideoPipeline splits target-tagged entries per expert
+            # [wiring-lora] LoRA rides the ENGINE's per-side registry, not this base cfg: the
+            # loader-level create-time entries are seeded as the "loader" side below, chained
+            # QuantFuncNativeLoRA nodes REPLACE their wire's side ("high"/"low"), and the
+            # factory reads the UNION at create time (WanVideoPipeline splits target-tagged
+            # entries per expert engine-side).
+
+            # Every model that drives THIS shared engine — the loader pair now, LoRA-rebuilt
+            # side models appended later — so the factory binds them ALL for cache liveness
+            # (CR defense-in-depth: the rebuilt model must not depend solely on comfy keeping
+            # the loader outputs cached).
+            engine_models = []
 
             def _factory():
                 # comfy's device (0 when CUDA_VISIBLE_DEVICES pins one card; the real index on a
                 # multi-visible setup) — the engine must create on the SAME card comfy computes on.
                 dev = comfy.model_management.get_torch_device()
-                eng, ckey = get_engine(model_dir, create_cfg=cfg,
+                cfg2 = dict(cfg)
+                _union = engine.lora_union()          # late-bound: `engine` is defined below
+                if _union:
+                    cfg2["lora"] = _union
+                eng, ckey = get_engine(model_dir, create_cfg=cfg2,
                                        device_idx=getattr(dev, "index", 0) or 0)
-                # Liveness tracker for the host-RAM sweep: BOTH loader outputs (model_high +
-                # model_low) are live consumers of the ONE shared handle — bind each, so the
-                # sweep keeps the handle while EITHER survives (the registry holds a weakref
-                # LIST per ckey; _may_release refuses while any sibling lives).
-                for _m in (model_high, model_low):
-                    bind_pipeline_model(ckey, _m)
+                # Liveness tracker for the host-RAM sweep: EVERY still-live consumer of the ONE
+                # shared handle (loader pair + any LoRA-rebuilt side models) — bind each, so the
+                # sweep keeps the handle while ANY survives (the registry holds a weakref LIST
+                # per ckey; the retire chokepoint refuses while any sibling lives). engine_models holds
+                # weakrefs so superseded chain models can still be GC'd.
+                for _wr_m in engine_models:
+                    _m = _wr_m()
+                    if _m is not None:
+                        bind_pipeline_model(ckey, _m)
                 return eng, ckey
 
             # DEFERRED create (QFLazyEngine): a chained QuantFuncNativeLoRA rebuilds for its
             # accumulated set, so an eager create here would build ONE PIPELINE PER CHAIN LINK.
             engine = qfmp.QFLazyEngine(_factory, estimate_footprint(model_dir),
-                                      may_release=may_release_handle)
+                                      retire=retire_handle)
+            if entries:
+                engine.set_lora_side("loader", list(entries))   # create-time loader-level set
 
             # Wan A14B uses the Wan 2.1 VAE (16-ch AutoencoderKLWan) → WAN21_I2V latent_format
             # (Wan21, 16-ch). NOT WAN22_T2V (48-ch, that is the 5B TI2V VAE). UNet build DISABLED
@@ -587,6 +611,12 @@ def register(deps):
                                    resident_block_count=resident_block_count,
                                    xfm_in_channels=_xfm_in_channels)
             model_low._qf_shadow = True
+            # [wiring-lora] wire identity: chaining QuantFuncNativeLoRA on an output DERIVES its
+            # target from this tag (clones share .model, so the tag survives comfy's wire clones).
+            setattr(model_high, qfmp.QF_EXPERT_ATTR, "high")
+            setattr(model_low, qfmp.QF_EXPERT_ATTR, "low")
+            import weakref as _weakref
+            engine_models.extend([_weakref.ref(model_high), _weakref.ref(model_low)])
             # Default the sampler to the CHECKPOINT'S OWN flow schedule when the staged package
             # declares one (no-op-safe when absent; a stock ModelSamplingSD3 downstream still wins).
             apply_checkpoint_flow_shift(model_high, model_dir)
@@ -600,19 +630,48 @@ def register(deps):
                   f"footprint~{engine.footprint_bytes // (1024*1024)}MB (create deferred)")
 
             def _lora_rebuild_dual(_entries):
-                # v1 refusal, LOUD (never silent): a QuantFuncNativeLoRA chained on ONE of the two
-                # outputs would rebuild a NEW engine pair while the OTHER output still references
-                # the old engine — two full engines resident (2x VRAM) and a silently split LoRA
-                # state. Engine-side per-expert LoRA (target high/low) belongs on the LOADER as a
-                # lora input — tracked follow-up; the 4-step production checkpoints ship BAKED.
-                raise RuntimeError(
-                    "qf_native wan: QuantFuncNativeLoRA cannot chain onto the dual-output wan "
-                    "loader yet (it would fork the shared engine). Use checkpoints with the LoRA "
-                    "baked in (the shipped 4-step exports), or wait for the loader-level lora "
-                    "input.")
+                # [wiring-lora] v2 — retires the v1 refusal. The chained node tagged each entry
+                # with its WIRE's side (high/low, from QF_EXPERT_ATTR); this wire's cumulative
+                # stack REPLACES that side on the ONE shared lazy engine (both loader outputs —
+                # and every comfy clone of them — reference this same `engine` object, so there
+                # is no engine fork and no sibling stranded on an old handle: the union
+                # re-creates at the next begin via reconcile_lora). Return a FRESH same-side
+                # model/patcher carrying the new wire stack: the chain stays FUNCTIONAL —
+                # convergence is carried by the run-start _assert_wire_lora (EVERY wire,
+                # including a raw output after a node deletion, re-writes its own truth into
+                # the side registry before the next session), NOT by comfy caching semantics;
+                # loader-cached state is never mutated (an append-onto-shared-attr design
+                # would duplicate entries on every strength-change re-run).
+                side = ((_entries[-1].get("target") if _entries else None) or "all")
+                engine.set_lora_side(side, _entries)
+                m2 = QFWanModel(model_config, engine, None, device=device,
+                                resident_block_count=resident_block_count,
+                                xfm_in_channels=_xfm_in_channels)
+                setattr(m2, qfmp.QF_EXPERT_ATTR, side)
+                if side == "low":
+                    m2._qf_shadow = True     # ledger share mirrors the loader's low output
+                apply_checkpoint_flow_shift(m2, model_dir)
+                p2 = QFModelPatcher(m2, load_device=device, offload_device=offload)
+                # liveness (CR defense-in-depth): the rebuilt model is a first-class consumer of
+                # the shared handle — register for the factory's bind (next create) AND bind now
+                # when already materialized, instead of riding solely on comfy caching the
+                # loader outputs.
+                import weakref as _weakref
+                # prune dead refs on every append (reviewer-D LOW: unbounded growth across
+                # many re-runs — superseded chain models are GC'd, drop their refs here)
+                engine_models[:] = [r for r in engine_models if r() is not None]
+                engine_models.append(_weakref.ref(m2))
+                if engine._ckey is not None:
+                    bind_pipeline_model(engine._ckey, m2)
+                return qfmp.tag_lora_rebuild(p2, _entries, _lora_rebuild_dual)
 
-            qfmp.tag_lora_rebuild(patcher_high, entries, _lora_rebuild_dual)
-            qfmp.tag_lora_rebuild(patcher_low, entries, _lora_rebuild_dual)
+            # [wiring-lora] the WIRE stacks start EMPTY (reviewer-C): loader-level create-time
+            # entries live ONLY in the "loader" side (seeded above) — tagging the raw pair
+            # with `entries` would (a) duplicate them into a wire side on the first chained
+            # node (loader side + wire side both carrying them) and (b) make the raw output's
+            # run-start assert re-write loader entries as wire truth. [] is the wire's truth.
+            qfmp.tag_lora_rebuild(patcher_high, [], _lora_rebuild_dual)
+            qfmp.tag_lora_rebuild(patcher_low, [], _lora_rebuild_dual)
             return patcher_high, patcher_low
 
         return _build(list(lora_entries))

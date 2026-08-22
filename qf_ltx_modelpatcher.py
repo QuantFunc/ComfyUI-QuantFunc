@@ -373,7 +373,7 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
                  start_image=None, resident_block_count=999, video_vae_path=None):
         super().__init__(model_config, device=device)   # disable_unet honored in BaseModel.__init__
         self.diffusion_model = _QFStub()
-        self._resident_block_count = int(resident_block_count)   # [manual-residency] video begin knob
+        self.set_resident_block_count(resident_block_count)     # [manual-residency] generic knob (QFSessionModelMixin)
         self._qf = engine                    # QFEngineHandle (lib + pipeline + open session)
         # i2v (frame-0 conditioning): a comfy IMAGE from the loader's start_image input, or None = t2v.
         # Consumed at _begin (temp PNG → quantfunc_denoise_begin_edit; engine center-crop-fills + VAE-
@@ -635,8 +635,8 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
         # LTX takes NO pooled cond.
         bpx.max_pooled_dims = (ctypes.c_int * 2)(0, 0)
         bpx.cond_dtype = _qf_dtype(vemb_group.dtype)
-        bpx._opts = json.dumps({**{"num_frames": self._num_frames, "fps": float(self._fps),
-                                   "resident_block_count": self._resident_block_count},
+        bpx._opts = json.dumps({**{"num_frames": self._num_frames, "fps": float(self._fps)},
+                                **self.residency_opts(),
                                 **self._begin_extra_opts()}).encode()
         bpx.options_json = bpx._opts
         session = ctypes.c_void_p()
@@ -1139,7 +1139,7 @@ def register(deps):
     liveness registry, footprint estimator, lazy-engine class) without importing __init__."""
     get_engine = deps["get_engine"]
     bind_pipeline_model = deps["bind_pipeline_model"]
-    may_release_handle = deps["may_release_handle"]
+    retire_handle = deps["retire_handle"]
     estimate_footprint = deps["estimate_footprint"]
 
 
@@ -1307,7 +1307,7 @@ def register(deps):
                 # CHAIN LINK (and comfy's node-output cache would pin every intermediate's
                 # multi-GB CPU backup). Only the model the sampler touches is ever created.
                 engine = qfmp.QFLazyEngine(_factory, estimate_footprint(model_dir),
-                                      may_release=may_release_handle)
+                                      retire=retire_handle)
                 device = comfy.model_management.get_torch_device()
                 offload = comfy.model_management.unet_offload_device()
                 unet_config = {"image_model": "ltxav", "disable_unet_model_creation": True}
@@ -1352,7 +1352,7 @@ def register(deps):
             # CHAIN LINK (and comfy's node-output cache would pin every intermediate's
             # multi-GB CPU backup). Only the model the sampler touches is ever created.
             engine = qfmp.QFLazyEngine(_factory, estimate_footprint(model_dir),
-                                      may_release=may_release_handle)
+                                      retire=retire_handle)
             # [19B non-gated connector] authoritative head count from the ORIGINAL model dir\'s diffusers
             # LTX2TextConnectors config (the 19B family ships NON-gated connector weights; the head split
             # lives ONLY here). Absent/malformed -> None (gated checkpoints need nothing; a non-gated one
