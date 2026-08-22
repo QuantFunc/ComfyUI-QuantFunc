@@ -642,7 +642,19 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
             # begin_edit_cond frame-0 cond latent (identity latent scale; engine packs ->
             # per-step impose + velocity pin + finalize pin — the c5.8g chain; no engine
             # VAE). LEGACY (no video_vae): temp PNG -> begin_edit engine-encode.
-            if self._video_vae_path and hasattr(lib, "quantfunc_denoise_begin_edit_cond"):
+            if self._video_vae_path and not hasattr(lib, "quantfunc_denoise_begin_edit_cond"):
+                # Wan-precedent fail-loud (CR minor-1): the user asked for the cond-latent
+                # route (video_vae wired) but the loaded .so predates the ABI — a SILENT
+                # fall-through to the legacy engine-encode route would run a materially
+                # different mechanism than requested (and fail confusingly on file-mode
+                # packages that carry no engine VAE weights).
+                raise RuntimeError(
+                    "qf_native ltx2 i2v: video_vae is wired (cond-latent route), but the "
+                    "loaded engine .so predates the i2v cond-latent ABI (no "
+                    "quantfunc_denoise_begin_edit_cond export). Update the plugin's engine "
+                    "library, or disconnect video_vae to use the legacy engine-encode route "
+                    "(full packages only).")
+            if self._video_vae_path:
                 if self._i2v_vae is None:
                     import comfy.sd as _csd
                     import comfy.utils as _cutils
@@ -1164,7 +1176,16 @@ def register(deps):
                 return False
         if _has_connector_keys(transformer1_path):
             connectors_src = transformer1_path
-        elif connectors_path and _has_connector_keys(connectors_path):
+        elif connectors_path:
+            # EXPLICIT parameter: valid or REFUSE (CR minor-2) — a silent fall-through to
+            # the same-dir auto-probe would load weights the user did not pick.
+            if not _has_connector_keys(connectors_path):
+                raise RuntimeError(
+                    f"qf_native ltx2: the picked connectors_file "
+                    f"({os.path.basename(str(connectors_path))}) carries no "
+                    f"embeddings_connector keys (unreadable or not a connectors file) — "
+                    f"pick the ltx-2.5 connectors file, or leave the input empty to "
+                    f"auto-detect a sibling next to the transformer.")
             connectors_src = connectors_path
         else:
             # SAME-DIR auto-probe (UX fallback, tests-eb-aligned): a *connector*.safetensors

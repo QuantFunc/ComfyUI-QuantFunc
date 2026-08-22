@@ -281,6 +281,16 @@ def main():
           os.path.realpath(os.path.join(_imd, "vae", "model.safetensors"))
           .endswith("fx-ltx25-audio-vae.safetensors"))
 
+    # EXPLICITLY-picked but INVALID connectors_file -> REFUSE (no silent auto-probe; CR minor-2)
+    try:
+        LtxL.load("fx-ltx-2.5-quantfunc-4bit.safetensors", "ltx2-2.5-22b", 999,
+                  te_file="fx-gemma4-with-proj.safetensors",
+                  audio_vae="fx-ltx25-audio-vae.safetensors",
+                  connectors_file="fx-minimax-h3-quantfunc-int4.safetensors")  # keyless dummy
+        check("ltx2 explicit-invalid connectors_file refuses (no probe fallback)", False, "-> no exception")
+    except RuntimeError as e:
+        check("ltx2 explicit-invalid connectors_file refuses (no probe fallback)",
+              "no" in str(e) and "connector" in str(e).lower(), f"-> {str(e)[:80]}")
     # keyless transformer, NO connectors_file, valid sibling IN THE SAME DIR -> AUTO-PROBE picks it
     out_probe = LtxL.load("fx-ltx-2.5-quantfunc-4bit.safetensors", "ltx2-2.5-22b", 999,
                           te_file="fx-gemma4-with-proj.safetensors",
