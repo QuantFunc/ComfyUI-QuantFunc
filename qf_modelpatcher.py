@@ -837,8 +837,8 @@ class QFModelPatcher(comfy.model_patcher.ModelPatcher):
             return 0
         want = int(memory_to_free or 0)
         _qf_cancel_pending_detach(eng)   # real pressure supersedes a lazy-detach window
-        print(f"[qf_prof] partially_unload asked={want // (1024*1024)} MB "
-              f"(loaded={self.loaded_size() // (1024*1024)} MB)", flush=True)
+        qfe._dbg_prof(f"partially_unload asked={want // (1024*1024)} MB "
+                      f"(loaded={self.loaded_size() // (1024*1024)} MB)")
         if want > 0 and hasattr(eng, "partial_unload_vram"):
             freed = eng.partial_unload_vram(want)
             if freed >= want:
@@ -846,8 +846,8 @@ class QFModelPatcher(comfy.model_patcher.ModelPatcher):
                       f"{want // (1024*1024)} MB request (weights stay live)", flush=True)
                 return freed
             # partial insufficient — full fallback keeps the honest-ledger guarantee
-            print(f"[qf_prof] partial shed INSUFFICIENT: freed={freed // (1024*1024)} MB < "
-                  f"want={want // (1024*1024)} MB -> full-unload fallback", flush=True)
+            qfe._dbg_prof(f"partial shed INSUFFICIENT: freed={freed // (1024*1024)} MB < "
+                          f"want={want // (1024*1024)} MB -> full-unload fallback")
         return eng.unload_vram()
 
 
@@ -895,8 +895,7 @@ class QFModelPatcher(comfy.model_patcher.ModelPatcher):
                                 return
                             eng.pending_detach = False
                             eng._qf_detach_timer = None
-                            print("[qf_prof] lazy-detach window expired -> real engine unload",
-                                  flush=True)
+                            qfe._dbg_prof("lazy-detach window expired -> real engine unload")
                             eng.unload_vram()
                     except Exception:  # noqa: BLE001 — a timer thread must never raise
                         pass
