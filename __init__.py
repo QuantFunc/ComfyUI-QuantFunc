@@ -481,7 +481,7 @@ if _IMPORT_OK:
 
 
     def _run_family_load(expect_family, transformer1, model_config,
-                         resident_block_count, transformer2):
+                         resident_block_count, transformer2, sparse_opts=None):
         """The SHARED loader core behind the per-family nodes (user 2026-08-21 pivot). All
         validation is preserved verbatim from the original single-node load(); the per-family
         nodes add only (a) a family-filtered preset dropdown and (b) this family guard —
@@ -540,9 +540,15 @@ if _IMPORT_OK:
         # fallback layer (te/audio_vae/connectors conventional-filename resolution) served
         # only the transitional split exports; an incomplete single-file export is refused
         # loud by the family builder instead of being silently completed.
+        # [sparse switch, user 2026-08-24 "稀疏你要做开关"] pass ONLY when engaged so families
+        # whose builders don't accept it yet fail loud on an attempted toggle instead of
+        # silently ignoring the switch (v1 wires minimax-h3; wan/ltx follow the same kwarg).
+        _kw = {}
+        if sparse_opts:
+            _kw["sparse_opts"] = sparse_opts
         return builder(transformer1_path=xfm1, transformer2_path=xfm2,
                        resident_block_count=int(resident_block_count),
-                       bundle_dir=bundle_dir)
+                       bundle_dir=bundle_dir, **_kw)
 
     _RESIDENT_BLOCKS_INPUT = ("INT", {"default": 999, "min": 1, "max": 1024,
                                       "tooltip": "GPU-resident transformer blocks — the native "
@@ -645,6 +651,21 @@ if _IMPORT_OK:
                                  {"tooltip": "The OFFICIAL MiniMax-H3 model config preset. "
                                              + _preset_file_expectations()}),
                 "resident_block_count": _RESIDENT_BLOCKS_INPUT,
+            }, "optional": {
+                # [sparse switch, user 2026-08-24] CREATE-level toggle (flipping it re-creates
+                # the pipeline — the engine's sparse selector + attention backend are create
+                # keys). off = the default sage2 dense path, byte-identical to before this
+                # widget existed. meansim = the engine's SHIPPED sparse control (flash-branch
+                # BSA hook, engine-gated by svg2_min_tokens so short sequences stay dense).
+                "sparse": (["off", "meansim"],
+                           {"default": "off",
+                            "tooltip": "Sparse self-attention (LOSSY, quality A/B advised): "
+                                       "meansim = block top-p keep on the flash branch. "
+                                       "Toggling re-creates the pipeline."}),
+                "sparse_cdf": ("FLOAT", {"default": 0.98, "min": 0.5, "max": 1.0, "step": 0.01,
+                                         "tooltip": "Top-p mass kept (<1.0 = sparser; 1.0 = "
+                                                    "keep-all, bit-exact dense). Only used when "
+                                                    "sparse != off."}),
             }}
 
         RETURN_TYPES = ("MODEL",)
@@ -653,9 +674,15 @@ if _IMPORT_OK:
         DESCRIPTION = ("QuantFunc MiniMax-H3 loader (svdq, denoise_only): one native AV MODEL a "
                        "stock sampler drives with latents. " + _COMMON_LIMITS)
 
-        def load(self, transformer, model_config, resident_block_count=999):
+        def load(self, transformer, model_config, resident_block_count=999,
+                 sparse="off", sparse_cdf=0.98):
+            sparse_opts = None
+            if sparse != "off":
+                sparse_opts = {"attention_backend": "flash",
+                               "sparse_selector": str(sparse),
+                               "sparse_cdf": float(sparse_cdf)}
             return (_run_family_load("minimax-h3", transformer, model_config,
-                                     resident_block_count, None),)
+                                     resident_block_count, None, sparse_opts=sparse_opts),)
 
     class QuantFuncNativeLoRA:
         """Sidecar LoRA for the QuantFunc native loader — MODEL in, MODEL out (LoraLoaderModelOnly

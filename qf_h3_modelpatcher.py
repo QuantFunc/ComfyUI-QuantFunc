@@ -496,7 +496,7 @@ def register(deps):
 
 
     def build(transformer1_path, transformer2_path, resident_block_count, bundle_dir=None,
-              lora_entries=()):
+              lora_entries=(), sparse_opts=None):
         """File-based loading for MiniMax-H3 — the wan staging pattern, single-expert:
         stage the shipped config bundle (configs/minimax-h3-*/, official configs) + symlink
         the single transformer file; engine create runs denoise_only=True (TE + VAE weights
@@ -507,9 +507,16 @@ def register(deps):
         if transformer2_path:
             raise RuntimeError("qf_native minimax-h3: single-expert family — transformer2 must be empty")
         model_dir = qfmp.stage_denoise_only_package(bundle_dir, transformer1_path, None)
+        # [sparse switch] the selector/backend are CREATE keys the engine's transformer
+        # factory parses (attention_backend / sparse_selector / sparse_cdf — the shared
+        # makeSvg2Config path); merged here they also enter the pipeline-cache identity
+        # via create_cfg, so off↔on never collides with a cached dense handle.
+        create_extra = {"denoise_only": True}
+        if sparse_opts:
+            create_extra.update(sparse_opts)
         return _build_from_package(model_dir, os.path.basename(transformer1_path),
                                    resident_block_count, lora_entries=lora_entries,
-                                   create_extra={"denoise_only": True})
+                                   create_extra=create_extra)
 
     def _build_from_package(model_dir, model_name, resident_block_count, start_image=None,
               connector_ckpt="(none)", lora_entries=(), create_extra=None):
