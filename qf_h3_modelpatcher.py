@@ -97,6 +97,30 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
         self._out_audio = None            # reused audio velocity_out buffer [1, K*T, 32]
         self._max_ctx_seq = 0
 
+    # ── honest engine working-set report (single-stage seam; brim fix 2026-08-24) ──
+    # The mixin's memory_required deliberately reports ONLY comfy-side copies — right for the
+    # WAN TWO-stage seam, where a big stage-2 estimate made comfy evict the stage-1 ENGINE
+    # (the 2026-08-22 inter-stage thrash fix). H3 is SINGLE-stage: we are the model being
+    # loaded, so a truthful estimate makes comfy evict CO-TENANTS (the ~5 GB staged official
+    # VAE / TE), never us — exactly its native model management doing its job. MEASURED
+    # (远程-linux 3090, 124f/38k-tok, nsys qfmemo2/4): with the VAE staged through our
+    # denoise, engine allocs ran at the 24 GB brim → per-block physical-OOM → allocator
+    # sync storms (cudaFree 161 s CPU/run) ≈ 9 s/step GPU idle. Working set ≈ linear in
+    # latent volume: ~10 GB at 10.2 M latent elems ⇒ ~1.0 KB/elem + floor. Over-report is
+    # bounded (comfy just frees co-tenants it can reload for decode); under-report degrades
+    # to today's behavior.
+    _QF_H3_ENGINE_WORKING_BYTES_PER_LATENT_ELEM = 1024
+    _QF_H3_ENGINE_WORKING_FLOOR_BYTES = 1536 * 1024 * 1024
+
+    def memory_required(self, input_shape, cond_shapes=None, **_kw):
+        base = super().memory_required(input_shape, cond_shapes=cond_shapes, **_kw)
+        n_lat = 1
+        for d in list(input_shape):
+            n_lat *= max(1, int(d))
+        eng = (self._QF_H3_ENGINE_WORKING_FLOOR_BYTES +
+               n_lat * self._QF_H3_ENGINE_WORKING_BYTES_PER_LATENT_ELEM)
+        return int(base) + int(eng)
+
     # Conditioning keys this external session does NOT consume — a wired node feeding one would be
     # SILENTLY dropped -> plausible-but-wrong AV. FAIL LOUD (mirror QFLTXModel's defensive superset).
     # Defensive SUPERSET (wan/LTX precedent): every key comfy's MiniMaxH3.extra_conds + the
