@@ -401,6 +401,15 @@ def _get_engine(model_dir, create_cfg=None, device_idx=0):
     # [manual-residency] the session-knob-≠-create-key guard is sealed INSIDE
     # qf_engine.create_pipeline (the real quantfunc_create boundary — construction-enforced,
     # unbypassable by a future direct caller), not duplicated here (one truth source).
+    # [EXPERIMENT-ONLY 2026-08-23, svg2/backend A/B — remove after measurement; shipped
+    # form will be loader-node widgets, per the no-env-production-switch rule]:
+    # QF_NATIVE_CREATE_EXTRA merges extra create keys (sparse_selector/sparse_cdf/
+    # attention_backend...) BEFORE the cache key is computed, so每个 extra 配置有独立
+    # pipeline cache 身份 (never collides with the default config's handle).
+    _extra = os.environ.get("QF_NATIVE_CREATE_EXTRA")
+    if _extra:
+        create_cfg = {**(create_cfg or {}), **json.loads(_extra)}
+        print(f"[qf_native] EXPERIMENT create-extra merged: {_extra}", flush=True)
     lib = qfe.load_lib()
     # device_idx follows COMFY's torch device (the builders pass get_torch_device().index), so
     # a ComfyUI started on a different GPU — or an in-process device choice — drives the engine
