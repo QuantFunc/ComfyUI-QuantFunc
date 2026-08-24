@@ -255,7 +255,9 @@ class QFCloudTEClip:
             return cond, None
         return cond
 
-    def clone(self):
+    def clone(self, *_args, **_kwargs):
+        # Tolerant of real-CLIP clone kwargs (e.g. nodes_hooks.py clone(disable_dynamic=True)) —
+        # the shim is stateless-per-encode, so an equivalent instance is always a valid clone.
         return QFCloudTEClip(self._model_id, self._output_dtype, self._timeout, self._device_idx)
 
     # inert hook points some graph utilities touch on real CLIPs
@@ -263,6 +265,15 @@ class QFCloudTEClip:
 
     def add_hooks_to_dict(self, d):
         return d
+
+    def __getattr__(self, name):
+        # LOUD refusal for the rest of the real-CLIP surface (LoraLoader's add_patches,
+        # CLIPSetLastLayer's clip_layer, ...): AttributeError (so benign hasattr() probes
+        # stay False) with a message naming the boundary instead of a bare traceback.
+        raise AttributeError(
+            f"QuantFunc cloud TE CLIP shim has no '{name}' — it supports the official "
+            f"conditioning nodes only (tokenize / encode_from_tokens[_scheduled]). "
+            f"LoRA-on-CLIP / CLIP hooks / set-last-layer need a local CLIP loader.")
 
 
 class QuantFuncCloudTELoader:
