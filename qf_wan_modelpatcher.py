@@ -510,7 +510,7 @@ def register(deps):
     apply_checkpoint_flow_shift = deps["apply_checkpoint_flow_shift"]
 
     def build(transformer1_path, transformer2_path, resident_block_count, bundle_dir,
-              lora_entries=()):
+              lora_entries=(), sparse_opts=None):
         """wan A14B from BARE transformer FILES (INT8-Fast-aligned): transformer1 = HIGH-noise
         expert, transformer2 = LOW-noise expert — BOTH required (A14B is dual-expert; a missing
         low expert would denoise the low-sigma phase with nothing). The engine create is
@@ -549,6 +549,16 @@ def register(deps):
             _sm = _wan_device_sm()
             if _sm in (86, 89):
                 cfg["attention_backend"] = "qfa"
+            if sparse_opts:
+                # [sparse switch] user-enabled sparse REQUIRES the flash/BSA executor
+                # today (the svg2 keep_set renders via mha_fwd_block), so these CREATE
+                # keys — including attention_backend=flash — deliberately OVERRIDE the
+                # sm86/89 qfa compat pin above for sparse runs. (sage2/qfa block-sparse
+                # executor support is the next wave, user 2026-08-25 "svg2要支持sage2
+                # 与qfa"; until then sparse-on-wan means the flash executor.) Merged
+                # into cfg → enters the pipeline-cache identity, so sparse on/off never
+                # collides with a cached dense handle.
+                cfg.update(sparse_opts)
             # [wiring-lora] LoRA rides the ENGINE's per-side registry, not this base cfg: the
             # loader-level create-time entries are seeded as the "loader" side below, chained
             # QuantFuncNativeLoRA nodes REPLACE their wire's side ("high"/"low"), and the

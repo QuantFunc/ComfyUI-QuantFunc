@@ -1169,7 +1169,7 @@ def register(deps):
 
 
     def build(transformer1_path, transformer2_path, resident_block_count, bundle_dir=None,
-              lora_entries=()):
+              lora_entries=(), sparse_opts=None):
         """File-based (ComfyUI single-file) loading for LTX-2.5 — the wan staging pattern
         with a ONE-FILE contract (user 2026-08-22 — the loader depends on nothing but
         the single ALL-IN export, mirroring the official comfy single-file):
@@ -1226,8 +1226,14 @@ def register(deps):
                                    # ~2-4GB/s (nsys: memcpy = 86% of API time). Pinned host
                                    # backups cut every offload/reload 3-6x. RAM budget: one
                                    # model's footprint, freed with the backup.
+                                   # [sparse switch] the selector/backend are CREATE keys
+                                   # (attention_backend / sparse_selector / sparse_cdf —
+                                   # the shared makeSvg2Config path); merged here they
+                                   # also enter the pipeline-cache identity, so sparse
+                                   # on/off never collides with a cached dense handle.
                                    create_extra={"denoise_only": True,
-                                                 "use_pinned_memory": True})
+                                                 "use_pinned_memory": True,
+                                                 **(sparse_opts or {})})
 
     def _build_from_package(model_dir, model_name, resident_block_count,
               connector_ckpt="(none)", lora_entries=(), create_extra=None):

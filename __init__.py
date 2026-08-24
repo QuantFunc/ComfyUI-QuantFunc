@@ -580,6 +580,25 @@ if _IMPORT_OK:
         "CUDA-toolchain check refuses a torch/.so CUDA-major mismatch; on Windows/macOS set "
         "QF_NATIVE_ALLOW_UNVERIFIED_TOOLCHAIN=1 after confirming they share a CUDA major.")
 
+    def _sparse_create_opts(sparse, sparse_cdf=None):
+        """ONE-number sparse contract (user 2026-08-25): 1.0 → None (dense create,
+        byte-identical to no-widget). <1.0 → the SVG2 SEMANTIC selector (k-means
+        clustered top-p, parity-proven vs official Sparse-VideoGen f89aeda; user
+        2026-08-25 switched the knob from meansim to svg2) keeping that fraction of
+        attention mass on the flash block-sparse executor. Engine floors
+        (svg2_min_tokens / min_kc_ratio) keep short sequences dense. Back-compat:
+        the legacy H3 string form ("off"/"meansim") + separate sparse_cdf maps in,
+        never crashes (an explicit legacy "meansim" ALSO lands on svg2 — the knob is
+        one user-facing dial, not a selector picker)."""
+        if isinstance(sparse, str):
+            sparse = 1.0 if sparse == "off" else float(sparse_cdf if sparse_cdf is not None else 0.98)
+        sparse = float(sparse)
+        if sparse >= 1.0:
+            return None
+        return {"attention_backend": "flash",
+                "sparse_selector": "svg2",
+                "sparse_cdf": sparse}
+
     class QuantFuncWanLoader:
         """Wan 2.x loader — DUAL MODEL outputs (high-noise, low-noise) over ONE shared engine,
         mirroring the official two-UNETLoader wan2.2 A14B workflow 1:1: wire model_high to the
@@ -621,7 +640,7 @@ if _IMPORT_OK:
                 "sparse": ("FLOAT", {"default": 1.0, "min": 0.5, "max": 1.0, "step": 0.01,
                            "tooltip": "Sparse self-attention (LOSSY): 1.0 = OFF (dense, "
                                       "sage/qfa path). <1.0 keeps that fraction of attention "
-                                      "mass per block (e.g. 0.98) via meansim block sparsity "
+                                      "mass per block (e.g. 0.98) via SVG2 semantic block sparsity (k-means clustered top-p) "
                                       "on the flash branch. CREATE key — changing it "
                                       "re-creates the pipeline."}),
             }}
@@ -641,10 +660,7 @@ if _IMPORT_OK:
 
         def load(self, transformer1, transformer2, model_config, resident_block_count=999,
                  step_cache=0.0, block_cache=0.0, sparse=1.0):
-            sparse = float(sparse) if not isinstance(sparse, str) else 1.0
-            sparse_opts = None if sparse >= 1.0 else {"attention_backend": "flash",
-                                                      "sparse_selector": "meansim",
-                                                      "sparse_cdf": sparse}
+            sparse_opts = _sparse_create_opts(sparse)
             return _run_family_load("wan", transformer1, model_config,
                                     resident_block_count, transformer2,
                                     sparse_opts=sparse_opts,
@@ -686,7 +702,7 @@ if _IMPORT_OK:
                 "sparse": ("FLOAT", {"default": 1.0, "min": 0.5, "max": 1.0, "step": 0.01,
                            "tooltip": "Sparse self-attention (LOSSY): 1.0 = OFF (dense, "
                                       "sage/qfa path). <1.0 keeps that fraction of attention "
-                                      "mass per block (e.g. 0.98) via meansim block sparsity "
+                                      "mass per block (e.g. 0.98) via SVG2 semantic block sparsity (k-means clustered top-p) "
                                       "on the flash branch. CREATE key — changing it "
                                       "re-creates the pipeline."}),
             }}
@@ -707,10 +723,7 @@ if _IMPORT_OK:
             # resolve from the preset manifest's aux_files inside _run_family_load; i2v is
             # the workflow's own latent conditioning (LTXVImgToVideoInplace), exactly like
             # wan's cond-latent shape.
-            sparse = float(sparse) if not isinstance(sparse, str) else 1.0
-            sparse_opts = None if sparse >= 1.0 else {"attention_backend": "flash",
-                                                      "sparse_selector": "meansim",
-                                                      "sparse_cdf": sparse}
+            sparse_opts = _sparse_create_opts(sparse)
             return (_run_family_load("ltx2", transformer, model_config,
                                      resident_block_count, None,
                                      sparse_opts=sparse_opts,
@@ -750,16 +763,16 @@ if _IMPORT_OK:
                                          "Runtime session knob — takes effect next run, never "
                                          "rebuilds. COMPOSABLE with step_cache (EC skips whole "
                                          "steps; FBC skips blocks inside computed steps)."}),
-                # [sparse, user 2026-08-25 simplification: ONE number, 1.0 = OFF] CREATE-level
-                # (changing it re-creates the pipeline — the engine's sparse selector +
-                # attention backend are create keys). 1.0 = the default dense path (sage/qfa,
-                # byte-identical to before this widget existed). <1.0 = meansim block sparse
-                # attention on the flash branch, keeping this fraction of attention mass
+                # [sparse, user 2026-08-25: ONE number, 1.0 = OFF; <1.0 = SVG2 semantic]
+                # CREATE-level (selector + attention backend are create keys). 1.0 = the
+                # default dense path (sage/qfa, byte-identical to before this widget
+                # existed). <1.0 = SVG2 semantic block-sparse attention (k-means clustered
+                # top-p) on the flash executor, keeping this fraction of attention mass
                 # (engine-gated by svg2_min_tokens so short sequences stay dense).
                 "sparse": ("FLOAT", {"default": 1.0, "min": 0.5, "max": 1.0, "step": 0.01,
                            "tooltip": "Sparse self-attention (LOSSY): 1.0 = OFF (dense, "
                                       "qfa/sage path). <1.0 keeps that fraction of attention "
-                                      "mass per block (e.g. 0.98) via meansim block sparsity. "
+                                      "mass per block (e.g. 0.98) via SVG2 semantic block sparsity (k-means clustered top-p). "
                                       "CREATE key — changing it re-creates the pipeline."}),
             }}
 
@@ -771,17 +784,7 @@ if _IMPORT_OK:
 
         def load(self, transformer, model_config, resident_block_count=999,
                  sparse=1.0, sparse_cdf=None, step_cache=0.0, block_cache=0.0):
-            # ONE-number contract (user 2026-08-25): sparse==1.0 → OFF (dense); <1.0 → meansim
-            # keeping that mass fraction. Back-compat: an old saved workflow may still send the
-            # legacy string ("off"/"meansim") + separate sparse_cdf — map it, never crash.
-            if isinstance(sparse, str):
-                sparse = 1.0 if sparse == "off" else float(sparse_cdf if sparse_cdf is not None else 0.98)
-            sparse = float(sparse)
-            sparse_opts = None
-            if sparse < 1.0:
-                sparse_opts = {"attention_backend": "flash",
-                               "sparse_selector": "meansim",
-                               "sparse_cdf": sparse}
+            sparse_opts = _sparse_create_opts(sparse, sparse_cdf)
             return (_run_family_load("minimax-h3", transformer, model_config,
                                      resident_block_count, None, sparse_opts=sparse_opts,
                                      easycache_thresh=step_cache,
