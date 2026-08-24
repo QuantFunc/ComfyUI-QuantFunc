@@ -616,8 +616,13 @@ class QFEngineHandle:
                           f"{last_err(self.lib)}", flush=True)
                 except Exception:  # noqa: BLE001
                     pass
-        except Exception:  # noqa: BLE001 — end is best-effort on teardown
+        except Exception as _end_exc:  # noqa: BLE001 — end is best-effort on teardown
             ok = False
+            try:  # R7 observability: this branch previously left no trail (leg-1 was
+                #   diagnosed FROM logs — a silent branch here would blind the next diagnosis)
+                print(f"[qf_native] WARNING quantfunc_denoise_end raised: {_end_exc!r}", flush=True)
+            except Exception:  # noqa: BLE001
+                pass
         # RETAIN the pointer on a refused end (2026-08-24 busy incident, leg 2). The old
         # "clear regardless" rationale was FALSE: no _begin blocks on a stale pointer (all
         # call this bare and proceed), but clearing it made an engine-side-open session
