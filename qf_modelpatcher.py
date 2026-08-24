@@ -984,6 +984,14 @@ class QFModelPatcher(comfy.model_patcher.ModelPatcher):
         if not holds:
             return 0
         if getattr(eng, "current_session", None) is not None:
+            # Retention (2026-08-24, delta-CR R8): this pre-check is the 4th truthiness
+            # consumer — short-circuiting here defeated release()'s own self-heal for a
+            # retained-but-dead pointer. Attempt the end first; only a session that STILL
+            # refuses to end (genuinely running) declines the RAM reclaim.
+            end = getattr(eng, "end_session_if_open", None)
+            if end is not None:
+                end()
+        if getattr(eng, "current_session", None) is not None:
             return 0
         release = getattr(eng, "release", None)
         if release is None:            # a plain (non-lazy) handle cannot be re-created: keep it
