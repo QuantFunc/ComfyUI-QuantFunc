@@ -38,7 +38,10 @@ _DEFAULT_SERVER_URL = "https://service.quantfunc.com"
 # Worker model ids the cloud service serves for the native lane. Dropdown (user order:
 # model_id 要下拉框). Extend as the serving lane deploys more TE workers.
 _MODEL_CHOICES = ["qwen3-vl-32b"]
-_DTYPE_CHOICES = {"fp32": qf_engine.QF_FP32, "fp8_e4m3": qf_engine.QF_FP8_E4M3}
+# Product wire contract (engine 0faf1d60): bf16 (default) / fp8_e4m3; fp32 = debug-only
+# (the worker computes in bf16 — fp32 doubles wire bytes carrying 16 zero bits).
+_DTYPE_CHOICES = {"bf16": qf_engine.QF_BF16, "fp8_e4m3": qf_engine.QF_FP8_E4M3,
+                  "fp32_debug": qf_engine.QF_FP32}
 _PER_CALL_WAIT_MS = 5000   # per-call wait sub-step budget (ms); the shim loops for the overall budget
 _POLL_INTERVAL_S = 1.0     # sleep between resume polls (s)
 
@@ -137,14 +140,21 @@ def _read_tensor(lib, handle) -> torch.Tensor:
     numel = 1
     for d in shape:
         numel *= d
-    elem = 4 if dtype.value == 0 else 1
+    elem = {0: 4, 1: 1, 2: 2}.get(dtype.value)
+    if elem is None:
+        raise RuntimeError(f"cloud TE: unknown result tensor dtype {dtype.value}")
     raw = (ctypes.c_ubyte * (numel * elem))()
     if lib.quantfunc_tensor_read(handle, raw, len(raw)) != qf_engine.QUANTFUNC_OK:
         raise RuntimeError("cloud TE: tensor_read failed: " + _last_error(lib))
     payload = bytes(raw)
-    if dtype.value == 0:  # float32, C-contiguous
+    if dtype.value == 0:  # float32, C-contiguous (debug wire format)
         arr = np.frombuffer(payload, dtype=np.float32).reshape(shape).copy()
         return torch.from_numpy(arr)
+    if dtype.value == 2:  # bf16: raw bfloat16 bit patterns, little-endian (engine 0faf1d60).
+        # Passthrough as torch.bfloat16 — the family seams cast conds to bf16 anyway, so this
+        # is the zero-conversion path (scales MUST be absent for dtype 2 per the C contract).
+        bf = torch.frombuffer(bytearray(payload), dtype=torch.uint8).view(torch.bfloat16)
+        return bf.reshape(shape).clone()
     # dtype == 1: fp8_e4m3 payload + per-token scales (len = seq = dims[-2]).
     seq = shape[-2] if len(shape) >= 2 else 1
     sc = (ctypes.c_float * seq)()
@@ -352,10 +362,12 @@ class QuantFuncCloudTELoader:
                              "tooltip": "TE model served by the QuantFunc cloud worker."}),
             },
             "optional": {
-                "output_dtype": (list(_DTYPE_CHOICES.keys()), {"default": "fp32",
-                                 "tooltip": "Wire format of the returned embedding. fp8_e4m3 "
-                                            "halves the download; both decode to the same "
-                                            "conditioning path."}),
+                "output_dtype": (list(_DTYPE_CHOICES.keys()), {"default": "bf16",
+                                 "tooltip": "Wire format of the returned embedding. bf16 = the "
+                                            "product default (the worker computes in bf16 — "
+                                            "lossless, half the fp32 bytes); fp8_e4m3 halves it "
+                                            "again (per-token scales); fp32_debug = debug-only "
+                                            "numeric-compare format."}),
                 "timeout_seconds": ("INT", {"default": 600, "min": 1, "max": 36000}),
                 "device_idx": ("INT", {"default": 0, "min": 0, "max": 15}),
             },
