@@ -240,9 +240,12 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
         """Open the joint-AV external denoise session. x_video=[1,24,T,H,W], x_audio=[1,32,2,audio_t],
         vemb=[1,S,D] Qwen3-VL hidden states. audio_dims [B,C,K,T] + the AV sigma shifts ride options_json."""
         qfmp._qf_cancel_pending_detach(self._qf)   # session begin supersedes a lazy-detach window
+        lib = self._qf.lib   # MATERIALIZE FIRST: a fresh deferred wrapper (_real=None) cache-hits
+        # the SAME resident engine an interrupted run may have left with an OPEN session; ending
+        # before materializing was a no-op on that wrapper -> begin hit "pipeline busy" until the
+        # 5-min engine watchdog (measured 2026-08-24). Post-materialize, the close is real.
         self._qf.end_session_if_open()
         self._ctx_key_assigner.reset()   # per-generation uuid→key numbering (no cross-gen leak)
-        lib = self._qf.lib
         bpx = qfe.DenoiseBeginParams()
         ctypes.memset(ctypes.byref(bpx), 0, ctypes.sizeof(bpx))
         bpx.struct_size = ctypes.sizeof(bpx)

@@ -676,9 +676,10 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
         [1,S,4096] POST-connector video_embeds. Geometry: engine derives F_lat/H_lat/W_lat from
         num_frames + width/height (spatial 32, temporal 8)."""
         qfmp._qf_cancel_pending_detach(self._qf)   # session begin supersedes a lazy-detach window
+        lib = self._qf.lib   # MATERIALIZE FIRST (see qf_h3_modelpatcher._begin: a deferred wrapper
+        # no-ops the close while the cached engine still holds an interrupted run's open session)
         self._qf.end_session_if_open()
         self._ctx_key_assigner.reset()   # per-generation uuid→key numbering (no cross-gen leak)
-        lib = self._qf.lib
         bpx = qfe.DenoiseBeginParams()
         ctypes.memset(ctypes.byref(bpx), 0, ctypes.sizeof(bpx))
         bpx.struct_size = ctypes.sizeof(bpx)

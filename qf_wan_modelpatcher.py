@@ -213,12 +213,13 @@ class QFWanModel(QFSessionModelMixin, comfy.model_base.WAN21):
         """Open the edit session. x_group/ctx_group are PER-COND-GROUP (B==1) slices — begin binds
         the geometry MAXIMA with B==1 (the engine + include/quantfunc.h require cond B==1)."""
         qfmp._qf_cancel_pending_detach(self._qf)   # session begin supersedes a lazy-detach window
-        self._qf.end_session_if_open()    # clean any stale session from a prior failed run on this pipeline
         # ([wiring-lora] the LoRA drift-retire needs NO call here: it runs inside
         #  QFLazyEngine.ensure() itself — the lib access below triggers it.)
         # start_image=None = t2v (branch below). The ENGINE refuses an i2v checkpoint
         # (in>out) without a ref fail-loud at begin — no silent t2v on an i2v model.
-        lib = self._qf.lib
+        lib = self._qf.lib   # MATERIALIZE FIRST (see qf_h3_modelpatcher._begin: a deferred wrapper
+        # no-ops the close while the cached engine still holds an interrupted run's open session)
+        self._qf.end_session_if_open()    # clean any stale session from a prior failed run on this pipeline
         bpx = qfe.DenoiseBeginParams()
         ctypes.memset(ctypes.byref(bpx), 0, ctypes.sizeof(bpx))
         bpx.struct_size = ctypes.sizeof(bpx)
