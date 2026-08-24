@@ -17,6 +17,7 @@ QF_SERVER_URL else the engine default. All upload/signing/crypto lives inside th
 (pending → resume via a durable task_id) until terminal or budget.
 """
 import ctypes
+import hashlib
 import json
 import os
 import tempfile
@@ -57,6 +58,42 @@ def _read_auth():
         except Exception:  # noqa: BLE001
             pass
     return key, surl
+
+
+_RESUME_CACHE_PATH = os.path.join(tempfile.gettempdir(), "qf_cloud_te_resume.json")
+
+
+def _resume_cache_load() -> dict:
+    try:
+        return json.load(open(_RESUME_CACHE_PATH))
+    except Exception:  # noqa: BLE001 — absent/corrupt cache = empty (worst case: one extra task)
+        return {}
+
+
+def _resume_cache_store(d: dict):
+    try:
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(_RESUME_CACHE_PATH))
+        with os.fdopen(fd, "w") as f:
+            json.dump(d, f)
+        os.replace(tmp, _RESUME_CACHE_PATH)
+    except Exception:  # noqa: BLE001 — cache is an optimization, never fail the encode over it
+        pass
+
+
+def _request_key(model_id, output_dtype, text, ref_paths) -> str:
+    """Content-addressed identity of one encode request — the loader-form replacement for the
+    removed resume_task_id widget: an IDENTICAL re-run auto-resumes its still-open cloud task
+    instead of submitting a second billable one. Ref images hash by CONTENT (paths are temp)."""
+    h = hashlib.sha256()
+    for part in (model_id, "\0", output_dtype, "\0", text):
+        h.update(part.encode("utf-8"))
+    for p in ref_paths:
+        h.update(b"\0")
+        try:
+            h.update(open(p, "rb").read())
+        except OSError:
+            h.update(p.encode("utf-8"))
+    return h.hexdigest()
 
 
 def _last_error(lib) -> str:
@@ -159,35 +196,55 @@ def _cloud_encode(text, ref_paths, model_id, output_dtype, timeout_seconds, devi
     p.progress_callback = cb
     p.callback_user_data = None
 
+    # Loader-form resume (no widget): an IDENTICAL request re-run resumes its still-open
+    # cloud task via a content-keyed local cache instead of submitting a second billable task.
+    req_key = _request_key(model_id, output_dtype, text, ref_paths)
+    cache = _resume_cache_load()
+    cached_tid = cache.get(req_key, "")
+    resume_bytes = cached_tid.encode("utf-8") if cached_tid else None
+    if resume_bytes:
+        p.resume_task_id = resume_bytes  # keep bytes alive via resume_bytes
+
     out_result = ctypes.c_void_p()
     out_pending = ctypes.c_int(0)
     task_buf = ctypes.create_string_buffer(64)   # Snowflake task_id <= 20 bytes
     deadline = time.time() + float(timeout_seconds)
+
+    def _drop_cache_entry():
+        c = _resume_cache_load()
+        if c.pop(req_key, None) is not None:
+            _resume_cache_store(c)
+
     try:
         while True:
             rc = lib.quantfunc_te_cloud_encode(
                 ctypes.byref(p), ctypes.byref(out_result),
                 ctypes.byref(out_pending), task_buf, len(task_buf))
+            tid = task_buf.value.decode("utf-8", "replace")
+            if tid and tid != cache.get(req_key):
+                cache[req_key] = tid
+                _resume_cache_store(cache)   # persist BEFORE any raise → a re-run resumes
             if rc != qf_engine.QUANTFUNC_OK:
+                _drop_cache_entry()          # terminal failure — resuming it is pointless
                 err = _last_error(lib)
-                tid = task_buf.value.decode("utf-8", "replace")
                 if tid:
-                    err += (f" — a task already exists (task_id={tid}); it stays resumable "
-                            f"server-side, re-running the workflow will not double-bill")
+                    err += f" (task_id={tid})"
                 raise RuntimeError("cloud TE encode failed: " + err)
             if out_pending.value == 0:
                 break
-            tid = task_buf.value.decode("utf-8", "replace")
             if tid:
                 p.resume_task_id = task_buf.value  # keep bytes alive via task_buf
             if _mm is not None:
                 _mm.throw_exception_if_processing_interrupted()
             if time.time() > deadline:
-                raise RuntimeError(f"cloud TE: timed out after {timeout_seconds}s "
-                                   f"(task still processing; task_id={tid}). Re-run to resume.")
+                raise RuntimeError(
+                    f"cloud TE: timed out after {timeout_seconds}s (task still processing; "
+                    f"task_id={tid}). Re-running the SAME workflow auto-resumes this task "
+                    f"(content-keyed local cache) — no second billable submit.")
             time.sleep(_POLL_INTERVAL_S)
         if not out_result:
             raise RuntimeError("cloud TE: terminal state but no result tensor: " + _last_error(lib))
+        _drop_cache_entry()                  # success — the task is consumed
         return _read_tensor(lib, out_result)
     finally:
         if out_result:
