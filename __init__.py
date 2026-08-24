@@ -803,3 +803,16 @@ if _IMPORT_OK:
     NODE_DISPLAY_NAME_MAPPINGS.update({"QuantFuncNativeLoRA": "QuantFunc Native LoRA"})
 
 
+# ── QuantFunc Cloud TE encode node (design v11) ──────────────────────────────────
+# Module-level merge (never replace), independent of the family-loader flow, so the
+# cloud-TE node registers even when the family loaders are unavailable. Fully guarded —
+# a failure (e.g. torch missing outside ComfyUI) must never break plugin import.
+try:
+    from . import qf_cloud_te_node as _qf_cloud_te
+    NODE_CLASS_MAPPINGS.update(_qf_cloud_te.NODE_CLASS_MAPPINGS)
+    NODE_DISPLAY_NAME_MAPPINGS.update(_qf_cloud_te.NODE_DISPLAY_NAME_MAPPINGS)
+except Exception as _qf_cloud_te_exc:  # noqa: BLE001
+    import logging as _qf_lg
+    _qf_lg.warning("[qf_native] cloud-TE node not registered: %r", _qf_cloud_te_exc)
+
+
