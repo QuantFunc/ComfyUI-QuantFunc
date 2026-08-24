@@ -38,10 +38,11 @@ _DEFAULT_SERVER_URL = "https://service.quantfunc.com"
 # Worker model ids the cloud service serves for the native lane. Dropdown (user order:
 # model_id 要下拉框). Extend as the serving lane deploys more TE workers.
 _MODEL_CHOICES = ["qwen3-vl-32b"]
-# Product wire contract (engine 0faf1d60): bf16 (default) / fp8_e4m3; fp32 = debug-only
-# (the worker computes in bf16 — fp32 doubles wire bytes carrying 16 zero bits).
-_DTYPE_CHOICES = {"bf16": qf_engine.QF_BF16, "fp8_e4m3": qf_engine.QF_FP8_E4M3,
-                  "fp32_debug": qf_engine.QF_FP32}
+# Product wire contract (engine 0faf1d60 + user 2026-08-24 "插件透出的选项要将FP32干掉"):
+# the plugin EXPOSES only bf16 (default) / fp8_e4m3. fp32 exists engine-side as a debug wire
+# format but is deliberately NOT requestable from the loader (the read-out still tolerates a
+# dtype-0 result defensively).
+_DTYPE_CHOICES = {"bf16": qf_engine.QF_BF16, "fp8_e4m3": qf_engine.QF_FP8_E4M3}
 _PER_CALL_WAIT_MS = 5000   # per-call wait sub-step budget (ms); the shim loops for the overall budget
 _POLL_INTERVAL_S = 1.0     # sleep between resume polls (s)
 
@@ -365,9 +366,8 @@ class QuantFuncCloudTELoader:
                 "output_dtype": (list(_DTYPE_CHOICES.keys()), {"default": "bf16",
                                  "tooltip": "Wire format of the returned embedding. bf16 = the "
                                             "product default (the worker computes in bf16 — "
-                                            "lossless, half the fp32 bytes); fp8_e4m3 halves it "
-                                            "again (per-token scales); fp32_debug = debug-only "
-                                            "numeric-compare format."}),
+                                            "lossless); fp8_e4m3 halves the download again "
+                                            "(per-token dequant scales)."}),
                 "timeout_seconds": ("INT", {"default": 600, "min": 1, "max": 36000}),
                 "device_idx": ("INT", {"default": 0, "min": 0, "max": 15}),
             },
