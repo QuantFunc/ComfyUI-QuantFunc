@@ -443,6 +443,11 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
         # model instance across a requeue — so closing here forces _apply_model to _begin fresh. Idempotent
         # across the pos+neg extra_conds calls of a run (the 2nd finds nothing open → no-op).
         was_open, ok = self._qf.end_session_if_open()
+        # Retention (2026-08-24): even a REFUSED close (previous run's step still draining
+        # engine-side) must NOT let this run silently REUSE that session — force the first
+        # _apply_model through _begin (whose materialize-first close + busy-retry recovers
+        # correctly). Cleared at the gate; re-armed every run start.
+        self._qf_needs_begin = True
         if was_open:
             print("[qf_native] LTX: closed a pre-existing session at run start "
                   f"(prior run interrupted/uncleaned); end ok={ok}", flush=True)
@@ -761,7 +766,8 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
         # CONNECTOR BRIDGE: comfy pre-connector [B,S,6144] -> POST-connector video_embeds [B,S,4096].
         vemb = self._run_connector(c_crossattn, attention_mask=kwargs.get("attention_mask")
                                    ).to(dev, dtype=torch.bfloat16).contiguous()
-        if self._qf.current_session is None:
+        if self._qf.current_session is None or getattr(self, "_qf_needs_begin", False):
+            self._qf_needs_begin = False
             # shared black-video guard (see qf_modelpatcher.refuse_all_zero_initial_latent).
             qfmp.refuse_all_zero_initial_latent(xin, "LTX")
             self._begin(xin[0:1].contiguous(), vemb[0:1].contiguous())
@@ -994,7 +1000,8 @@ class QFLTXAVModel(QFLTXModel):
         # RAW dual-proj ctx (no plugin connector — see _run_connector).
         vemb = self._run_connector(c_crossattn, attention_mask=kwargs.get("attention_mask")
                                    ).to(dev, dtype=torch.bfloat16).contiguous()
-        if self._qf.current_session is None:
+        if self._qf.current_session is None or getattr(self, "_qf_needs_begin", False):
+            self._qf_needs_begin = False
             # shared black-video guard (see qf_modelpatcher.refuse_all_zero_initial_latent).
             qfmp.refuse_all_zero_initial_latent(xin, "LTX-AV")
             self._begin(xin[0:1].contiguous(), vemb[0:1].contiguous())

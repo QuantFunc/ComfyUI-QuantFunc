@@ -143,6 +143,11 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
         # RUN-START clean slate FIRST (session lifecycle) — before the loud-fails, so a rejected
         # bad-wiring requeue still closes a session stranded by a prior Interrupt.
         was_open, ok = self._qf.end_session_if_open()
+        # Retention (2026-08-24): even a REFUSED close (previous run's step still draining
+        # engine-side) must NOT let this run silently REUSE that session — force the first
+        # _apply_model through _begin (whose materialize-first close + busy-retry recovers
+        # correctly). Cleared at the gate; re-armed every run start.
+        self._qf_needs_begin = True
         if was_open:
             print("[qf_native] H3: closed a pre-existing session at run start (prior run interrupted); "
                   f"end ok={ok}", flush=True)
@@ -409,7 +414,8 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
             raise RuntimeError(f"qf_native H3: engine forward is B==1 per cond group but got batch={B} "
                                f"with cond_or_uncond={cou} — batch_size>1 latents are not supported")
         vemb = c_crossattn.to(dev, dtype=torch.bfloat16).contiguous()
-        if self._qf.current_session is None:
+        if self._qf.current_session is None or getattr(self, "_qf_needs_begin", False):
+            self._qf_needs_begin = False
             self._derive_geometry(x_video, transformer_options)   # session geometry from the GRAPH
             # shared black-video guard (see qf_modelpatcher.refuse_all_zero_initial_latent);
             # H3 is joint AV — the VIDEO lane's zero-latent is the same int4 NaN factory.

@@ -132,6 +132,11 @@ class QFWanModel(QFSessionModelMixin, comfy.model_base.WAN21):
         # QFWanModel instance across a requeue — so closing here forces _apply_model to _begin fresh.
         # Idempotent across the pos+neg extra_conds calls of a run (the 2nd finds nothing open → no-op).
         was_open, ok = self._qf.end_session_if_open()
+        # Retention (2026-08-24): even a REFUSED close (previous run's step still draining
+        # engine-side) must NOT let this run silently REUSE that session — force the first
+        # _apply_model through _begin (whose materialize-first close + busy-retry recovers
+        # correctly). Cleared at the gate; re-armed every run start.
+        self._qf_needs_begin = True
         if was_open:
             print("[qf_native] closed a pre-existing session at run start "
                   f"(prior run interrupted/uncleaned); end ok={ok}", flush=True)
@@ -382,7 +387,8 @@ class QFWanModel(QFSessionModelMixin, comfy.model_base.WAN21):
                             "session binds ONE fixed conditioning tail (one reference per "
                             "generation). Per-group refs are not supported through this seam.")
                 tail = tail[0:1].contiguous()
-        if self._qf.current_session is None:
+        if self._qf.current_session is None or getattr(self, "_qf_needs_begin", False):
+            self._qf_needs_begin = False
             self._derive_geometry(xin, transformer_options)  # session geometry from the GRAPH
             # ALL-ZERO INITIAL LATENT GUARD — the SHARED substrate helper (one mechanism,
             # three users; see qf_modelpatcher.refuse_all_zero_initial_latent for the full
