@@ -618,6 +618,12 @@ if _IMPORT_OK:
                                          "Runtime session knob — takes effect next run, never "
                                          "rebuilds. COMPOSABLE with step_cache (EC skips whole "
                                          "steps; FBC skips blocks inside computed steps)."}),
+                "sparse": ("FLOAT", {"default": 1.0, "min": 0.5, "max": 1.0, "step": 0.01,
+                           "tooltip": "Sparse self-attention (LOSSY): 1.0 = OFF (dense, "
+                                      "sage/qfa path). <1.0 keeps that fraction of attention "
+                                      "mass per block (e.g. 0.98) via meansim block sparsity "
+                                      "on the flash branch. CREATE key — changing it "
+                                      "re-creates the pipeline."}),
             }}
 
         RETURN_TYPES = ("MODEL", "MODEL")
@@ -634,9 +640,14 @@ if _IMPORT_OK:
             + _COMMON_LIMITS)
 
         def load(self, transformer1, transformer2, model_config, resident_block_count=999,
-                 step_cache=0.0, block_cache=0.0):
+                 step_cache=0.0, block_cache=0.0, sparse=1.0):
+            sparse = float(sparse) if not isinstance(sparse, str) else 1.0
+            sparse_opts = None if sparse >= 1.0 else {"attention_backend": "flash",
+                                                      "sparse_selector": "meansim",
+                                                      "sparse_cdf": sparse}
             return _run_family_load("wan", transformer1, model_config,
                                     resident_block_count, transformer2,
+                                    sparse_opts=sparse_opts,
                                     easycache_thresh=step_cache,
                                      fbcache_thresh=block_cache)
 
@@ -672,6 +683,12 @@ if _IMPORT_OK:
                                          "Runtime session knob — takes effect next run, never "
                                          "rebuilds. COMPOSABLE with step_cache (EC skips whole "
                                          "steps; FBC skips blocks inside computed steps)."}),
+                "sparse": ("FLOAT", {"default": 1.0, "min": 0.5, "max": 1.0, "step": 0.01,
+                           "tooltip": "Sparse self-attention (LOSSY): 1.0 = OFF (dense, "
+                                      "sage/qfa path). <1.0 keeps that fraction of attention "
+                                      "mass per block (e.g. 0.98) via meansim block sparsity "
+                                      "on the flash branch. CREATE key — changing it "
+                                      "re-creates the pipeline."}),
             }}
 
         RETURN_TYPES = ("MODEL",)
@@ -683,14 +700,20 @@ if _IMPORT_OK:
                        "only consumes latents; comfy's sampler applies the frame-0 mask). "
                        + _COMMON_LIMITS)
 
-        def load(self, transformer, model_config, resident_block_count=999, step_cache=0.0, block_cache=0.0):
+        def load(self, transformer, model_config, resident_block_count=999, step_cache=0.0,
+                 block_cache=0.0, sparse=1.0):
             # [aux-auto] NO aux file widgets and NO image socket (user 2026-08-22 "只保留
             # transformer/block/model_config … 只关注latent"): te/audio-vae/connectors
             # resolve from the preset manifest's aux_files inside _run_family_load; i2v is
             # the workflow's own latent conditioning (LTXVImgToVideoInplace), exactly like
             # wan's cond-latent shape.
+            sparse = float(sparse) if not isinstance(sparse, str) else 1.0
+            sparse_opts = None if sparse >= 1.0 else {"attention_backend": "flash",
+                                                      "sparse_selector": "meansim",
+                                                      "sparse_cdf": sparse}
             return (_run_family_load("ltx2", transformer, model_config,
                                      resident_block_count, None,
+                                     sparse_opts=sparse_opts,
                                      easycache_thresh=step_cache,
                                      fbcache_thresh=block_cache),)
 
