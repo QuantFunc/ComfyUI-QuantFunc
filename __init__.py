@@ -616,7 +616,8 @@ if _IMPORT_OK:
                                          "reconstructing from the cached residual — effective even "
                                          "on few-step distilled workflows (typical 0.05-0.12). "
                                          "Runtime session knob — takes effect next run, never "
-                                         "rebuilds. Mutually exclusive with step_cache (set one)."}),
+                                         "rebuilds. COMPOSABLE with step_cache (EC skips whole "
+                                         "steps; FBC skips blocks inside computed steps)."}),
             }}
 
         RETURN_TYPES = ("MODEL", "MODEL")
@@ -669,7 +670,8 @@ if _IMPORT_OK:
                                          "reconstructing from the cached residual — effective even "
                                          "on few-step distilled workflows (typical 0.05-0.12). "
                                          "Runtime session knob — takes effect next run, never "
-                                         "rebuilds. Mutually exclusive with step_cache (set one)."}),
+                                         "rebuilds. COMPOSABLE with step_cache (EC skips whole "
+                                         "steps; FBC skips blocks inside computed steps)."}),
             }}
 
         RETURN_TYPES = ("MODEL",)
@@ -723,7 +725,8 @@ if _IMPORT_OK:
                                          "reconstructing from the cached residual — effective even "
                                          "on few-step distilled workflows (typical 0.05-0.12). "
                                          "Runtime session knob — takes effect next run, never "
-                                         "rebuilds. Mutually exclusive with step_cache (set one)."}),
+                                         "rebuilds. COMPOSABLE with step_cache (EC skips whole "
+                                         "steps; FBC skips blocks inside computed steps)."}),
                 # [sparse switch, user 2026-08-24] CREATE-level toggle (flipping it re-creates
                 # the pipeline — the engine's sparse selector + attention backend are create
                 # keys). off = the default sage2 dense path, byte-identical to before this

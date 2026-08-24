@@ -308,25 +308,21 @@ class QFSessionModelMixin:
         """The begin-options fragment EVERY family merges into its options_json — the ONE
         injection point for ALL runtime session knobs (residency + the step-cache
         thresholds; same non-ckey, re-applied-at-every-begin class). Cache keys are
-        OMITTED at thresh<=0 so the OFF path is byte-identical. The engine cache_mode is
-        SINGLE-SELECT: step_cache (EasyCache, step-level) and fbcache (First-Block Cache,
-        block-level) are mutually exclusive — BOTH >0 refuses LOUD here (a silent
-        priority pick would be the classic silently-wrong-path)."""
+        OMITTED at thresh<=0 so the OFF path is byte-identical. step_cache (EasyCache,
+        STEP-level) and fbcache (First-Block Cache, BLOCK-level) are ORTHOGONAL and
+        COMPOSABLE (user 2026-08-24 "fbcache与step cache应该不冲突"): EC decides whether
+        a step runs at all; FBC decides, inside a computed step, whether blocks 1..N-1
+        run — an EC-skipped step never touches the transformer, so FBC state simply
+        carries over. fbcache rides its OWN engine key `fbcache_thresh` (an OLDER
+        engine refuses the unknown key LOUD — honest, never silent)."""
         o = {"resident_block_count": int(self._resident_block_count)}
         te = float(getattr(self, "_easycache_thresh", 0.0) or 0.0)
         tf = float(getattr(self, "_fbcache_thresh", 0.0) or 0.0)
-        if te > 0.0 and tf > 0.0:
-            raise RuntimeError(
-                "qf_native: BOTH step_cache and fbcache thresholds are set (> 0) on this "
-                "loader — the engine session cache_mode is single-select. Set exactly one "
-                "(step_cache = EasyCache whole-step skips, ≥16-step workflows; fbcache = "
-                "First-Block Cache block skips, works on few-step distilled too).")
         if te > 0.0:
             o["cache_mode"] = "easycache"
             o["cache_thresh"] = te
-        elif tf > 0.0:
-            o["cache_mode"] = "fbcache"
-            o["cache_thresh"] = tf
+        if tf > 0.0:
+            o["fbcache_thresh"] = tf
         return o
 
     def _assert_wire_lora(self):
