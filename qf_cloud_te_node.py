@@ -161,7 +161,9 @@ def _read_tensor(lib, handle) -> torch.Tensor:
 
 def _cloud_encode(text, ref_paths, model_id, output_dtype, timeout_seconds, device_idx):
     """One text (+ordered ref image paths) → [1,seq,hidden] fp32 tensor via the engine
-    C-API, looping resume→terminal. Raises loud with a resumable task_id on failure."""
+    C-API, looping resume→terminal. A pending/timeout raise carries a resumable task_id
+    (the content-keyed cache auto-resumes an identical re-run); a terminal failure DROPS
+    the cache entry — that task is dead, a re-run submits fresh."""
     lib = qf_engine.load_lib()
     if not hasattr(lib, "quantfunc_te_cloud_encode"):
         raise RuntimeError("This libquantfunc.so has no cloud-TE support — rebuild/update "
@@ -243,6 +245,7 @@ def _cloud_encode(text, ref_paths, model_id, output_dtype, timeout_seconds, devi
                     f"(content-keyed local cache) — no second billable submit.")
             time.sleep(_POLL_INTERVAL_S)
         if not out_result:
+            _drop_cache_entry()   # terminal (same out_pending==0 edge as success) — entry is dead
             raise RuntimeError("cloud TE: terminal state but no result tensor: " + _last_error(lib))
         _drop_cache_entry()                  # success — the task is consumed
         return _read_tensor(lib, out_result)
@@ -317,9 +320,10 @@ class QFCloudTEClip:
         # the shim is stateless-per-encode, so an equivalent instance is always a valid clone.
         return QFCloudTEClip(self._model_id, self._output_dtype, self._timeout, self._device_idx)
 
-    # inert hook points some graph utilities touch on real CLIPs
-    patcher = None
-
+    # NOTE deliberately NO `patcher` attribute: a None stub let comfy internals crash
+    # three lines downstream (`clip.patcher.forced_hooks` -> raw NoneType AttributeError,
+    # delta-CR R5). Absent, access falls to __getattr__'s message-bearing refusal and
+    # hasattr() probes stay False.
     def add_hooks_to_dict(self, d):
         return d
 
