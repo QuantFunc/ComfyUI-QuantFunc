@@ -293,7 +293,7 @@ class QFSessionModelMixin:
     # engine-side off-path guarantee, lighting_step_cache.h easycacheWrapStep). >0 arms
     # lighting::CacheMode::EasyCache with this mean_abs_diff skip budget. ──
     _easycache_thresh = 0.0       # class default; loaders set the widget value (step_cache)
-    _fbcache_thresh = 0.0         # class default; loaders set the widget value (fbcache)
+    _fbcache_thresh = 0.0         # class default; loaders set the widget value (block_cache)
 
     def set_resident_block_count(self, n):
         self._resident_block_count = int(n)
