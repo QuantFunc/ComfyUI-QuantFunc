@@ -792,6 +792,10 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
             # session gate now keys one EcEntry per cond branch and force-computes at key=0).
             cuid = cuuids[i] if (cuuids is not None and i < len(cuuids)) else None
             p.cfg_context_key = self._ctx_key_assigner.key(cuid)
+            if os.environ.get("QF_NATIVE_DEBUG_CTXKEY"):   # off by default; probes the uuid path
+                print(f"[qf_native] LTX CTXKEY step={step_index} grp={i} cuuids_none={cuuids is None} "
+                      f"len={0 if cuuids is None else len(cuuids)} cuid={str(cuid)[:8]} key={p.cfg_context_key}",
+                      flush=True)
             self._call_denoise_step(
                 p, f"LTX denoise_step[step={step_index},group={i},key={p.cfg_context_key}]")  # QFSessionModelMixin
             # UNPACK velocity [1,N,128] -> [1,128,F,H,W] (exact inverse of the pack)
@@ -990,6 +994,10 @@ class QFLTXAVModel(QFLTXModel):
             self._out_audio = torch.empty((1, La, _LTXAV_AUDIO_PACK), dtype=torch.float32, device=dev)
         sig_all = sigma.reshape(-1) if torch.is_tensor(sigma) else None
         step_index = self._sigma_step_index(sigma, sig_all, transformer_options)
+        # [easycache-key] the AV class has its OWN step loop (this one), so the base t2v
+        # loop's uuid-derived key never runs here — extract uuids for THIS loop too (the
+        # e1_w2-measured miss: AV sessions kept passing key=0 → EC silently disabled).
+        cuuids = transformer_options.get("uuids") if isinstance(transformer_options, dict) else None
         out5d = torch.empty_like(xin)
         out_audio = torch.empty_like(x_audio)
         for i in range(B):
@@ -1016,7 +1024,14 @@ class QFLTXAVModel(QFLTXModel):
             p.context = vi.data_ptr()
             p.context_dims = (ctypes.c_int * 3)(*vi.shape)
             p.context_dtype = _qf_dtype(vi.dtype)
-            p.cfg_context_key = 0
+            # [easycache-key] uuid-symbolic key (was constant 0 = kNoCtxKey; the EC session
+            # gate force-computes at 0 — the AV loop was the measured miss, see loop head).
+            cuid = cuuids[i] if (cuuids is not None and i < len(cuuids)) else None
+            p.cfg_context_key = self._ctx_key_assigner.key(cuid)
+            if os.environ.get("QF_NATIVE_DEBUG_CTXKEY"):
+                print(f"[qf_native] LTX-AV CTXKEY step={step_index} grp={i} "
+                      f"cuuids_none={cuuids is None} cuid={str(cuid)[:8]} key={p.cfg_context_key}",
+                      flush=True)
             mp = qfe.DenoiseStepMultiParams()
             ctypes.memset(ctypes.byref(mp), 0, ctypes.sizeof(mp))
             mp.struct_size = ctypes.sizeof(mp)
