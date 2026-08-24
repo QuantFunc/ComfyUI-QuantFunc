@@ -213,5 +213,75 @@ class QuantFuncCloudTEEncode:
         return ([[emb, {}]],)
 
 
-NODE_CLASS_MAPPINGS = {"QuantFuncCloudTEEncode": QuantFuncCloudTEEncode}
-NODE_DISPLAY_NAME_MAPPINGS = {"QuantFuncCloudTEEncode": "QuantFunc Cloud TE Encode"}
+class QuantFuncH3AddReference:
+    """Attach ONE reference image to an existing H3 conditioning (`minimax_refs`) —
+    the DiT-side half of the official MiniMaxH3ReferenceToVideo, for conditioning
+    produced WITHOUT the local CLIP (e.g. QuantFuncCloudTEEncode).
+
+    The official node does two inseparable things: (1) present the refs to the
+    Qwen3-VL text encoder (<Picture i> tokens) and (2) VAE-encode each ref into a
+    `minimax_refs` block the DiT consumes every step. With the cloud TE, half (1)
+    rides QuantFuncCloudTEEncode's `ref_images` input (SAME images, SAME order —
+    <Picture 1> = first chained reference), and this node replicates half (2)
+    byte-for-byte from the official image branch (aspect-preserving down-scale,
+    32-px canvas rounding, vae.encode, same block keys). Chain one node per
+    reference, exactly like MiniMaxH3AddGuide chains guides. Image refs only —
+    video/audio references need the local-CLIP path (the cloud worker takes image
+    refs)."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "positive": ("CONDITIONING",),
+                "vae": ("VAE",),
+                "ref_image": ("IMAGE",),
+                "width": ("INT", {"default": 1344, "min": 32, "max": 8192, "step": 32,
+                          "tooltip": "The GENERATION width — used only by 'match' sizing (scale the ref down to the generation's pixel area)."}),
+                "height": ("INT", {"default": 768, "min": 32, "max": 8192, "step": 32}),
+                "ref_image_size": (["match", "max"], {"default": "match",
+                    "tooltip": "'match' scales the ref (down only, keeping aspect) to the generation's pixel area; 'max' uses the reference pipeline's 2048px short edge for best identity fidelity (slower — ref tokens ride every step)."}),
+            },
+        }
+
+    RETURN_TYPES = ("CONDITIONING",)
+    RETURN_NAMES = ("positive",)
+    FUNCTION = "add_reference"
+    CATEGORY = "QuantFunc/cloud"
+
+    # mirrors comfy_extras/nodes_minimax_h3.py (CANVAS_MULTIPLE=32, REF_IMAGE_SHORT_EDGE=2048)
+    _CANVAS_MULTIPLE = 32
+    _REF_SHORT_EDGE = 2048
+
+    def add_reference(self, positive, vae, ref_image, width, height, ref_image_size="match"):
+        import math
+        import comfy.utils
+        import node_helpers
+
+        h, w = ref_image.shape[1], ref_image.shape[2]
+        if ref_image_size == "match":
+            scale = min(1.0, math.sqrt((width * height) / (w * h)))
+        else:
+            scale = min(1.0, self._REF_SHORT_EDGE / min(w, h))
+        cm = self._CANVAS_MULTIPLE
+        tw = max(cm, round(w * scale / cm) * cm)
+        th = max(cm, round(h * scale / cm) * cm)
+        # official _resize: [B,H,W,C] -> lanczos -> [1,th,tw,3], stretch (crop disabled)
+        samples = ref_image[:1, ..., :3].movedim(-1, 1)
+        samples = comfy.utils.common_upscale(samples, tw, th, "lanczos", "disabled")
+        resized = samples.movedim(1, -1)
+        z = vae.encode(resized)
+        block = {"kind": "image", "latent_h": th // 16, "latent_w": tw // 16, "latent": z}
+        refs = list(positive[0][1].get("minimax_refs", []))
+        refs.append(block)
+        return (node_helpers.conditioning_set_values(positive, {"minimax_refs": refs}),)
+
+
+NODE_CLASS_MAPPINGS = {
+    "QuantFuncCloudTEEncode": QuantFuncCloudTEEncode,
+    "QuantFuncH3AddReference": QuantFuncH3AddReference,
+}
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "QuantFuncCloudTEEncode": "QuantFunc Cloud TE Encode",
+    "QuantFuncH3AddReference": "QuantFunc H3 Add Reference (cloud TE)",
+}
