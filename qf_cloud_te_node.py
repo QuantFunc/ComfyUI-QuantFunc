@@ -390,5 +390,16 @@ class QuantFuncCloudTELoader:
         return (QFCloudTEClip(model_id, output_dtype, int(timeout_seconds), int(device_idx)),)
 
 
+# [5b6525d durable guard] the load() SIGNATURE default and the widget default must
+# both stay members of _DTYPE_CHOICES — the fp32-default crash class (a choice was
+# removed but a stale default survived and KeyError'd the omitted-widget path).
+# Import-time, loud, in-repo (the commit's original "asserted in-repo" claim is made
+# true HERE; a one-off python -c check leaves no regression protection).
+import inspect as _inspect
+_sig_default = _inspect.signature(QuantFuncCloudTELoader.load).parameters["output_dtype"].default
+assert _sig_default in _DTYPE_CHOICES, (
+    f"qf_cloud_te_node: load() output_dtype default {_sig_default!r} is not in "
+    f"_DTYPE_CHOICES {list(_DTYPE_CHOICES)} — stale default after a choice removal")
+
 NODE_CLASS_MAPPINGS = {"QuantFuncCloudTELoader": QuantFuncCloudTELoader}
 NODE_DISPLAY_NAME_MAPPINGS = {"QuantFuncCloudTELoader": "QuantFunc Cloud TE Loader"}
