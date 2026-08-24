@@ -727,20 +727,17 @@ if _IMPORT_OK:
                                          "Runtime session knob — takes effect next run, never "
                                          "rebuilds. COMPOSABLE with step_cache (EC skips whole "
                                          "steps; FBC skips blocks inside computed steps)."}),
-                # [sparse switch, user 2026-08-24] CREATE-level toggle (flipping it re-creates
-                # the pipeline — the engine's sparse selector + attention backend are create
-                # keys). off = the default sage2 dense path, byte-identical to before this
-                # widget existed. meansim = the engine's SHIPPED sparse control (flash-branch
-                # BSA hook, engine-gated by svg2_min_tokens so short sequences stay dense).
-                "sparse": (["off", "meansim"],
-                           {"default": "off",
-                            "tooltip": "Sparse self-attention (LOSSY, quality A/B advised): "
-                                       "meansim = block top-p keep on the flash branch. "
-                                       "Toggling re-creates the pipeline."}),
-                "sparse_cdf": ("FLOAT", {"default": 0.98, "min": 0.5, "max": 1.0, "step": 0.01,
-                                         "tooltip": "Top-p mass kept (<1.0 = sparser; 1.0 = "
-                                                    "keep-all, bit-exact dense). Only used when "
-                                                    "sparse != off."}),
+                # [sparse, user 2026-08-25 simplification: ONE number, 1.0 = OFF] CREATE-level
+                # (changing it re-creates the pipeline — the engine's sparse selector +
+                # attention backend are create keys). 1.0 = the default dense path (sage/qfa,
+                # byte-identical to before this widget existed). <1.0 = meansim block sparse
+                # attention on the flash branch, keeping this fraction of attention mass
+                # (engine-gated by svg2_min_tokens so short sequences stay dense).
+                "sparse": ("FLOAT", {"default": 1.0, "min": 0.5, "max": 1.0, "step": 0.01,
+                           "tooltip": "Sparse self-attention (LOSSY): 1.0 = OFF (dense, "
+                                      "qfa/sage path). <1.0 keeps that fraction of attention "
+                                      "mass per block (e.g. 0.98) via meansim block sparsity. "
+                                      "CREATE key — changing it re-creates the pipeline."}),
             }}
 
         RETURN_TYPES = ("MODEL",)
@@ -750,12 +747,18 @@ if _IMPORT_OK:
                        "stock sampler drives with latents. " + _COMMON_LIMITS)
 
         def load(self, transformer, model_config, resident_block_count=999,
-                 sparse="off", sparse_cdf=0.98, step_cache=0.0, block_cache=0.0):
+                 sparse=1.0, sparse_cdf=None, step_cache=0.0, block_cache=0.0):
+            # ONE-number contract (user 2026-08-25): sparse==1.0 → OFF (dense); <1.0 → meansim
+            # keeping that mass fraction. Back-compat: an old saved workflow may still send the
+            # legacy string ("off"/"meansim") + separate sparse_cdf — map it, never crash.
+            if isinstance(sparse, str):
+                sparse = 1.0 if sparse == "off" else float(sparse_cdf if sparse_cdf is not None else 0.98)
+            sparse = float(sparse)
             sparse_opts = None
-            if sparse != "off":
+            if sparse < 1.0:
                 sparse_opts = {"attention_backend": "flash",
-                               "sparse_selector": str(sparse),
-                               "sparse_cdf": float(sparse_cdf)}
+                               "sparse_selector": "meansim",
+                               "sparse_cdf": sparse}
             return (_run_family_load("minimax-h3", transformer, model_config,
                                      resident_block_count, None, sparse_opts=sparse_opts,
                                      easycache_thresh=step_cache,
