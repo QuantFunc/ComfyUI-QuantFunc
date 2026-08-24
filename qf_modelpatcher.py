@@ -285,14 +285,32 @@ class QFSessionModelMixin:
     # every widget change) — is enforced fail-loud by _refuse_session_knobs_in_create() at the
     # single engine-create chokepoint (__init__._get_engine).
     _resident_block_count = 999   # class default; families set the widget value in __init__
+    # ── [easycache] runtime step-cache threshold (SAME session-knob class as residency:
+    # merged into the denoise_begin options_json below, re-read by the engine at EVERY
+    # session begin → a widget change takes effect on the NEXT run with NO rebuild; the
+    # knob never enters create_cfg/ckey). 0.0 = OFF: the keys are OMITTED entirely, the
+    # engine spec stays cache_mode=0/thresh=0 → the step path is BYTE-IDENTICAL (the
+    # engine-side off-path guarantee, lighting_step_cache.h easycacheWrapStep). >0 arms
+    # lighting::CacheMode::EasyCache with this mean_abs_diff skip budget. ──
+    _easycache_thresh = 0.0       # class default; loaders set the widget value
 
     def set_resident_block_count(self, n):
         self._resident_block_count = int(n)
 
+    def set_easycache_thresh(self, t):
+        self._easycache_thresh = float(t)
+
     def residency_opts(self):
-        """The begin-options fragment EVERY family merges into its options_json (the one
-        injection point of the runtime-adjustable residency knob)."""
-        return {"resident_block_count": int(self._resident_block_count)}
+        """The begin-options fragment EVERY family merges into its options_json — the ONE
+        injection point for BOTH runtime session knobs (residency + the EasyCache
+        threshold; same non-ckey, re-applied-at-every-begin class). EasyCache keys are
+        OMITTED at thresh<=0 so the OFF path is byte-identical."""
+        o = {"resident_block_count": int(self._resident_block_count)}
+        t = float(getattr(self, "_easycache_thresh", 0.0) or 0.0)
+        if t > 0.0:
+            o["cache_mode"] = "easycache"
+            o["cache_thresh"] = t
+        return o
 
     def _assert_wire_lora(self):
         """[wiring-lora] RUN-START side assert (reviewer-C correctness fix): THIS model's wire

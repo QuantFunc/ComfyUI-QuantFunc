@@ -390,6 +390,12 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
         self._step_i = 0
         self._sess_denoise = 0
         self._out = None                     # reused packed velocity_out buffer [1,N,128]
+        # [easycache-key] symbolic per-conditioning cfg_context_key (mirrors QFWanModel #B3).
+        # Historically LTX passed 0 (kNoCtxKey) because it engaged NO key-trusting cache
+        # (dossier seq-229) — the merged EasyCache session gate NOW trusts the key (its §6.5
+        # no-key guard force-computes at key=0, silently disabling EC). uuid-derived keys give
+        # each cond branch its own EcEntry (no cross-branch collapse) at zero cost when EC off.
+        self._ctx_key_assigner = qfmp._CtxKeyAssigner()
         # Max POST-CONNECTOR seq len across a run's cond groups (pos+neg), accumulated in extra_conds and used
         # to size the engine begin context MAXIMA (see _begin). Ported from QFWanModel: pos/neg can have
         # DIFFERENT prompt lengths and reach the engine as SEPARATE B==1 step calls against ONE session, while
@@ -668,6 +674,7 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
         num_frames + width/height (spatial 32, temporal 8)."""
         qfmp._qf_cancel_pending_detach(self._qf)   # session begin supersedes a lazy-detach window
         self._qf.end_session_if_open()
+        self._ctx_key_assigner.reset()   # per-generation uuid→key numbering (no cross-gen leak)
         lib = self._qf.lib
         bpx = qfe.DenoiseBeginParams()
         ctypes.memset(ctypes.byref(bpx), 0, ctypes.sizeof(bpx))
@@ -731,6 +738,9 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
         xin = x.to(torch.bfloat16).contiguous()          # [B, 128, F, H, W]
         B = int(xin.shape[0])
         cou = transformer_options.get("cond_or_uncond") if isinstance(transformer_options, dict) else None
+        # [easycache-key] comfy's per-conditioning uuids (aligned with cond_or_uncond) — the
+        # symbolic-key source (see QFWanModel #B3 comment for why NOT the 0/1 role index).
+        cuuids = transformer_options.get("uuids") if isinstance(transformer_options, dict) else None
         if B > 1 and (cou is None or len(cou) != B):
             raise RuntimeError(f"qf_native LTX: engine forward is B==1 per cond group but got batch={B} "
                                f"with cond_or_uncond={cou} — batch_size>1 latents are not supported")
@@ -777,8 +787,13 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
             p.context = vi.data_ptr()
             p.context_dims = (ctypes.c_int * 3)(*vi.shape)
             p.context_dtype = _qf_dtype(vi.dtype)
-            p.cfg_context_key = 0                        # LTX has NO key-trusting step cache (dossier seq-229)
-            self._call_denoise_step(p, f"LTX denoise_step[step={step_index},group={i}]")  # QFSessionModelMixin
+            # [easycache-key] symbolic key from comfy's per-conditioning uuid (was constant 0 =
+            # kNoCtxKey when LTX engaged no key-trusting cache, dossier seq-229; the EasyCache
+            # session gate now keys one EcEntry per cond branch and force-computes at key=0).
+            cuid = cuuids[i] if (cuuids is not None and i < len(cuuids)) else None
+            p.cfg_context_key = self._ctx_key_assigner.key(cuid)
+            self._call_denoise_step(
+                p, f"LTX denoise_step[step={step_index},group={i},key={p.cfg_context_key}]")  # QFSessionModelMixin
             # UNPACK velocity [1,N,128] -> [1,128,F,H,W] (exact inverse of the pack)
             out5d[i:i + 1] = self._out.transpose(1, 2).reshape(1, C, F, H, W).to(xin.dtype)
             self._qf.step_count += 1

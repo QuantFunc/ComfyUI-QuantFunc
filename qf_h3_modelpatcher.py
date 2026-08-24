@@ -96,6 +96,11 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
         self._out_video = None            # reused velocity_out buffer [1,24,T,H,W]
         self._out_audio = None            # reused audio velocity_out buffer [1, K*T, 32]
         self._max_ctx_seq = 0
+        # [easycache-key] symbolic per-conditioning cfg_context_key (mirrors QFWanModel #B3;
+        # was constant 0 = kNoCtxKey — the merged EasyCache session gate force-computes at
+        # key=0, silently disabling EC on this seam). fl2va is single-branch today; the
+        # uuid-derived key stays correct if a second cond branch ever appears.
+        self._ctx_key_assigner = qfmp._CtxKeyAssigner()
 
     # ── honest engine working-set report (single-stage seam; brim fix 2026-08-24) ──
     # The mixin's memory_required deliberately reports ONLY comfy-side copies — right for the
@@ -236,6 +241,7 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
         vemb=[1,S,D] Qwen3-VL hidden states. audio_dims [B,C,K,T] + the AV sigma shifts ride options_json."""
         qfmp._qf_cancel_pending_detach(self._qf)   # session begin supersedes a lazy-detach window
         self._qf.end_session_if_open()
+        self._ctx_key_assigner.reset()   # per-generation uuid→key numbering (no cross-gen leak)
         lib = self._qf.lib
         bpx = qfe.DenoiseBeginParams()
         ctypes.memset(ctypes.byref(bpx), 0, ctypes.sizeof(bpx))
@@ -386,6 +392,8 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
         dev = x_video.device
         B = int(x_video.shape[0])
         cou = transformer_options.get("cond_or_uncond") if isinstance(transformer_options, dict) else None
+        # [easycache-key] comfy's per-conditioning uuids — symbolic-key source (QFWanModel #B3).
+        cuuids = transformer_options.get("uuids") if isinstance(transformer_options, dict) else None
         if B > 1 and (cou is None or len(cou) != B):
             raise RuntimeError(f"qf_native H3: engine forward is B==1 per cond group but got batch={B} "
                                f"with cond_or_uncond={cou} — batch_size>1 latents are not supported")
@@ -453,7 +461,10 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
             p.context = vi.data_ptr()
             p.context_dims = (ctypes.c_int * 3)(*vi.shape)
             p.context_dtype = _qf_dtype(vi.dtype)
-            p.cfg_context_key = 0
+            # [easycache-key] symbolic key from comfy's per-conditioning uuid (was constant 0;
+            # the EasyCache session gate force-computes at key=0 — see __init__ note).
+            cuid = cuuids[i] if (cuuids is not None and i < len(cuuids)) else None
+            p.cfg_context_key = self._ctx_key_assigner.key(cuid)
             # ── audio lane (rides the same video sigma) ──
             mp = qfe.DenoiseStepMultiParams()
             ctypes.memset(ctypes.byref(mp), 0, ctypes.sizeof(mp))
