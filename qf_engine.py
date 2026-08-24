@@ -452,14 +452,15 @@ def _enc(s):
 
 
 def _refuse_session_knobs_in_create(config_json):
-    """[manual-residency] STRUCTURAL half of the runtime-adjustable residency guarantee, sealed
+    """[session-knobs] STRUCTURAL half of the runtime-adjustable session-knob guarantee, sealed
     at the REAL create boundary (every quantfunc_create goes through create_pipeline, so a
     caller cannot bypass it by skipping the package's _get_engine cache wrapper — reviewer-B
-    hard-seal). resident_block_count is a SESSION knob: QFSessionModelMixin.residency_opts()
-    injects it into every denoise_begin and the engine re-plans residency bidirectionally per
-    session (measured: rb-swap with no rebuild). In a create config it would enter the pipeline
-    cache identity upstream and silently reintroduce a full model rebuild on every widget
-    change — refuse loud, both the dict and the pre-serialized-string form."""
+    hard-seal). The refused set = EVERY session knob QFSessionModelMixin.residency_opts()
+    injects into denoise_begin: resident_block_count (residency re-planned per session;
+    measured rb-swap with no rebuild) AND the EasyCache keys cache_mode/cache_thresh (+ the
+    loader-widget spelling "easycache"). In a create config any of them would enter the
+    pipeline cache identity upstream and silently reintroduce a full model rebuild on every
+    widget change — refuse loud, both the dict and the pre-serialized-string form."""
     cfg = config_json
     if isinstance(cfg, str):
         try:
@@ -471,7 +472,10 @@ def _refuse_session_knobs_in_create(config_json):
         # RECURSIVE (reviewer-D LOW): the knob nested anywhere in the config tree would
         # equally enter the json-hashed cache identity — refuse it at any depth.
         if isinstance(obj, dict):
-            if "resident_block_count" in obj:
+            # session knobs (runtime, re-applied per denoise_begin) — NONE may enter the
+            # create config / ckey: resident_block_count + the EasyCache keys (the same
+            # guarantee class; a create-side leak would rebuild the pipeline per widget change).
+            if any(k in obj for k in ("resident_block_count", "cache_mode", "cache_thresh", "easycache")):
                 return True
             return any(_scan(v) for v in obj.values())
         if isinstance(obj, list):
@@ -479,10 +483,11 @@ def _refuse_session_knobs_in_create(config_json):
         return False
     if _scan(cfg):
         raise RuntimeError(
-            "qf_native: resident_block_count is a runtime SESSION knob (it rides every "
-            "denoise_begin via QFSessionModelMixin.residency_opts) and must never appear "
-            "anywhere in a create config — that would bake it into the pipeline cache "
-            "identity and rebuild the whole pipeline on every widget change.")
+            "qf_native: a runtime SESSION knob (resident_block_count / cache_mode / "
+            "cache_thresh / easycache — they ride every denoise_begin via "
+            "QFSessionModelMixin.residency_opts) must never appear anywhere in a create "
+            "config — that would bake it into the pipeline cache identity and rebuild "
+            "the whole pipeline on every widget change.")
 
 
 def create_pipeline(lib, *, model_dir, transformer_path=None, model_backend="svdq",

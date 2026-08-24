@@ -692,7 +692,9 @@ if _IMPORT_OK:
                                          "reuse the cached trajectory (typical 0.02-0.05; larger "
                                          "= faster but drifts more). Runtime session knob — "
                                          "takes effect next run, never rebuilds the pipeline. "
-                                         "H3 note: AV(audio)-live sessions never skip by design."}),
+                                         "H3/AV note: audio-live sessions skip WITH a per-lane audio "
+                                         "transport + an audio transient guard (audio-quiet steps "
+                                         "only); few-step distilled workflows rarely have headroom."}),
                 # [sparse switch, user 2026-08-24] CREATE-level toggle (flipping it re-creates
                 # the pipeline — the engine's sparse selector + attention backend are create
                 # keys). off = the default sage2 dense path, byte-identical to before this

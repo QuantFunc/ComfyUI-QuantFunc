@@ -4,9 +4,12 @@ LTX-2 external denoise SESSION (quantfunc_denoise_begin/step/finalize/end, the S
 wan seam uses — reused from qf_engine.py).
 
 WHY this is DIFFERENT from the wan seam (design findings, dossier seq-229..234):
-- NO cfg_context_key machinery. seq-229 established the LTX-2 lighting transformer engages NONE of the
-  key-trusting step caches (ctx_cache_/cross_kv_cache_/fbcache_) — it is not in the *TransformerLighting
-  opt-in set. So there is no _CtxKeyAssigner analog; every step passes cfg_context_key=0 (kNoCtxKey).
+- cfg_context_key: seq-229 established the LTX-2 lighting transformer engages NONE of the
+  key-trusting step caches (ctx_cache_/cross_kv_cache_/fbcache_) — historically every step passed
+  cfg_context_key=0 (kNoCtxKey). SINCE the EasyCache session gate (merge 516a6d78) the key IS
+  consumed (one EcEntry per cond branch; key=0 force-computes), so BOTH step loops (t2v + AV) now
+  derive uuid-symbolic keys via the shared _CtxKeyAssigner (wan #B3 pattern) — see [easycache-key]
+  comments at the loops.
 - PACKED latent. The engine session denoises a packed token latent [1,N,128] (N=F_lat*H_lat*W_lat),
   NOT comfy's 5D [1,128,F,H,W]. seq-230: the mapping is a plain REVERSIBLE reshape+transpose (row-major
   (F,H,W)), the exact inverse of the engine's pack_video_tokens — nothing inferred.
