@@ -253,6 +253,16 @@ def _bind(lib):
         lib.quantfunc_tensor_read.argtypes = [v, ctypes.c_void_p, ctypes.c_size_t]
         lib.quantfunc_tensor_read_scales.restype = ctypes.c_int
         lib.quantfunc_tensor_read_scales.argtypes = [v, ctypes.POINTER(ctypes.c_float), ctypes.c_size_t]
+        # [token-tags] optional exports (engine 9f3fd77f+): per-row modality tags for the
+        # H3 fl2va semantic channel. An OLD .so lacks them — probe, never hard-require.
+        try:
+            lib.quantfunc_tensor_tags_count.restype = ctypes.c_size_t
+            lib.quantfunc_tensor_tags_count.argtypes = [v]
+            lib.quantfunc_tensor_read_tags.restype = ctypes.c_int
+            lib.quantfunc_tensor_read_tags.argtypes = [v, ctypes.POINTER(ctypes.c_int32), ctypes.c_size_t]
+            lib._has_tensor_tags = True
+        except AttributeError:
+            lib._has_tensor_tags = False
         lib.quantfunc_tensor_destroy.restype = None
         lib.quantfunc_tensor_destroy.argtypes = [v]
     return lib

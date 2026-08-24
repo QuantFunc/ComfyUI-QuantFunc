@@ -130,6 +130,21 @@ def _save_ref_images(images) -> list:
     return paths
 
 
+def _read_tensor_tags(lib, handle):
+    """Optional per-row modality tags (engine 9f3fd77f+ .so AND a tags-emitting
+    worker): torch.long [seq] (0=vision incl flanks, 1=text) or None. The npz
+    parser already fail-louds on a misaligned array, so present ⇒ aligned."""
+    if not getattr(lib, "_has_tensor_tags", False):
+        return None
+    n = int(lib.quantfunc_tensor_tags_count(handle))
+    if n <= 0:
+        return None
+    buf = (ctypes.c_int32 * n)()
+    if lib.quantfunc_tensor_read_tags(handle, buf, n) != qf_engine.QUANTFUNC_OK:
+        raise RuntimeError("cloud TE: tensor_read_tags failed: " + _last_error(lib))
+    return torch.from_numpy(np.frombuffer(bytes(buf), dtype=np.int32).copy()).long()
+
+
 def _read_tensor(lib, handle) -> torch.Tensor:
     """Read a quantfunc_tensor_t handle → float32 torch tensor [1, seq, hidden]."""
     ndim = ctypes.c_int32()
@@ -259,7 +274,9 @@ def _cloud_encode(text, ref_paths, model_id, output_dtype, timeout_seconds, devi
             _drop_cache_entry()   # terminal (same out_pending==0 edge as success) — entry is dead
             raise RuntimeError("cloud TE: terminal state but no result tensor: " + _last_error(lib))
         _drop_cache_entry()                  # success — the task is consumed
-        return _read_tensor(lib, out_result)
+        emb = _read_tensor(lib, out_result)
+        tags = _read_tensor_tags(lib, out_result)
+        return emb, tags
     finally:
         if out_result:
             try:
@@ -313,9 +330,19 @@ class QFCloudTEClip:
 
     def encode_from_tokens_scheduled(self, tokens, unprojected=False, add_dict=None, show_pbar=True):
         ref_paths = _save_ref_images(tokens.get("ref_tensors") or None)
-        emb = _cloud_encode(tokens["text"], ref_paths, self._model_id,
-                            self._output_dtype, self._timeout, self._device_idx)
+        emb, tags = _cloud_encode(tokens["text"], ref_paths, self._model_id,
+                                  self._output_dtype, self._timeout, self._device_idx)
         meta = dict(add_dict or {})
+        # [token-tags — the H3 fl2va semantic channel] official-comfy-identical key:
+        # model_base.MiniMaxH3.extra_conds reads minimax_token_tags → payload
+        # text_token_tags → per-row modality AdaLN. Absent (pre-tags worker / old
+        # .so) = today's degraded behavior, LOUD once so the gap is visible.
+        if tags is not None:
+            meta["minimax_token_tags"] = tags
+        elif ref_paths:
+            print("[qf_cloud_te] WARNING: image refs sent but the worker/engine "
+                  "returned NO token tags — vision rows will be modulated as text "
+                  "(first-frame semantics degrade; upgrade the worker/.so)", flush=True)
         return [[emb, meta]]
 
     def encode_from_tokens(self, tokens, return_pooled=False, return_dict=False):
