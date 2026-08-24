@@ -599,8 +599,8 @@ if _IMPORT_OK:
                                              + _preset_file_expectations()}),
                 "resident_block_count": _RESIDENT_BLOCKS_INPUT,
             }, "optional": {
-                "easycache": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.005,
-                              "tooltip": "EasyCache step-skip threshold (0 = OFF, byte-identical). "
+                "step_cache": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.005,
+                              "tooltip": "Step cache threshold (EasyCache; 0 = OFF, byte-identical). "
                                          ">0 lets the engine SKIP whole denoise steps whose "
                                          "predicted change is below this relative budget and "
                                          "reuse the cached trajectory (typical 0.02-0.05; larger "
@@ -622,10 +622,10 @@ if _IMPORT_OK:
             + _COMMON_LIMITS)
 
         def load(self, transformer1, transformer2, model_config, resident_block_count=999,
-                 easycache=0.0):
+                 step_cache=0.0):
             return _run_family_load("wan", transformer1, model_config,
                                     resident_block_count, transformer2,
-                                    easycache_thresh=easycache)
+                                    easycache_thresh=step_cache)
 
     class QuantFuncLTXLoader:
         """LTX-2 loader — single MODEL output (single-expert family)."""
@@ -643,8 +643,8 @@ if _IMPORT_OK:
                                              + _preset_file_expectations()}),
                 "resident_block_count": _RESIDENT_BLOCKS_INPUT,
             }, "optional": {
-                "easycache": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.005,
-                              "tooltip": "EasyCache step-skip threshold (0 = OFF, byte-identical). "
+                "step_cache": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.005,
+                              "tooltip": "Step cache threshold (EasyCache; 0 = OFF, byte-identical). "
                                          ">0 lets the engine SKIP whole denoise steps whose "
                                          "predicted change is below this relative budget and "
                                          "reuse the cached trajectory (typical 0.02-0.05; larger "
@@ -661,7 +661,7 @@ if _IMPORT_OK:
                        "only consumes latents; comfy's sampler applies the frame-0 mask). "
                        + _COMMON_LIMITS)
 
-        def load(self, transformer, model_config, resident_block_count=999, easycache=0.0):
+        def load(self, transformer, model_config, resident_block_count=999, step_cache=0.0):
             # [aux-auto] NO aux file widgets and NO image socket (user 2026-08-22 "只保留
             # transformer/block/model_config … 只关注latent"): te/audio-vae/connectors
             # resolve from the preset manifest's aux_files inside _run_family_load; i2v is
@@ -669,7 +669,7 @@ if _IMPORT_OK:
             # wan's cond-latent shape.
             return (_run_family_load("ltx2", transformer, model_config,
                                      resident_block_count, None,
-                                     easycache_thresh=easycache),)
+                                     easycache_thresh=step_cache),)
 
     class QuantFuncH3Loader:
         """MiniMax-H3 loader — single MODEL output (single-expert AV family)."""
@@ -685,8 +685,8 @@ if _IMPORT_OK:
                                              + _preset_file_expectations()}),
                 "resident_block_count": _RESIDENT_BLOCKS_INPUT,
             }, "optional": {
-                "easycache": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.005,
-                              "tooltip": "EasyCache step-skip threshold (0 = OFF, byte-identical). "
+                "step_cache": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.005,
+                              "tooltip": "Step cache threshold (EasyCache; 0 = OFF, byte-identical). "
                                          ">0 lets the engine SKIP whole denoise steps whose "
                                          "predicted change is below this relative budget and "
                                          "reuse the cached trajectory (typical 0.02-0.05; larger "
@@ -718,7 +718,7 @@ if _IMPORT_OK:
                        "stock sampler drives with latents. " + _COMMON_LIMITS)
 
         def load(self, transformer, model_config, resident_block_count=999,
-                 sparse="off", sparse_cdf=0.98, easycache=0.0):
+                 sparse="off", sparse_cdf=0.98, step_cache=0.0):
             sparse_opts = None
             if sparse != "off":
                 sparse_opts = {"attention_backend": "flash",
@@ -726,7 +726,7 @@ if _IMPORT_OK:
                                "sparse_cdf": float(sparse_cdf)}
             return (_run_family_load("minimax-h3", transformer, model_config,
                                      resident_block_count, None, sparse_opts=sparse_opts,
-                                     easycache_thresh=easycache),)
+                                     easycache_thresh=step_cache),)
 
     class QuantFuncNativeLoRA:
         """Sidecar LoRA for the QuantFunc native loader — MODEL in, MODEL out (LoraLoaderModelOnly

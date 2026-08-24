@@ -507,7 +507,7 @@ def _refuse_session_knobs_in_create(config_json):
     hard-seal). The refused set = EVERY session knob QFSessionModelMixin.residency_opts()
     injects into denoise_begin: resident_block_count (residency re-planned per session;
     measured rb-swap with no rebuild) AND the EasyCache keys cache_mode/cache_thresh (+ the
-    loader-widget spelling "easycache"). In a create config any of them would enter the
+    loader-widget spellings "step_cache" / legacy "easycache"). In a create config any of them would enter the
     pipeline cache identity upstream and silently reintroduce a full model rebuild on every
     widget change — refuse loud, both the dict and the pre-serialized-string form."""
     cfg = config_json
@@ -524,7 +524,7 @@ def _refuse_session_knobs_in_create(config_json):
             # session knobs (runtime, re-applied per denoise_begin) — NONE may enter the
             # create config / ckey: resident_block_count + the EasyCache keys (the same
             # guarantee class; a create-side leak would rebuild the pipeline per widget change).
-            if any(k in obj for k in ("resident_block_count", "cache_mode", "cache_thresh", "easycache")):
+            if any(k in obj for k in ("resident_block_count", "cache_mode", "cache_thresh", "easycache", "step_cache")):
                 return True
             return any(_scan(v) for v in obj.values())
         if isinstance(obj, list):
@@ -533,7 +533,7 @@ def _refuse_session_knobs_in_create(config_json):
     if _scan(cfg):
         raise RuntimeError(
             "qf_native: a runtime SESSION knob (resident_block_count / cache_mode / "
-            "cache_thresh / easycache — they ride every denoise_begin via "
+            "cache_thresh / step_cache (easycache) — they ride every denoise_begin via "
             "QFSessionModelMixin.residency_opts) must never appear anywhere in a create "
             "config — that would bake it into the pipeline cache identity and rebuild "
             "the whole pipeline on every widget change.")
