@@ -378,7 +378,7 @@ class QuantFuncCloudTELoader:
     FUNCTION = "load"
     CATEGORY = "QuantFunc/cloud"
 
-    def load(self, model_id, output_dtype="fp32", timeout_seconds=600, device_idx=0):
+    def load(self, model_id, output_dtype="bf16", timeout_seconds=600, device_idx=0):
         lib = qf_engine.load_lib()
         if not hasattr(lib, "quantfunc_te_cloud_encode"):
             raise RuntimeError("This libquantfunc.so has no cloud-TE support — rebuild/update "
