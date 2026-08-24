@@ -12,6 +12,13 @@ import struct
 QUANTFUNC_OK = 0
 # quantfunc_dtype_t: FP32=0, FP16=1, BF16=2 (matches QF_DTYPE in the harness)
 QF_FP32, QF_FP16, QF_BF16 = 0, 1, 2
+# fp8_e4m3 — a valid OUTPUT dtype request for the cloud/standalone TE encode only
+# (the result tensor handle reports its own dtype code 1 with per-token scales).
+QF_FP8_E4M3 = 3
+
+# Cloud TE progress/cancel callback: int(int done, int total, void* user) — a non-zero
+# return CANCELS the in-flight encode (mirrors TECloudParams.progress_callback).
+QF_TE_CLOUD_PROGRESS_CB = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p)
 
 
 def _dbg_prof(msg):
@@ -157,6 +164,25 @@ class DenoiseStepMultiParams(ctypes.Structure):
     ]
 
 
+class TECloudParams(ctypes.Structure):
+    # Field order/types mirror include/quantfunc.h TECloudParams VERBATIM (natural
+    # alignment matches the C compiler, so ctypes reproduces the C layout).
+    _fields_ = [
+        ("server_url", ctypes.c_char_p),
+        ("api_key", ctypes.c_char_p),
+        ("device_idx", ctypes.c_int),
+        ("model_id", ctypes.c_char_p),
+        ("text", ctypes.c_char_p),
+        ("ref_paths", ctypes.POINTER(ctypes.c_char_p)),
+        ("n_refs", ctypes.c_int),
+        ("output_dtype", ctypes.c_int),
+        ("resume_task_id", ctypes.c_char_p),
+        ("wait_ms", ctypes.c_int),
+        ("progress_callback", QF_TE_CLOUD_PROGRESS_CB),
+        ("callback_user_data", ctypes.c_void_p),
+    ]
+
+
 def _bind(lib):
     v = ctypes.c_void_p
     lib.quantfunc_create.restype = ctypes.c_int
@@ -206,6 +232,29 @@ def _bind(lib):
         lib.quantfunc_partial_unload.restype = ctypes.c_int
         lib.quantfunc_partial_unload.argtypes = [v, ctypes.c_uint64,
                                                  ctypes.POINTER(ctypes.c_int64)]
+    # Cloud TE encode + tensor readout (design v11). hasattr-gated: an older .so
+    # simply lacks these and the cloud-TE node then refuses with clear guidance.
+    if hasattr(lib, "quantfunc_te_cloud_encode"):
+        lib.quantfunc_te_cloud_encode.restype = ctypes.c_int
+        lib.quantfunc_te_cloud_encode.argtypes = [
+            ctypes.POINTER(TECloudParams),   # in
+            ctypes.POINTER(v),               # out_result (tensor handle)
+            ctypes.POINTER(ctypes.c_int),    # out_pending
+            ctypes.c_char_p,                 # out_task_id (mutable buffer)
+            ctypes.c_size_t,                 # out_task_id_cap
+        ]
+        lib.quantfunc_default_te_cloud_params.restype = TECloudParams
+        lib.quantfunc_default_te_cloud_params.argtypes = []
+        lib.quantfunc_tensor_info.restype = ctypes.c_int
+        lib.quantfunc_tensor_info.argtypes = [
+            v, ctypes.POINTER(ctypes.c_int32),
+            ctypes.POINTER(ctypes.c_int64), ctypes.POINTER(ctypes.c_int32)]
+        lib.quantfunc_tensor_read.restype = ctypes.c_int
+        lib.quantfunc_tensor_read.argtypes = [v, ctypes.c_void_p, ctypes.c_size_t]
+        lib.quantfunc_tensor_read_scales.restype = ctypes.c_int
+        lib.quantfunc_tensor_read_scales.argtypes = [v, ctypes.POINTER(ctypes.c_float), ctypes.c_size_t]
+        lib.quantfunc_tensor_destroy.restype = None
+        lib.quantfunc_tensor_destroy.argtypes = [v]
     return lib
 
 
@@ -614,6 +663,13 @@ class QFEngineHandle:
         ESTIMATE (footprint) so comfy's ledger can HONESTLY credit it, or 0 if nothing was freed."""
         if self.pipeline is None or self.unloaded:
             return 0
+        import os as _os
+        if _os.environ.get("QF_NATIVE_PROF") == "1":
+            import traceback as _tb
+            frames = _tb.extract_stack(limit=5)[:-1]
+            chain = " <- ".join(f"{_os.path.basename(f.filename)}:{f.lineno}:{f.name}"
+                                for f in reversed(frames))
+            print(f"[qf_prof] unload_vram CALLER: {chain}", flush=True)
         self.end_session_if_open()          # a live session on unloaded VRAM would be a UAF on reuse
         try:
             st = self.lib.quantfunc_unload_sync(self.pipeline)
