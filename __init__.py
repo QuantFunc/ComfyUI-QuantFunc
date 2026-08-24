@@ -482,7 +482,7 @@ if _IMPORT_OK:
 
     def _run_family_load(expect_family, transformer1, model_config,
                          resident_block_count, transformer2, sparse_opts=None,
-                         easycache_thresh=0.0):
+                         easycache_thresh=0.0, fbcache_thresh=0.0):
         """The SHARED loader core behind the per-family nodes (user 2026-08-21 pivot). All
         validation is preserved verbatim from the original single-node load(); the per-family
         nodes add only (a) a family-filtered preset dropdown and (b) this family guard —
@@ -558,10 +558,13 @@ if _IMPORT_OK:
         # _refuse_session_knobs_in_create class of guarantee, by construction). 0.0 =
         # OFF → the begin keys are omitted → engine step path byte-identical.
         t = float(easycache_thresh or 0.0)
+        tf = float(fbcache_thresh or 0.0)
         for mp in (out if isinstance(out, (tuple, list)) else (out,)):
             m = getattr(mp, "model", None)
             if m is not None and hasattr(m, "set_easycache_thresh"):
                 m.set_easycache_thresh(t)
+            if m is not None and hasattr(m, "set_fbcache_thresh"):
+                m.set_fbcache_thresh(tf)
         return out
 
     _RESIDENT_BLOCKS_INPUT = ("INT", {"default": 999, "min": 1, "max": 1024,
@@ -606,6 +609,14 @@ if _IMPORT_OK:
                                          "reuse the cached trajectory (typical 0.02-0.05; larger "
                                          "= faster but drifts more). Runtime session knob — "
                                          "takes effect next run, never rebuilds the pipeline."}),
+                "fbcache": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.005,
+                              "tooltip": "First-Block Cache threshold (0 = OFF, byte-identical). "
+                                         ">0 runs block 0 every step and SKIPS blocks 1..N-1 when "
+                                         "block 0's output change is below this relative budget, "
+                                         "reconstructing from the cached residual — effective even "
+                                         "on few-step distilled workflows (typical 0.05-0.12). "
+                                         "Runtime session knob — takes effect next run, never "
+                                         "rebuilds. Mutually exclusive with step_cache (set one)."}),
             }}
 
         RETURN_TYPES = ("MODEL", "MODEL")
@@ -622,10 +633,11 @@ if _IMPORT_OK:
             + _COMMON_LIMITS)
 
         def load(self, transformer1, transformer2, model_config, resident_block_count=999,
-                 step_cache=0.0):
+                 step_cache=0.0, fbcache=0.0):
             return _run_family_load("wan", transformer1, model_config,
                                     resident_block_count, transformer2,
-                                    easycache_thresh=step_cache)
+                                    easycache_thresh=step_cache,
+                                     fbcache_thresh=fbcache)
 
     class QuantFuncLTXLoader:
         """LTX-2 loader — single MODEL output (single-expert family)."""
@@ -650,6 +662,14 @@ if _IMPORT_OK:
                                          "reuse the cached trajectory (typical 0.02-0.05; larger "
                                          "= faster but drifts more). Runtime session knob — "
                                          "takes effect next run, never rebuilds the pipeline."}),
+                "fbcache": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.005,
+                              "tooltip": "First-Block Cache threshold (0 = OFF, byte-identical). "
+                                         ">0 runs block 0 every step and SKIPS blocks 1..N-1 when "
+                                         "block 0's output change is below this relative budget, "
+                                         "reconstructing from the cached residual — effective even "
+                                         "on few-step distilled workflows (typical 0.05-0.12). "
+                                         "Runtime session knob — takes effect next run, never "
+                                         "rebuilds. Mutually exclusive with step_cache (set one)."}),
             }}
 
         RETURN_TYPES = ("MODEL",)
@@ -661,7 +681,7 @@ if _IMPORT_OK:
                        "only consumes latents; comfy's sampler applies the frame-0 mask). "
                        + _COMMON_LIMITS)
 
-        def load(self, transformer, model_config, resident_block_count=999, step_cache=0.0):
+        def load(self, transformer, model_config, resident_block_count=999, step_cache=0.0, fbcache=0.0):
             # [aux-auto] NO aux file widgets and NO image socket (user 2026-08-22 "只保留
             # transformer/block/model_config … 只关注latent"): te/audio-vae/connectors
             # resolve from the preset manifest's aux_files inside _run_family_load; i2v is
@@ -669,7 +689,8 @@ if _IMPORT_OK:
             # wan's cond-latent shape.
             return (_run_family_load("ltx2", transformer, model_config,
                                      resident_block_count, None,
-                                     easycache_thresh=step_cache),)
+                                     easycache_thresh=step_cache,
+                                     fbcache_thresh=fbcache),)
 
     class QuantFuncH3Loader:
         """MiniMax-H3 loader — single MODEL output (single-expert AV family)."""
@@ -695,6 +716,14 @@ if _IMPORT_OK:
                                          "H3/AV note: audio-live sessions skip WITH a per-lane audio "
                                          "transport + an audio transient guard (audio-quiet steps "
                                          "only); few-step distilled workflows rarely have headroom."}),
+                "fbcache": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.005,
+                              "tooltip": "First-Block Cache threshold (0 = OFF, byte-identical). "
+                                         ">0 runs block 0 every step and SKIPS blocks 1..N-1 when "
+                                         "block 0's output change is below this relative budget, "
+                                         "reconstructing from the cached residual — effective even "
+                                         "on few-step distilled workflows (typical 0.05-0.12). "
+                                         "Runtime session knob — takes effect next run, never "
+                                         "rebuilds. Mutually exclusive with step_cache (set one)."}),
                 # [sparse switch, user 2026-08-24] CREATE-level toggle (flipping it re-creates
                 # the pipeline — the engine's sparse selector + attention backend are create
                 # keys). off = the default sage2 dense path, byte-identical to before this
@@ -718,7 +747,7 @@ if _IMPORT_OK:
                        "stock sampler drives with latents. " + _COMMON_LIMITS)
 
         def load(self, transformer, model_config, resident_block_count=999,
-                 sparse="off", sparse_cdf=0.98, step_cache=0.0):
+                 sparse="off", sparse_cdf=0.98, step_cache=0.0, fbcache=0.0):
             sparse_opts = None
             if sparse != "off":
                 sparse_opts = {"attention_backend": "flash",
@@ -726,7 +755,8 @@ if _IMPORT_OK:
                                "sparse_cdf": float(sparse_cdf)}
             return (_run_family_load("minimax-h3", transformer, model_config,
                                      resident_block_count, None, sparse_opts=sparse_opts,
-                                     easycache_thresh=step_cache),)
+                                     easycache_thresh=step_cache,
+                                     fbcache_thresh=fbcache),)
 
     class QuantFuncNativeLoRA:
         """Sidecar LoRA for the QuantFunc native loader — MODEL in, MODEL out (LoraLoaderModelOnly

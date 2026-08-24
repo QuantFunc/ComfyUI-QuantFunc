@@ -524,7 +524,7 @@ def _refuse_session_knobs_in_create(config_json):
             # session knobs (runtime, re-applied per denoise_begin) — NONE may enter the
             # create config / ckey: resident_block_count + the EasyCache keys (the same
             # guarantee class; a create-side leak would rebuild the pipeline per widget change).
-            if any(k in obj for k in ("resident_block_count", "cache_mode", "cache_thresh", "easycache", "step_cache")):
+            if any(k in obj for k in ("resident_block_count", "cache_mode", "cache_thresh", "easycache", "step_cache", "fbcache")):
                 return True
             return any(_scan(v) for v in obj.values())
         if isinstance(obj, list):
