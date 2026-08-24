@@ -27,6 +27,7 @@ math, parity+official-value death rules in test_minimax_h3_pack.cpp).
 """
 import os
 import ctypes
+import time
 import json
 import logging
 import math
@@ -350,6 +351,13 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
         bpx.options_json = bpx._opts
         session = ctypes.c_void_p()
         st = lib.quantfunc_denoise_begin(self._qf.pipeline, ctypes.byref(bpx), ctypes.byref(session))
+        if st != qfe.QUANTFUNC_OK and "busy" in (qfe.last_err(lib) or ""):
+            # ONE bounded recovery (2026-08-24 busy incident): a just-interrupted run's final
+            # step may still be draining engine-side — its refused end RETAINED our pointer,
+            # so an end+retry can win once the step lands. Non-busy refusals fall through.
+            time.sleep(2.0)
+            self._qf.end_session_if_open()
+            st = lib.quantfunc_denoise_begin(self._qf.pipeline, ctypes.byref(bpx), ctypes.byref(session))
         self._begin_keep = bpx
         if st != qfe.QUANTFUNC_OK:
             raise RuntimeError(f"denoise_begin (H3 t2va) failed: {qfe.last_err(lib)}")

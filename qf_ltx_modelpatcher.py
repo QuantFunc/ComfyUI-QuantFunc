@@ -30,6 +30,7 @@ Landing HELD (build+verify only). Only THIS loader node is swapped into an other
 workflow.
 """
 import ctypes
+import time
 import json
 import logging
 import math
@@ -717,6 +718,13 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
             import time as _time
             _t0 = _time.perf_counter()
         st = lib.quantfunc_denoise_begin(self._qf.pipeline, ctypes.byref(bpx), ctypes.byref(session))
+        if st != qfe.QUANTFUNC_OK and "busy" in (qfe.last_err(lib) or ""):
+            # ONE bounded recovery (2026-08-24 busy incident): a just-interrupted run's final
+            # step may still be draining engine-side — its refused end RETAINED our pointer,
+            # so an end+retry can win once the step lands. Non-busy refusals fall through.
+            time.sleep(2.0)
+            self._qf.end_session_if_open()
+            st = lib.quantfunc_denoise_begin(self._qf.pipeline, ctypes.byref(bpx), ctypes.byref(session))
         if _prof:
             print(f"[qf_prof] begin_call {(_time.perf_counter()-_t0)*1000:.0f} ms", flush=True)
         self._begin_keep = bpx

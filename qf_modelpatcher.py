@@ -552,6 +552,11 @@ class QFLazyEngine:
         if self._real is None or self._created_lora_sig == self._lora_sig():
             return False
         if getattr(self._real, "current_session", None):
+            # Retention (2026-08-24): a REFUSED end now keeps the pointer, so first try to
+            # close it — a stale/abandoned session ends here and the retire proceeds; only a
+            # session that STILL refuses to end (genuinely running) takes the raise below.
+            self._real.end_session_if_open()
+        if getattr(self._real, "current_session", None):
             # A wire changed its LoRA truth MID-GENERATION (e.g. the OTHER expert's wire
             # asserted a different stack at its stage — a LoRA node deleted there). The
             # running session was created under the old union and cannot be retargeted
@@ -634,6 +639,10 @@ class QFLazyEngine:
             self._real = None
             self._unloaded = True
             return False
+        if getattr(self._real, "current_session", None) is not None:
+            # Retention (2026-08-24): try to close a stale/abandoned session first — only a
+            # session that still refuses to end (genuinely running) blocks the release.
+            self._real.end_session_if_open()
         if getattr(self._real, "current_session", None) is not None:
             return False
         # keep_binding=True: the SAME ckey's next handle re-binds this entry's surviving

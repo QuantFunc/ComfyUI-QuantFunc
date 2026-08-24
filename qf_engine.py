@@ -618,10 +618,18 @@ class QFEngineHandle:
                     pass
         except Exception:  # noqa: BLE001 — end is best-effort on teardown
             ok = False
-        # Clear regardless: a failed end must not leave a half-open handle that blocks the next begin
-        # (a stale non-None session is exactly the interrupt-strands-the-session bug, #2). The status
-        # is surfaced above, not swallowed into a false "closed".
-        self.current_session = None
+        # RETAIN the pointer on a refused end (2026-08-24 busy incident, leg 2). The old
+        # "clear regardless" rationale was FALSE: no _begin blocks on a stale pointer (all
+        # call this bare and proceed), but clearing it made an engine-side-open session
+        # PERMANENTLY unreachable — a step-in-flight refusal left the handle Sessioning
+        # with no python pointer, so every later begin was "pipeline busy" until the 5-min
+        # engine watchdog. Retention is safe both ways: a step-in-flight session (the
+        # step drains in seconds) gets CLOSED by the next end attempt; an already-reaped
+        # session's end keeps refusing harmlessly (the by-id session slab makes a dead
+        # pointer's end a typed refusal, never a UAF) and the next successful begin
+        # overwrites the pointer anyway.
+        if ok:
+            self.current_session = None
         return (True, ok)
 
     def partial_unload_vram(self, bytes_requested):
@@ -641,6 +649,10 @@ class QFEngineHandle:
         # engine's saturating range explicitly (the engine treats >= total weight bytes as
         # "shed all sheddable").
         bytes_requested = min(int(bytes_requested), (1 << 63) - 1)
+        if self.current_session is not None:
+            # Retention (2026-08-24): a retained stale pointer must not permanently refuse
+            # VRAM reclaim — try the end first; a genuinely open session keeps refusing.
+            self.end_session_if_open()
         if self.current_session is not None:
             _dbg_prof("partial_unload refused: session open")
             return 0                        # mid-session: refuse (lease would too)
