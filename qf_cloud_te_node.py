@@ -164,7 +164,7 @@ def _read_tensor(lib, handle) -> torch.Tensor:
     scales = torch.from_numpy(np.frombuffer(bytes(sc), dtype=np.float32).copy())
     if not hasattr(torch, "float8_e4m3fn"):
         raise RuntimeError("cloud TE: fp8_e4m3 output needs torch>=2.1 (float8_e4m3fn); "
-                           "use output_dtype='fp32' instead.")
+                           "use output_dtype='bf16' instead.")
     e4m3 = torch.frombuffer(bytearray(payload), dtype=torch.uint8).view(torch.float8_e4m3fn)
     x = e4m3.float().reshape(shape)                       # decode e4m3 → f32
     return x * scales.reshape(1, seq, 1)                  # de-quantize per token
