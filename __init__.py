@@ -580,7 +580,7 @@ if _IMPORT_OK:
         "CUDA-toolchain check refuses a torch/.so CUDA-major mismatch; on Windows/macOS set "
         "QF_NATIVE_ALLOW_UNVERIFIED_TOOLCHAIN=1 after confirming they share a CUDA major.")
 
-    def _sparse_create_opts(sparse, sparse_cdf=None):
+    def _sparse_create_opts(sparse, sparse_cdf=None, algo="svg2"):
         """ONE-number sparse contract (user 2026-08-25): 1.0 → None (dense create,
         byte-identical to no-widget). <1.0 → the SVG2 SEMANTIC selector (k-means
         clustered top-p, parity-proven vs official Sparse-VideoGen f89aeda; user
@@ -591,12 +591,21 @@ if _IMPORT_OK:
         never crashes (an explicit legacy "meansim" ALSO lands on svg2 — the knob is
         one user-facing dial, not a selector picker)."""
         if isinstance(sparse, str):
+            # legacy H3 string form: "off" | a selector name. A legacy explicit
+            # "meansim" now HONORS meansim (it used to silently land on svg2 —
+            # wrong once the selector became user-choosable).
+            if sparse == "meansim":
+                algo = "meansim"
             sparse = 1.0 if sparse == "off" else float(sparse_cdf if sparse_cdf is not None else 0.98)
         sparse = float(sparse)
         if sparse >= 1.0:
             return None
+        if algo not in ("svg2", "meansim"):
+            # fail-loud: the engine's parseSelector would throw anyway; say it here
+            # with the valid choices instead of deep in create_pipeline.
+            raise ValueError(f"sparse_algo must be 'svg2' or 'meansim', got {algo!r}")
         return {"attention_backend": "flash",
-                "sparse_selector": "svg2",
+                "sparse_selector": algo,
                 "sparse_cdf": sparse}
 
     class QuantFuncWanLoader:
@@ -643,6 +652,13 @@ if _IMPORT_OK:
                                       "mass per block (e.g. 0.98) via SVG2 semantic block sparsity (k-means clustered top-p) "
                                       "on the flash branch. CREATE key — changing it "
                                       "re-creates the pipeline."}),
+                "sparse_algo": (["svg2", "meansim"], {"default": "svg2",
+                           "tooltip": "WHICH sparse selector `sparse` engages (ignored at 1.0). "
+                                      "svg2 = semantic k-means top-p — best selectivity, but until "
+                                      "the #642 tail-permutation lands it keeps ~95% of blocks "
+                                      "(MEASURED) and gains little. meansim = block-mean top-p — "
+                                      "keeps ~70% at the same dial (MEASURED) and is the one with "
+                                      "real effect today. Default svg2 preserves prior behaviour."}),
             }}
 
         RETURN_TYPES = ("MODEL", "MODEL")
@@ -659,8 +675,8 @@ if _IMPORT_OK:
             + _COMMON_LIMITS)
 
         def load(self, transformer1, transformer2, model_config, resident_block_count=999,
-                 step_cache=0.0, block_cache=0.0, sparse=1.0):
-            sparse_opts = _sparse_create_opts(sparse)
+                 step_cache=0.0, block_cache=0.0, sparse=1.0, sparse_algo="svg2"):
+            sparse_opts = _sparse_create_opts(sparse, algo=sparse_algo)
             return _run_family_load("wan", transformer1, model_config,
                                     resident_block_count, transformer2,
                                     sparse_opts=sparse_opts,
@@ -705,6 +721,13 @@ if _IMPORT_OK:
                                       "mass per block (e.g. 0.98) via SVG2 semantic block sparsity (k-means clustered top-p) "
                                       "on the flash branch. CREATE key — changing it "
                                       "re-creates the pipeline."}),
+                "sparse_algo": (["svg2", "meansim"], {"default": "svg2",
+                           "tooltip": "WHICH sparse selector `sparse` engages (ignored at 1.0). "
+                                      "svg2 = semantic k-means top-p — best selectivity, but until "
+                                      "the #642 tail-permutation lands it keeps ~95% of blocks "
+                                      "(MEASURED) and gains little. meansim = block-mean top-p — "
+                                      "keeps ~70% at the same dial (MEASURED) and is the one with "
+                                      "real effect today. Default svg2 preserves prior behaviour."}),
             }}
 
         RETURN_TYPES = ("MODEL",)
@@ -717,13 +740,13 @@ if _IMPORT_OK:
                        + _COMMON_LIMITS)
 
         def load(self, transformer, model_config, resident_block_count=999, step_cache=0.0,
-                 block_cache=0.0, sparse=1.0):
+                 block_cache=0.0, sparse=1.0, sparse_algo="svg2"):
             # [aux-auto] NO aux file widgets and NO image socket (user 2026-08-22 "只保留
             # transformer/block/model_config … 只关注latent"): te/audio-vae/connectors
             # resolve from the preset manifest's aux_files inside _run_family_load; i2v is
             # the workflow's own latent conditioning (LTXVImgToVideoInplace), exactly like
             # wan's cond-latent shape.
-            sparse_opts = _sparse_create_opts(sparse)
+            sparse_opts = _sparse_create_opts(sparse, algo=sparse_algo)
             return (_run_family_load("ltx2", transformer, model_config,
                                      resident_block_count, None,
                                      sparse_opts=sparse_opts,
@@ -774,6 +797,13 @@ if _IMPORT_OK:
                                       "qfa/sage path). <1.0 keeps that fraction of attention "
                                       "mass per block (e.g. 0.98) via SVG2 semantic block sparsity (k-means clustered top-p). "
                                       "CREATE key — changing it re-creates the pipeline."}),
+                "sparse_algo": (["svg2", "meansim"], {"default": "svg2",
+                           "tooltip": "WHICH sparse selector `sparse` engages (ignored at 1.0). "
+                                      "svg2 = semantic k-means top-p — best selectivity, but until "
+                                      "the #642 tail-permutation lands it keeps ~95% of blocks "
+                                      "(MEASURED) and gains little. meansim = block-mean top-p — "
+                                      "keeps ~70% at the same dial (MEASURED) and is the one with "
+                                      "real effect today. Default svg2 preserves prior behaviour."}),
             }}
 
         RETURN_TYPES = ("MODEL",)
@@ -783,8 +813,9 @@ if _IMPORT_OK:
                        "stock sampler drives with latents. " + _COMMON_LIMITS)
 
         def load(self, transformer, model_config, resident_block_count=999,
-                 sparse=1.0, sparse_cdf=None, step_cache=0.0, block_cache=0.0):
-            sparse_opts = _sparse_create_opts(sparse, sparse_cdf)
+                 sparse=1.0, sparse_cdf=None, step_cache=0.0, block_cache=0.0,
+                 sparse_algo="svg2"):
+            sparse_opts = _sparse_create_opts(sparse, sparse_cdf, algo=sparse_algo)
             return (_run_family_load("minimax-h3", transformer, model_config,
                                      resident_block_count, None, sparse_opts=sparse_opts,
                                      easycache_thresh=step_cache,
