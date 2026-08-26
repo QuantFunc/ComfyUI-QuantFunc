@@ -608,6 +608,56 @@ if _IMPORT_OK:
                 "sparse_selector": algo,
                 "sparse_cdf": sparse}
 
+    # [attention backend selector, user 2026-08-27] one user-facing dropdown per loader.
+    # SM-GATED: SM80+ offers the full set; SM75 (Turing) has NO int8-QK sage and NO
+    # flash_attn build, so only qfa + fp16_native are valid there. The widget VALUE is a
+    # display name; _attn_backend_to_engine maps it to the engine's comp_opts string
+    # ("fp16_native" -> "native"). "auto" = the engine's per-SM resolution (default), and
+    # is passed through so the user's choice is always the single source of truth.
+    _ATTN_BACKEND_SM80PLUS = ["auto", "qfa", "flash", "sage", "fp16_native"]
+    _ATTN_BACKEND_SM75 = ["qfa", "fp16_native"]
+
+    def _attn_backend_choices():
+        choices = _ATTN_BACKEND_SM80PLUS
+        try:
+            import torch
+            if torch.cuda.is_available():
+                maj, _min = torch.cuda.get_device_capability(0)
+                if maj < 8:  # SM75 Turing (sm_7x): no sage int8-QK, no flash_attn
+                    choices = _ATTN_BACKEND_SM75
+        except Exception:  # noqa: BLE001 — no torch/CUDA at import → assume modern; engine validates
+            pass
+        return choices
+
+    def _attn_backend_input(default="auto"):
+        choices = _attn_backend_choices()
+        # per-loader default; falls back to the first valid choice when the requested
+        # default isn't offered on this SM (e.g. H3 wants 'flash' but SM75 has no flash).
+        d = default if default in choices else choices[0]
+        return (choices, {"default": d,
+                "tooltip": "Self-attention backend. auto = engine picks per-SM (default). "
+                           "flash = fp16 flash-attn (most robust; H3 high-res needs this). "
+                           "sage = int8-QK sage (fastest, SM80+). qfa = int8-QK + Hadamard "
+                           "rotation. fp16_native = portable fp16/fp32-score fallback. "
+                           "SM75 (Turing) offers only qfa + fp16_native. CREATE key — "
+                           "changing it re-creates the pipeline."})
+
+    def _attn_backend_to_engine(v):
+        # widget display name -> engine comp_opts attention_backend string
+        return "native" if v == "fp16_native" else (v or "auto")
+
+    def _merge_attn_backend(create_opts, attention_backend):
+        """Fold the user's backend choice into the create-time opts dict. An EXPLICIT
+        choice (anything but 'auto') WINS over the svg2 selector's flash default; 'auto'
+        leaves create_opts untouched (svg2<1.0 -> flash, dense -> engine per-model default).
+        Returns the dict (possibly newly created) or None when nothing to pass."""
+        eng = _attn_backend_to_engine(attention_backend)
+        if eng == "auto":
+            return create_opts or None
+        d = dict(create_opts or {})
+        d["attention_backend"] = eng
+        return d
+
     class QuantFuncWanLoader:
         """Wan 2.x loader — DUAL MODEL outputs (high-noise, low-noise) over ONE shared engine,
         mirroring the official two-UNETLoader wan2.2 A14B workflow 1:1: wire model_high to the
@@ -659,6 +709,7 @@ if _IMPORT_OK:
                                       "(MEASURED) and gains little. meansim = block-mean top-p — "
                                       "keeps ~70% at the same dial (MEASURED) and is the one with "
                                       "real effect today. Default svg2 preserves prior behaviour."}),
+                "attention_backend": _attn_backend_input(),
             }}
 
         RETURN_TYPES = ("MODEL", "MODEL")
@@ -675,8 +726,10 @@ if _IMPORT_OK:
             + _COMMON_LIMITS)
 
         def load(self, transformer1, transformer2, model_config, resident_block_count=999,
-                 step_cache=0.0, block_cache=0.0, sparse=1.0, sparse_algo="svg2"):
+                 step_cache=0.0, block_cache=0.0, sparse=1.0, sparse_algo="svg2",
+                 attention_backend="auto"):
             sparse_opts = _sparse_create_opts(sparse, algo=sparse_algo)
+            sparse_opts = _merge_attn_backend(sparse_opts, attention_backend)
             return _run_family_load("wan", transformer1, model_config,
                                     resident_block_count, transformer2,
                                     sparse_opts=sparse_opts,
@@ -728,6 +781,7 @@ if _IMPORT_OK:
                                       "(MEASURED) and gains little. meansim = block-mean top-p — "
                                       "keeps ~70% at the same dial (MEASURED) and is the one with "
                                       "real effect today. Default svg2 preserves prior behaviour."}),
+                "attention_backend": _attn_backend_input(),
             }}
 
         RETURN_TYPES = ("MODEL",)
@@ -740,13 +794,14 @@ if _IMPORT_OK:
                        + _COMMON_LIMITS)
 
         def load(self, transformer, model_config, resident_block_count=999, step_cache=0.0,
-                 block_cache=0.0, sparse=1.0, sparse_algo="svg2"):
+                 block_cache=0.0, sparse=1.0, sparse_algo="svg2", attention_backend="auto"):
             # [aux-auto] NO aux file widgets and NO image socket (user 2026-08-22 "只保留
             # transformer/block/model_config … 只关注latent"): te/audio-vae/connectors
             # resolve from the preset manifest's aux_files inside _run_family_load; i2v is
             # the workflow's own latent conditioning (LTXVImgToVideoInplace), exactly like
             # wan's cond-latent shape.
             sparse_opts = _sparse_create_opts(sparse, algo=sparse_algo)
+            sparse_opts = _merge_attn_backend(sparse_opts, attention_backend)
             return (_run_family_load("ltx2", transformer, model_config,
                                      resident_block_count, None,
                                      sparse_opts=sparse_opts,
@@ -804,6 +859,12 @@ if _IMPORT_OK:
                                       "(MEASURED) and gains little. meansim = block-mean top-p — "
                                       "keeps ~70% at the same dial (MEASURED) and is the one with "
                                       "real effect today. Default svg2 preserves prior behaviour."}),
+                # H3 default = flash: this model's auto resolves to sage2 int8-QK, which is
+                # BROKEN on H3's post-qk-RMSNorm γ-outliers at high-res (blank/NaN — measured
+                # 928²/S=31538: attn out absmax 0 → step-1 all-NaN → audio avcodec crash +
+                # video blur). flash (fp16) is the verified-clean default; user can still pick
+                # auto/sage/qfa/native. (Wan→auto→qfa, LTX→auto are fine → they keep 'auto'.)
+                "attention_backend": _attn_backend_input("flash"),
             }}
 
         RETURN_TYPES = ("MODEL",)
@@ -814,8 +875,9 @@ if _IMPORT_OK:
 
         def load(self, transformer, model_config, resident_block_count=999,
                  sparse=1.0, sparse_cdf=None, step_cache=0.0, block_cache=0.0,
-                 sparse_algo="svg2"):
+                 sparse_algo="svg2", attention_backend="flash"):  # H3: flash default (auto→sage is broken)
             sparse_opts = _sparse_create_opts(sparse, sparse_cdf, algo=sparse_algo)
+            sparse_opts = _merge_attn_backend(sparse_opts, attention_backend)
             return (_run_family_load("minimax-h3", transformer, model_config,
                                      resident_block_count, None, sparse_opts=sparse_opts,
                                      easycache_thresh=step_cache,
