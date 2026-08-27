@@ -710,6 +710,14 @@ if _IMPORT_OK:
                                       "keeps ~70% at the same dial (MEASURED) and is the one with "
                                       "real effect today. Default svg2 preserves prior behaviour."}),
                 "attention_backend": _attn_backend_input(),
+                "svg2_tail_perm": ("BOOLEAN", {"default": False,
+                    "tooltip": "#642 tail-confined permutation (svg2 selector only). ON = sort the "
+                               "VIDEO-TAIL tokens cluster-contiguous before block projection, so the "
+                               "svg2 semantic selector can actually DROP blocks (without it the "
+                               "original-order projection keeps ~100% = pure overhead). Measured: "
+                               "sparse 0.5 + svg2 + tail_perm keeps ~64% and is the fastest sparse "
+                               "config on flash/qfa. Default OFF (byte-identical to before) pending "
+                               "the equal-keep quality A/B; protected prefix rows never move."}),
                 "act_scale_g32": ("BOOLEAN", {"default": False,
                     "tooltip": "svdq int4 激活-scale 组宽开关 (#565). OFF=g64 (默认, 与旧版逐字节一致); "
                                "ON=g32 (更细的激活量化组, 实测 -9.1% 激活量化误差, 前向 +~45%, 仅 SM89/86 是真杠杆; "
@@ -733,9 +741,14 @@ if _IMPORT_OK:
 
         def load(self, transformer1, transformer2, model_config, resident_block_count=999,
                  step_cache=0.0, block_cache=0.0, sparse=1.0, sparse_algo="svg2",
-                 attention_backend="auto", act_scale_g32=False):
+                 attention_backend="auto", svg2_tail_perm=False, act_scale_g32=False):
             sparse_opts = _sparse_create_opts(sparse, algo=sparse_algo)
             sparse_opts = _merge_attn_backend(sparse_opts, attention_backend)
+            # [#642 tail-perm opt-in] only meaningful with an ENGAGED svg2 selector; inject only
+            # when ON so the default stays byte-identical (engine key svg2_tail_perm, default off).
+            if svg2_tail_perm and sparse_opts and sparse_opts.get("sparse_selector") == "svg2":
+                sparse_opts = dict(sparse_opts)
+                sparse_opts["svg2_tail_perm"] = True
             # #565 g32 opt-in: inject ONLY when ON so the default stays byte-identical (absent => g64).
             # svdq-int4-only (C-API 'act_scale_g32' → svdq factory); a checkpoint act_g32_v1 marker outranks it.
             # NB _sparse_create_opts returns None when sparse is OFF (1.0) and _merge_attn_backend
