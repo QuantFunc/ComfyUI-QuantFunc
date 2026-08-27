@@ -697,18 +697,13 @@ if _IMPORT_OK:
                                          "rebuilds. COMPOSABLE with step_cache (EC skips whole "
                                          "steps; FBC skips blocks inside computed steps)."}),
                 "sparse": ("FLOAT", {"default": 1.0, "min": 0.5, "max": 1.0, "step": 0.01,
-                           "tooltip": "Sparse self-attention (LOSSY): 1.0 = OFF (dense, "
-                                      "sage/qfa path). <1.0 keeps that fraction of attention "
-                                      "mass per block (e.g. 0.98) via SVG2 semantic block sparsity (k-means clustered top-p) "
-                                      "on the flash branch. CREATE key — changing it "
-                                      "re-creates the pipeline."}),
-                "sparse_algo": (["svg2", "meansim"], {"default": "svg2",
-                           "tooltip": "WHICH sparse selector `sparse` engages (ignored at 1.0). "
-                                      "svg2 = semantic k-means top-p — best selectivity, but until "
-                                      "the #642 tail-permutation lands it keeps ~95% of blocks "
-                                      "(MEASURED) and gains little. meansim = block-mean top-p — "
-                                      "keeps ~70% at the same dial (MEASURED) and is the one with "
-                                      "real effect today. Default svg2 preserves prior behaviour."}),
+                           "tooltip": "Sparse self-attention (LOSSY): 1.0 = OFF (dense). <1.0 keeps "
+                                      "that fraction of attention mass per block via the svg2 "
+                                      "semantic selector (k-means clustered top-p; THE default — "
+                                      "the algorithm is no longer a user choice; measured best "
+                                      "operating point ~0.5: fastest sparse config on flash/qfa "
+                                      "and beats block-mean selection on quality at matched "
+                                      "keep). CREATE key — changing it re-creates the pipeline."}),
                 "attention_backend": _attn_backend_input(),
                 "svg2_tail_perm": ("BOOLEAN", {"default": False,
                     "tooltip": "#642 tail-confined permutation (svg2 selector only). ON = sort the "
@@ -795,18 +790,13 @@ if _IMPORT_OK:
                                          "rebuilds. COMPOSABLE with step_cache (EC skips whole "
                                          "steps; FBC skips blocks inside computed steps)."}),
                 "sparse": ("FLOAT", {"default": 1.0, "min": 0.5, "max": 1.0, "step": 0.01,
-                           "tooltip": "Sparse self-attention (LOSSY): 1.0 = OFF (dense, "
-                                      "sage/qfa path). <1.0 keeps that fraction of attention "
-                                      "mass per block (e.g. 0.98) via SVG2 semantic block sparsity (k-means clustered top-p) "
-                                      "on the flash branch. CREATE key — changing it "
-                                      "re-creates the pipeline."}),
-                "sparse_algo": (["svg2", "meansim"], {"default": "svg2",
-                           "tooltip": "WHICH sparse selector `sparse` engages (ignored at 1.0). "
-                                      "svg2 = semantic k-means top-p — best selectivity, but until "
-                                      "the #642 tail-permutation lands it keeps ~95% of blocks "
-                                      "(MEASURED) and gains little. meansim = block-mean top-p — "
-                                      "keeps ~70% at the same dial (MEASURED) and is the one with "
-                                      "real effect today. Default svg2 preserves prior behaviour."}),
+                           "tooltip": "Sparse self-attention (LOSSY): 1.0 = OFF (dense). <1.0 keeps "
+                                      "that fraction of attention mass per block via the svg2 "
+                                      "semantic selector (k-means clustered top-p; THE default — "
+                                      "the algorithm is no longer a user choice; measured best "
+                                      "operating point ~0.5: fastest sparse config on flash/qfa "
+                                      "and beats block-mean selection on quality at matched "
+                                      "keep). CREATE key — changing it re-creates the pipeline."}),
                 "attention_backend": _attn_backend_input(),
             }}
 
@@ -878,13 +868,6 @@ if _IMPORT_OK:
                                       "qfa/sage path). <1.0 keeps that fraction of attention "
                                       "mass per block (e.g. 0.98) via SVG2 semantic block sparsity (k-means clustered top-p). "
                                       "CREATE key — changing it re-creates the pipeline."}),
-                "sparse_algo": (["svg2", "meansim"], {"default": "svg2",
-                           "tooltip": "WHICH sparse selector `sparse` engages (ignored at 1.0). "
-                                      "svg2 = semantic k-means top-p — best selectivity, but until "
-                                      "the #642 tail-permutation lands it keeps ~95% of blocks "
-                                      "(MEASURED) and gains little. meansim = block-mean top-p — "
-                                      "keeps ~70% at the same dial (MEASURED) and is the one with "
-                                      "real effect today. Default svg2 preserves prior behaviour."}),
                 # H3 default = flash: this model's auto resolves to sage2 int8-QK, which is
                 # BROKEN on H3's post-qk-RMSNorm γ-outliers at high-res (blank/NaN — measured
                 # 928²/S=31538: attn out absmax 0 → step-1 all-NaN → audio avcodec crash +
