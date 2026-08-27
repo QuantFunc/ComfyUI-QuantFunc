@@ -710,6 +710,12 @@ if _IMPORT_OK:
                                       "keeps ~70% at the same dial (MEASURED) and is the one with "
                                       "real effect today. Default svg2 preserves prior behaviour."}),
                 "attention_backend": _attn_backend_input(),
+                "act_scale_g32": ("BOOLEAN", {"default": False,
+                    "tooltip": "svdq int4 激活-scale 组宽开关 (#565). OFF=g64 (默认, 与旧版逐字节一致); "
+                               "ON=g32 (更细的激活量化组, 实测 -9.1% 激活量化误差, 前向 +~45%, 仅 SM89/86 是真杠杆; "
+                               "SM120 上 int4 已用更细的 E0M3 g16, 此开关 no-op). 仅对 svdq int4 生效. "
+                               "把 int4 画质往 fp8 靠的实验开关 —— 温和收益, 单靠它通常不足以完全追平 fp8 "
+                               "(根因是 int4 激活精度; 干净对齐 fp8 需 a8w4)."}),
             }}
 
         RETURN_TYPES = ("MODEL", "MODEL")
@@ -727,9 +733,13 @@ if _IMPORT_OK:
 
         def load(self, transformer1, transformer2, model_config, resident_block_count=999,
                  step_cache=0.0, block_cache=0.0, sparse=1.0, sparse_algo="svg2",
-                 attention_backend="auto"):
+                 attention_backend="auto", act_scale_g32=False):
             sparse_opts = _sparse_create_opts(sparse, algo=sparse_algo)
             sparse_opts = _merge_attn_backend(sparse_opts, attention_backend)
+            # #565 g32 opt-in: inject ONLY when ON so the default stays byte-identical (absent => g64).
+            # svdq-int4-only (C-API 'act_scale_g32' → svdq factory); a checkpoint act_g32_v1 marker outranks it.
+            if act_scale_g32:
+                sparse_opts["act_scale_g32"] = True
             return _run_family_load("wan", transformer1, model_config,
                                     resident_block_count, transformer2,
                                     sparse_opts=sparse_opts,
