@@ -738,7 +738,10 @@ if _IMPORT_OK:
             sparse_opts = _merge_attn_backend(sparse_opts, attention_backend)
             # #565 g32 opt-in: inject ONLY when ON so the default stays byte-identical (absent => g64).
             # svdq-int4-only (C-API 'act_scale_g32' → svdq factory); a checkpoint act_g32_v1 marker outranks it.
+            # NB _sparse_create_opts returns None when sparse is OFF (1.0) and _merge_attn_backend
+            # passes None through for "auto" — materialize a dict before injecting (None-crash fix).
             if act_scale_g32:
+                sparse_opts = dict(sparse_opts) if sparse_opts else {}
                 sparse_opts["act_scale_g32"] = True
             return _run_family_load("wan", transformer1, model_config,
                                     resident_block_count, transformer2,
