@@ -91,11 +91,11 @@ class QFKrea2Model(QFSessionModelMixin, comfy.model_base.Krea2):
             int(ctx_group.shape[0]), _max_seq, int(ctx_group.shape[2]))
         self._max_ctx_seq = 0
         bpx.cond_dtype = _qf_dtype(ctx_group.dtype)
-        # residency_opts sends sparse_cdf UNCONDITIONALLY (the video families' session dial);
-        # krea2 has no sparse facet and the engine correctly REFUSES the key (E3 no-silent-drop)
-        # -> strip it here (the family knows itself). step/block cache keys are absent at 0.
-        _o = {k: v for k, v in dict(self.residency_opts()).items() if k != "sparse_cdf"}
-        bpx._opts = json.dumps(_o).encode()
+        # IMAGE session: the video-flavored residency_opts keys (sparse_cdf,
+        # resident_block_count, cache thresholds) are all engine-REFUSED here (E3,
+        # correctly — an image session has no sparse facet / manual residency).
+        # Send an EMPTY option set: krea2's begin needs nothing beyond the struct.
+        bpx._opts = json.dumps({}).encode()
         bpx.options_json = bpx._opts
         session = ctypes.c_void_p()
         st = lib.quantfunc_denoise_begin(self._qf.pipeline, ctypes.byref(bpx), ctypes.byref(session))

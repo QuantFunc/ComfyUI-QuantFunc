@@ -765,7 +765,6 @@ if _IMPORT_OK:
                 "model_config": (_model_config_choices(family="krea2"),
                                  {"tooltip": "The OFFICIAL Krea-2 model config preset. "
                                              + _preset_file_expectations()}),
-                "resident_block_count": _RESIDENT_BLOCKS_INPUT,
             }, "optional": {
                 "attention_backend": _attn_backend_input(),
             }}
@@ -776,12 +775,14 @@ if _IMPORT_OK:
         DESCRIPTION = ("QuantFunc Krea-2 Turbo loader (svdq, denoise_only): one native t2i "
                        "MODEL a stock sampler drives with latents. " + _COMMON_LIMITS)
 
-        def load(self, transformer, model_config, resident_block_count=999,
-                 attention_backend="auto"):
+        def load(self, transformer, model_config, attention_backend="auto"):
             # krea2: the backend is a CREATE key (no runtime dial wired on this family yet).
+            # No resident_block_count widget: IMAGE sessions do not consume manual block
+            # residency (the engine refuses the key; internal adjustBlocksForResolution
+            # owns residency) — 999 rides only the builder signature.
             sparse_opts = _merge_attn_backend(None, attention_backend)
             return (_run_family_load("krea2", transformer, model_config,
-                                     resident_block_count, None, sparse_opts=sparse_opts),)
+                                     999, None, sparse_opts=sparse_opts),)
 
 
     class QuantFuncH3Loader:
