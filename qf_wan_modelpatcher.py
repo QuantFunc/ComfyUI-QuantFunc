@@ -354,7 +354,7 @@ class QFWanModel(QFSessionModelMixin, comfy.model_base.WAN21):
         # unique per content (comfy batches by SHAPE only → a stock ConditioningCombine/SetArea puts two
         # DIFFERENT-content conditionings in one 0/1 bucket → a role key collides them → the engine's L2
         # cross-KV cache emits row-0's text for row-1: the seq-219 wrong-output defect). A content hash is the
-        # MIRROR failure — it collides two branches with IDENTICAL content into the STATEFUL fbcache_ slot
+        # MIRROR failure — it collides two branches with IDENTICAL content into the engine's STATEFUL block-cache slot
         # (src/gemm/lighting/CLAUDE.md #B3). comfy's uuid (aligned with cond_or_uncond) is distinct per
         # conditioning entry, stable across steps, and position-independent (robust to a mid-run composition
         # change like ConditioningSetTimestepRange) — see _CtxKeyAssigner. cond_or_uncond is still read only to
@@ -551,10 +551,10 @@ def register(deps):
                 cfg["attention_backend"] = "qfa"
             if sparse_opts:
                 # [sparse switch] user-enabled sparse REQUIRES the flash/BSA executor
-                # today (the svg2 keep_set renders via mha_fwd_block), so these CREATE
+                # today (the sparse keep-set renders via mha_fwd_block), so these CREATE
                 # keys — including attention_backend=flash — deliberately OVERRIDE the
                 # sm86/89 qfa compat pin above for sparse runs. (sage2/qfa block-sparse
-                # executor support is the next wave, user 2026-08-25 "svg2要支持sage2
+                # executor support is the next wave, user 2026-08-25 "稀疏要支持多后端
                 # 与qfa"; until then sparse-on-wan means the flash executor.) Merged
                 # into cfg → enters the pipeline-cache identity, so sparse on/off never
                 # collides with a cached dense handle.
