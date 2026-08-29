@@ -15,7 +15,7 @@ Design (measured from comfy 0.27.0 + include/quantfunc.h + the proven native_ses
   and NOT the 0/1 cond_or_uncond ROLE index. comfy batches by SHAPE only, so a stock
   ConditioningCombine/SetArea can put DIFFERENT content in ONE role bucket — a role key would collide them
   in the engine's cross-KV cache; a CONTENT hash is equally wrong (it collides two branches with identical
-  content into the engine's STATEFUL fbcache_ slot — src/gemm/lighting/CLAUDE.md #B3). comfy's uuid is
+  content into the engine's STATEFUL block-cache state slot — src/gemm/lighting/CLAUDE.md #B3). comfy's uuid is
   distinct per conditioning entry, content-independent, stable across steps, and position-independent
   (robust to a mid-run composition change) — see _CtxKeyAssigner.
   ★ COST (a real trade-off, NOT free): un-batching runs TWO sequential B==1 engine forwards per sampler
@@ -110,7 +110,7 @@ def _interrupt_poll_end_session_on_raise(qf):
 
 # The engine's "no trustworthy per-branch identity" sentinel: cfg_context_key == 0 (kNoCtxKey) makes the WAN
 # lighting transformer DISABLE all three step caches and recompute BIT-EXACT (WanTransformerLighting.cpp's
-# `have_ctx_key = raw_ctx_key != kNoCtxKey`; lighting_step_cache.h `kNoCtxKey`) — the sanctioned safe
+# `have_ctx_key = raw_ctx_key != kNoCtxKey`; the engine's cache layer `kNoCtxKey`) — the sanctioned safe
 # degradation "rather than falling back to a poisonable" reuse. NON-zero keys (>=1) enable caching.
 _KNO_CTX_KEY = 0
 
@@ -124,14 +124,14 @@ class _CtxKeyAssigner:
     WHY A UUID, AND WHY NOT A CONTENT HASH / ROLE INDEX / BATCH POSITION
     (src/gemm/lighting/CLAUDE.md #B3 — the hard death-rule this class exists to satisfy):
     The engine keys THREE per-step caches off this ABI value — the L2 memoization caches (`ctx_cache_`,
-    `cross_kv_cache_`) AND the STATEFUL L3 First-Block/TeaCache trajectory cache (`fbcache_`; running
+    `cross_kv_cache_`) AND the STATEFUL L3 block-level trajectory cache (`the engine's block-cache state slot `; running
     `accum`/`prev_blk0`). The key MUST be:
       (a) DISTINCT per distinct conditioning — else the L2 cross-KV cache emits one branch's projected text
           for another. The 0/1 cond_or_uncond ROLE INDEX is NOT unique: comfy batches by SHAPE only
           (comfy/conds.py CONDRegular.can_concat), so a stock ConditioningCombine/SetArea puts two
           DIFFERENT-content conditionings in ONE role bucket → same key → wrong text reuse (the seq-219
           defect);
-      (b) DISTINCT per branch even for IDENTICAL content — else two branches share the STATEFUL `fbcache_`
+      (b) DISTINCT per branch even for IDENTICAL content — else two branches share the STATEFUL `the engine's block-cache state slot `
           slot and their trajectories interleave (why #B3 forbids a CONTENT HASH, and why the engine deleted
           its own content signature `ctx_sig`); and
       (c) STABLE for a given conditioning across a generation's steps INCLUDING under a within-generation
@@ -285,44 +285,65 @@ class QFSessionModelMixin:
     # every widget change) — is enforced fail-loud by _refuse_session_knobs_in_create() at the
     # single engine-create chokepoint (__init__._get_engine).
     _resident_block_count = 999   # class default; families set the widget value in __init__
-    # ── [easycache] runtime step-cache threshold (SAME session-knob class as residency:
+    # ── [step-cache] runtime step-cache threshold (SAME session-knob class as residency:
     # merged into the denoise_begin options_json below, re-read by the engine at EVERY
     # session begin → a widget change takes effect on the NEXT run with NO rebuild; the
     # knob never enters create_cfg/ckey). 0.0 = OFF: the keys are OMITTED entirely, the
     # engine spec stays cache_mode=0/thresh=0 → the step path is BYTE-IDENTICAL (the
-    # engine-side off-path guarantee, lighting_step_cache.h easycacheWrapStep). >0 arms
-    # lighting::CacheMode::EasyCache with this mean_abs_diff skip budget. ──
-    _easycache_thresh = 0.0       # class default; loaders set the widget value (step_cache)
-    _fbcache_thresh = 0.0         # class default; loaders set the widget value (block_cache)
+    # engine-side off-path guarantee, the engine's cache layer the engine's step-cache wrapper). >0 arms
+    # lighting::CacheMode::the step cache with this mean_abs_diff skip budget. ──
+    _step_cache = 0.0             # class default; loaders set the widget value (step_cache)
+    _block_cache = 0.0            # class default; loaders set the widget value (block_cache)
+    _sparse = 1.0                 # class default; 1.0 = dense (loaders set the sparse widget)
 
     def set_resident_block_count(self, n):
         self._resident_block_count = int(n)
 
-    def set_easycache_thresh(self, t):
-        self._easycache_thresh = float(t)
+    def set_step_cache(self, t):
+        self._step_cache = float(t)
 
-    def set_fbcache_thresh(self, t):
-        self._fbcache_thresh = float(t)
+    def set_block_cache(self, t):
+        self._block_cache = float(t)
+
+    def set_sparse(self, s):
+        self._sparse = float(s)
+
+    def set_attn_backend(self, v):
+        # [runtime dial 2026-08-29] session knob — rides residency_opts() into EVERY
+        # denoise_begin; the engine swaps the per-forward dispatch string (no rebuild).
+        self._attn_backend = str(v or "auto")
 
     def residency_opts(self):
         """The begin-options fragment EVERY family merges into its options_json — the ONE
-        injection point for ALL runtime session knobs (residency + the step-cache
-        thresholds; same non-ckey, re-applied-at-every-begin class). Cache keys are
-        OMITTED at thresh<=0 so the OFF path is byte-identical. step_cache (EasyCache,
-        STEP-level) and fbcache (First-Block Cache, BLOCK-level) are ORTHOGONAL and
-        COMPOSABLE (user 2026-08-24 "fbcache与step cache应该不冲突"): EC decides whether
-        a step runs at all; FBC decides, inside a computed step, whether blocks 1..N-1
-        run — an EC-skipped step never touches the transformer, so FBC state simply
-        carries over. fbcache rides its OWN engine key `fbcache_thresh` (an OLDER
-        engine refuses the unknown key LOUD — honest, never silent)."""
+        injection point for ALL runtime session knobs (residency + the two cache
+        thresholds + the sparse dial; same non-ckey, re-applied-at-every-begin class →
+        a widget change takes effect on the NEXT run with NO pipeline rebuild). Cache
+        keys are OMITTED at thresh<=0 and the sparse key at >=1.0, so every OFF path
+        is byte-identical. step_cache (STEP-level) and block_cache (BLOCK-level) are
+        ORTHOGONAL and COMPOSABLE (user 2026-08-24): the step cache decides whether a
+        step runs at all; the block cache decides, inside a computed step, whether the
+        remaining blocks run — a step-skipped step never touches the transformer, so
+        block-cache state simply carries over. An OLDER engine refuses an unknown key
+        LOUD — honest, never silent."""
         o = {"resident_block_count": int(self._resident_block_count)}
-        te = float(getattr(self, "_easycache_thresh", 0.0) or 0.0)
-        tf = float(getattr(self, "_fbcache_thresh", 0.0) or 0.0)
+        te = float(getattr(self, "_step_cache", 0.0) or 0.0)
+        tf = float(getattr(self, "_block_cache", 0.0) or 0.0)
+        sp = float(getattr(self, "_sparse", 1.0) or 1.0)
         if te > 0.0:
-            o["cache_mode"] = "easycache"
-            o["cache_thresh"] = te
+            o["step_cache_thresh"] = te
         if tf > 0.0:
-            o["fbcache_thresh"] = tf
+            o["block_cache_thresh"] = tf
+        # sparse_cdf is sent UNCONDITIONALLY (including 1.0): the visible panel
+        # value must ALWAYS override whatever the pipeline currently runs —
+        # 1.0 explicitly resolves to dense in the engine, so a cached/created
+        # pipeline carrying an old sparse state can never ghost a stale dial
+        # onto a user who dialed it back to 1.0 (the measured 0.8-ghost class).
+        # Engine-side: every session-capable video pipeline accepts the key
+        # (begin capability gate), and this mixin is video-family-only.
+        o["sparse_cdf"] = sp
+        ab = str(getattr(self, "_attn_backend", "auto") or "auto")
+        if ab != "auto":
+            o["attention_backend"] = ab   # [runtime dial] auto = engine default, key omitted
         return o
 
     def _assert_wire_lora(self):

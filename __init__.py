@@ -695,17 +695,17 @@ if _IMPORT_OK:
                  attention_backend="auto", act_scale_g32=False):
             # [#659] the sparse dial is a SESSION knob (never a create key — no rebuild
             # on change); sparse_opts carries CREATE-level keys only.
-            sparse_opts = _merge_attn_backend(None, attention_backend)
-            # #565 g32 opt-in: inject ONLY when ON so the default stays byte-identical (absent => g64).
-            # svdq-int4-only (C-API 'act_scale_g32' → svdq factory); a checkpoint act_g32_v1 marker outranks it.
-            if act_scale_g32:
-                sparse_opts = dict(sparse_opts) if sparse_opts else {}
-                sparse_opts["act_scale_g32"] = True
-            # [user 2026-08-29] cache/sparse entries REMOVED from the plugin surface —
-            # engine capabilities remain, defaults are all-OFF (byte-identical dense).
-            return _run_family_load("wan", transformer1, model_config,
+            # [runtime dial 2026-08-29] attention_backend is a SESSION knob now — NOT a
+            # create key (widget change no longer re-keys the loader = no rebuild).
+            sparse_opts = {"act_scale_g32": True} if act_scale_g32 else None
+            pair = _run_family_load("wan", transformer1, model_config,
                                     resident_block_count, transformer2,
                                     sparse_opts=sparse_opts)
+            eng_b = _attn_backend_to_engine(attention_backend)
+            for _p in pair:
+                if hasattr(_p, "set_attn_backend"):
+                    _p.set_attn_backend(eng_b)
+            return pair
 
     class QuantFuncLTXLoader:
         """LTX-2 loader — single MODEL output (single-expert family)."""
@@ -742,11 +742,11 @@ if _IMPORT_OK:
             # resolve from the preset manifest's aux_files inside _run_family_load; i2v is
             # the workflow's own latent conditioning (LTXVImgToVideoInplace), exactly like
             # wan's cond-latent shape.
-            sparse_opts = _merge_attn_backend(None, attention_backend)
-            # [user 2026-08-29] cache/sparse surface removed — all-OFF defaults.
-            return (_run_family_load("ltx2", transformer, model_config,
-                                     resident_block_count, None,
-                                     sparse_opts=sparse_opts),)
+            _p = _run_family_load("ltx2", transformer, model_config,
+                                   resident_block_count, None, sparse_opts=None)
+            if hasattr(_p, "set_attn_backend"):
+                _p.set_attn_backend(_attn_backend_to_engine(attention_backend))
+            return (_p,)
 
     class QuantFuncH3Loader:
         """MiniMax-H3 loader — single MODEL output (single-expert AV family)."""
@@ -779,10 +779,11 @@ if _IMPORT_OK:
 
         def load(self, transformer, model_config, resident_block_count=999,
                  attention_backend="flash"):  # H3: flash default (auto→sage is broken)
-            sparse_opts = _merge_attn_backend(None, attention_backend)
-            # [user 2026-08-29] cache/sparse surface removed — all-OFF defaults.
-            return (_run_family_load("minimax-h3", transformer, model_config,
-                                     resident_block_count, None, sparse_opts=sparse_opts),)
+            _p = _run_family_load("minimax-h3", transformer, model_config,
+                                   resident_block_count, None, sparse_opts=None)
+            if hasattr(_p, "set_attn_backend"):
+                _p.set_attn_backend(_attn_backend_to_engine(attention_backend))
+            return (_p,)
 
     class QuantFuncNativeLoRA:
         """Sidecar LoRA for the QuantFunc native loader — MODEL in, MODEL out (LoraLoaderModelOnly
