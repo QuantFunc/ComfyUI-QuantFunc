@@ -155,6 +155,12 @@ class QFKrea2Model(QFSessionModelMixin, comfy.model_base.Krea2):
             _interrupt_poll_end_session_on_raise(self._qf)
             xi = xin[i:i + 1].contiguous()
             oi = self._out[i:i + 1]
+            # comfy's krea2 rides the Wan21 VIDEO latent format ([B,C,T=1,H,W]); the
+            # engine session is IMAGE 4D — squeeze the singleton T for the ABI (both
+            # views share storage, so the velocity lands back in _out correctly).
+            if xi.dim() == 5 and xi.shape[2] == 1:
+                xi = xi.squeeze(2).contiguous()
+                oi = oi.squeeze(2)
             ci = ctx[i:i + 1].contiguous()
             cuid = cuuids[i] if (cuuids is not None and i < len(cuuids)) else None
             ctx_key = self._ctx_key_assigner.key(cuid)
