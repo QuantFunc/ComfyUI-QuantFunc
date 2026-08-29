@@ -786,11 +786,16 @@ if _IMPORT_OK:
                  resident_block_count=0):
             # [runtime dials] backend + residency are SESSION knobs (engine
             # applyAttnBackendDial / applyManualResidencyImageSessions): NOT create
-            # keys, so a widget change never re-keys the loader = no rebuild.
+            # keys, so a widget change never re-keys the engine = no rebuild.
             # resident_block_count 0 = auto (key omitted from begin — engine
             # warmup/auto residency, byte-unchanged legacy); >0 = manual pin.
+            # The WIDGET value rides the BUILD kwargs (single writer): the
+            # NativeLoRA chain's internal rebuild constructs a FRESH model wrapper
+            # from the CAPTURED build kwargs, so a post-load setter alone is
+            # overwritten on the LoRA path (measured R1: begin carried the old
+            # hardcoded 999 while the widget said 0).
             _p = _run_family_load("krea2", transformer, model_config,
-                                  999, None, sparse_opts=None)
+                                  int(resident_block_count), None, sparse_opts=None)
             _mm = getattr(_p, "model", None)
             if _mm is not None and hasattr(_mm, "set_attn_backend"):
                 _mm.set_attn_backend(_attn_backend_to_engine(attention_backend))
