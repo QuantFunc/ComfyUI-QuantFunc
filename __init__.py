@@ -873,6 +873,44 @@ if _IMPORT_OK:
                        "QuantFunc Native Loader; chain several to stack). The engine merges sidecar "
                        "LoRA at create time, so the pipeline is re-created for the new set.")
 
+        @staticmethod
+        def _refuse_foreign_lora_format(path):
+            """[one-format policy, user 2026-08-30] the native path adapts ONE
+            mainstream format — diffusers/PEFT canonical (<module>.lora_A/B.weight).
+            Anything else (kohya sd-scripts / ai-toolkit underscore keys, LyCORIS
+            LoHa/LoKr) is refused LOUD with the exact converter command — never
+            half-applied. Header-only sniff (8-byte len + json), no tensor reads."""
+            import json as _j, struct as _st
+            try:
+                with open(path, "rb") as f:
+                    n = _st.unpack("<Q", f.read(8))[0]
+                    if n > 512 * 1024 * 1024:
+                        raise ValueError("implausible safetensors header size")
+                    keys = [k for k in _j.loads(f.read(n)) if k != "__metadata__"]
+            except Exception as e:
+                raise RuntimeError(
+                    f"QuantFuncNativeLoRA: cannot read '{path}' as safetensors ({e!r})")
+            conv = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "scripts", "qf_lora_convert.py")
+            if any(".hada_" in k or ".lokr_" in k for k in keys):
+                raise RuntimeError(
+                    "QuantFuncNativeLoRA: this is a LyCORIS (LoHa/LoKr) file — a factored "
+                    "decomposition the native path does not consume. Merge/re-export it to a "
+                    "standard LoRA first.")
+            if any(k.startswith(("lora_unet_", "lora_transformer_", "lora_te_",
+                                 "lora_te1_", "lora_te2_")) for k in keys):
+                raise RuntimeError(
+                    "QuantFuncNativeLoRA: kohya/ai-toolkit-format LoRA detected. The native "
+                    "path adapts ONE format (diffusers/PEFT canonical) — convert once with:\n"
+                    f"  python3 {conv} --in '{path}' --out '<same-dir>/<name>-diff.safetensors'\n"
+                    "then pick the converted file in this node.")
+            if not any(".lora_A." in k or ".lora_B." in k or ".lora_down." in k
+                       or ".lora_up." in k for k in keys):
+                raise RuntimeError(
+                    "QuantFuncNativeLoRA: no recognizable LoRA keys (lora_A/lora_B/"
+                    "lora_down/lora_up) in this file — not a LoRA, or an unsupported "
+                    f"format. If it is a LoRA, convert it: python3 {conv} --in ... --out ...")
+
         def apply(self, model, lora_name, strength):
             rebuild = qfmp.rebuild_of(model)
             if rebuild is None:
@@ -880,6 +918,7 @@ if _IMPORT_OK:
                     "QuantFuncNativeLoRA: this MODEL is not a QuantFunc native model — wire it "
                     "downstream of the QuantFunc Native Loader. (For a stock comfy model use the "
                     "built-in LoraLoaderModelOnly instead.)")
+            self._refuse_foreign_lora_format(_resolve_lora(lora_name))
             stack = qfmp.lora_stack_of(model)
             stack.append({"path": _resolve_lora(lora_name), "scale": float(strength),
                           "target": qfmp.expert_of(model)})   # [wiring-lora] wire-derived side
