@@ -9,6 +9,7 @@ which is byte-identical to the engine's expected [1, S, L*td] staging, so cond p
 """
 import ctypes
 import json
+import os
 
 import torch
 
@@ -185,12 +186,26 @@ def register(deps):
     retire_handle = deps["retire_handle"]
     estimate_footprint = deps["estimate_footprint"]
 
-    def build(model_name, model_dir, resident_block_count, lora_entries, create_extra):
+    def build(transformer1_path, transformer2_path, resident_block_count, bundle_dir=None,
+              lora_entries=(), sparse_opts=None):
+        """File-based Krea-2 Turbo t2i — the H3 single-expert staging pattern: stage the
+        shipped config bundle (configs/krea2-turbo-*/, minimal official skeleton) + symlink
+        the transformer file; engine create runs denoise_only=True (TE + VAE weights
+        skipped — comfy's krea2 CLIP owns conditioning, comfy's VAEDecode decodes; the
+        engine reads the staged configs for session geometry only)."""
+        if transformer2_path:
+            raise RuntimeError("qf_native krea2: single-expert family — transformer2 must be empty")
+        model_dir = qfmp.stage_denoise_only_package(bundle_dir, transformer1_path, None)
+        create_extra = {"denoise_only": True}
+        if sparse_opts:
+            create_extra.update(sparse_opts)
+        model_name = os.path.basename(transformer1_path)
+
         def _build(lora_entries):
-            _lora_cfg = dict(create_extra or {})     # file-mode: {"denoise_only": True}
+            _lora_cfg = dict(create_extra or {})
             if lora_entries:
-                _lora_cfg["lora"] = list(lora_entries)
-            engine_models = []                        # weakrefs — the Wan discipline (no model cycle)
+                _lora_cfg["lora"] = list(lora_entries)   # engine svdq load: sidecar apply post-load
+            engine_models = []                            # weakrefs — the Wan discipline (no model cycle)
             def _factory():
                 eng, ckey = get_engine(model_dir, create_cfg=(_lora_cfg or None))
                 for _wr_m in engine_models:
