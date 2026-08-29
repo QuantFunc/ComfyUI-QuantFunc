@@ -231,7 +231,19 @@ QuantFunc has pre-exported commonly used models (runtime-quantized and ready to 
 
 > **[Model Loading & Downloads →](doc/model-loading-and-apikey_zh.md)** (Chinese)
 
-### 3.4 Example Workflows
+### 3.4 LoRA Format Conversion (Native Loaders)
+
+The native loaders (Krea-2 / LTX-2 / MiniMax-H3) adapt ONE LoRA format — diffusers/PEFT
+canonical. Convert kohya / ai-toolkit LoRAs once with the bundled pure-Python tool (no
+torch, no GPU, lossless byte-copy):
+
+```bash
+python3 scripts/qf_lora_convert.py --in my_kohya_lora.safetensors --out my_lora-diff.safetensors
+```
+
+> **[LoRA Format Converter →](doc/lora-convert.md)**
+
+### 3.5 Example Workflows
 
 Import from [`workflow_sample/`](workflow_sample/):
 
