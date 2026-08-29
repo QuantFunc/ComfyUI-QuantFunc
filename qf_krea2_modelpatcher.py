@@ -91,11 +91,14 @@ class QFKrea2Model(QFSessionModelMixin, comfy.model_base.Krea2):
             int(ctx_group.shape[0]), _max_seq, int(ctx_group.shape[2]))
         self._max_ctx_seq = 0
         bpx.cond_dtype = _qf_dtype(ctx_group.dtype)
-        # IMAGE session: the video-flavored residency_opts keys (sparse_cdf,
-        # resident_block_count, cache thresholds) are all engine-REFUSED here (E3,
-        # correctly — an image session has no sparse facet / manual residency).
-        # Send an EMPTY option set: krea2's begin needs nothing beyond the struct.
-        bpx._opts = json.dumps({}).encode()
+        # IMAGE session: the video-flavored residency_opts keys are engine-REFUSED here
+        # (E3, correctly). Send ONLY the runtime attn-backend dial (engine
+        # applyAttnBackendDial via the generic begin channel; omitted at auto).
+        _o = {}
+        ab = str(getattr(self, "_attn_backend", "auto") or "auto")
+        if ab != "auto":
+            _o["attention_backend"] = ab
+        bpx._opts = json.dumps(_o).encode()
         bpx.options_json = bpx._opts
         session = ctypes.c_void_p()
         st = lib.quantfunc_denoise_begin(self._qf.pipeline, ctypes.byref(bpx), ctypes.byref(session))

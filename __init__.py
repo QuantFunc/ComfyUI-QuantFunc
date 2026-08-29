@@ -776,13 +776,16 @@ if _IMPORT_OK:
                        "MODEL a stock sampler drives with latents. " + _COMMON_LIMITS)
 
         def load(self, transformer, model_config, attention_backend="auto"):
-            # krea2: the backend is a CREATE key (no runtime dial wired on this family yet).
-            # No resident_block_count widget: IMAGE sessions do not consume manual block
-            # residency (the engine refuses the key; internal adjustBlocksForResolution
-            # owns residency) — 999 rides only the builder signature.
-            sparse_opts = _merge_attn_backend(None, attention_backend)
-            return (_run_family_load("krea2", transformer, model_config,
-                                     999, None, sparse_opts=sparse_opts),)
+            # [runtime dial] the backend is a SESSION knob (engine applyAttnBackendDial on
+            # Krea2TransformerLighting — per-forward cfg read): NOT a create key, so a
+            # widget change never re-keys the loader = no rebuild. No resident_block_count
+            # widget: IMAGE sessions do not consume manual residency.
+            _p = _run_family_load("krea2", transformer, model_config,
+                                  999, None, sparse_opts=None)
+            _mm = getattr(_p, "model", None)
+            if _mm is not None and hasattr(_mm, "set_attn_backend"):
+                _mm.set_attn_backend(_attn_backend_to_engine(attention_backend))
+            return (_p,)
 
 
     class QuantFuncH3Loader:
