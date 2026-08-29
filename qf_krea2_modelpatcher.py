@@ -125,13 +125,22 @@ class QFKrea2Model(QFSessionModelMixin, comfy.model_base.Krea2):
             raise RuntimeError(
                 "qf_native krea2: c_concat conditioning is not part of the t2i seam — remove "
                 "the node feeding it.")
+        # krea2 engine is a BF16-latent/BF16-cond family (factory dtype=Tensor::BF16;
+        # the video seams run FP32 latents — NOT this one). comfy hands FP32 through the
+        # stubbed model config, so the seam casts HERE (x for the step ABI, ctx for begin).
+        if x.dtype != torch.bfloat16:
+            x_bf = x.to(torch.bfloat16)
+        else:
+            x_bf = x
+        if ctx.dtype != torch.bfloat16:
+            ctx = ctx.to(torch.bfloat16)
         sig_all = sigma.reshape(-1) if torch.is_tensor(sigma) else None
         sched = transformer_options.get("sample_sigmas", None)
         if sched is not None:
             self._num_steps = max(1, int(sched.numel()) - 1)
         elif self._num_steps <= 0:
             self._num_steps = 1
-        xin = x
+        xin = x_bf
         B = int(xin.shape[0])
         if getattr(self, "_qf_needs_begin", True) or self._qf.current_session is None:
             self._begin(xin[0:1], ctx[0:1])
