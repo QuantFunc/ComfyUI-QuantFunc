@@ -703,8 +703,9 @@ if _IMPORT_OK:
                                     sparse_opts=sparse_opts)
             eng_b = _attn_backend_to_engine(attention_backend)
             for _p in pair:
-                if hasattr(_p, "set_attn_backend"):
-                    _p.set_attn_backend(eng_b)
+                _mm = getattr(_p, "model", None)   # the session mixin lives on the MODEL
+                if _mm is not None and hasattr(_mm, "set_attn_backend"):
+                    _mm.set_attn_backend(eng_b)
             return pair
 
     class QuantFuncLTXLoader:
@@ -744,8 +745,9 @@ if _IMPORT_OK:
             # wan's cond-latent shape.
             _p = _run_family_load("ltx2", transformer, model_config,
                                    resident_block_count, None, sparse_opts=None)
-            if hasattr(_p, "set_attn_backend"):
-                _p.set_attn_backend(_attn_backend_to_engine(attention_backend))
+            _mm = getattr(_p, "model", None)
+            if _mm is not None and hasattr(_mm, "set_attn_backend"):
+                _mm.set_attn_backend(_attn_backend_to_engine(attention_backend))
             return (_p,)
 
     class QuantFuncH3Loader:
@@ -781,8 +783,9 @@ if _IMPORT_OK:
                  attention_backend="flash"):  # H3: flash default (auto→sage is broken)
             _p = _run_family_load("minimax-h3", transformer, model_config,
                                    resident_block_count, None, sparse_opts=None)
-            if hasattr(_p, "set_attn_backend"):
-                _p.set_attn_backend(_attn_backend_to_engine(attention_backend))
+            _mm = getattr(_p, "model", None)
+            if _mm is not None and hasattr(_mm, "set_attn_backend"):
+                _mm.set_attn_backend(_attn_backend_to_engine(attention_backend))
             return (_p,)
 
     class QuantFuncNativeLoRA:
