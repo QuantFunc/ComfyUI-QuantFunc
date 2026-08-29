@@ -5,10 +5,10 @@ wan seam uses — reused from qf_engine.py).
 
 WHY this is DIFFERENT from the wan seam (design findings, dossier seq-229..234):
 - cfg_context_key: seq-229 established the LTX-2 lighting transformer engages NONE of the
-  key-trusting step caches (ctx_cache_/cross_kv_cache_/fbcache_) — historically every step passed
-  cfg_context_key=0 (kNoCtxKey). SINCE the EasyCache session gate (merge 516a6d78) the key IS
+  key-trusting step caches (ctx_cache_/cross_kv_cache_/the engine's block-cache state slot ) — historically every step passed
+  cfg_context_key=0 (kNoCtxKey). SINCE the the step cache session gate (merge 516a6d78) the key IS
   consumed (one EcEntry per cond branch; key=0 force-computes), so BOTH step loops (t2v + AV) now
-  derive uuid-symbolic keys via the shared _CtxKeyAssigner (wan #B3 pattern) — see [easycache-key]
+  derive uuid-symbolic keys via the shared _CtxKeyAssigner (wan #B3 pattern) — see [step-cache-key]
   comments at the loops.
 - PACKED latent. The engine session denoises a packed token latent [1,N,128] (N=F_lat*H_lat*W_lat),
   NOT comfy's 5D [1,128,F,H,W]. seq-230: the mapping is a plain REVERSIBLE reshape+transpose (row-major
@@ -31,6 +31,7 @@ workflow.
 """
 import ctypes
 import time
+import weakref
 import json
 import logging
 import math
@@ -394,9 +395,9 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
         self._step_i = 0
         self._sess_denoise = 0
         self._out = None                     # reused packed velocity_out buffer [1,N,128]
-        # [easycache-key] symbolic per-conditioning cfg_context_key (mirrors QFWanModel #B3).
+        # [step-cache-key] symbolic per-conditioning cfg_context_key (mirrors QFWanModel #B3).
         # Historically LTX passed 0 (kNoCtxKey) because it engaged NO key-trusting cache
-        # (dossier seq-229) — the merged EasyCache session gate NOW trusts the key (its §6.5
+        # (dossier seq-229) — the merged the step cache session gate NOW trusts the key (its §6.5
         # no-key guard force-computes at key=0, silently disabling EC). uuid-derived keys give
         # each cond branch its own EcEntry (no cross-branch collapse) at zero cost when EC off.
         self._ctx_key_assigner = qfmp._CtxKeyAssigner()
@@ -755,7 +756,7 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
         xin = x.to(torch.bfloat16).contiguous()          # [B, 128, F, H, W]
         B = int(xin.shape[0])
         cou = transformer_options.get("cond_or_uncond") if isinstance(transformer_options, dict) else None
-        # [easycache-key] comfy's per-conditioning uuids (aligned with cond_or_uncond) — the
+        # [step-cache-key] comfy's per-conditioning uuids (aligned with cond_or_uncond) — the
         # symbolic-key source (see QFWanModel #B3 comment for why NOT the 0/1 role index).
         cuuids = transformer_options.get("uuids") if isinstance(transformer_options, dict) else None
         if B > 1 and (cou is None or len(cou) != B):
@@ -805,8 +806,8 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
             p.context = vi.data_ptr()
             p.context_dims = (ctypes.c_int * 3)(*vi.shape)
             p.context_dtype = _qf_dtype(vi.dtype)
-            # [easycache-key] symbolic key from comfy's per-conditioning uuid (was constant 0 =
-            # kNoCtxKey when LTX engaged no key-trusting cache, dossier seq-229; the EasyCache
+            # [step-cache-key] symbolic key from comfy's per-conditioning uuid (was constant 0 =
+            # kNoCtxKey when LTX engaged no key-trusting cache, dossier seq-229; the the step cache
             # session gate now keys one EcEntry per cond branch and force-computes at key=0).
             cuid = cuuids[i] if (cuuids is not None and i < len(cuuids)) else None
             p.cfg_context_key = self._ctx_key_assigner.key(cuid)
@@ -1013,7 +1014,7 @@ class QFLTXAVModel(QFLTXModel):
             self._out_audio = torch.empty((1, La, _LTXAV_AUDIO_PACK), dtype=torch.float32, device=dev)
         sig_all = sigma.reshape(-1) if torch.is_tensor(sigma) else None
         step_index = self._sigma_step_index(sigma, sig_all, transformer_options)
-        # [easycache-key] the AV class has its OWN step loop (this one), so the base t2v
+        # [step-cache-key] the AV class has its OWN step loop (this one), so the base t2v
         # loop's uuid-derived key never runs here — extract uuids for THIS loop too (the
         # e1_w2-measured miss: AV sessions kept passing key=0 → EC silently disabled).
         cuuids = transformer_options.get("uuids") if isinstance(transformer_options, dict) else None
@@ -1043,7 +1044,7 @@ class QFLTXAVModel(QFLTXModel):
             p.context = vi.data_ptr()
             p.context_dims = (ctypes.c_int * 3)(*vi.shape)
             p.context_dtype = _qf_dtype(vi.dtype)
-            # [easycache-key] uuid-symbolic key (was constant 0 = kNoCtxKey; the EC session
+            # [step-cache-key] uuid-symbolic key (was constant 0 = kNoCtxKey; the EC session
             # gate force-computes at 0 — the AV loop was the measured miss, see loop head).
             cuid = cuuids[i] if (cuuids is not None and i < len(cuuids)) else None
             p.cfg_context_key = self._ctx_key_assigner.key(cuid)
@@ -1228,7 +1229,7 @@ def register(deps):
                                    # model's footprint, freed with the backup.
                                    # [sparse switch] the selector/backend are CREATE keys
                                    # (attention_backend / sparse_selector / sparse_cdf —
-                                   # the shared makeSvg2Config path); merged here they
+                                   # the shared the engine's sparse-config parse); merged here they
                                    # also enter the pipeline-cache identity, so sparse
                                    # on/off never collides with a cached dense handle.
                                    create_extra={"denoise_only": True,
@@ -1285,9 +1286,13 @@ def register(deps):
                                  "model.diffusion_model.audio_embeddings_connector.")
                 or _file_has_prefix(_conn_staged, "audio_embeddings_connector."))
             if _is_av:
+                engine_models = []   # [leak fix 2026-08-29] weakrefs — the Wan discipline (no model cycle)
                 def _factory():
                     eng, ckey = get_engine(model_dir, create_cfg=(_lora_cfg or None))
-                    bind_pipeline_model(ckey, model)
+                    for _wr_m in engine_models:
+                        _m = _wr_m()
+                        if _m is not None:
+                            bind_pipeline_model(ckey, _m)
                     return eng, ckey
 
                 # DEFERRED create (QFLazyEngine): a chained QuantFuncNativeLoRA rebuilds for its
@@ -1303,6 +1308,7 @@ def register(deps):
                 qfmp.ensure_model_config_attrs(model_config)
                 model = QFLTXAVModel(model_config, engine, device=device,
                                      resident_block_count=resident_block_count)
+                engine_models.append(weakref.ref(model))
                 patcher = QFModelPatcher(model, load_device=device, offload_device=offload)
                 print(f"[qf_native] loaded QuantFuncNativeLoader (LTX-2.5 JOINT-AV svdq) "
                       f"package={model_name} resident_blocks={resident_block_count} "
@@ -1328,9 +1334,13 @@ def register(deps):
             # it currently WORKS here because LTX's TE tiers accept the default — but if an LTX TE arch
             # without a wired 4-bit tier ever routes through this minimal create, it hits the same class.
             # No fix now (adding keys back defeats minimal=True's purpose); this note is the tripwire.
+            engine_models = []   # [leak fix 2026-08-29] weakrefs — the Wan discipline (no model cycle)
             def _factory():
                 eng, ckey = get_engine(model_dir, create_cfg=(_lora_cfg or None))
-                bind_pipeline_model(ckey, model)
+                for _wr_m in engine_models:
+                    _m = _wr_m()
+                    if _m is not None:
+                        bind_pipeline_model(ckey, _m)
                 return eng, ckey
 
             # DEFERRED create (QFLazyEngine): a chained QuantFuncNativeLoRA rebuilds for its
@@ -1383,6 +1393,7 @@ def register(deps):
             model = QFLTXModel(model_config, engine, connector, device=device,
                                audio_connector=audio_connector,
                                resident_block_count=resident_block_count)
+            engine_models.append(weakref.ref(model))
             patcher = QFModelPatcher(model, load_device=device, offload_device=offload)
             print(f"[qf_native] loaded QuantFuncNativeLoader (LTX-2 svdq) package={model_name} "
                   f"resident_blocks={resident_block_count} "

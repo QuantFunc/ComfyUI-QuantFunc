@@ -28,6 +28,7 @@ math, parity+official-value death rules in test_minimax_h3_pack.cpp).
 import os
 import ctypes
 import time
+import weakref
 import json
 import logging
 import math
@@ -97,8 +98,8 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
         self._out_video = None            # reused velocity_out buffer [1,24,T,H,W]
         self._out_audio = None            # reused audio velocity_out buffer [1, K*T, 32]
         self._max_ctx_seq = 0
-        # [easycache-key] symbolic per-conditioning cfg_context_key (mirrors QFWanModel #B3;
-        # was constant 0 = kNoCtxKey — the merged EasyCache session gate force-computes at
+        # [step-cache-key] symbolic per-conditioning cfg_context_key (mirrors QFWanModel #B3;
+        # was constant 0 = kNoCtxKey — the merged the step cache session gate force-computes at
         # key=0, silently disabling EC on this seam). fl2va is single-branch today; the
         # uuid-derived key stays correct if a second cond branch ever appears.
         self._ctx_key_assigner = qfmp._CtxKeyAssigner()
@@ -408,7 +409,7 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
         dev = x_video.device
         B = int(x_video.shape[0])
         cou = transformer_options.get("cond_or_uncond") if isinstance(transformer_options, dict) else None
-        # [easycache-key] comfy's per-conditioning uuids — symbolic-key source (QFWanModel #B3).
+        # [step-cache-key] comfy's per-conditioning uuids — symbolic-key source (QFWanModel #B3).
         cuuids = transformer_options.get("uuids") if isinstance(transformer_options, dict) else None
         if B > 1 and (cou is None or len(cou) != B):
             raise RuntimeError(f"qf_native H3: engine forward is B==1 per cond group but got batch={B} "
@@ -478,8 +479,8 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
             p.context = vi.data_ptr()
             p.context_dims = (ctypes.c_int * 3)(*vi.shape)
             p.context_dtype = _qf_dtype(vi.dtype)
-            # [easycache-key] symbolic key from comfy's per-conditioning uuid (was constant 0;
-            # the EasyCache session gate force-computes at key=0 — see __init__ note).
+            # [step-cache-key] symbolic key from comfy's per-conditioning uuid (was constant 0;
+            # the the step cache session gate force-computes at key=0 — see __init__ note).
             cuid = cuuids[i] if (cuuids is not None and i < len(cuuids)) else None
             p.cfg_context_key = self._ctx_key_assigner.key(cuid)
             # ── audio lane (rides the same video sigma) ──
@@ -561,7 +562,7 @@ def register(deps):
         model_dir = qfmp.stage_denoise_only_package(bundle_dir, transformer1_path, None)
         # [sparse switch] the selector/backend are CREATE keys the engine's transformer
         # factory parses (attention_backend / sparse_selector / sparse_cdf — the shared
-        # makeSvg2Config path); merged here they also enter the pipeline-cache identity
+        # the engine's sparse-config parse); merged here they also enter the pipeline-cache identity
         # via create_cfg, so off↔on never collides with a cached dense handle.
         create_extra = {"denoise_only": True}
         if sparse_opts:
@@ -588,9 +589,17 @@ def register(deps):
                 _lora_cfg["lora"] = list(lora_entries)   # engine svdq load: sidecar apply post-load
             # H3 svdq is PRE-quantized: create is MINIMAL. The svdquant metadata carries the
             # layout/precision; anything on top competes + mis-resolves (LTX minimal note).
+            # [leak fix 2026-08-29] the Wan discipline: the factory must NOT capture `model`
+            # strongly (model -> engine -> _factory -> model was a pure ref-CYCLE — comfy's
+            # "Potential memory leak ... full garbage collect / WARNING memory leak with
+            # QFH3Model" pair, measured on the user's box). Weakref list, resolved at call.
+            engine_models = []
             def _factory():
                 eng, ckey = get_engine(model_dir, create_cfg=(_lora_cfg or None))
-                bind_pipeline_model(ckey, model)
+                for _wr_m in engine_models:
+                    _m = _wr_m()
+                    if _m is not None:
+                        bind_pipeline_model(ckey, _m)
                 return eng, ckey
 
             # DEFERRED create (QFLazyEngine): a chained QuantFuncNativeLoRA rebuilds for its
@@ -608,6 +617,7 @@ def register(deps):
 
             model = QFH3Model(model_config, engine, device=device,
                               resident_block_count=resident_block_count)
+            engine_models.append(weakref.ref(model))
             patcher = QFModelPatcher(model, load_device=device, offload_device=offload)
             print(f"[qf_native] loaded QuantFuncNativeLoader (MiniMax-H3 svdq AV) package={model_name} "
                   f"resident_blocks={resident_block_count} "
