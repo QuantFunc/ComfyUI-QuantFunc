@@ -212,6 +212,30 @@ class _QFStub(torch.nn.Module):
                            "a ComfyUI upgrade may have changed the apply-model dispatch")
 
 
+def make_engine_factory(get_engine_fn, bind_pipeline_model):
+    """[P5, independent-CR 2026-08-30] The ONE deferred-create factory shape every
+    family builder previously hand-copied 4x (Wan / H3 / LTX-AV / LTX-video — that
+    exact drift left 3 of 4 sites unfixed in the leak class): a weakref LIST of
+    this build-chain's models (weakrefs so a superseded chain model can still be
+    GC'd — the Wan discipline, no model<->engine cycle) + a factory that, at real
+    engine create, binds every SURVIVING model to the resolved ckey.
+
+    Returns (factory, register_model): pass `factory` to QFLazyEngine; call
+    `register_model(m)` for every model the build creates (Wan calls it twice)."""
+    import weakref as _weakref
+    engine_models = []
+    def factory():
+        eng, ckey = get_engine_fn()
+        for _wr in engine_models:
+            _m = _wr()
+            if _m is not None:
+                bind_pipeline_model(ckey, _m)
+        return eng, ckey
+    def register_model(m):
+        engine_models.append(_weakref.ref(m))
+    return factory, register_model
+
+
 def save_ref_tempfile(image):
     """Write a loader start_image IMAGE (comfy [B,H,W,C] float 0..1) to a disposable temp PNG the
     engine can load_image()+VAE-encode (Option C — the engine encodes the pixels itself). Frame 0

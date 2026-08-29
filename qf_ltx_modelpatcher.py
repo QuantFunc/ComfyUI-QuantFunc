@@ -6,7 +6,7 @@ wan seam uses — reused from qf_engine.py).
 WHY this is DIFFERENT from the wan seam (design findings, dossier seq-229..234):
 - cfg_context_key: seq-229 established the LTX-2 lighting transformer engages NONE of the
   key-trusting step caches (ctx_cache_/cross_kv_cache_/the engine's block-cache state slot ) — historically every step passed
-  cfg_context_key=0 (kNoCtxKey). SINCE the the step cache session gate (merge 516a6d78) the key IS
+  cfg_context_key=0 (kNoCtxKey). SINCE the step-cache session gate (merge 516a6d78) the key IS
   consumed (one EcEntry per cond branch; key=0 force-computes), so BOTH step loops (t2v + AV) now
   derive uuid-symbolic keys via the shared _CtxKeyAssigner (wan #B3 pattern) — see [step-cache-key]
   comments at the loops.
@@ -807,7 +807,7 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
             p.context_dims = (ctypes.c_int * 3)(*vi.shape)
             p.context_dtype = _qf_dtype(vi.dtype)
             # [step-cache-key] symbolic key from comfy's per-conditioning uuid (was constant 0 =
-            # kNoCtxKey when LTX engaged no key-trusting cache, dossier seq-229; the the step cache
+            # kNoCtxKey when LTX engaged no key-trusting cache, dossier seq-229; the step-cache
             # session gate now keys one EcEntry per cond branch and force-computes at key=0).
             cuid = cuuids[i] if (cuuids is not None and i < len(cuuids)) else None
             p.cfg_context_key = self._ctx_key_assigner.key(cuid)
@@ -1286,14 +1286,9 @@ def register(deps):
                                  "model.diffusion_model.audio_embeddings_connector.")
                 or _file_has_prefix(_conn_staged, "audio_embeddings_connector."))
             if _is_av:
-                engine_models = []   # [leak fix 2026-08-29] weakrefs — the Wan discipline (no model cycle)
-                def _factory():
-                    eng, ckey = get_engine(model_dir, create_cfg=(_lora_cfg or None))
-                    for _wr_m in engine_models:
-                        _m = _wr_m()
-                        if _m is not None:
-                            bind_pipeline_model(ckey, _m)
-                    return eng, ckey
+                _factory, _register_model = qfmp.make_engine_factory(
+                    lambda: get_engine(model_dir, create_cfg=(_lora_cfg or None)),
+                    bind_pipeline_model)
 
                 # DEFERRED create (QFLazyEngine): a chained QuantFuncNativeLoRA rebuilds for its
                 # accumulated LoRA set, so an eager create here would build ONE PIPELINE PER
@@ -1308,7 +1303,7 @@ def register(deps):
                 qfmp.ensure_model_config_attrs(model_config)
                 model = QFLTXAVModel(model_config, engine, device=device,
                                      resident_block_count=resident_block_count)
-                engine_models.append(weakref.ref(model))
+                _register_model(model)
                 patcher = QFModelPatcher(model, load_device=device, offload_device=offload)
                 print(f"[qf_native] loaded QuantFuncNativeLoader (LTX-2.5 JOINT-AV svdq) "
                       f"package={model_name} resident_blocks={resident_block_count} "
@@ -1334,14 +1329,9 @@ def register(deps):
             # it currently WORKS here because LTX's TE tiers accept the default — but if an LTX TE arch
             # without a wired 4-bit tier ever routes through this minimal create, it hits the same class.
             # No fix now (adding keys back defeats minimal=True's purpose); this note is the tripwire.
-            engine_models = []   # [leak fix 2026-08-29] weakrefs — the Wan discipline (no model cycle)
-            def _factory():
-                eng, ckey = get_engine(model_dir, create_cfg=(_lora_cfg or None))
-                for _wr_m in engine_models:
-                    _m = _wr_m()
-                    if _m is not None:
-                        bind_pipeline_model(ckey, _m)
-                return eng, ckey
+            _factory, _register_model = qfmp.make_engine_factory(
+                lambda: get_engine(model_dir, create_cfg=(_lora_cfg or None)),
+                bind_pipeline_model)
 
             # DEFERRED create (QFLazyEngine): a chained QuantFuncNativeLoRA rebuilds for its
             # accumulated LoRA set, so an eager create here would build ONE PIPELINE PER
@@ -1393,7 +1383,7 @@ def register(deps):
             model = QFLTXModel(model_config, engine, connector, device=device,
                                audio_connector=audio_connector,
                                resident_block_count=resident_block_count)
-            engine_models.append(weakref.ref(model))
+            _register_model(model)
             patcher = QFModelPatcher(model, load_device=device, offload_device=offload)
             print(f"[qf_native] loaded QuantFuncNativeLoader (LTX-2 svdq) package={model_name} "
                   f"resident_blocks={resident_block_count} "

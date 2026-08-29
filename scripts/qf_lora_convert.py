@@ -56,9 +56,16 @@ _ROOT_PREFIXES = ("diffusion_model.", "transformer.", "lora_unet.", "unet.",
                   "base_model.model.", "model.")
 
 
+_MAX_HEADER_BYTES = 512 * 1024 * 1024  # same plausibility cap as the plugin's node sniff
+
+
 def _read_st(path):
     with open(path, "rb") as f:
         n = struct.unpack("<Q", f.read(8))[0]
+        if n > _MAX_HEADER_BYTES:
+            raise SystemExit(
+                "qf_lora_convert: implausible safetensors header size %d in '%s' — "
+                "corrupt or not a safetensors file" % (n, path))
         hdr = json.loads(f.read(n))
         blob = f.read()
     return hdr, blob
@@ -124,6 +131,10 @@ def build_model_inverse(model_path):
     # header-only read (no blob copy) — a checkpoint can be many GB
     with open(model_path, "rb") as f:
         n = struct.unpack("<Q", f.read(8))[0]
+        if n > _MAX_HEADER_BYTES:
+            raise SystemExit(
+                "qf_lora_convert: implausible safetensors header size %d in '%s'"
+                % (n, model_path))
         keys = [k for k in json.loads(f.read(n)) if k != "__metadata__"]
     mods = set()
     for k in keys:
@@ -242,6 +253,12 @@ def convert_file(in_path, out_path, verbose=True, model_path=None):
         raise SystemExit(
             "qf_lora_convert: could not detect the LoRA format (no kohya "
             "lora_unet_* / diffusers .lora_A/.lora_down keys found).")
+    if fmt == "kohya" and model_inv is None:
+        print("[qf_lora_convert] WARNING: converting kohya keys WITHOUT --model — the "
+              "underscore->dot reconstruction falls back to a built-in vocabulary that is "
+              "corpus-fitted and may miss a family's novel module names. STRONGLY "
+              "recommended: pass --model <target-checkpoint.safetensors> for an exact, "
+              "vocabulary-free inverse.", flush=True)
     out_tensors = []
     dropped = 0
     seen = {}

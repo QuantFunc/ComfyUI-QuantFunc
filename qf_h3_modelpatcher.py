@@ -480,7 +480,7 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
             p.context_dims = (ctypes.c_int * 3)(*vi.shape)
             p.context_dtype = _qf_dtype(vi.dtype)
             # [step-cache-key] symbolic key from comfy's per-conditioning uuid (was constant 0;
-            # the the step cache session gate force-computes at key=0 — see __init__ note).
+            # the step-cache session gate force-computes at key=0 — see __init__ note).
             cuid = cuuids[i] if (cuuids is not None and i < len(cuuids)) else None
             p.cfg_context_key = self._ctx_key_assigner.key(cuid)
             # ── audio lane (rides the same video sigma) ──
@@ -593,14 +593,9 @@ def register(deps):
             # strongly (model -> engine -> _factory -> model was a pure ref-CYCLE — comfy's
             # "Potential memory leak ... full garbage collect / WARNING memory leak with
             # QFH3Model" pair, measured on the user's box). Weakref list, resolved at call.
-            engine_models = []
-            def _factory():
-                eng, ckey = get_engine(model_dir, create_cfg=(_lora_cfg or None))
-                for _wr_m in engine_models:
-                    _m = _wr_m()
-                    if _m is not None:
-                        bind_pipeline_model(ckey, _m)
-                return eng, ckey
+            _factory, _register_model = qfmp.make_engine_factory(
+                lambda: get_engine(model_dir, create_cfg=(_lora_cfg or None)),
+                bind_pipeline_model)
 
             # DEFERRED create (QFLazyEngine): a chained QuantFuncNativeLoRA rebuilds for its
             # accumulated LoRA set, so an eager create here would build ONE PIPELINE PER
@@ -617,7 +612,7 @@ def register(deps):
 
             model = QFH3Model(model_config, engine, device=device,
                               resident_block_count=resident_block_count)
-            engine_models.append(weakref.ref(model))
+            _register_model(model)
             patcher = QFModelPatcher(model, load_device=device, offload_device=offload)
             print(f"[qf_native] loaded QuantFuncNativeLoader (MiniMax-H3 svdq AV) package={model_name} "
                   f"resident_blocks={resident_block_count} "

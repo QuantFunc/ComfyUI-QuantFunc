@@ -43,7 +43,7 @@ python3 qf_lora_convert.py --self-test /path/to/some_diffusers_lora.safetensors
 | 情况 | 行为 |
 |---|---|
 | 已是 diffusers/PEFT 形 | 归一(`lora_down/up` → `lora_A/B`)后原样输出 |
-| kohya / ai-toolkit(`lora_unet_*` 下划线键) | 键名重建为点分模块路径;`--model` 时用目标 checkpoint 的真实模块表做精确逆映射,否则用内置词表 |
+| kohya / ai-toolkit(`lora_unet_*` 下划线键) | 键名重建为点分模块路径;`--model` 时用目标 checkpoint 的真实模块表做精确逆映射;**不带 `--model` 时退化为内置词表(按真实语料拟合、新家族可能漏词,工具会打警告)——强烈建议总是带 `--model`** |
 | 文本编码器 LoRA(`lora_te*`) | 丢弃(原生 loader 只驱动 transformer) |
 | LyCORIS(LoHa/LoKr) | **响亮拒绝**——它是因子分解不是 (A,B) 低秩对,改名转不动;请先合并/重导出为标准 LoRA |
 | 两个源键映射到同一目标键 | 拒绝(绝不猜) |

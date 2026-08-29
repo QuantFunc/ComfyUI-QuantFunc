@@ -586,6 +586,11 @@ def register(deps):
                 # sweep keeps the handle while ANY survives (the registry holds a weakref LIST
                 # per ckey; the retire chokepoint refuses while any sibling lives). engine_models holds
                 # weakrefs so superseded chain models can still be GC'd.
+                # [P5 note] the SIMPLE single-model shape of this pattern is factored into
+                # qfmp.make_engine_factory (h3/krea2/ltx-av/ltx-video use it); wan keeps its
+                # own variant DELIBERATELY — dual-model registration, per-call union cfg, and
+                # the rebuild-site prune+bind-now below don't fit the shared shape without
+                # param soup. If you change the bind semantics, change BOTH.
                 for _wr_m in engine_models:
                     _m = _wr_m()
                     if _m is not None:

@@ -240,14 +240,9 @@ def register(deps):
             _lora_cfg = dict(create_extra or {})
             if lora_entries:
                 _lora_cfg["lora"] = list(lora_entries)   # engine svdq load: sidecar apply post-load
-            engine_models = []                            # weakrefs — the Wan discipline (no model cycle)
-            def _factory():
-                eng, ckey = get_engine(model_dir, create_cfg=(_lora_cfg or None))
-                for _wr_m in engine_models:
-                    _m = _wr_m()
-                    if _m is not None:
-                        bind_pipeline_model(ckey, _m)
-                return eng, ckey
+            _factory, _register_model = qfmp.make_engine_factory(
+                lambda: get_engine(model_dir, create_cfg=(_lora_cfg or None)),
+                bind_pipeline_model)
             engine = qfmp.QFLazyEngine(_factory, estimate_footprint(model_dir),
                                        retire=retire_handle)
             device = comfy.model_management.get_torch_device()
@@ -257,7 +252,7 @@ def register(deps):
             qfmp.ensure_model_config_attrs(model_config)
             model = QFKrea2Model(model_config, engine, device=device,
                                  resident_block_count=resident_block_count)
-            engine_models.append(weakref.ref(model))
+            _register_model(model)
             patcher = QFModelPatcher(model, load_device=device, offload_device=offload)
             print(f"[qf_native] loaded QuantFuncNativeLoader (Krea-2 t2i svdq) package={model_name} "
                   f"resident_blocks={resident_block_count} "

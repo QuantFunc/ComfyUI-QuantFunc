@@ -481,8 +481,7 @@ if _IMPORT_OK:
 
 
     def _run_family_load(expect_family, transformer1, model_config,
-                         resident_block_count, transformer2, sparse_opts=None,
-                         step_cache=0.0, block_cache=0.0, sparse_dial=1.0):
+                         resident_block_count, transformer2, sparse_opts=None):
         """The SHARED loader core behind the per-family nodes (user 2026-08-21 pivot). All
         validation is preserved verbatim from the original single-node load(); the per-family
         nodes add only (a) a family-filtered preset dropdown and (b) this family guard —
@@ -558,19 +557,13 @@ if _IMPORT_OK:
         out = builder(transformer1_path=xfm1, transformer2_path=xfm2,
                       resident_block_count=int(resident_block_count),
                       bundle_dir=bundle_dir, **_kw)
-        t = float(step_cache or 0.0)
-        tf = float(block_cache or 0.0)
-        sp = float(sparse_dial if sparse_dial is not None else 1.0)
-        for mp in (out if isinstance(out, (tuple, list)) else (out,)):
-            m = getattr(mp, "model", None)
-            if m is None:
-                continue
-            if hasattr(m, "set_step_cache"):
-                m.set_step_cache(t)
-            if hasattr(m, "set_block_cache"):
-                m.set_block_cache(tf)
-            if hasattr(m, "set_sparse"):
-                m.set_sparse(sp)
+        # [cache/sparse surface REMOVED, user 2026-08-29 「移除所有loader的cache以及
+        # 稀疏入口 整体默认不生效」] The per-model set_step_cache/set_block_cache/
+        # set_sparse arming that lived here is GONE with the loader widgets — the
+        # mixin defaults (0.0/0.0/1.0) already omit every begin key, so the engine
+        # paths are byte-identical without any call. Re-enabling is a plugin-side
+        # revert of THIS commit (widgets + this arming loop); the engine session
+        # dials are untouched and stay available.
         return out
 
     _RESIDENT_BLOCKS_INPUT = ("INT", {"default": 999, "min": 1, "max": 1024,
@@ -585,17 +578,6 @@ if _IMPORT_OK:
         "(refused loud). (2) Interrupt stops BETWEEN denoise steps. (3) On Linux a fail-closed "
         "CUDA-toolchain check refuses a torch/.so CUDA-major mismatch; on Windows/macOS set "
         "QF_NATIVE_ALLOW_UNVERIFIED_TOOLCHAIN=1 after confirming they share a CUDA major.")
-
-    def _sparse_dial(sparse, sparse_cdf=None):
-        """ONE-number sparse dial (user 2026-08-25 one-dial contract; #659 made it a
-        SESSION knob — it NEVER enters create, so changing it never rebuilds the
-        pipeline). 1.0 = dense (the begin key is omitted → byte-identical engine
-        path). <1.0 = keep that fraction of attention mass; the engine picks and
-        floors the internals (short sequences stay dense). Back-compat: the legacy
-        H3 string form ("off" | a name) maps to a number and never crashes."""
-        if isinstance(sparse, str):
-            sparse = 1.0 if sparse == "off" else float(sparse_cdf if sparse_cdf is not None else 0.98)
-        return float(sparse)
 
     # [attention backend selector, user 2026-08-27] one user-facing dropdown per loader.
     # SM-GATED: SM80+ offers the full set; SM75 (Turing) has NO int8-QK sage and NO
