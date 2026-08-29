@@ -25,15 +25,32 @@ import json, struct, sys, argparse, os
 # flattening need listing. Single-token names (blocks, attn, ff, norm, proj,
 # gate, up, down, …) naturally become correct dotted segments and need nothing.
 _PROTECTED = sorted({
+    # block groups
     "single_transformer_blocks", "transformer_blocks", "layerwise_blocks",
-    "refiner_blocks", "token_refiner", "text_fusion", "feed_forward",
-    "self_attn", "cross_attn", "add_q_proj", "add_k_proj", "add_v_proj",
-    "to_add_out", "time_mod_proj", "time_embed", "final_layer", "norm_out",
-    "proj_out", "proj_in", "img_mlp", "txt_mlp", "img_mod", "txt_mod",
-    "img_in", "txt_in", "to_out", "to_gate", "to_q", "to_k", "to_v",
-    "add_q", "add_k", "add_v", "linear_1", "linear_2", "norm_q", "norm_k",
-    "norm1", "norm2", "ff_net",
-}, key=len, reverse=True)  # longest-first so add_q_proj beats add_q
+    "refiner_blocks", "token_refiner", "text_fusion",
+    # attention modules (incl. the LTX-2 AV towers — from REAL LoRA corpora)
+    "self_attn", "cross_attn", "audio_attn1", "audio_attn2",
+    "audio_to_video_attn", "video_to_audio_attn", "audio_ff",
+    "to_gate_logits", "to_gate", "to_out", "to_q", "to_k", "to_v",
+    "add_q_proj", "add_k_proj", "add_v_proj", "to_add_out",
+    "add_q", "add_k", "add_v",
+    # ffn / embeds / singles
+    "feed_forward", "time_mod_proj", "time_embed", "final_layer",
+    "audio_patch_proj", "audio_proj_in", "audio_time_embed",
+    "norm_out", "proj_out", "proj_in", "img_mlp", "txt_mlp", "img_mod",
+    "txt_mod", "img_in", "txt_in", "linear_1", "linear_2",
+    "norm_q", "norm_k", "norm1", "norm2",
+    # LTX-2 model-level compounds (REAL 22b LoRA corpus)
+    "av_ca_a2v_gate_adaln_single", "av_ca_v2a_gate_adaln_single",
+    "av_ca_audio_scale_shift_adaln_single", "av_ca_video_scale_shift_adaln_single",
+    "audio_prompt_adaln_single", "audio_adaln_single", "prompt_adaln_single",
+    "adaln_single", "timestep_embedder", "audio_patchify_proj", "patchify_proj",
+    "audio_proj_out", "caption_projection",
+    # NOTE: "ff_net" was WRONG here (the diffusers name is ff.net — ff and net
+    # are separate segments that split naturally; protecting the pair kept the
+    # underscore and produced a nonexistent module). Removed after the REAL
+    # LTX-2.5 corpus round-trip caught it.
+}, key=len, reverse=True)  # longest-first so to_gate_logits beats to_gate
 
 _ROOT_PREFIXES = ("diffusion_model.", "transformer.", "lora_unet.", "unet.",
                   "base_model.model.", "model.")
@@ -98,6 +115,34 @@ def kohya_join(underscored):
     return s
 
 
+def build_model_inverse(model_path):
+    """Derive the EXACT underscore->dotted inverse map from a target checkpoint:
+    every tensor key minus its leaf names a real module path; flatten each with
+    '_' and map back. This makes kohya reconstruction unambiguous for ANY family
+    with zero vocabulary — the checkpoint IS the dictionary. Colliding flats are
+    refused (never guessed)."""
+    # header-only read (no blob copy) — a checkpoint can be many GB
+    with open(model_path, "rb") as f:
+        n = struct.unpack("<Q", f.read(8))[0]
+        keys = [k for k in json.loads(f.read(n)) if k != "__metadata__"]
+    mods = set()
+    for k in keys:
+        if "." not in k:
+            continue
+        mods.add(k.rsplit(".", 1)[0])          # module = key minus tensor leaf
+    # also add parent chains (to_out registered as to_out.0 -> its parent to_out)
+    inv = {}
+    clash = set()
+    for m in mods:
+        flat = m.replace(".", "_")
+        if flat in inv and inv[flat] != m:
+            clash.add(flat)
+        inv[flat] = m
+    for c in clash:
+        del inv[c]                              # ambiguous — fall to vocab join
+    return inv
+
+
 def strip_root(path):
     changed = True
     while changed:
@@ -148,8 +193,11 @@ def _split_role(key):
     return None, None
 
 
-def convert_key(orig, src_fmt):
-    """orig external key -> canonical diffusers key, or None to DROP."""
+def convert_key(orig, src_fmt, model_inv=None):
+    """orig external key -> canonical diffusers key, or None to DROP.
+    model_inv: exact flat->dotted map derived from the target checkpoint
+    (--model); consulted BEFORE the vocabulary join — unambiguous for any
+    family. Vocab join is the model-less fallback."""
     if orig == "__metadata__":
         return None
     if src_fmt == "kohya":
@@ -162,7 +210,7 @@ def convert_key(orig, src_fmt):
             if body.startswith(pre):
                 body = body[len(pre):]
                 break
-        dotted = kohya_join(body)
+        dotted = (model_inv or {}).get(body) or kohya_join(body)
     else:  # diffusers / peft
         if orig.startswith(("lora_te_", "lora_te1_", "lora_te2_")):
             return None
@@ -178,7 +226,8 @@ def convert_key(orig, src_fmt):
     return dotted + "." + leaf + ".weight"
 
 
-def convert_file(in_path, out_path, verbose=True):
+def convert_file(in_path, out_path, verbose=True, model_path=None):
+    model_inv = build_model_inverse(model_path) if model_path else None
     hdr, blob = _read_st(in_path)
     meta = hdr.get("__metadata__", {})
     keys = [k for k in hdr if k != "__metadata__"]
@@ -197,7 +246,7 @@ def convert_file(in_path, out_path, verbose=True):
     dropped = 0
     seen = {}
     for k in keys:
-        nk = convert_key(k, fmt)
+        nk = convert_key(k, fmt, model_inv)
         if nk is None:
             dropped += 1
             continue
@@ -285,13 +334,14 @@ def main():
     ap = argparse.ArgumentParser(description="Convert a LoRA to QuantFunc diffusers/PEFT canonical form.")
     ap.add_argument("--in", dest="inp", help="input LoRA .safetensors")
     ap.add_argument("--out", dest="out", help="output .safetensors (diffusers canonical)")
+    ap.add_argument("--model", dest="model", help="target checkpoint .safetensors — derives the EXACT module-name inverse (any family, zero vocabulary)")
     ap.add_argument("--self-test", dest="selftest", help="round-trip a diffusers LoRA through a synthesized kohya twin")
     a = ap.parse_args()
     if a.selftest:
         sys.exit(0 if self_test(a.selftest) else 1)
     if not a.inp or not a.out:
         ap.error("need --in and --out (or --self-test)")
-    convert_file(a.inp, a.out)
+    convert_file(a.inp, a.out, model_path=a.model)
 
 
 if __name__ == "__main__":
