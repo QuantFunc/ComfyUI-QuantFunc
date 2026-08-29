@@ -451,7 +451,7 @@ if _IMPORT_OK:
     # detection rule) and exposes exactly three names: FAMILY / matches() / register(deps).
     # Adding a family = write qf_<name>_modelpatcher.py + add it to _FAMILY_MODULES. No edit to the
     # node, the dispatch or the detection lives here, so families cannot bleed into each other.
-    _FAMILY_MODULES = ("qf_wan_modelpatcher", "qf_ltx_modelpatcher", "qf_h3_modelpatcher")
+    _FAMILY_MODULES = ("qf_wan_modelpatcher", "qf_ltx_modelpatcher", "qf_h3_modelpatcher", "qf_krea2_modelpatcher")
     _FAMILY_BUILDERS = {}     # family key -> build(...)
     _FAMILY_MATCHERS = []     # (family key, matches) in registration order. The FILE-based
     #    loader takes model_type EXPLICITLY (a bare .safetensors has no model_index to
@@ -750,6 +750,35 @@ if _IMPORT_OK:
                 _mm.set_attn_backend(_attn_backend_to_engine(attention_backend))
             return (_p,)
 
+    class QuantFuncKrea2Loader:
+        """Krea-2 Turbo loader (svdq, denoise_only, t2i) — the first IMAGE family on the
+        native seam: one MODEL a stock KSampler drives with latents; CLIP (type krea2) +
+        VAE + sampler stay comfy-owned (drop-in for the official UNETLoader slot)."""
+
+        @classmethod
+        def INPUT_TYPES(cls):
+            return {"required": {
+                "transformer": (_transformer_choices(),
+                                {"tooltip": "The Krea-2 Turbo transformer .safetensors under "
+                                            "models/diffusion_models (the QuantFunc int4 "
+                                            "export)."}),
+                "model_config": (_model_config_choices(family="krea2"),
+                                 {"tooltip": "The OFFICIAL Krea-2 model config preset. "
+                                             + _preset_file_expectations()}),
+                "resident_block_count": _RESIDENT_BLOCKS_INPUT,
+            }}
+
+        RETURN_TYPES = ("MODEL",)
+        FUNCTION = "load"
+        CATEGORY = "loaders"
+        DESCRIPTION = ("QuantFunc Krea-2 Turbo loader (svdq, denoise_only): one native t2i "
+                       "MODEL a stock sampler drives with latents. " + _COMMON_LIMITS)
+
+        def load(self, transformer, model_config, resident_block_count=999):
+            return (_run_family_load("krea2", transformer, model_config,
+                                     resident_block_count, None, sparse_opts=None),)
+
+
     class QuantFuncH3Loader:
         """MiniMax-H3 loader — single MODEL output (single-expert AV family)."""
 
@@ -839,11 +868,13 @@ if _IMPORT_OK:
     NODE_CLASS_MAPPINGS.update({"QuantFuncWanLoader": QuantFuncWanLoader,
                                 "QuantFuncLTXLoader": QuantFuncLTXLoader,
                                 "QuantFuncH3Loader": QuantFuncH3Loader,
+                                "QuantFuncKrea2Loader": QuantFuncKrea2Loader,
                                 "QuantFuncNativeLoRA": QuantFuncNativeLoRA})
     NODE_DISPLAY_NAME_MAPPINGS.update({
         "QuantFuncWanLoader": "QuantFunc Wan Loader (high+low)",
         "QuantFuncLTXLoader": "QuantFunc LTX-2 Loader",
-        "QuantFuncH3Loader": "QuantFunc MiniMax-H3 Loader"})
+        "QuantFuncH3Loader": "QuantFunc MiniMax-H3 Loader",
+        "QuantFuncKrea2Loader": "QuantFunc Krea-2 Loader"})
 
     # AUTOMATION — a mechanism must not depend on someone remembering to run it (CR): run the reject-list
     # completeness scan AT IMPORT so a comfy upgrade that adds a consumable conditioning key emits a loud

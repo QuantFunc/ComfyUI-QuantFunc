@@ -1,0 +1,25 @@
+{
+ "_class_name": "Krea2Pipeline",
+ "image_model": "krea2",
+ "is_distilled": true,
+ "transformer": [
+  "diffusers",
+  "Krea2Transformer2DModel"
+ ],
+ "text_encoder": [
+  "transformers",
+  "Qwen3VLForConditionalGeneration"
+ ],
+ "vae": [
+  "diffusers",
+  "AutoencoderKLQwenImage"
+ ],
+ "scheduler": [
+  "diffusers",
+  "FlowMatchEulerDiscreteScheduler"
+ ],
+ "tokenizer": [
+  "transformers",
+  "Qwen2TokenizerFast"
+ ]
+}
