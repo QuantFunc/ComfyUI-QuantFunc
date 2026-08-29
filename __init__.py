@@ -767,6 +767,13 @@ if _IMPORT_OK:
                                              + _preset_file_expectations()}),
             }, "optional": {
                 "attention_backend": _attn_backend_input(),
+                "resident_block_count": ("INT", {
+                    "default": 0, "min": 0, "max": 999,
+                    "tooltip": "0 = auto (engine-managed residency, the default). "
+                               ">0 = MANUAL: pin the first N transformer blocks "
+                               "GPU-resident (999 = as many as fit; never-OOM "
+                               "guarded). SESSION knob — applied at the next "
+                               "sampling run, no model rebuild."}),
             }}
 
         RETURN_TYPES = ("MODEL",)
@@ -775,16 +782,20 @@ if _IMPORT_OK:
         DESCRIPTION = ("QuantFunc Krea-2 Turbo loader (svdq, denoise_only): one native t2i "
                        "MODEL a stock sampler drives with latents. " + _COMMON_LIMITS)
 
-        def load(self, transformer, model_config, attention_backend="auto"):
-            # [runtime dial] the backend is a SESSION knob (engine applyAttnBackendDial on
-            # Krea2TransformerLighting — per-forward cfg read): NOT a create key, so a
-            # widget change never re-keys the loader = no rebuild. No resident_block_count
-            # widget: IMAGE sessions do not consume manual residency.
+        def load(self, transformer, model_config, attention_backend="auto",
+                 resident_block_count=0):
+            # [runtime dials] backend + residency are SESSION knobs (engine
+            # applyAttnBackendDial / applyManualResidencyImageSessions): NOT create
+            # keys, so a widget change never re-keys the loader = no rebuild.
+            # resident_block_count 0 = auto (key omitted from begin — engine
+            # warmup/auto residency, byte-unchanged legacy); >0 = manual pin.
             _p = _run_family_load("krea2", transformer, model_config,
                                   999, None, sparse_opts=None)
             _mm = getattr(_p, "model", None)
             if _mm is not None and hasattr(_mm, "set_attn_backend"):
                 _mm.set_attn_backend(_attn_backend_to_engine(attention_backend))
+            if _mm is not None and hasattr(_mm, "set_resident_block_count"):
+                _mm.set_resident_block_count(int(resident_block_count))
             return (_p,)
 
 

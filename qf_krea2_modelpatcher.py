@@ -91,13 +91,19 @@ class QFKrea2Model(QFSessionModelMixin, comfy.model_base.Krea2):
             int(ctx_group.shape[0]), _max_seq, int(ctx_group.shape[2]))
         self._max_ctx_seq = 0
         bpx.cond_dtype = _qf_dtype(ctx_group.dtype)
-        # IMAGE session: the video-flavored residency_opts keys are engine-REFUSED here
-        # (E3, correctly). Send ONLY the runtime attn-backend dial (engine
-        # applyAttnBackendDial via the generic begin channel; omitted at auto).
+        # IMAGE session: the video-flavored residency_opts CACHE/SPARSE keys are
+        # engine-REFUSED here (E3, correctly) — send only the knobs the image seam
+        # consumes: the runtime attn-backend dial (applyAttnBackendDial) and, when
+        # the widget sets it >0, manual residency (engine
+        # applyManualResidencyImageSessions; 0/absent = engine auto residency,
+        # byte-unchanged legacy).
         _o = {}
         ab = str(getattr(self, "_attn_backend", "auto") or "auto")
         if ab != "auto":
             _o["attention_backend"] = ab
+        _rb = int(getattr(self, "_resident_block_count", 0) or 0)
+        if _rb > 0:
+            _o["resident_block_count"] = _rb
         bpx._opts = json.dumps(_o).encode()
         bpx.options_json = bpx._opts
         session = ctypes.c_void_p()
