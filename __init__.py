@@ -401,9 +401,9 @@ def _get_engine(model_dir, create_cfg=None, device_idx=0):
     # [manual-residency] the session-knob-≠-create-key guard is sealed INSIDE
     # qf_engine.create_pipeline (the real quantfunc_create boundary — construction-enforced,
     # unbypassable by a future direct caller), not duplicated here (one truth source).
-    # [EXPERIMENT-ONLY 2026-08-23, svg2/backend A/B — remove after measurement; shipped
+    # [EXPERIMENT-ONLY 2026-08-23, internal A/B — remove after measurement; shipped
     # form will be loader-node widgets, per the no-env-production-switch rule]:
-    # QF_NATIVE_CREATE_EXTRA merges extra create keys (sparse_selector/sparse_cdf/
+    # QF_NATIVE_CREATE_EXTRA merges extra create keys (internal dials /
     # attention_backend...) BEFORE the cache key is computed, so每个 extra 配置有独立
     # pipeline cache 身份 (never collides with the default config's handle).
     _extra = os.environ.get("QF_NATIVE_CREATE_EXTRA")
@@ -482,7 +482,7 @@ if _IMPORT_OK:
 
     def _run_family_load(expect_family, transformer1, model_config,
                          resident_block_count, transformer2, sparse_opts=None,
-                         easycache_thresh=0.0, fbcache_thresh=0.0):
+                         step_cache=0.0, block_cache=0.0, sparse_dial=1.0):
         """The SHARED loader core behind the per-family nodes (user 2026-08-21 pivot). All
         validation is preserved verbatim from the original single-node load(); the per-family
         nodes add only (a) a family-filtered preset dropdown and (b) this family guard —
@@ -541,30 +541,36 @@ if _IMPORT_OK:
         # fallback layer (te/audio_vae/connectors conventional-filename resolution) served
         # only the transitional split exports; an incomplete single-file export is refused
         # loud by the family builder instead of being silently completed.
-        # [sparse switch, user 2026-08-24 "稀疏你要做开关"] pass ONLY when engaged so families
-        # whose builders don't accept it yet fail loud on an attempted toggle instead of
-        # silently ignoring the switch (v1 wires minimax-h3; wan/ltx follow the same kwarg).
+        # [#659] ALL runtime dials — the two cache thresholds AND the sparse dial —
+        # are SESSION knobs (same class as resident_block_count): armed
+        # POST-construction on the returned patcher(s)' model via the mixin
+        # setters, injected into every denoise_begin by residency_opts().
+        # Deliberately NOT builder/create kwargs → they can never enter
+        # create_cfg/ckey (NO pipeline rebuild on any widget change — user
+        # 2026-08-28 "调整sparse要重建pipeline完全没必要" + "调整block/step cache
+        # 能复用pipeline"). OFF values (0.0 / 1.0) omit the begin keys entirely →
+        # the engine paths are byte-identical.
         _kw = {}
         if sparse_opts:
+            # create-LEVEL keys only (attention backend / quant toggles). The
+            # sparse dial itself is a SESSION knob (below) and never rides here.
             _kw["sparse_opts"] = sparse_opts
         out = builder(transformer1_path=xfm1, transformer2_path=xfm2,
                       resident_block_count=int(resident_block_count),
                       bundle_dir=bundle_dir, **_kw)
-        # [easycache, user 2026-08-24] runtime step-cache threshold — SESSION-knob class
-        # (same as resident_block_count): armed POST-construction on the returned
-        # patcher(s)' model via QFSessionModelMixin.set_easycache_thresh, injected into
-        # every denoise_begin by residency_opts(). Deliberately NOT a builder/create
-        # kwarg → can never enter create_cfg/ckey (no rebuild on widget change; the
-        # _refuse_session_knobs_in_create class of guarantee, by construction). 0.0 =
-        # OFF → the begin keys are omitted → engine step path byte-identical.
-        t = float(easycache_thresh or 0.0)
-        tf = float(fbcache_thresh or 0.0)
+        t = float(step_cache or 0.0)
+        tf = float(block_cache or 0.0)
+        sp = float(sparse_dial if sparse_dial is not None else 1.0)
         for mp in (out if isinstance(out, (tuple, list)) else (out,)):
             m = getattr(mp, "model", None)
-            if m is not None and hasattr(m, "set_easycache_thresh"):
-                m.set_easycache_thresh(t)
-            if m is not None and hasattr(m, "set_fbcache_thresh"):
-                m.set_fbcache_thresh(tf)
+            if m is None:
+                continue
+            if hasattr(m, "set_step_cache"):
+                m.set_step_cache(t)
+            if hasattr(m, "set_block_cache"):
+                m.set_block_cache(tf)
+            if hasattr(m, "set_sparse"):
+                m.set_sparse(sp)
         return out
 
     _RESIDENT_BLOCKS_INPUT = ("INT", {"default": 999, "min": 1, "max": 1024,
@@ -580,33 +586,16 @@ if _IMPORT_OK:
         "CUDA-toolchain check refuses a torch/.so CUDA-major mismatch; on Windows/macOS set "
         "QF_NATIVE_ALLOW_UNVERIFIED_TOOLCHAIN=1 after confirming they share a CUDA major.")
 
-    def _sparse_create_opts(sparse, sparse_cdf=None, algo="svg2"):
-        """ONE-number sparse contract (user 2026-08-25): 1.0 → None (dense create,
-        byte-identical to no-widget). <1.0 → the SVG2 SEMANTIC selector (k-means
-        clustered top-p, parity-proven vs official Sparse-VideoGen f89aeda; user
-        2026-08-25 switched the knob from meansim to svg2) keeping that fraction of
-        attention mass on the flash block-sparse executor. Engine floors
-        (svg2_min_tokens / min_kc_ratio) keep short sequences dense. Back-compat:
-        the legacy H3 string form ("off"/"meansim") + separate sparse_cdf maps in,
-        never crashes (an explicit legacy "meansim" ALSO lands on svg2 — the knob is
-        one user-facing dial, not a selector picker)."""
+    def _sparse_dial(sparse, sparse_cdf=None):
+        """ONE-number sparse dial (user 2026-08-25 one-dial contract; #659 made it a
+        SESSION knob — it NEVER enters create, so changing it never rebuilds the
+        pipeline). 1.0 = dense (the begin key is omitted → byte-identical engine
+        path). <1.0 = keep that fraction of attention mass; the engine picks and
+        floors the internals (short sequences stay dense). Back-compat: the legacy
+        H3 string form ("off" | a name) maps to a number and never crashes."""
         if isinstance(sparse, str):
-            # legacy H3 string form: "off" | a selector name. A legacy explicit
-            # "meansim" now HONORS meansim (it used to silently land on svg2 —
-            # wrong once the selector became user-choosable).
-            if sparse == "meansim":
-                algo = "meansim"
             sparse = 1.0 if sparse == "off" else float(sparse_cdf if sparse_cdf is not None else 0.98)
-        sparse = float(sparse)
-        if sparse >= 1.0:
-            return None
-        if algo not in ("svg2", "meansim"):
-            # fail-loud: the engine's parseSelector would throw anyway; say it here
-            # with the valid choices instead of deep in create_pipeline.
-            raise ValueError(f"sparse_algo must be 'svg2' or 'meansim', got {algo!r}")
-        return {"attention_backend": "flash",
-                "sparse_selector": algo,
-                "sparse_cdf": sparse}
+        return float(sparse)
 
     # [attention backend selector, user 2026-08-27] one user-facing dropdown per loader.
     # SM-GATED: SM80+ offers the full set; SM75 (Turing) has NO int8-QK sage and NO
@@ -648,9 +637,9 @@ if _IMPORT_OK:
 
     def _merge_attn_backend(create_opts, attention_backend):
         """Fold the user's backend choice into the create-time opts dict. An EXPLICIT
-        choice (anything but 'auto') WINS over the svg2 selector's flash default; 'auto'
-        leaves create_opts untouched (svg2<1.0 -> flash, dense -> engine per-model default).
-        Returns the dict (possibly newly created) or None when nothing to pass."""
+        choice (anything but 'auto') always WINS; 'auto' leaves create_opts untouched
+        (engine per-model default). Returns the dict (possibly newly created) or None
+        when nothing to pass."""
         eng = _attn_backend_to_engine(attention_backend)
         if eng == "auto":
             return create_opts or None
@@ -680,39 +669,7 @@ if _IMPORT_OK:
                                              + _preset_file_expectations()}),
                 "resident_block_count": _RESIDENT_BLOCKS_INPUT,
             }, "optional": {
-                "step_cache": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.005,
-                              "tooltip": "Step cache threshold (EasyCache; 0 = OFF, byte-identical). "
-                                         ">0 lets the engine SKIP whole denoise steps whose "
-                                         "predicted change is below this relative budget and "
-                                         "reuse the cached trajectory (typical 0.02-0.05; larger "
-                                         "= faster but drifts more). Runtime session knob — "
-                                         "takes effect next run, never rebuilds the pipeline."}),
-                "block_cache": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.005,
-                              "tooltip": "Block cache threshold (First-Block Cache; 0 = OFF, byte-identical). "
-                                         ">0 runs block 0 every step and SKIPS blocks 1..N-1 when "
-                                         "block 0's output change is below this relative budget, "
-                                         "reconstructing from the cached residual — effective even "
-                                         "on few-step distilled workflows (typical 0.05-0.12). "
-                                         "Runtime session knob — takes effect next run, never "
-                                         "rebuilds. COMPOSABLE with step_cache (EC skips whole "
-                                         "steps; FBC skips blocks inside computed steps)."}),
-                "sparse": ("FLOAT", {"default": 1.0, "min": 0.5, "max": 1.0, "step": 0.01,
-                           "tooltip": "Sparse self-attention (LOSSY): 1.0 = OFF (dense). <1.0 keeps "
-                                      "that fraction of attention mass per block via the svg2 "
-                                      "semantic selector (k-means clustered top-p; THE default — "
-                                      "the algorithm is no longer a user choice; measured best "
-                                      "operating point ~0.5: fastest sparse config on flash/qfa "
-                                      "and beats block-mean selection on quality at matched "
-                                      "keep). CREATE key — changing it re-creates the pipeline."}),
                 "attention_backend": _attn_backend_input(),
-                "svg2_tail_perm": ("BOOLEAN", {"default": False,
-                    "tooltip": "#642 tail-confined permutation (svg2 selector only). ON = sort the "
-                               "VIDEO-TAIL tokens cluster-contiguous before block projection, so the "
-                               "svg2 semantic selector can actually DROP blocks (without it the "
-                               "original-order projection keeps ~100% = pure overhead). Measured: "
-                               "sparse 0.5 + svg2 + tail_perm keeps ~64% and is the fastest sparse "
-                               "config on flash/qfa. Default OFF (byte-identical to before) pending "
-                               "the equal-keep quality A/B; protected prefix rows never move."}),
                 "act_scale_g32": ("BOOLEAN", {"default": False,
                     "tooltip": "svdq int4 激活-scale 组宽开关 (#565). OFF=g64 (默认, 与旧版逐字节一致); "
                                "ON=g32 (更细的激活量化组, 实测 -9.1% 激活量化误差, 前向 +~45%, 仅 SM89/86 是真杠杆; "
@@ -735,27 +692,20 @@ if _IMPORT_OK:
             + _COMMON_LIMITS)
 
         def load(self, transformer1, transformer2, model_config, resident_block_count=999,
-                 step_cache=0.0, block_cache=0.0, sparse=1.0, sparse_algo="svg2",
-                 attention_backend="auto", svg2_tail_perm=False, act_scale_g32=False):
-            sparse_opts = _sparse_create_opts(sparse, algo=sparse_algo)
-            sparse_opts = _merge_attn_backend(sparse_opts, attention_backend)
-            # [#642 tail-perm opt-in] only meaningful with an ENGAGED svg2 selector; inject only
-            # when ON so the default stays byte-identical (engine key svg2_tail_perm, default off).
-            if svg2_tail_perm and sparse_opts and sparse_opts.get("sparse_selector") == "svg2":
-                sparse_opts = dict(sparse_opts)
-                sparse_opts["svg2_tail_perm"] = True
+                 attention_backend="auto", act_scale_g32=False):
+            # [#659] the sparse dial is a SESSION knob (never a create key — no rebuild
+            # on change); sparse_opts carries CREATE-level keys only.
+            sparse_opts = _merge_attn_backend(None, attention_backend)
             # #565 g32 opt-in: inject ONLY when ON so the default stays byte-identical (absent => g64).
             # svdq-int4-only (C-API 'act_scale_g32' → svdq factory); a checkpoint act_g32_v1 marker outranks it.
-            # NB _sparse_create_opts returns None when sparse is OFF (1.0) and _merge_attn_backend
-            # passes None through for "auto" — materialize a dict before injecting (None-crash fix).
             if act_scale_g32:
                 sparse_opts = dict(sparse_opts) if sparse_opts else {}
                 sparse_opts["act_scale_g32"] = True
+            # [user 2026-08-29] cache/sparse entries REMOVED from the plugin surface —
+            # engine capabilities remain, defaults are all-OFF (byte-identical dense).
             return _run_family_load("wan", transformer1, model_config,
                                     resident_block_count, transformer2,
-                                    sparse_opts=sparse_opts,
-                                    easycache_thresh=step_cache,
-                                     fbcache_thresh=block_cache)
+                                    sparse_opts=sparse_opts)
 
     class QuantFuncLTXLoader:
         """LTX-2 loader — single MODEL output (single-expert family)."""
@@ -773,30 +723,6 @@ if _IMPORT_OK:
                                              + _preset_file_expectations()}),
                 "resident_block_count": _RESIDENT_BLOCKS_INPUT,
             }, "optional": {
-                "step_cache": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.005,
-                              "tooltip": "Step cache threshold (EasyCache; 0 = OFF, byte-identical). "
-                                         ">0 lets the engine SKIP whole denoise steps whose "
-                                         "predicted change is below this relative budget and "
-                                         "reuse the cached trajectory (typical 0.02-0.05; larger "
-                                         "= faster but drifts more). Runtime session knob — "
-                                         "takes effect next run, never rebuilds the pipeline."}),
-                "block_cache": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.005,
-                              "tooltip": "Block cache threshold (First-Block Cache; 0 = OFF, byte-identical). "
-                                         ">0 runs block 0 every step and SKIPS blocks 1..N-1 when "
-                                         "block 0's output change is below this relative budget, "
-                                         "reconstructing from the cached residual — effective even "
-                                         "on few-step distilled workflows (typical 0.05-0.12). "
-                                         "Runtime session knob — takes effect next run, never "
-                                         "rebuilds. COMPOSABLE with step_cache (EC skips whole "
-                                         "steps; FBC skips blocks inside computed steps)."}),
-                "sparse": ("FLOAT", {"default": 1.0, "min": 0.5, "max": 1.0, "step": 0.01,
-                           "tooltip": "Sparse self-attention (LOSSY): 1.0 = OFF (dense). <1.0 keeps "
-                                      "that fraction of attention mass per block via the svg2 "
-                                      "semantic selector (k-means clustered top-p; THE default — "
-                                      "the algorithm is no longer a user choice; measured best "
-                                      "operating point ~0.5: fastest sparse config on flash/qfa "
-                                      "and beats block-mean selection on quality at matched "
-                                      "keep). CREATE key — changing it re-creates the pipeline."}),
                 "attention_backend": _attn_backend_input(),
             }}
 
@@ -809,20 +735,18 @@ if _IMPORT_OK:
                        "only consumes latents; comfy's sampler applies the frame-0 mask). "
                        + _COMMON_LIMITS)
 
-        def load(self, transformer, model_config, resident_block_count=999, step_cache=0.0,
-                 block_cache=0.0, sparse=1.0, sparse_algo="svg2", attention_backend="auto"):
+        def load(self, transformer, model_config, resident_block_count=999,
+                 attention_backend="auto"):
             # [aux-auto] NO aux file widgets and NO image socket (user 2026-08-22 "只保留
             # transformer/block/model_config … 只关注latent"): te/audio-vae/connectors
             # resolve from the preset manifest's aux_files inside _run_family_load; i2v is
             # the workflow's own latent conditioning (LTXVImgToVideoInplace), exactly like
             # wan's cond-latent shape.
-            sparse_opts = _sparse_create_opts(sparse, algo=sparse_algo)
-            sparse_opts = _merge_attn_backend(sparse_opts, attention_backend)
+            sparse_opts = _merge_attn_backend(None, attention_backend)
+            # [user 2026-08-29] cache/sparse surface removed — all-OFF defaults.
             return (_run_family_load("ltx2", transformer, model_config,
                                      resident_block_count, None,
-                                     sparse_opts=sparse_opts,
-                                     easycache_thresh=step_cache,
-                                     fbcache_thresh=block_cache),)
+                                     sparse_opts=sparse_opts),)
 
     class QuantFuncH3Loader:
         """MiniMax-H3 loader — single MODEL output (single-expert AV family)."""
@@ -838,36 +762,7 @@ if _IMPORT_OK:
                                              + _preset_file_expectations()}),
                 "resident_block_count": _RESIDENT_BLOCKS_INPUT,
             }, "optional": {
-                "step_cache": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.005,
-                              "tooltip": "Step cache threshold (EasyCache; 0 = OFF, byte-identical). "
-                                         ">0 lets the engine SKIP whole denoise steps whose "
-                                         "predicted change is below this relative budget and "
-                                         "reuse the cached trajectory (typical 0.02-0.05; larger "
-                                         "= faster but drifts more). Runtime session knob — "
-                                         "takes effect next run, never rebuilds the pipeline. "
-                                         "H3/AV note: audio-live sessions skip WITH a per-lane audio "
-                                         "transport + an audio transient guard (audio-quiet steps "
-                                         "only); few-step distilled workflows rarely have headroom."}),
-                "block_cache": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.005,
-                              "tooltip": "Block cache threshold (First-Block Cache; 0 = OFF, byte-identical). "
-                                         ">0 runs block 0 every step and SKIPS blocks 1..N-1 when "
-                                         "block 0's output change is below this relative budget, "
-                                         "reconstructing from the cached residual — effective even "
-                                         "on few-step distilled workflows (typical 0.05-0.12). "
-                                         "Runtime session knob — takes effect next run, never "
-                                         "rebuilds. COMPOSABLE with step_cache (EC skips whole "
-                                         "steps; FBC skips blocks inside computed steps)."}),
-                # [sparse, user 2026-08-25: ONE number, 1.0 = OFF; <1.0 = SVG2 semantic]
-                # CREATE-level (selector + attention backend are create keys). 1.0 = the
-                # default dense path (sage/qfa, byte-identical to before this widget
-                # existed). <1.0 = SVG2 semantic block-sparse attention (k-means clustered
-                # top-p) on the flash executor, keeping this fraction of attention mass
-                # (engine-gated by svg2_min_tokens so short sequences stay dense).
-                "sparse": ("FLOAT", {"default": 1.0, "min": 0.5, "max": 1.0, "step": 0.01,
-                           "tooltip": "Sparse self-attention (LOSSY): 1.0 = OFF (dense, "
-                                      "qfa/sage path). <1.0 keeps that fraction of attention "
-                                      "mass per block (e.g. 0.98) via SVG2 semantic block sparsity (k-means clustered top-p). "
-                                      "CREATE key — changing it re-creates the pipeline."}),
+                # [sparse, user 2026-08-25 ONE-number dial; #659 session knob — no rebuild]
                 # H3 default = flash: this model's auto resolves to sage2 int8-QK, which is
                 # BROKEN on H3's post-qk-RMSNorm γ-outliers at high-res (blank/NaN — measured
                 # 928²/S=31538: attn out absmax 0 → step-1 all-NaN → audio avcodec crash +
@@ -883,14 +778,11 @@ if _IMPORT_OK:
                        "stock sampler drives with latents. " + _COMMON_LIMITS)
 
         def load(self, transformer, model_config, resident_block_count=999,
-                 sparse=1.0, sparse_cdf=None, step_cache=0.0, block_cache=0.0,
-                 sparse_algo="svg2", attention_backend="flash"):  # H3: flash default (auto→sage is broken)
-            sparse_opts = _sparse_create_opts(sparse, sparse_cdf, algo=sparse_algo)
-            sparse_opts = _merge_attn_backend(sparse_opts, attention_backend)
+                 attention_backend="flash"):  # H3: flash default (auto→sage is broken)
+            sparse_opts = _merge_attn_backend(None, attention_backend)
+            # [user 2026-08-29] cache/sparse surface removed — all-OFF defaults.
             return (_run_family_load("minimax-h3", transformer, model_config,
-                                     resident_block_count, None, sparse_opts=sparse_opts,
-                                     easycache_thresh=step_cache,
-                                     fbcache_thresh=block_cache),)
+                                     resident_block_count, None, sparse_opts=sparse_opts),)
 
     class QuantFuncNativeLoRA:
         """Sidecar LoRA for the QuantFunc native loader — MODEL in, MODEL out (LoraLoaderModelOnly
