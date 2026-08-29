@@ -137,12 +137,19 @@ class QFKrea2Model(QFSessionModelMixin, comfy.model_base.Krea2):
         # krea2 engine is a BF16-latent/BF16-cond family (factory dtype=Tensor::BF16;
         # the video seams run FP32 latents — NOT this one). comfy hands FP32 through the
         # stubbed model config, so the seam casts HERE (x for the step ABI, ctx for begin).
+        # DEVICE discipline (measured on cu12/3090, 2026-08-30): the engine step ABI
+        # takes DEVICE pointers; comfy is free to hand the cond on CPU (its device
+        # placement varies by version/vram mode) — a CPU ctx data_ptr reached the
+        # engine's cond copy as cudaMemcpy 'invalid argument' (size=26x30720x2 exact).
+        # Cast to the LATENT's device + bf16 in one .to() — a no-op when already there
+        # (the 4090 boxes), the fix where comfy kept cond host-side.
+        _dev = x.device
         if x.dtype != torch.bfloat16:
             x_bf = x.to(torch.bfloat16)
         else:
             x_bf = x
-        if ctx.dtype != torch.bfloat16:
-            ctx = ctx.to(torch.bfloat16)
+        if ctx.dtype != torch.bfloat16 or ctx.device != _dev:
+            ctx = ctx.to(device=_dev, dtype=torch.bfloat16)
         sig_all = sigma.reshape(-1) if torch.is_tensor(sigma) else None
         sched = transformer_options.get("sample_sigmas", None)
         if sched is not None:
