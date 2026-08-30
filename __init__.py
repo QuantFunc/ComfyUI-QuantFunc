@@ -900,7 +900,12 @@ if _IMPORT_OK:
                     "QuantFuncNativeLoRA: this MODEL is not a QuantFunc native model — wire it "
                     "downstream of the QuantFunc Native Loader. (For a stock comfy model use the "
                     "built-in LoraLoaderModelOnly instead.)")
-            self._refuse_foreign_lora_format(_resolve_lora(lora_name))
+            # [R2-generality fix] the ONE-FORMAT refusal applies only to families the
+            # engine actually restricts (Krea2/LTX2/H3 — mirror of the engine's E1 arm);
+            # Wan keeps native kohya support (WAN_RULES) and marks itself exempt via
+            # _qf_kohya_lora_ok on its model class.
+            if not getattr(model.model, "_qf_kohya_lora_ok", False):
+                self._refuse_foreign_lora_format(_resolve_lora(lora_name))
             stack = qfmp.lora_stack_of(model)
             stack.append({"path": _resolve_lora(lora_name), "scale": float(strength),
                           "target": qfmp.expert_of(model)})   # [wiring-lora] wire-derived side

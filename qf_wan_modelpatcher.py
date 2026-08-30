@@ -48,6 +48,12 @@ def matches(pipeline_class, transformer_class=""):
 
 
 class QFWanModel(QFSessionModelMixin, comfy.model_base.WAN21):
+    # [one-format policy EXEMPTION, R2-generality CR 2026-08-30] Wan is NOT a
+    # one-format family: the engine's WAN_RULES + kohyaProtectedWan deliberately
+    # keep native kohya/musubi LoRA support (LoRALoader.cpp Wan arm returns before
+    # the E1 refusal). The shared NativeLoRA node's foreign-format sentinel reads
+    # this attribute and skips the refusal for wan models.
+    _qf_kohya_lora_ok = True
     # Wan VAE scale factors (AutoencoderKLWan): temporal 4, spatial 8. The session geometry is
     # DERIVED from the latent the sampler hands us + the sampler's own sigma schedule — the loader
     # carries NO geometry widgets (official-loader shape: length/size come from WanImageToVideo or
