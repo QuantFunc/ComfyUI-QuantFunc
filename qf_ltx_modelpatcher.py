@@ -1171,51 +1171,95 @@ def register(deps):
 
     def build(transformer1_path, transformer2_path, resident_block_count, bundle_dir=None,
               lora_entries=(), sparse_opts=None):
-        """File-based (ComfyUI single-file) loading for LTX-2.5 — the wan staging pattern
-        with a ONE-FILE contract (user 2026-08-22 — the loader depends on nothing but
-        the single ALL-IN export, mirroring the official comfy single-file):
-        - transformer/  <- the all-in export (transformer + connector blocks +
-          text_embedding_projection + audio lane packed inside);
-        - connectors/   <- the SAME file, self-linked (engine #565 comfy25 branch detects
-          the model.diffusion_model.*_embeddings_connector.* prefix, renames + strips;
-          text projections load single-file-first from it too).
-        NO te_file / audio_vae / connectors fallbacks exist: an export missing the packed
-        blocks is refused loud as INCOMPLETE. AV capability = the packed
-        audio_embeddings_connector (the engine's denoise_only has_audio_ probe mirrors it);
-        audio decode is the workflow's own audio VAELoader, never engine-side.
+        """File-based (ComfyUI single-file) loading for LTX-2.5 — the wan staging pattern.
+        CONNECTORS-SOURCE contract (user 2026-08-31 — fully support the transformer-only
+        export; supersedes the 2026-08-22 one-file-only ruling):
+        - transformer/  <- the transformer export (ALL-IN or transformer-only);
+        - connectors/   <- resolved in priority order (a QUALIFYING source packs BOTH
+          modality blocks — model.diffusion_model.{video,audio}_embeddings_connector.* —
+          the joint-AV discriminant; a video-only source is rejected, see below):
+            (1) the transformer file itself, when it qualifies (ALL-IN — the
+                official-comfy-single-file mirror; byte-identical to the old path);
+            (2) a same-dir sibling `*connector*.safetensors` that qualifies —
+                the shared, recipe-independent completion file (extracted VERBATIM from
+                the official comfy model file's connector keys; one copy serves every
+                quantized transformer variant).
+          NEITHER found -> fail loud naming the dir probed, the BOTH-modality
+          requirement, and both remedies (a video-only-connector source additionally
+          gets the joint-AV explanation — it must not fall through to the retired 2.3
+          video-only path whose connector_ckpt widget no longer exists). The engine
+          #565 comfy25 branch consumes either source identically (prefix detect ->
+          rename+strip).
+        text_embedding_projection is deliberately NOT required from the model file: the
+        workflow's with-proj clip applies it TE-side (comfy lt.py dual_linear), the
+        session cond arrives post-projection, and the engine loads it opportunistically
+        (single-file first, te-dir fallback, else skip — LTX2VideoPipeline.cpp:376-397).
+        AV capability = the packed audio_embeddings_connector in the RESOLVED connectors
+        source (the engine's denoise_only has_audio_ probe + the _is_av discriminant
+        below both read that source; every resolved source qualifies -> file-mode
+        always arms AV); audio decode is the workflow's own audio
+        VAELoader, never engine-side.
         Engine create runs denoise_only=True (VAE decode weights skipped; TE lazy)."""
         if transformer2_path:
             raise RuntimeError("qf_native ltx2: single-expert family — transformer2 must be empty")
-        # ONE-FILE CONTRACT (user 2026-08-22 "引擎层不应该依赖这个…给一个依赖他的理由" —
-        # there is none): the ComfyUI single-file export MUST pack the connector blocks AND
-        # text_embedding_projection, exactly like the OFFICIAL comfy single-file (#565).
-        # A transformer-only file is an INCOMPLETE (transitional) export — refused loud,
-        # never silently completed from fallback files (the old split int4 + separate
-        # ltx25-connectors flow is retired; no manifest fallback, no sibling auto-probe,
-        # no te_file). Cheap safetensors HEADER probes:
-        def _has_keys(path, needle):
-            import struct as _st
+        # CONNECTORS-SOURCE resolution (user 2026-08-31). The engine applies the
+        # embeddings-connector tail itself on the unprocessed dual-proj cond — the
+        # official comfy contract (lt.py marks TE output `unprocessed_ltxav_embeds`;
+        # the model side owns the connector) — so a weight source MUST exist; no
+        # workflow module can substitute it (the TE-side compat branch is legacy-shape
+        # only and upstream-marked TODO:remove). The probe is CONTENT-based (header
+        # prefix via _file_has_prefix), never name-based trust; the name filter merely
+        # bounds which siblings get their header read.
+        # A QUALIFYING source packs BOTH modality blocks (video AND audio) — the same
+        # joint-AV discriminant `_is_av` reads downstream. LTX-2.5 file-mode is
+        # joint-AV; a video-only-connector source cannot arm it, and accepting one
+        # would fall through to the retired 2.3 video-only path whose connector_ckpt
+        # widget no longer exists (an unactionable dead-letter refusal) — so it is
+        # rejected HERE with an accurate message instead.
+        _CONN_VID = "model.diffusion_model.video_embeddings_connector."
+        _CONN_AUD = "model.diffusion_model.audio_embeddings_connector."
+        def _qualifies(path):
+            return (_file_has_prefix(path, _CONN_VID)
+                    and _file_has_prefix(path, _CONN_AUD))
+        conn_src = None
+        if _qualifies(transformer1_path):
+            conn_src = transformer1_path   # ALL-IN: self-link, byte-identical to the old path
+        else:
+            _dir = os.path.dirname(transformer1_path)
             try:
-                with open(path, "rb") as f:
-                    n = _st.unpack("<Q", f.read(8))[0]
-                    if n > (1 << 31):
-                        return False
-                    hdr = json.loads(f.read(n))
-                return any(needle in k for k in hdr)
-            except Exception:  # noqa: BLE001 — unreadable/not-safetensors = no keys
-                return False
-        _missing = [nm for nm, needle in (
-            ("connector blocks (embeddings_connector.*)", "embeddings_connector"),
-            ("text projections (text_embedding_projection.*)", "text_embedding_projection"),
-        ) if not _has_keys(transformer1_path, needle)]
-        if _missing:
-            raise RuntimeError(
-                f"qf_native ltx2: {os.path.basename(transformer1_path)} is an INCOMPLETE "
-                f"single-file export — it does not pack: {', '.join(_missing)}. The LTX "
-                f"loader depends on exactly ONE file (like the official comfy single-file, "
-                f"which packs both). Use the ALL-IN QuantFunc export "
-                f"(*-allin-*.safetensors); split transformer-only exports are retired.")
-        extra = {"connectors": transformer1_path}   # self-link: the one file is the source
+                _sibs = sorted(f for f in os.listdir(_dir)
+                               if f.lower().endswith(".safetensors")
+                               and "connector" in f.lower())
+            except OSError:  # unreadable dir = no siblings; the raise below names it
+                _sibs = []
+            _qualified = [os.path.join(_dir, _f) for _f in _sibs
+                          if os.path.join(_dir, _f) != transformer1_path
+                          and _qualifies(os.path.join(_dir, _f))]
+            if _qualified:
+                conn_src = _qualified[0]   # deterministic: sorted-first
+                if len(_qualified) > 1:
+                    print(f"[qf_native] ltx2: {len(_qualified)} qualifying connectors "
+                          f"completion files in {_dir!r}; using the alphabetically-first "
+                          f"{os.path.basename(conn_src)} (others: "
+                          f"{', '.join(os.path.basename(p) for p in _qualified[1:])})",
+                          flush=True)
+            if conn_src is None:
+                _why = ("packs the video_embeddings_connector but NOT the audio one — "
+                        "LTX-2.5 file-mode is joint-AV and needs BOTH — "
+                        if _file_has_prefix(transformer1_path, _CONN_VID)
+                        else "is a transformer-only export ")
+                raise RuntimeError(
+                    f"qf_native ltx2: {os.path.basename(transformer1_path)} {_why}"
+                    f"and no connectors completion file was found "
+                    f"next to it (probed {_dir!r} for *connector*.safetensors packing "
+                    f"BOTH {_CONN_VID}* and {_CONN_AUD}*). The engine applies the "
+                    f"embeddings-connector tail "
+                    f"itself (official comfy contract: TE output is unprocessed_ltxav_embeds), "
+                    f"so a source is required. Fix: place the shared ltx-2.5-connectors file "
+                    f"in the same folder, or use an ALL-IN export (*-allin-*.safetensors).")
+            print(f"[qf_native] ltx2: transformer-only export — connectors completion file: "
+                  f"{os.path.basename(conn_src)}", flush=True)
+        extra = {"connectors": conn_src}
         model_dir = qfmp.stage_denoise_only_package(bundle_dir, transformer1_path, None,
                                                     extra_links=extra)
         return _build_from_package(model_dir, os.path.basename(transformer1_path),

@@ -235,18 +235,37 @@ def main():
     # into transformer/ AND connectors/ [#565 comfy25 branch], te + audio_vae links, cfg
     # carries denoise_only). The synthetic fx-ltx manifest (no file_hints) keeps exercising
     # bare routing; the REAL preset exercises the full staged shape.
-    # ── ONE-FILE CONTRACT (user 2026-08-22 "引擎层不应该依赖这个") ──────────────────
-    # The loader depends on exactly ONE transformer file; the workflow owns every other
-    # stage. An export NOT packing the connector blocks + text projections (the retired
-    # split transformer-only int4) is INCOMPLETE -> refused loud, never silently completed
-    # from fallback files (aux-auto layer deleted; no sibling auto-probe; no te_file).
+    # ── CONNECTORS-SOURCE CONTRACT (user 2026-08-31, supersedes the 2026-08-22
+    # one-file ruling "引擎层不应该依赖这个") ─────────────────────────────────────
+    # A transformer-only export RESOLVES via a same-dir QUALIFYING completion sibling
+    # (content-probed: BOTH modality connector prefixes — the joint-AV discriminant);
+    # it refuses loud ONLY when no qualifying source exists. text projections are no
+    # longer required (the with-proj clip applies them TE-side; the engine loads them
+    # opportunistically with a te-dir fallback).
+    _out_split = None
     try:
-        LtxL.load("fx-ltx-2.5-quantfunc-4bit.safetensors", "ltx2-2.5-22b", 999)
-        check("ltx2 INCOMPLETE (keyless split) export refuses loud", False, "-> no exception")
+        _out_split = LtxL.load("fx-ltx-2.5-quantfunc-4bit.safetensors", "ltx2-2.5-22b", 999)[0]
     except RuntimeError as e:
-        check("ltx2 INCOMPLETE (keyless split) export refuses loud",
-              "INCOMPLETE" in str(e) and "connector blocks" in str(e)
-              and "text projections" in str(e) and "allin" in str(e),
+        check("ltx2 transformer-only resolves via the sibling completion file", False,
+              f"-> unexpected refusal: {str(e)[:90]}")
+    if _out_split is not None:
+        _ = _out_split.model._qf.lib   # first touch materializes the staged pkg key
+        _smd = _out_split.model._qf._ckey[0]
+        _ssrc = os.path.realpath(os.path.join(_smd, "connectors", "model.safetensors"))
+        check("ltx2 transformer-only resolves via the sibling completion file",
+              _ssrc.endswith("fx-ltx25-connectors.safetensors"),
+              f"-> staged connectors {_ssrc[-48:]}")
+    # loud-refusal arm (the iso fixture built for exactly this): NO probe candidates
+    # next to the transformer -> the new message names the probed dir, the
+    # BOTH-modality requirement, and both remedies.
+    try:
+        LtxL.load("fx-iso-ltx-2.5-quantfunc-4bit.safetensors", "ltx2-2.5-22b", 999)
+        check("ltx2 transformer-only with NO completion source refuses loud",
+              False, "-> no exception")
+    except RuntimeError as e:
+        check("ltx2 transformer-only with NO completion source refuses loud",
+              "transformer-only" in str(e) and "connectors completion" in str(e)
+              and "allin" in str(e) and "audio_embeddings_connector" in str(e),
               f"-> {str(e)[:90]}")
     # trimmed node surface (user 2026-08-22 "只保留transformer/block/model_config…只关注latent"):
     # NO optional sockets either — i2v rides the workflow's own latent path (Inplace).
@@ -285,17 +304,38 @@ def main():
     _h2 += b" " * ((8 - (len(_h2) % 8)) % 8)
     with open(os.path.join(dm, _half2), "wb") as _fh:
         _fh.write(_st2.pack("<Q", len(_h2))); _fh.write(_h2); _fh.write(b"\0" * 4)
+    # NEW-contract expectations for the two half shapes: a video-only-connector
+    # transformer does NOT self-qualify (joint-AV needs BOTH modalities) and a
+    # proj-only transformer has no connector blocks at all — with a qualifying
+    # sibling present, BOTH resolve via the completion file (never the retired 2.3
+    # connector_ckpt dead-letter, whose widget no longer exists on the node).
     _msgs = {}
     for _f in (_half1, _half2):
         try:
-            LtxL.load(_f, "ltx2-2.5-22b", 999)
-            _msgs[_f] = "no exception"
+            _o = LtxL.load(_f, "ltx2-2.5-22b", 999)[0]
+            _ = _o.model._qf.lib   # first touch materializes the staged pkg key
+            _md_ = _o.model._qf._ckey[0]
+            _msgs[_f] = os.path.realpath(os.path.join(_md_, "connectors", "model.safetensors"))
         except RuntimeError as e:
-            _msgs[_f] = str(e)
-    check("ltx2 INCOMPLETE probe names the MISSING piece per-file (both ways)",
-          "text projections" in _msgs[_half1] and "connector blocks" not in _msgs[_half1]
-          and "connector blocks" in _msgs[_half2] and "text projections" not in _msgs[_half2],
-          f"-> connonly:{_msgs[_half1][:60]} | projonly:{_msgs[_half2][:60]}")
+            _msgs[_f] = f"REFUSED: {str(e)[:70]}"
+    check("ltx2 partial shapes resolve via the sibling completion file (both ways)",
+          _msgs[_half1].endswith("fx-ltx25-connectors.safetensors")
+          and _msgs[_half2].endswith("fx-ltx25-connectors.safetensors"),
+          f"-> connonly:{_msgs[_half1][-44:]} | projonly:{_msgs[_half2][-44:]}")
+    # isolated video-only-connector (no sibling): the ACCURATE joint-AV refusal —
+    # names the missing audio modality, never the unactionable connector_ckpt message.
+    _half1_iso = "fx-iso-ltx-2.5-connonly-quantfunc-4bit.safetensors"
+    import shutil as _sh
+    _sh.copyfile(os.path.join(dm, _half1), os.path.join(dm2, _half1_iso))
+    try:
+        LtxL.load(_half1_iso, "ltx2-2.5-22b", 999)
+        check("ltx2 video-only-connector with NO completion source gets the joint-AV refusal",
+              False, "-> no exception")
+    except RuntimeError as e:
+        check("ltx2 video-only-connector with NO completion source gets the joint-AV refusal",
+              "NOT the audio" in str(e) and "joint-AV" in str(e)
+              and "connector_ckpt" not in str(e),
+              f"-> {str(e)[:90]}")
     # ── positive path: the all-in file alone loads (AV via the packed audio connector) ──
     out_ltx = LtxL.load(_allin_name, "ltx2-2.5-22b", 999)[0]
     check("ltx2 AV file-mode returns a QFModelPatcher",
