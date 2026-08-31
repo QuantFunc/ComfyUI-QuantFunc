@@ -337,6 +337,17 @@ class QFSessionModelMixin:
         # denoise_begin; the engine swaps the per-forward dispatch string (no rebuild).
         self._attn_backend = str(v or "auto")
 
+    def set_sol_tau(self, v):
+        # [sol-tau dial 2026-08-31] the ONE user-facing Sol-Attn knob (user "就一个
+        # 就好"): the qfa=sol route's z-score keep threshold. LOWER = more exact
+        # blocks (denser/slower; <= -8 = the engine routes true DENSE qfa), HIGHER =
+        # sparser/faster. Same rides-residency_opts session-knob class as
+        # set_attn_backend; only meaningful under attention_backend=qfa.
+        try:
+            self._sol_tau = float(v)
+        except (TypeError, ValueError):
+            self._sol_tau = 1.0
+
     def residency_opts(self):
         """The begin-options fragment EVERY family merges into its options_json — the ONE
         injection point for ALL runtime session knobs (residency + the two cache
@@ -368,6 +379,14 @@ class QFSessionModelMixin:
         ab = str(getattr(self, "_attn_backend", "auto") or "auto")
         if ab != "auto":
             o["attention_backend"] = ab   # [runtime dial] auto = engine default, key omitted
+        # [sol-tau dial] omitted at the 1.0 default (old-engine compatible: an older
+        # .so refuses unknown keys LOUD, and default users never send it). Ghost-proof
+        # despite the omission: the ENGINE resets an absent sol_tau to 1.0 at every
+        # begin (absent = reset-to-default, not keep-current) — so dialing back to
+        # 1.0 truly restores the default even on a reused engine-resident pipeline.
+        st = float(getattr(self, "_sol_tau", 1.0) or 1.0)
+        if abs(st - 1.0) > 1e-6:
+            o["sol_tau"] = st
         return o
 
     def _assert_wire_lora(self):

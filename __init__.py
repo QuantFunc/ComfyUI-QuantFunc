@@ -596,6 +596,17 @@ if _IMPORT_OK:
                                      "Runtime session knob — takes effect next run, never "
                                      "rebuilds. COMPOSABLE with step_cache (EC skips whole "
                                      "steps; FBC skips blocks inside computed steps)."})
+    # [sol-tau dial 2026-08-31] the ONE user-facing Sol-Attn knob (user "就一个就好").
+    # Only meaningful under attention_backend=qfa (qfa = sol+qfa on H3/LTX). Same
+    # runtime-session-knob class as step_cache/sparse: re-sent each run, no rebuild;
+    # 1.0 default is omitted (older engines refuse unknown keys loud) and the engine
+    # resets an absent key to 1.0 (dialing back truly restores the default).
+    _SOL_TAU_INPUT = ("FLOAT", {"default": 1.0, "min": -8.0, "max": 4.0, "step": 0.05,
+                     "tooltip": "Sol-Attn quality<->speed dial (qfa backend only). "
+                                "LOWER = more exact attention blocks = denser/slower "
+                                "(-8 = fully DENSE qfa, the quality end); HIGHER = "
+                                "sparser/faster but rougher. Default 1.0. Runtime "
+                                "session knob — takes effect next run, no rebuild."})
 
     def _arm_session_caches(_mm, step_cache, block_cache):
         """Arm the EasyCache (step) + FBCache (block) session knobs on a loaded model.
@@ -750,6 +761,7 @@ if _IMPORT_OK:
                 "resident_block_count": _RESIDENT_BLOCKS_INPUT,
             }, "optional": {
                 "attention_backend": _attn_backend_input(),
+                "sol_tau": _SOL_TAU_INPUT,
                 "step_cache": _STEP_CACHE_INPUT,
                 "block_cache": _BLOCK_CACHE_INPUT,
             }}
@@ -764,7 +776,7 @@ if _IMPORT_OK:
                        + _COMMON_LIMITS)
 
         def load(self, transformer, model_config, resident_block_count=999,
-                 attention_backend="auto", step_cache=0.0, block_cache=0.0):
+                 attention_backend="auto", sol_tau=1.0, step_cache=0.0, block_cache=0.0):
             # [aux-auto] NO aux file widgets and NO image socket (user 2026-08-22 "只保留
             # transformer/block/model_config … 只关注latent"): te/audio-vae/connectors
             # resolve from the preset manifest's aux_files inside _run_family_load; i2v is
@@ -775,6 +787,8 @@ if _IMPORT_OK:
             _mm = getattr(_p, "model", None)
             if _mm is not None and hasattr(_mm, "set_attn_backend"):
                 _mm.set_attn_backend(_attn_backend_to_engine(attention_backend))
+            if _mm is not None and hasattr(_mm, "set_sol_tau"):
+                _mm.set_sol_tau(sol_tau)
             _arm_session_caches(_mm, step_cache, block_cache)
             return (_p,)
 
@@ -853,6 +867,7 @@ if _IMPORT_OK:
                 # video blur). flash (fp16) is the verified-clean default; user can still pick
                 # auto/sage/qfa/native. (Wan→auto→qfa, LTX→auto are fine → they keep 'auto'.)
                 "attention_backend": _attn_backend_input("flash"),
+                "sol_tau": _SOL_TAU_INPUT,
                 "step_cache": _STEP_CACHE_INPUT,
                 "block_cache": _BLOCK_CACHE_INPUT,
             }}
@@ -864,12 +879,14 @@ if _IMPORT_OK:
                        "stock sampler drives with latents. " + _COMMON_LIMITS)
 
         def load(self, transformer, model_config, resident_block_count=999,
-                 attention_backend="flash", step_cache=0.0, block_cache=0.0):  # H3: flash default (auto→sage is broken)
+                 attention_backend="flash", sol_tau=1.0, step_cache=0.0, block_cache=0.0):  # H3: flash default (auto→sage is broken)
             _p = _run_family_load("minimax-h3", transformer, model_config,
                                    resident_block_count, None, sparse_opts=None)
             _mm = getattr(_p, "model", None)
             if _mm is not None and hasattr(_mm, "set_attn_backend"):
                 _mm.set_attn_backend(_attn_backend_to_engine(attention_backend))
+            if _mm is not None and hasattr(_mm, "set_sol_tau"):
+                _mm.set_sol_tau(sol_tau)
             _arm_session_caches(_mm, step_cache, block_cache)
             return (_p,)
 

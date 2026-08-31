@@ -275,7 +275,8 @@ def main():
     _lit = LtxL.INPUT_TYPES()
     check("ltx node surface = latent-trio required + session-dial optionals (no sparse)",
           list(_lit["required"].keys()) == ["transformer", "model_config", "resident_block_count"]
-          and list(_lit.get("optional", {}).keys()) == ["attention_backend", "step_cache", "block_cache"]
+          and list(_lit.get("optional", {}).keys()) == ["attention_backend", "sol_tau",
+                                                        "step_cache", "block_cache"]
           and "sparse" not in _lit.get("optional", {}),
           f"-> req={list(_lit['required'].keys())} opt={list(_lit.get('optional', {}).keys())}")
     # the ALL-IN single file: projections + BOTH modality connector blocks packed (the audio
