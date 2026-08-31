@@ -621,7 +621,7 @@ if _IMPORT_OK:
     # display name; _attn_backend_to_engine maps it to the engine's comp_opts string
     # ("fp16_native" -> "native"). "auto" = the engine's per-SM resolution (default), and
     # is passed through so the user's choice is always the single source of truth.
-    _ATTN_BACKEND_SM80PLUS = ["auto", "qfa", "flash", "sage", "fp16_native"]
+    _ATTN_BACKEND_SM80PLUS = ["auto", "qfa", "qfa-sol", "flash", "sage", "fp16_native"]
     _ATTN_BACKEND_SM75 = ["qfa", "fp16_native"]
 
     def _attn_backend_choices():
