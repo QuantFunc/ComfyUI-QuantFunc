@@ -267,12 +267,16 @@ def main():
               "transformer-only" in str(e) and "connectors completion" in str(e)
               and "allin" in str(e) and "audio_embeddings_connector" in str(e),
               f"-> {str(e)[:90]}")
-    # trimmed node surface (user 2026-08-22 "只保留transformer/block/model_config…只关注latent"):
-    # NO optional sockets either — i2v rides the workflow's own latent path (Inplace).
+    # node surface: required = latent-only trio (user 2026-08-22 "只保留transformer/block/
+    # model_config…只关注latent"); optional = the runtime SESSION dials (attention_backend
+    # 2026-08-27; step_cache + block_cache re-enabled 2026-08-31 「step cache 以及 fbcache
+    # 的开关重新开启」). Every optional is a session knob (no create key / no rebuild) —
+    # sparse is deliberately NOT among them (removed 2026-08-29, only the caches came back).
     _lit = LtxL.INPUT_TYPES()
-    check("ltx node surface = transformer/model_config/resident_block_count ONLY",
+    check("ltx node surface = latent-trio required + session-dial optionals (no sparse)",
           list(_lit["required"].keys()) == ["transformer", "model_config", "resident_block_count"]
-          and not _lit.get("optional"),
+          and list(_lit.get("optional", {}).keys()) == ["attention_backend", "step_cache", "block_cache"]
+          and "sparse" not in _lit.get("optional", {}),
           f"-> req={list(_lit['required'].keys())} opt={list(_lit.get('optional', {}).keys())}")
     # the ALL-IN single file: projections + BOTH modality connector blocks packed (the audio
     # one is ALSO the AV discriminant — no audio_vae staging, comfy owns audio decode).

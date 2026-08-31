@@ -572,6 +572,42 @@ if _IMPORT_OK:
                                                  "to the model's block count, so the default "
                                                  "keeps every block resident on a card that "
                                                  "fits."})
+    # [cache surface RE-ENABLED, user 2026-08-31 「step cache 以及 fbcache 的开关重新开启」]
+    # The step_cache (EasyCache) + block_cache (First-Block Cache = "fbcache") widgets
+    # restored to the video loaders (wan/LTX/H3) — the two loader widgets + their arming
+    # loop that the 2026-08-29 removal dropped. SPARSE is deliberately NOT re-enabled
+    # (the user named only the two caches). Both are RUNTIME SESSION knobs (mixin
+    # set_step_cache/set_block_cache → residency_opts begin keys; 0.0 = OFF = byte-identical,
+    # no create key, no pipeline rebuild on a widget change). Engine EasyCache/FBCache
+    # (lighting_step_cache.h) is untouched on main.
+    _STEP_CACHE_INPUT = ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.005,
+                         "tooltip": "Step cache threshold (EasyCache; 0 = OFF, byte-identical). "
+                                    ">0 lets the engine SKIP whole denoise steps whose "
+                                    "predicted change is below this relative budget and "
+                                    "reuse the cached trajectory (typical 0.02-0.05; larger "
+                                    "= faster but drifts more). Runtime session knob — "
+                                    "takes effect next run, never rebuilds the pipeline."})
+    _BLOCK_CACHE_INPUT = ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.005,
+                          "tooltip": "Block cache threshold (First-Block Cache; 0 = OFF, byte-identical). "
+                                     ">0 runs block 0 every step and SKIPS blocks 1..N-1 when "
+                                     "block 0's output change is below this relative budget, "
+                                     "reconstructing from the cached residual — effective even "
+                                     "on few-step distilled workflows (typical 0.05-0.12). "
+                                     "Runtime session knob — takes effect next run, never "
+                                     "rebuilds. COMPOSABLE with step_cache (EC skips whole "
+                                     "steps; FBC skips blocks inside computed steps)."})
+
+    def _arm_session_caches(_mm, step_cache, block_cache):
+        """Arm the EasyCache (step) + FBCache (block) session knobs on a loaded model.
+        Both are runtime session knobs (never create keys); 0.0 = OFF = byte-identical.
+        The mixin setters + residency_opts threading are on qf_modelpatcher.py (intact
+        through the 2026-08-29 removal — only the loader widgets + this arming were dropped)."""
+        if _mm is None:
+            return
+        if hasattr(_mm, "set_step_cache"):
+            _mm.set_step_cache(float(step_cache or 0.0))
+        if hasattr(_mm, "set_block_cache"):
+            _mm.set_block_cache(float(block_cache or 0.0))
     _COMMON_LIMITS = (
         "Sampler/scheduler/CFG stay ENTIRELY ComfyUI-side — the engine only denoises per step "
         "(latents in, velocity out). Limits: (1) ControlNet is not consumed by this seam "
@@ -652,6 +688,8 @@ if _IMPORT_OK:
                 "resident_block_count": _RESIDENT_BLOCKS_INPUT,
             }, "optional": {
                 "attention_backend": _attn_backend_input(),
+                "step_cache": _STEP_CACHE_INPUT,
+                "block_cache": _BLOCK_CACHE_INPUT,
                 "act_scale_g32": ("BOOLEAN", {"default": False,
                     "tooltip": "svdq int4 激活-scale 组宽开关 (#565). OFF=g64 (默认, 与旧版逐字节一致); "
                                "ON=g32 (更细的激活量化组, 实测 -9.1% 激活量化误差, 前向 +~45%, 仅 SM89/86 是真杠杆; "
@@ -674,7 +712,7 @@ if _IMPORT_OK:
             + _COMMON_LIMITS)
 
         def load(self, transformer1, transformer2, model_config, resident_block_count=999,
-                 attention_backend="auto", act_scale_g32=False):
+                 attention_backend="auto", step_cache=0.0, block_cache=0.0, act_scale_g32=False):
             # [#659] the sparse dial is a SESSION knob (never a create key — no rebuild
             # on change); sparse_opts carries CREATE-level keys only.
             # [runtime dial 2026-08-29] attention_backend is a SESSION knob now — NOT a
@@ -688,6 +726,7 @@ if _IMPORT_OK:
                 _mm = getattr(_p, "model", None)   # the session mixin lives on the MODEL
                 if _mm is not None and hasattr(_mm, "set_attn_backend"):
                     _mm.set_attn_backend(eng_b)
+                _arm_session_caches(_mm, step_cache, block_cache)
             return pair
 
     class QuantFuncLTXLoader:
@@ -707,6 +746,8 @@ if _IMPORT_OK:
                 "resident_block_count": _RESIDENT_BLOCKS_INPUT,
             }, "optional": {
                 "attention_backend": _attn_backend_input(),
+                "step_cache": _STEP_CACHE_INPUT,
+                "block_cache": _BLOCK_CACHE_INPUT,
             }}
 
         RETURN_TYPES = ("MODEL",)
@@ -719,7 +760,7 @@ if _IMPORT_OK:
                        + _COMMON_LIMITS)
 
         def load(self, transformer, model_config, resident_block_count=999,
-                 attention_backend="auto"):
+                 attention_backend="auto", step_cache=0.0, block_cache=0.0):
             # [aux-auto] NO aux file widgets and NO image socket (user 2026-08-22 "只保留
             # transformer/block/model_config … 只关注latent"): te/audio-vae/connectors
             # resolve from the preset manifest's aux_files inside _run_family_load; i2v is
@@ -730,6 +771,7 @@ if _IMPORT_OK:
             _mm = getattr(_p, "model", None)
             if _mm is not None and hasattr(_mm, "set_attn_backend"):
                 _mm.set_attn_backend(_attn_backend_to_engine(attention_backend))
+            _arm_session_caches(_mm, step_cache, block_cache)
             return (_p,)
 
     class QuantFuncKrea2Loader:
@@ -807,6 +849,8 @@ if _IMPORT_OK:
                 # video blur). flash (fp16) is the verified-clean default; user can still pick
                 # auto/sage/qfa/native. (Wan→auto→qfa, LTX→auto are fine → they keep 'auto'.)
                 "attention_backend": _attn_backend_input("flash"),
+                "step_cache": _STEP_CACHE_INPUT,
+                "block_cache": _BLOCK_CACHE_INPUT,
             }}
 
         RETURN_TYPES = ("MODEL",)
@@ -816,12 +860,13 @@ if _IMPORT_OK:
                        "stock sampler drives with latents. " + _COMMON_LIMITS)
 
         def load(self, transformer, model_config, resident_block_count=999,
-                 attention_backend="flash"):  # H3: flash default (auto→sage is broken)
+                 attention_backend="flash", step_cache=0.0, block_cache=0.0):  # H3: flash default (auto→sage is broken)
             _p = _run_family_load("minimax-h3", transformer, model_config,
                                    resident_block_count, None, sparse_opts=None)
             _mm = getattr(_p, "model", None)
             if _mm is not None and hasattr(_mm, "set_attn_backend"):
                 _mm.set_attn_backend(_attn_backend_to_engine(attention_backend))
+            _arm_session_caches(_mm, step_cache, block_cache)
             return (_p,)
 
     class QuantFuncNativeLoRA:
