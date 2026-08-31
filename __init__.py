@@ -621,7 +621,11 @@ if _IMPORT_OK:
     # display name; _attn_backend_to_engine maps it to the engine's comp_opts string
     # ("fp16_native" -> "native"). "auto" = the engine's per-SM resolution (default), and
     # is passed through so the user's choice is always the single source of truth.
-    _ATTN_BACKEND_SM80PLUS = ["auto", "qfa", "qfa-sol", "flash", "sage", "fp16_native"]
+    # [qfa = sol+qfa — user 2026-08-31 "不要新增任何开关 qfa就等于 sol+qfa"] there is NO separate
+    # "qfa-sol" option: on the video families (H3 / LTX2) selecting "qfa" routes self-attn through
+    # the engine's Sol-Attn NO-DROP arm at head_dim==128 automatically. The engine still ACCEPTS
+    # "qfa-sol" as a transparent alias, but it is deliberately NOT surfaced as a user-facing choice.
+    _ATTN_BACKEND_SM80PLUS = ["auto", "qfa", "flash", "sage", "fp16_native"]
     _ATTN_BACKEND_SM75 = ["qfa", "fp16_native"]
 
     def _attn_backend_choices():
