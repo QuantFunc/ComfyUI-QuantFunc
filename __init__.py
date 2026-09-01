@@ -828,7 +828,17 @@ if _IMPORT_OK:
                                "sampling run, no model rebuild."}),
                 # token-prune (CAT): image tokens only — text conditioning never
                 # pruned. SESSION knob (rides begin options), no rebuild.
-                "token_prune": _TOKEN_PRUNE_INPUT,
+                # IMAGE-tuned range/guidance (e2e 2026-09-01, 8-step distilled @1024²):
+                # 0.7 = clean vs dense (1.2x); 0.5 = subject clean but BACKGROUND
+                # mosaic patches (1.4x); 0.3 = mosaic everywhere (1.8x). A single
+                # image has no temporal masking, so stale patches show directly.
+                "token_prune": ("FLOAT", {
+                    "default": 1.0, "min": 0.2, "max": 1.0, "step": 0.05,
+                    "tooltip": "Token-prune keep fraction (CAT). 1.0 = OFF. "
+                               "IMAGE recommendation: 0.7 (clean, ~1.2x faster). "
+                               "Below 0.6 expect mosaic patches on this 8-step "
+                               "distilled model (text conditioning never pruned; "
+                               "last step always full)."}),
             }}
 
         RETURN_TYPES = ("MODEL",)
