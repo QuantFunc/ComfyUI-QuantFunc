@@ -601,12 +601,19 @@ if _IMPORT_OK:
     # runtime-session-knob class as step_cache/sparse: re-sent each run, no rebuild;
     # 1.0 default is omitted (older engines refuse unknown keys loud) and the engine
     # resets an absent key to 1.0 (dialing back truly restores the default).
-    _SOL_TAU_INPUT = ("FLOAT", {"default": 1.0, "min": -8.0, "max": 4.0, "step": 0.05,
-                     "tooltip": "Sol-Attn quality<->speed dial (qfa backend only). "
-                                "LOWER = more exact attention blocks = denser/slower "
-                                "(-8 = fully DENSE qfa, the quality end); HIGHER = "
-                                "sparser/faster but rougher. Default 1.0. Runtime "
-                                "session knob — takes effect next run, no rebuild."})
+    _TOKEN_PRUNE_INPUT = ("FLOAT", {"default": 1.0, "min": 0.2, "max": 1.0, "step": 0.05,
+                     "tooltip": "Token-prune keep fraction (CAT). 1.0 = OFF; e.g. 0.4-0.5 = "
+                                "recompute only that fraction of VIDEO tokens per step "
+                                "(~1.4-1.5x faster, quality floor: last step always full; "
+                                "audio never pruned). Auto-disabled while a step/block cache "
+                                "is armed (they don't compose)."})
+    _SOL_TAU_INPUT = ("FLOAT", {"default": 1.0, "min": 0.02, "max": 1.0, "step": 0.01,
+                     "tooltip": "Sol-Attn keep-ratio (qfa/flash/sage backends). 1.0 = OFF "
+                                "(the backend's original dense attention). <1 = sol engaged; "
+                                "value ~= fraction of attention blocks computed exactly: "
+                                "SMALLER = sparser = FASTER. 0.15-0.2 = the measured speed "
+                                "optimum (recommended start); 0.05-0.1 = faster (watch "
+                                "quality); 0.3-0.5 = quality-leaning."})
 
     def _arm_session_caches(_mm, step_cache, block_cache):
         """Arm the EasyCache (step) + FBCache (block) session knobs on a loaded model.
@@ -762,6 +769,7 @@ if _IMPORT_OK:
             }, "optional": {
                 "attention_backend": _attn_backend_input(),
                 "sol_tau": _SOL_TAU_INPUT,
+                "token_prune": _TOKEN_PRUNE_INPUT,
                 "step_cache": _STEP_CACHE_INPUT,
                 "block_cache": _BLOCK_CACHE_INPUT,
             }}
@@ -776,7 +784,7 @@ if _IMPORT_OK:
                        + _COMMON_LIMITS)
 
         def load(self, transformer, model_config, resident_block_count=999,
-                 attention_backend="auto", sol_tau=1.0, step_cache=0.0, block_cache=0.0):
+                 attention_backend="auto", sol_tau=1.0, token_prune=1.0, step_cache=0.0, block_cache=0.0):
             # [aux-auto] NO aux file widgets and NO image socket (user 2026-08-22 "只保留
             # transformer/block/model_config … 只关注latent"): te/audio-vae/connectors
             # resolve from the preset manifest's aux_files inside _run_family_load; i2v is
@@ -789,6 +797,8 @@ if _IMPORT_OK:
                 _mm.set_attn_backend(_attn_backend_to_engine(attention_backend))
             if _mm is not None and hasattr(_mm, "set_sol_tau"):
                 _mm.set_sol_tau(sol_tau)
+            if _mm is not None and hasattr(_mm, "set_token_prune"):
+                _mm.set_token_prune(token_prune)
             _arm_session_caches(_mm, step_cache, block_cache)
             return (_p,)
 
@@ -816,6 +826,9 @@ if _IMPORT_OK:
                                "GPU-resident (999 = as many as fit; never-OOM "
                                "guarded). SESSION knob — applied at the next "
                                "sampling run, no model rebuild."}),
+                # token-prune (CAT): image tokens only — text conditioning never
+                # pruned. SESSION knob (rides begin options), no rebuild.
+                "token_prune": _TOKEN_PRUNE_INPUT,
             }}
 
         RETURN_TYPES = ("MODEL",)
@@ -825,7 +838,7 @@ if _IMPORT_OK:
                        "MODEL a stock sampler drives with latents. " + _COMMON_LIMITS)
 
         def load(self, transformer, model_config, attention_backend="auto",
-                 resident_block_count=0):
+                 resident_block_count=0, token_prune=1.0):
             # [runtime dials] backend + residency are SESSION knobs (engine
             # applyAttnBackendDial / applyManualResidencyImageSessions): NOT create
             # keys, so a widget change never re-keys the engine = no rebuild.
@@ -843,6 +856,8 @@ if _IMPORT_OK:
                 _mm.set_attn_backend(_attn_backend_to_engine(attention_backend))
             if _mm is not None and hasattr(_mm, "set_resident_block_count"):
                 _mm.set_resident_block_count(int(resident_block_count))
+            if _mm is not None and hasattr(_mm, "set_token_prune"):
+                _mm.set_token_prune(token_prune)
             return (_p,)
 
 
@@ -868,6 +883,7 @@ if _IMPORT_OK:
                 # auto/sage/qfa/native. (Wan→auto→qfa, LTX→auto are fine → they keep 'auto'.)
                 "attention_backend": _attn_backend_input("flash"),
                 "sol_tau": _SOL_TAU_INPUT,
+                "token_prune": _TOKEN_PRUNE_INPUT,
                 "step_cache": _STEP_CACHE_INPUT,
                 "block_cache": _BLOCK_CACHE_INPUT,
             }}
@@ -879,7 +895,7 @@ if _IMPORT_OK:
                        "stock sampler drives with latents. " + _COMMON_LIMITS)
 
         def load(self, transformer, model_config, resident_block_count=999,
-                 attention_backend="flash", sol_tau=1.0, step_cache=0.0, block_cache=0.0):  # H3: flash default (auto→sage is broken)
+                 attention_backend="flash", sol_tau=1.0, token_prune=1.0, step_cache=0.0, block_cache=0.0):  # H3: flash default (auto→sage is broken)
             _p = _run_family_load("minimax-h3", transformer, model_config,
                                    resident_block_count, None, sparse_opts=None)
             _mm = getattr(_p, "model", None)
@@ -887,6 +903,8 @@ if _IMPORT_OK:
                 _mm.set_attn_backend(_attn_backend_to_engine(attention_backend))
             if _mm is not None and hasattr(_mm, "set_sol_tau"):
                 _mm.set_sol_tau(sol_tau)
+            if _mm is not None and hasattr(_mm, "set_token_prune"):
+                _mm.set_token_prune(token_prune)
             _arm_session_caches(_mm, step_cache, block_cache)
             return (_p,)
 
