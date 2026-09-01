@@ -104,6 +104,17 @@ class QFKrea2Model(QFSessionModelMixin, comfy.model_base.Krea2):
         _rb = int(getattr(self, "_resident_block_count", 0) or 0)
         if _rb > 0:
             _o["resident_block_count"] = _rb
+        # token-prune (CAT): the krea2 _begin builds its own _o (video residency_opts
+        # keys are engine-REFUSED here), so the mixin's generic emission never runs —
+        # emit the key HERE or the widget is silently dropped (field 2026-09-01:
+        # user set 0.3, engine stayed 1.0, no ARMED line). Engine session parse is
+        # generic (denoise begin :4511); absent = engine resets to 1.0 (anti-ghost).
+        try:
+            _tp = float(getattr(self, "_token_prune", 1.0) or 1.0)
+        except Exception:
+            _tp = 1.0
+        if 0.0 < _tp < 1.0:
+            _o["token_prune_keep_ratio"] = _tp
         bpx._opts = json.dumps(_o).encode()
         bpx.options_json = bpx._opts
         session = ctypes.c_void_p()
