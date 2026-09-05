@@ -47,9 +47,17 @@ def _package_weight_paths(pkg):
     return outs
 
 
-def _estimate_package_footprint(pkg):
-    """Engine-resident transformer weight bytes for a package — computed from the FILES, so the
-    memory ledger has a real number before the pipeline is created (QFLazyEngine)."""
+def _estimate_package_footprint(pkg, device_idx=0, server_url=None, api_key=None):
+    """Engine-resident transformer weight bytes for a package, so the memory ledger has a real number
+    before the pipeline is created (QFLazyEngine). EXACT when the engine offers it (the loader-law
+    estimate, SM-aware + page-rounded — the disk size under-reports a packed svdq transformer by ~41 %
+    on SM89), else the on-disk proxy."""
+    try:
+        exact = qfe.estimate_resident_bytes(qfe.load_lib(), pkg, device_idx=device_idx, server_url=server_url, api_key=api_key)
+        if exact > 0:
+            return exact
+    except Exception:  # noqa: BLE001 — fall through to the disk proxy
+        pass
     try:
         return qfe.estimate_footprint_bytes(*_package_weight_paths(pkg))
     except Exception:  # noqa: BLE001 — a bad estimate must not break loading
@@ -432,7 +440,7 @@ def _get_engine(model_dir, create_cfg=None, device_idx=0):
     # Footprint = the ENGINE-RESIDENT transformer weight bytes only (dual-expert). VAE + text_encoder
     # stay NATIVE comfy nodes (comfy already accounts for them), so they must NOT be added here — an
     # over-report would make comfy's ledger evict siblings that actually fit.
-    footprint = _estimate_package_footprint(model_dir)
+    footprint = _estimate_package_footprint(model_dir, device_idx=int(device_idx), server_url=cfg.get("server_url"), api_key=cfg.get("api_key"))
     eng = qfe.QFEngineHandle(lib, pipeline, footprint_bytes=footprint)
     _PIPELINE_CACHE[ckey] = eng
     return eng, ckey

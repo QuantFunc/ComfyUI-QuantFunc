@@ -571,6 +571,39 @@ def create_pipeline(lib, *, model_dir, transformer_path=None, model_backend="svd
     return handle
 
 
+class ResidentEstimateParams(ctypes.Structure):
+    """Mirror of quantfunc_resident_estimate_params_t (engine >= 36f4ed2cb)."""
+    _fields_ = [("model_dir", ctypes.c_char_p), ("transformer_weights", ctypes.c_char_p),
+                ("server_url", ctypes.c_char_p), ("api_key", ctypes.c_char_p), ("device_idx", ctypes.c_int)]
+
+
+def estimate_resident_bytes(lib, model_dir, device_idx=0, transformer_path=None, server_url=None, api_key=None):
+    """EXACT pre-load resident-VRAM estimate from the ENGINE's own loader law (quantfunc_estimate_resident_bytes:
+    safetensors header x the per-slot packed forms of this device's SM tier, arena-page-rounded, + non-block residents;
+    header-only, no model load, no VRAM). This is what comfy's ledger should charge BEFORE create — the on-disk size
+    under-reports a packed svdq transformer by ~41 % on SM89 (measured; see estimate_footprint_bytes). Returns 0 when
+    the .so predates the API, the call fails, or the law does not model the checkpoint (QUANTFUNC_ERROR_UNSUPPORTED —
+    never a silently sized guess); callers then fall back to the disk proxy and the live post-load measurement."""
+    fn = getattr(lib, "quantfunc_estimate_resident_bytes", None)
+    if fn is None or not model_dir:
+        return 0
+    try:
+        fn.restype = ctypes.c_int
+        fn.argtypes = [ctypes.POINTER(ResidentEstimateParams), ctypes.POINTER(ctypes.c_uint64)]
+        p = ResidentEstimateParams(model_dir=_enc(model_dir), transformer_weights=_enc(transformer_path) if transformer_path else None,
+                                   server_url=_enc(server_url) if server_url else None, api_key=_enc(api_key) if api_key else None,
+                                   device_idx=int(device_idx))
+        out = ctypes.c_uint64(0)
+        st = fn(ctypes.byref(p), ctypes.byref(out))
+        if st != 0:
+            _dbg_prof(f"resident-estimate unavailable (status {st}): {last_err(lib)}")
+            return 0
+        return int(out.value)
+    except Exception as ex:  # noqa: BLE001 — an estimate must never break loading
+        _dbg_prof(f"resident-estimate failed: {ex!r}")
+        return 0
+
+
 def estimate_footprint_bytes(*paths):
     """ESTIMATE (NOT a live-VRAM measurement) of the engine's resident footprint, from the ON-DISK
     packed size (os.path.getsize) of the given weight file(s)/dir(s). qf_modelpatcher's model_size()/
