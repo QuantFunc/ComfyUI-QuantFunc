@@ -704,6 +704,13 @@ class QFLazyEngine:
     def unload_vram(self):
         return 0 if self._real is None else self._real.unload_vram()
 
+    def partial_unload_vram(self, bytes_requested):
+        # MEASURED (2026-09-05, LTX-2.5 acceptance box): comfy asked for 300–2700 MB at every VAE load, but the
+        # patcher's `hasattr(eng, "partial_unload_vram")` saw THIS wrapper (no forwarder) → False → the full
+        # unload ran every time (vram::releaseAll evicted 16.9 GB, re-paged at the next run: +2.9 s). Forward
+        # it; unmaterialized = nothing to shed (0 → the patcher's full-unload fallback is a no-op too).
+        return 0 if self._real is None else self._real.partial_unload_vram(bytes_requested)
+
     # NOTE: deliberately NO destroy() on the wrapper. The raw ungated destroy was dead code with
     # zero callers, and any future caller reaching for it would reproduce the shared-handle UAF the
     # liveness gate exists to prevent — release(requester=...) is the one sanctioned teardown (the
