@@ -70,7 +70,17 @@ def _qf_dtype(torch_dtype):
 # (zero reload); no successor within the window ⇒ the real unload runs, so a workflow switch
 # still frees VRAM within seconds. 15 s = 500x the measured 27 ms swap gap, small enough that
 # a genuine drop frees before a human notices.
-_QF_LAZY_DETACH_SECONDS = 15.0
+#
+# 2026-09-05 (LTX-2.5 acceptance, measured on the user box): 15 s EXPIRED INSIDE EVERY RUN — the
+# window armed after the main sampler ran out during the refine sampler / VAE decode, so the next
+# run's main node paid the full reload (3.0 s: 12,597 per-parameter cudaMalloc + ~11 GB pageable
+# H2D, nsys W10) plus the engine's per-geometry rope rebuild (~1.2 s). Real VRAM pressure does
+# NOT depend on this timer: comfy's free_memory sweep reaches partially_unload() (engine
+# quantfunc_partial_unload sheds blocks, full unload as the fallback) and cancels the window
+# (_qf_cancel_pending_detach) — so the window only bounds how long an IDLE engine keeps VRAM
+# nobody asked for. 120 s covers a whole multi-stage run plus the gap to the next queue entry;
+# model-agnostic (the policy lives here, not in any loader).
+_QF_LAZY_DETACH_SECONDS = 120.0
 
 
 def _qf_cancel_pending_detach(eng):
