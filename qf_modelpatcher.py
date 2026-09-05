@@ -711,6 +711,9 @@ class QFLazyEngine:
         # it; unmaterialized = nothing to shed (0 → the patcher's full-unload fallback is a no-op too).
         return 0 if self._real is None else self._real.partial_unload_vram(bytes_requested)
 
+    def resident_vram_bytes(self):
+        return 0 if self._real is None else self._real.resident_vram_bytes()
+
     # NOTE: deliberately NO destroy() on the wrapper. The raw ungated destroy was dead code with
     # zero callers, and any future caller reaching for it would reproduce the shared-handle UAF the
     # liveness gate exists to prevent — release(requester=...) is the one sanctioned teardown (the
@@ -916,7 +919,18 @@ class QFModelPatcher(comfy.model_patcher.ModelPatcher):
         if self._is_shadow():
             return self._QF_SHADOW_LEDGER_BYTES
         eng = self._engine()
-        return max(1, int(eng.footprint_bytes)) if eng is not None else 1
+        if eng is None:
+            return 1
+        # The on-disk ESTIMATE under-reports a resident engine (the coalesced pack is larger than the file;
+        # workspaces/activations are not in it — measured 12,688 vs 16,928+ MB): comfy then over-commits the
+        # card for its own dynamic models and the arena thrashes. Report the LIVE residency when the engine
+        # can tell it, never less than the estimate (the estimate is the load-time need while unloaded).
+        live = 0
+        try:
+            live = int(getattr(eng, "resident_vram_bytes", lambda: 0)() or 0)
+        except Exception:  # noqa: BLE001
+            live = 0
+        return max(1, int(eng.footprint_bytes), live)
 
     def model_size(self):
         return self._footprint()

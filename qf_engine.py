@@ -686,6 +686,21 @@ class QFEngineHandle:
             return 0
         return int(freed.value)
 
+    def resident_vram_bytes(self):
+        """LIVE device residency of the engine (paged weight arena mapped pages + the caching allocator's
+        footprint) via quantfunc_resident_vram_bytes; 0 when unsupported (old .so) / unloaded / no pipeline.
+        MEASURED (2026-09-05, LTX-2.5 acceptance box): the on-disk ESTIMATE reported 12,688 MB while the engine
+        held 16,928 MB of pack + activations — comfy's dynamic TE loader filled the ~4 GB the ledger did not
+        see, and the arena thrashed (page-out/page-in inside every forward of the first run)."""
+        if self.pipeline is None or self.unloaded or not hasattr(self.lib, "quantfunc_resident_vram_bytes"):
+            return 0
+        out = ctypes.c_uint64(0)
+        try:
+            st = self.lib.quantfunc_resident_vram_bytes(self.pipeline, ctypes.byref(out))
+        except Exception:  # noqa: BLE001
+            return 0
+        return int(out.value) if st == QUANTFUNC_OK else 0
+
     def unload_vram(self):
         """Co-eviction (#4): free the engine's VRAM (quantfunc_unload_sync — GPU->CPU, keeps the CPU
         backup; the pipeline auto-reloads on the next generate). Idempotent. Returns the freed byte
