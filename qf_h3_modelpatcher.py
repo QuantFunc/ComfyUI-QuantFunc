@@ -81,10 +81,9 @@ from comfy.ldm.minimax.model import pack_audio, unpack_audio, patchify_video, un
 class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
     """MiniMax-H3 svdq joint-AV pipeline exposed as a native comfy MODEL (native-KSampler seam), t2va."""
 
-    def __init__(self, model_config, engine, device=None, resident_block_count=999):
+    def __init__(self, model_config, engine, device=None):
         super().__init__(model_config, device=device)     # disable_unet honored in BaseModel.__init__
         self.diffusion_model = _QFStub()
-        self.set_resident_block_count(resident_block_count)     # [manual-residency] generic knob (QFSessionModelMixin)
         self._qf = engine
         self._num_steps = 0               # DERIVED per run from sample_sigmas (len-1) at _begin
         self._num_frames = 0              # DERIVED per run from the video latent's T (see _derive_geometry)
@@ -282,7 +281,7 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
                 f"the stock ModelSamplingMiniMaxH3 node (shift_video + shift_audio) for H3, or wire no "
                 f"sampling node at all to keep the checkpoint defaults.")
         _opts = {
-            **self.residency_opts(),                              # [manual-residency] generic knob
+            **self.residency_opts(),                              # [session-knobs] generic knob
             "audio_dims": audio_dims,
             "av_sigma_shift_video": float(ms.shift),
             "av_sigma_shift_audio": float(ms.audio_shift or 3.0),
@@ -548,7 +547,7 @@ def register(deps):
     estimate_footprint = deps["estimate_footprint"]
 
 
-    def build(transformer1_path, transformer2_path, resident_block_count, bundle_dir=None,
+    def build(transformer1_path, transformer2_path, bundle_dir=None,
               lora_entries=(), sparse_opts=None):
         """File-based loading for MiniMax-H3 — the wan staging pattern, single-expert:
         stage the shipped config bundle (configs/minimax-h3-*/, official configs) + symlink
@@ -568,10 +567,10 @@ def register(deps):
         if sparse_opts:
             create_extra.update(sparse_opts)
         return _build_from_package(model_dir, os.path.basename(transformer1_path),
-                                   resident_block_count, lora_entries=lora_entries,
+                                   lora_entries=lora_entries,
                                    create_extra=create_extra)
 
-    def _build_from_package(model_dir, model_name, resident_block_count, start_image=None,
+    def _build_from_package(model_dir, model_name, start_image=None,
               connector_ckpt="(none)", lora_entries=(), create_extra=None):
         if start_image is not None:
             raise RuntimeError(
@@ -610,12 +609,10 @@ def register(deps):
             model_config = comfy.supported_models.MiniMaxH3(unet_config)
             qfmp.ensure_model_config_attrs(model_config)
 
-            model = QFH3Model(model_config, engine, device=device,
-                              resident_block_count=resident_block_count)
+            model = QFH3Model(model_config, engine, device=device)
             _register_model(model)
             patcher = QFModelPatcher(model, load_device=device, offload_device=offload)
             print(f"[qf_native] loaded QuantFuncNativeLoader (MiniMax-H3 svdq AV) package={model_name} "
-                  f"resident_blocks={resident_block_count} "
                   f"footprint~{engine.footprint_bytes // (1024*1024)}MB (create deferred)", flush=True)
             return qfmp.tag_lora_rebuild(patcher, lora_entries, _build)
 

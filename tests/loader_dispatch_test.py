@@ -204,9 +204,8 @@ def main():
     # ── 1) UI surface (per-family pivot): wan = dual required transformers + DUAL MODEL outputs;
     #      single-expert nodes = one transformer; preset dropdowns are FAMILY-FILTERED ──
     it = WanL.INPUT_TYPES()
-    check("wan required = transformer1/transformer2/model_config/resident_block_count",
-          list(it["required"].keys()) == ["transformer1", "transformer2", "model_config",
-                                          "resident_block_count"],
+    check("wan required = transformer1/transformer2/model_config",
+          list(it["required"].keys()) == ["transformer1", "transformer2", "model_config"],
           f"-> {list(it['required'].keys())}")
     check("wan has NO optional block (transformer2 is required)", not it.get("optional"))
     check("wan RETURN = two MODELs named high/low",
@@ -244,7 +243,7 @@ def main():
     # opportunistically with a te-dir fallback).
     _out_split = None
     try:
-        _out_split = LtxL.load("fx-ltx-2.5-quantfunc-4bit.safetensors", "ltx2-2.5-22b", 999)[0]
+        _out_split = LtxL.load("fx-ltx-2.5-quantfunc-4bit.safetensors", "ltx2-2.5-22b")[0]
     except RuntimeError as e:
         check("ltx2 transformer-only resolves via the sibling completion file", False,
               f"-> unexpected refusal: {str(e)[:90]}")
@@ -259,7 +258,7 @@ def main():
     # next to the transformer -> the new message names the probed dir, the
     # BOTH-modality requirement, and both remedies.
     try:
-        LtxL.load("fx-iso-ltx-2.5-quantfunc-4bit.safetensors", "ltx2-2.5-22b", 999)
+        LtxL.load("fx-iso-ltx-2.5-quantfunc-4bit.safetensors", "ltx2-2.5-22b")
         check("ltx2 transformer-only with NO completion source refuses loud",
               False, "-> no exception")
     except RuntimeError as e:
@@ -267,18 +266,47 @@ def main():
               "transformer-only" in str(e) and "connectors completion" in str(e)
               and "allin" in str(e) and "audio_embeddings_connector" in str(e),
               f"-> {str(e)[:90]}")
-    # node surface: required = latent-only trio (user 2026-08-22 "只保留transformer/block/
-    # model_config…只关注latent"); optional = the runtime SESSION dials (attention_backend
-    # 2026-08-27; step_cache + block_cache re-enabled 2026-08-31 「step cache 以及 fbcache
-    # 的开关重新开启」). Every optional is a session knob (no create key / no rebuild) —
-    # sparse is deliberately NOT among them (removed 2026-08-29, only the caches came back).
+    # node surface: required = latent-only duo (transformer + model_config; the manual
+    # block-count widget was REMOVED 2026-09-12 — residency is arena-managed); optional =
+    # the runtime SESSION dials (attention_backend 2026-08-27; sol_tau; quality_enhance
+    # [token-prune switch, replaced the raw token_prune float 2026-09-12]; step_cache +
+    # block_cache). Every optional is a session knob (no create key / no rebuild) — sparse is
+    # deliberately NOT among them (removed 2026-08-29, only the caches came back).
     _lit = LtxL.INPUT_TYPES()
-    check("ltx node surface = latent-trio required + session-dial optionals (no sparse)",
-          list(_lit["required"].keys()) == ["transformer", "model_config", "resident_block_count"]
-          and list(_lit.get("optional", {}).keys()) == ["attention_backend", "sol_tau",
+    check("ltx node surface = latent-duo required + session-dial optionals (no sparse)",
+          list(_lit["required"].keys()) == ["transformer", "model_config"]
+          and list(_lit.get("optional", {}).keys()) == ["attention_backend", "sol_tau", "quality_enhance",
                                                         "step_cache", "block_cache"]
           and "sparse" not in _lit.get("optional", {}),
           f"-> req={list(_lit['required'].keys())} opt={list(_lit.get('optional', {}).keys())}")
+    # h3 node surface (same latent-duo + session dials shape as ltx; block-count removed 2026-09)
+    _h3it = H3L.INPUT_TYPES()
+    check("h3 node surface = latent-duo required + session-dial optionals",
+          list(_h3it["required"].keys()) == ["transformer", "model_config"]
+          and list(_h3it.get("optional", {}).keys()) == ["attention_backend", "sol_tau",
+                                                          "quality_enhance", "step_cache", "block_cache"],
+          f"-> req={list(_h3it['required'].keys())} opt={list(_h3it.get('optional', {}).keys())}")
+    # (B) quality_enhance switch -> engine token-prune keep-fraction (ON = full quality, OFF = prune)
+    check("quality_enhance mapper: ON->1.0 / OFF->0.8",
+          qfn._quality_enhance_to_token_prune(True) == 1.0
+          and qfn._quality_enhance_to_token_prune(False) == 0.8,
+          f"-> ON={qfn._quality_enhance_to_token_prune(True)} OFF={qfn._quality_enhance_to_token_prune(False)}")
+    # (B) the token_prune WIRING itself: set_token_prune -> residency_opts emits token_prune_keep_ratio
+    #     (unset/default omits it). NOTE: the pixel-level A/B (quality_enhance ON vs OFF) is the USER's
+    #     ComfyUI acceptance — this arm only proves the widget->engine key wiring, not the visual effect.
+    from qfn_test_pkg import qf_modelpatcher as _qmp_tp
+    class _TPProbe(_qmp_tp.QFSessionModelMixin):
+        pass
+    _tp_on = _TPProbe(); _tp_on.set_token_prune(0.8)
+    _d_tp_on = _tp_on.residency_opts()
+    _d_tp_def = _TPProbe().residency_opts()
+    check("token_prune wiring: set_token_prune(0.8) -> residency_opts token_prune_keep_ratio=0.8; default omits",
+          _d_tp_on.get("token_prune_keep_ratio") == 0.8 and "token_prune_keep_ratio" not in _d_tp_def,
+          f"-> set={_d_tp_on.get('token_prune_keep_ratio')} default_has_key={'token_prune_keep_ratio' in _d_tp_def}")
+    # qfa REMOVED as a user-facing attention_backend choice (2026-09-13)
+    check("attention_backend choices drop qfa (SM80+ and SM75)",
+          "qfa" not in qfn._ATTN_BACKEND_SM80PLUS and "qfa" not in qfn._ATTN_BACKEND_SM75,
+          f"-> sm80+={qfn._ATTN_BACKEND_SM80PLUS} sm75={qfn._ATTN_BACKEND_SM75}")
     # the ALL-IN single file: projections + BOTH modality connector blocks packed (the audio
     # one is ALSO the AV discriminant — no audio_vae staging, comfy owns audio decode).
     import struct as _st2
@@ -317,7 +345,7 @@ def main():
     _msgs = {}
     for _f in (_half1, _half2):
         try:
-            _o = LtxL.load(_f, "ltx2-2.5-22b", 999)[0]
+            _o = LtxL.load(_f, "ltx2-2.5-22b")[0]
             _ = _o.model._qf.lib   # first touch materializes the staged pkg key
             _md_ = _o.model._qf._ckey[0]
             _msgs[_f] = os.path.realpath(os.path.join(_md_, "connectors", "model.safetensors"))
@@ -333,7 +361,7 @@ def main():
     import shutil as _sh
     _sh.copyfile(os.path.join(dm, _half1), os.path.join(dm2, _half1_iso))
     try:
-        LtxL.load(_half1_iso, "ltx2-2.5-22b", 999)
+        LtxL.load(_half1_iso, "ltx2-2.5-22b")
         check("ltx2 video-only-connector with NO completion source gets the joint-AV refusal",
               False, "-> no exception")
     except RuntimeError as e:
@@ -342,7 +370,7 @@ def main():
               and "connector_ckpt" not in str(e),
               f"-> {str(e)[:90]}")
     # ── positive path: the all-in file alone loads (AV via the packed audio connector) ──
-    out_ltx = LtxL.load(_allin_name, "ltx2-2.5-22b", 999)[0]
+    out_ltx = LtxL.load(_allin_name, "ltx2-2.5-22b")[0]
     check("ltx2 AV file-mode returns a QFModelPatcher",
           type(out_ltx).__name__ == "QFModelPatcher")
     check("ltx2 AV model is QFLTXAVModel (packed audio connector -> AV path)",
@@ -445,7 +473,7 @@ def main():
           [round(v, 4) for v in (_mdl._pending_frame_t_scale or [])] == [0.3, 1.0],
           f"-> {_mdl._pending_frame_t_scale}")
     # minimax-h3 file-mode: minimal staging (configs + single xfm; no extra links)
-    out_h3 = H3L.load("fx-minimax-h3-quantfunc-int4.safetensors", "minimax-h3-fl2va", 999)[0]
+    out_h3 = H3L.load("fx-minimax-h3-quantfunc-int4.safetensors", "minimax-h3-fl2va")[0]
     check("h3 file-mode returns a QFModelPatcher + QFH3Model",
           type(out_h3).__name__ == "QFModelPatcher"
           and type(out_h3.model).__name__ == "QFH3Model", f"-> {type(out_h3.model).__name__}")
@@ -462,26 +490,26 @@ def main():
     # a preset whose manifest family does not match the NODE's family → the defense-in-depth guard
     try:
         WanL.load("fx-t2v-4steps-high-quantfunc-int4.safetensors",
-                  "fx-t2v-4steps-low-quantfunc-int4.safetensors", "fx-ltx", 999)
+                  "fx-t2v-4steps-low-quantfunc-int4.safetensors", "fx-ltx")
         check("cross-family preset on the wan node refused", False, "-> no exception")
     except RuntimeError as e:
         check("cross-family preset on the wan node refused", "declares family" in str(e))
     try:
-        LtxL.load("fx-t2v-4steps-high-quantfunc-int4.safetensors", "fx-alien", 999)
+        LtxL.load("fx-t2v-4steps-high-quantfunc-int4.safetensors", "fx-alien")
         check("unknown-family preset refused (family guard)", False, "-> no exception")
     except RuntimeError as e:
         check("unknown-family preset refused (family guard)", "declares family" in str(e))
     for evil_cfg in ("../wan2.2-a14b-t2v", "a/b", "..", ""):
         try:
             WanL.load("fx-t2v-4steps-high-quantfunc-int4.safetensors",
-                      "fx-t2v-4steps-low-quantfunc-int4.safetensors", evil_cfg, 999)
+                      "fx-t2v-4steps-low-quantfunc-int4.safetensors", evil_cfg)
             check(f"model_config refuses {evil_cfg!r}", False, "-> loaded!")
         except RuntimeError:
             check(f"model_config refuses {evil_cfg!r}", True)
     # manifest-driven SHAPE mismatches
     try:
         WanL.load("fx-t2v-4steps-high-quantfunc-int4.safetensors",
-                  "fx-t2v-4steps-low-quantfunc-int4.safetensors", "fx-single", 999)
+                  "fx-t2v-4steps-low-quantfunc-int4.safetensors", "fx-single")
         check("single-expert preset + transformer2 refused", False, "-> no exception")
     except RuntimeError as e:
         check("single-expert preset + transformer2 refused", "single-transformer" in str(e))
@@ -489,7 +517,7 @@ def main():
     # ── 3) wan dual-expert staging + denoise_only create cfg + DUAL MODEL outputs ──
     try:
         pair = WanL.load("fx-t2v-4steps-high-quantfunc-int4.safetensors",
-                         "fx-t2v-4steps-low-quantfunc-int4.safetensors", "wan2.2-a14b-t2v", 999)
+                         "fx-t2v-4steps-low-quantfunc-int4.safetensors", "wan2.2-a14b-t2v")
         check("wan loader returns a (high, low) pair", isinstance(pair, tuple) and len(pair) == 2)
         out, low = pair
         check("both outputs are QFModelPatcher",
@@ -602,7 +630,7 @@ def main():
     # a NON-conforming file name for the preset must be refused loud (file_hints mechanism)
     try:
         WanL.load("other.safetensors", "fx-t2v-4steps-low-quantfunc-int4.safetensors",
-                  "wan2.2-a14b-t2v", 999)
+                  "wan2.2-a14b-t2v")
         check("file_hints refuses a non-conforming transformer1", False, "-> loaded!")
     except RuntimeError as e:
         check("file_hints refuses a non-conforming transformer1",
@@ -610,7 +638,7 @@ def main():
 
     # wan without a low expert must refuse (A14B is dual-expert; "" maps to the none-sentinel)
     try:
-        WanL.load("fx-t2v-4steps-high-quantfunc-int4.safetensors", "", "wan2.2-a14b-t2v", 999)
+        WanL.load("fx-t2v-4steps-high-quantfunc-int4.safetensors", "", "wan2.2-a14b-t2v")
         check("wan single-file refused (dual-expert required)", False, "-> no exception")
     except RuntimeError as e:
         check("wan single-file refused (dual-expert required)", "DUAL-expert" in str(e))
@@ -623,19 +651,19 @@ def main():
             fh.write(b"\0" * 16)
     try:
         WanL.load("fx-t2v-4steps-high-quantfunc-int4.safetensors",
-                  "fx-i2v-4steps-low-quantfunc-int4.safetensors", "wan2.2-a14b-i2v", 999)
+                  "fx-i2v-4steps-low-quantfunc-int4.safetensors", "wan2.2-a14b-i2v")
         check("i2v preset refuses a t2v transformer1", False, "-> loaded!")
     except RuntimeError as e:
         check("i2v preset refuses a t2v transformer1", "does not look like" in str(e))
     try:
         WanL.load("fx-i2v-4steps-high-quantfunc-int4.safetensors",
-                  "fx-t2v-4steps-low-quantfunc-int4.safetensors", "wan2.2-a14b-t2v", 999)
+                  "fx-t2v-4steps-low-quantfunc-int4.safetensors", "wan2.2-a14b-t2v")
         check("t2v preset refuses an i2v transformer1", False, "-> loaded!")
     except RuntimeError as e:
         check("t2v preset refuses an i2v transformer1", "does not look like" in str(e))
     pair_i2v = WanL.load("fx-i2v-4steps-high-quantfunc-int4.safetensors",
                          "fx-i2v-4steps-low-quantfunc-int4.safetensors",
-                         "wan2.2-a14b-i2v", 999)
+                         "wan2.2-a14b-i2v")
     check("i2v preset loads a conforming pair (dual outputs)",
           isinstance(pair_i2v, tuple) and len(pair_i2v) == 2)
     mi_i2v = json.load(open(os.path.join(cfgroot, "wan2.2-a14b-i2v", "model_index.json")))
@@ -708,7 +736,7 @@ def main():
                                          (0,  False, "no CUDA -> NO pin (fail-safe AUTO)")):
             _wan_mod._wan_device_sm = (lambda v: (lambda: v))(_sm_val)
             _pair = WanL.load("fx-t2v-4steps-high-quantfunc-int4.safetensors",
-                              "fx-t2v-4steps-low-quantfunc-int4.safetensors", "wan2.2-a14b-t2v", 999)
+                              "fx-t2v-4steps-low-quantfunc-int4.safetensors", "wan2.2-a14b-t2v")
             _p = _pair[0]
             _n0 = len(creates)
             _ = _p.model._qf.lib          # touch -> create (or cache-hit on an identical cfg)
@@ -765,7 +793,7 @@ def main():
 
         base, base_low = WanL.load("fx-t2v-4steps-high-quantfunc-int4.safetensors",
                                    "fx-t2v-4steps-low-quantfunc-int4.safetensors",
-                                   "wan2.2-a14b-t2v", 999)
+                                   "wan2.2-a14b-t2v")
         shifted = ModelSamplingSD3().patch(base, 11.0)[0]     # upstream comfy patch on the pair's high
         check("comfy patches still apply to the dual outputs (clone path intact)",
               "model_sampling" in shifted.object_patches)
@@ -926,10 +954,10 @@ def main():
                     _viol.append(f"{_fn}:{_n.lineno}")
         check("destroy() is callable ONLY inside _retire_handle (AST call+alias, derived files)",
               not _viol, f"-> violations={_viol}")
-        # recursive create-guard (reviewer-D LOW): the knob nested at any depth refuses.
+        # recursive create-guard (reviewer-D LOW): a session knob nested at any depth refuses.
         from qfn_test_pkg import qf_engine as _rqe
         _nr = 0
-        for _bad in ({"a": {"resident_block_count": 1}}, {"lora": [{"resident_block_count": 2}]}):
+        for _bad in ({"a": {"step_cache": 1}}, {"lora": [{"sparse": 2}]}):
             try:
                 _rqe._refuse_session_knobs_in_create(_bad)
             except RuntimeError:
@@ -939,8 +967,22 @@ def main():
             _rqe._refuse_session_knobs_in_create({"a": {"b": 1}, "lora": [{"path": "x"}]})
         except RuntimeError:
             _nok = False
-        check("create guard refuses the knob at ANY depth (both ways)", _nr == 2 and _nok,
+        check("create guard refuses a session knob at ANY depth (both ways)", _nr == 2 and _nok,
               f"-> nested-raised={_nr}/2 clean-passed={_nok}")
+        # STRING (pre-serialized JSON) form must ALSO refuse (qf_engine isinstance(cfg,str) branch —
+        # its only prior coverage was the deleted resident_block_count block; re-added with a live key)
+        _sr = False
+        try:
+            _rqe._refuse_session_knobs_in_create('{"denoise_only": true, "step_cache": 0.05}')
+        except RuntimeError:
+            _sr = True
+        _sok = True
+        try:
+            _rqe._refuse_session_knobs_in_create('{"denoise_only": true}')
+        except RuntimeError:
+            _sok = False
+        check("create guard refuses a session knob in the STRING (JSON) form too",
+              _sr and _sok, f"-> str-with-key raised={_sr} str-clean passed={_sok}")
     except Exception as e:  # noqa: BLE001
         check("wiring-derived dual LoRA arm", False, f"-> raised {type(e).__name__}: {e}")
 
@@ -950,7 +992,7 @@ def main():
             open(os.path.join(dm, f), "wb").write(b"\0" * 16)
         fresh, fresh_low = WanL.load("ram-t2v-high-quantfunc-int4.safetensors",
                                      "ram-t2v-low-quantfunc-int4.safetensors",
-                                     "wan2.2-a14b-t2v", 999)
+                                     "wan2.2-a14b-t2v")
         eng = fresh.model._qf
         check("never-created engine reports 0 host RAM", fresh.loaded_ram_size() == 0)
         check("never-created engine frees 0 host RAM", fresh.partially_unload_ram(10 ** 12) == 0)
@@ -973,9 +1015,9 @@ def main():
         for f in ("sh-t2v-high-quantfunc-int4.safetensors", "sh-t2v-low-quantfunc-int4.safetensors"):
             open(os.path.join(dm, f), "wb").write(b"\0" * 16)
         pa, pa_low = WanL.load("sh-t2v-high-quantfunc-int4.safetensors",
-                               "sh-t2v-low-quantfunc-int4.safetensors", "wan2.2-a14b-t2v", 999)
+                               "sh-t2v-low-quantfunc-int4.safetensors", "wan2.2-a14b-t2v")
         pb, pb_low = WanL.load("sh-t2v-high-quantfunc-int4.safetensors",
-                               "sh-t2v-low-quantfunc-int4.safetensors", "wan2.2-a14b-t2v", 999)
+                               "sh-t2v-low-quantfunc-int4.safetensors", "wan2.2-a14b-t2v")
         ra = pa.model._qf.ensure()
         rb = pb.model._qf.ensure()
         check("two loads of one file-pair share the real handle", ra is rb)
@@ -1084,66 +1126,6 @@ def main():
                       f"-> match({match_name})={ok_match} refuse(unrelated)={ok_refuse}")
     except Exception as e:  # noqa: BLE001
         check("file_hints contract scan", False, f"-> raised {type(e).__name__}: {e}")
-
-    # ── [manual-residency] runtime-adjustable resident_block_count = GENERIC-layer capability ──
-    # (a) mixin owns knob + the ONE injection point (default + set both reflected);
-    # (b) the structural guard refuses the knob in create_cfg (both ways);
-    # (c) no family re-inlines a per-family copy (the regression that would fork the knob
-    #     back out of the generic layer) — every family references residency_opts().
-    try:
-        from qfn_test_pkg import qf_modelpatcher as _qmp
-
-        class _RBProbe(_qmp.QFSessionModelMixin):
-            pass
-        _pr = _RBProbe()
-        _d0 = _pr.residency_opts()
-        _pr.set_resident_block_count(12)
-        _d1 = _pr.residency_opts()
-        check("mixin residency knob: default + set both reflected",
-              _d0 == {"resident_block_count": 999} and _d1 == {"resident_block_count": 12},
-              f"-> default={_d0} set={_d1}")
-        import qfn_test_pkg as _pkg
-        from qfn_test_pkg import qf_engine as _rqe
-        # Guard now sealed at the REAL create boundary (qf_engine.create_pipeline — reviewer-B
-        # hard-seal): both the dict and the pre-serialized-string config forms must refuse the
-        # session knob; both without-key forms + None must pass.
-        _raised = 0
-        for _badcfg in ({"denoise_only": True, "resident_block_count": 30},
-                        '{"denoise_only": true, "resident_block_count": 30}'):
-            try:
-                _rqe._refuse_session_knobs_in_create(_badcfg)
-            except RuntimeError:
-                _raised += 1
-        _passed = True
-        try:
-            _rqe._refuse_session_knobs_in_create({"denoise_only": True})
-            _rqe._refuse_session_knobs_in_create('{"denoise_only": true}')
-            _rqe._refuse_session_knobs_in_create(None)
-        except RuntimeError:
-            _passed = False
-        check("create-boundary session-knob guard discriminates both ways (dict + string forms)",
-              _raised == 2 and _passed,
-              f"-> with-key raised={_raised}/2 without-key passed={_passed}")
-        import inspect as _insp
-        import importlib as _implib
-        # AUTO-COVER every REGISTERED family (reviewer-B generality fix): derive the module list
-        # from the package's OWN _FAMILY_MODULES registry — a future 4th family added per the
-        # documented contract is scanned automatically; a hardcoded 3-tuple would stay green
-        # while the new family forked the knob back out of the generic layer. Floor >=3 so a
-        # registry shrink can't silently shrink coverage either.
-        _fam_mods = [(_n, _implib.import_module("." + _n, "qfn_test_pkg"))
-                     for _n in _pkg._FAMILY_MODULES]
-        _bad_inline, _uses = [], []
-        for _tag, _m in _fam_mods:
-            _src = _insp.getsource(_m)
-            if '"resident_block_count": self._resident_block_count' in _src:
-                _bad_inline.append(_tag)
-            _uses.append("self.residency_opts()" in _src)
-        check("ALL REGISTERED families use the generic injection (auto-covers future families)",
-              not _bad_inline and all(_uses) and len(_fam_mods) >= 3,
-              f"-> families={[t for t, _ in _fam_mods]} re-inlined={_bad_inline} uses={_uses}")
-    except Exception as e:  # noqa: BLE001
-        check("manual-residency generic-layer arm", False, f"-> raised {type(e).__name__}: {e}")
 
     print("LOADER_DISPATCH:", "PASS" if bad == 0 else f"FAIL ({bad} wrong)")
     return 0 if bad == 0 else 1

@@ -3,6 +3,8 @@ native ComfyUI loader. Structs mirror include/quantfunc.h (session structs copie
 verbatim from the PROVEN tests/scripts/native_session_t1.py). No tests/lib dependency.
 """
 import ctypes
+import re as _re_soname
+_SONAME_RE = _re_soname.compile(r"lib[^/]*\.so(?:\.\d+[a-z]?)*")   # lib*.so, lib*.so.5, libopencv_core.so.4.5d
 import json
 import os
 import platform
@@ -481,10 +483,14 @@ def load_lib():
             entries = os.listdir(so_dir)
         except OSError:
             entries = []
+        # Only REAL sonames: `lib*.so` or `lib*.so.<digits>[.<digits>...]`. A backup copy of a
+        # sidecar (`libquantfunc_attention.so.prod-bak`, `.so.pre-<tag>`) is NOT a sidecar: gdb on
+        # 2026-09-12 showed THREE builds of libquantfunc_attention.so mapped into one ComfyUI
+        # process (the real one + two backups), and the process aborted at exit with
+        # "double free or corruption" from their colliding static destructors.
         pending = sorted(
             f for f in entries
-            if f.startswith("lib") and ".so" in f and f != base
-            and not f.startswith(base + ".") and ".bak" not in f
+            if _SONAME_RE.fullmatch(f) and f != base
         )
         for _ in range(max(1, len(pending))):
             still = []
@@ -515,8 +521,7 @@ def _refuse_session_knobs_in_create(config_json):
     at the REAL create boundary (every quantfunc_create goes through create_pipeline, so a
     caller cannot bypass it by skipping the package's _get_engine cache wrapper — reviewer-B
     hard-seal). The refused set = EVERY session knob QFSessionModelMixin.residency_opts()
-    injects into denoise_begin: resident_block_count (residency re-planned per session;
-    measured rb-swap with no rebuild) AND the runtime cache/sparse keys (+ the
+    injects into denoise_begin: the runtime cache/sparse keys (+ the
     loader-widget spellings step_cache/block_cache/sparse). In a create config any of them would enter the
     pipeline cache identity upstream and silently reintroduce a full model rebuild on every
     widget change — refuse loud, both the dict and the pre-serialized-string form."""
@@ -532,9 +537,9 @@ def _refuse_session_knobs_in_create(config_json):
         # equally enter the json-hashed cache identity — refuse it at any depth.
         if isinstance(obj, dict):
             # session knobs (runtime, re-applied per denoise_begin) — NONE may enter the
-            # create config / ckey: resident_block_count + the runtime session keys (the same
-            # guarantee class; a create-side leak would rebuild the pipeline per widget change).
-            if any(k in obj for k in ("resident_block_count", "cache_mode", "cache_thresh",
+            # create config / ckey: the runtime session keys (the same guarantee class; a
+            # create-side leak would rebuild the pipeline per widget change).
+            if any(k in obj for k in ("cache_mode", "cache_thresh",
                                       "step_cache", "block_cache", "step_cache_thresh",
                                       "block_cache_thresh", "sparse", "sparse_cdf")):
                 return True
@@ -544,8 +549,8 @@ def _refuse_session_knobs_in_create(config_json):
         return False
     if _scan(cfg):
         raise RuntimeError(
-            "qf_native: a runtime SESSION knob (resident_block_count / cache_mode / "
-            "cache_thresh / step_cache — they ride every denoise_begin via "
+            "qf_native: a runtime SESSION knob (cache_mode / cache_thresh / "
+            "step_cache — they ride every denoise_begin via "
             "QFSessionModelMixin.residency_opts) must never appear anywhere in a create "
             "config — that would bake it into the pipeline cache identity and rebuild "
             "the whole pipeline on every widget change.")
@@ -553,7 +558,26 @@ def _refuse_session_knobs_in_create(config_json):
 
 def create_pipeline(lib, *, model_dir, transformer_path=None, model_backend="svdq",
                     device_idx=0, config_json=None):
-    _refuse_session_knobs_in_create(config_json)   # [manual-residency] session knob ≠ create key
+    _refuse_session_knobs_in_create(config_json)   # [session-knobs] session knob ≠ create key
+    # [metadata-KV disk cache — user 2026-09-01 "为啥metadata每次都重新请求后端 不是有缓存吗"]
+    # The engine HAS a two-tier keymap/metadata cache (process mem → disk CIPHERTEXT at
+    # <_cache_dir>/.quantfunc_keymap_cache/), but the disk tier arms only when create passes
+    # `_cache_dir` — which this plugin never did, so every ComfyUI RESTART re-fetched from the
+    # backend. Default it to the plugin's own cache/ dir (ciphertext-only on disk; decrypt
+    # stays in-memory per use — no security change). An explicit caller _cache_dir still wins.
+    try:
+        _cdir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache")
+        os.makedirs(_cdir, exist_ok=True)
+        if config_json is None:
+            config_json = {"_cache_dir": _cdir}
+        elif isinstance(config_json, dict):
+            config_json.setdefault("_cache_dir", _cdir)
+        else:
+            _cj = json.loads(config_json)
+            if isinstance(_cj, dict) and "_cache_dir" not in _cj:
+                _cj["_cache_dir"] = _cdir; config_json = json.dumps(_cj)
+    except Exception:
+        pass  # cache dir is an optimization — never block create on it
     p = InitParams()
     p._keep = [_enc(model_dir), _enc(transformer_path), _enc(model_backend)]
     p.model_dir = p._keep[0]

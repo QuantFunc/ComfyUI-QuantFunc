@@ -406,7 +406,7 @@ def _get_engine(model_dir, create_cfg=None, device_idx=0):
     package (engine loads model_dir/transformer[_2]/ directly — no path override).
     create_cfg carries the per-family create keys (e.g. wan text_precision) + the
     declarative lora stack from chained QuantFuncNativeLoRA nodes."""
-    # [manual-residency] the session-knob-≠-create-key guard is sealed INSIDE
+    # [session-knobs] the session-knob-≠-create-key guard is sealed INSIDE
     # qf_engine.create_pipeline (the real quantfunc_create boundary — construction-enforced,
     # unbypassable by a future direct caller), not duplicated here (one truth source).
     # [EXPERIMENT-ONLY 2026-08-23, internal A/B — remove after measurement; shipped
@@ -434,13 +434,19 @@ def _get_engine(model_dir, create_cfg=None, device_idx=0):
     if key:
         cfg["api_key"] = key
         cfg["server_url"] = surl
-    pipeline = qfe.create_pipeline(lib, model_dir=model_dir, transformer_path=None,
-                                   model_backend="svdq", device_idx=int(device_idx),
-                                   config_json=(cfg if cfg else None))
     # Footprint = the ENGINE-RESIDENT transformer weight bytes only (dual-expert). VAE + text_encoder
     # stay NATIVE comfy nodes (comfy already accounts for them), so they must NOT be added here — an
     # over-report would make comfy's ledger evict siblings that actually fit.
+    # ORDER IS LOAD-BEARING: the exact estimate is a PIPELINE-LESS engine entry that installs its own
+    # metadata-KV resolver and CLEARS the process slot on exit (quantfunc_api.cpp ClearResolverOnExit).
+    # Called AFTER create it wiped the live pipeline's resolver, so a LAZY-weight family (MiniMax-H3
+    # materializes its transformer at the first denoise_begin) failed its first sealed-metadata touch
+    # with "KV-protected … API key is required" (measured 2026-09-07, h3 venue on 远程-linux-d).
+    # Estimating BEFORE create leaves create's resolver as the last writer.
     footprint = _estimate_package_footprint(model_dir, device_idx=int(device_idx), server_url=cfg.get("server_url"), api_key=cfg.get("api_key"))
+    pipeline = qfe.create_pipeline(lib, model_dir=model_dir, transformer_path=None,
+                                   model_backend="svdq", device_idx=int(device_idx),
+                                   config_json=(cfg if cfg else None))
     eng = qfe.QFEngineHandle(lib, pipeline, footprint_bytes=footprint)
     _PIPELINE_CACHE[ckey] = eng
     return eng, ckey
@@ -449,7 +455,7 @@ def _get_engine(model_dir, create_cfg=None, device_idx=0):
 if _IMPORT_OK:
     # ── family REGISTRY: assembled from the per-family modules. Family LOGIC lives in the family
     #    modules; what remains here is the shared NODE SURFACE — transformer1/transformer2 FILE
-    #    dropdowns + model_type + resident_block_count (the LoRA node's target is WIRE-derived,
+    #    dropdowns + model_type (the LoRA node's target is WIRE-derived,
     #    no combo — chaining on the high output acts on the high expert). That
     #    surface is family-neutral as long as a new family fits the "1-2 transformer files +
     #    shipped config bundle" shape; one needing a NEW input must extend INPUT_TYPES here, so
@@ -489,7 +495,7 @@ if _IMPORT_OK:
 
 
     def _run_family_load(expect_family, transformer1, model_config,
-                         resident_block_count, transformer2, sparse_opts=None):
+                         transformer2, sparse_opts=None):
         """The SHARED loader core behind the per-family nodes (user 2026-08-21 pivot). All
         validation is preserved verbatim from the original single-node load(); the per-family
         nodes add only (a) a family-filtered preset dropdown and (b) this family guard —
@@ -549,7 +555,7 @@ if _IMPORT_OK:
         # only the transitional split exports; an incomplete single-file export is refused
         # loud by the family builder instead of being silently completed.
         # [#659] ALL runtime dials — the two cache thresholds AND the sparse dial —
-        # are SESSION knobs (same class as resident_block_count): armed
+        # are SESSION knobs (never create keys): armed
         # POST-construction on the returned patcher(s)' model via the mixin
         # setters, injected into every denoise_begin by residency_opts().
         # Deliberately NOT builder/create kwargs → they can never enter
@@ -563,7 +569,6 @@ if _IMPORT_OK:
             # sparse dial itself is a SESSION knob (below) and never rides here.
             _kw["sparse_opts"] = sparse_opts
         out = builder(transformer1_path=xfm1, transformer2_path=xfm2,
-                      resident_block_count=int(resident_block_count),
                       bundle_dir=bundle_dir, **_kw)
         # [cache/sparse surface REMOVED, user 2026-08-29 「移除所有loader的cache以及
         # 稀疏入口 整体默认不生效」] The per-model set_step_cache/set_block_cache/
@@ -574,12 +579,6 @@ if _IMPORT_OK:
         # dials are untouched and stay available.
         return out
 
-    _RESIDENT_BLOCKS_INPUT = ("INT", {"default": 999, "min": 1, "max": 1024,
-                                      "tooltip": "GPU-resident transformer blocks — the native "
-                                                 "seam's ONLY residency knob. The engine clamps "
-                                                 "to the model's block count, so the default "
-                                                 "keeps every block resident on a card that "
-                                                 "fits."})
     # [cache surface RE-ENABLED, user 2026-08-31 「step cache 以及 fbcache 的开关重新开启」]
     # The step_cache (EasyCache) + block_cache (First-Block Cache = "fbcache") widgets
     # restored to the video loaders (wan/LTX/H3) — the two loader widgets + their arming
@@ -604,19 +603,31 @@ if _IMPORT_OK:
                                      "Runtime session knob — takes effect next run, never "
                                      "rebuilds. COMPOSABLE with step_cache (EC skips whole "
                                      "steps; FBC skips blocks inside computed steps)."})
-    # [sol-tau dial 2026-08-31] the ONE user-facing Sol-Attn knob (user "就一个就好").
-    # Only meaningful under attention_backend=qfa (qfa = sol+qfa on H3/LTX). Same
-    # runtime-session-knob class as step_cache/sparse: re-sent each run, no rebuild;
-    # 1.0 default is omitted (older engines refuse unknown keys loud) and the engine
-    # resets an absent key to 1.0 (dialing back truly restores the default).
-    _TOKEN_PRUNE_INPUT = ("FLOAT", {"default": 1.0, "min": 0.2, "max": 1.0, "step": 0.05,
-                     "tooltip": "Token-prune keep fraction (CAT). 1.0 = OFF; e.g. 0.4-0.5 = "
-                                "recompute only that fraction of VIDEO tokens per step "
-                                "(~1.4-1.5x faster, quality floor: last step always full; "
-                                "audio never pruned). Auto-disabled while a step/block cache "
-                                "is armed (they don't compose)."})
+    # [quality_enhance switch, user 2026-09-12] abstracts the raw token_prune float behind a
+    # BOOLEAN: OFF (default) = token-prune ON @0.8 keep (~1.2x faster; last step always full,
+    # audio never pruned), ON = keep every token (full quality, prune OFF). The engine is
+    # unchanged — it still receives token_prune_keep_ratio via set_token_prune/residency_opts.
+    _QUALITY_ENHANCE_INPUT = ("BOOLEAN", {"default": False,
+                     "tooltip": "Quality-enhance. OFF (default) = faster: token-prune ON at "
+                                "keep-fraction 0.8 (recompute 80% of VIDEO tokens per step, "
+                                "~1.2x; last step always full, audio never pruned). "
+                                "ON = full quality (keep every token, prune OFF). Runtime "
+                                "session knob — takes effect next run, never rebuilds."})
+
+    def _quality_enhance_to_token_prune(enhance):
+        """quality_enhance switch -> engine token-prune keep-fraction (user 2026-09-12):
+        ON = 1.0 (keep all tokens = prune OFF, full quality); OFF (default) = 0.8 (prune,
+        ~1.2x faster). The engine still receives the float via set_token_prune ->
+        residency_opts token_prune_keep_ratio; only the plugin-exposed widget changed."""
+        return 1.0 if enhance else 0.8
+
+    # [sol-tau dial 2026-08-31] the ONE user-facing Sol-Attn knob (user "就一个就好"). Applies to
+    # the flash/sage backends — the engine's applySolTauDial engages the Sol-Attn keep-ratio per
+    # block regardless of attention_backend (it is NOT tied to the removed qfa choice). Same
+    # runtime-session-knob class as step_cache/sparse: re-sent each run, no rebuild; 1.0 default is
+    # omitted (older engines refuse unknown keys loud) and the engine resets an absent key to 1.0.
     _SOL_TAU_INPUT = ("FLOAT", {"default": 1.0, "min": 0.02, "max": 1.0, "step": 0.01,
-                     "tooltip": "Sol-Attn keep-ratio (qfa/flash/sage backends). 1.0 = OFF "
+                     "tooltip": "Sol-Attn keep-ratio (flash/sage backends). 1.0 = OFF "
                                 "(the backend's original dense attention). <1 = sol engaged; "
                                 "value ~= fraction of attention blocks computed exactly: "
                                 "SMALLER = sparser = FASTER. 0.15-0.2 = the measured speed "
@@ -643,16 +654,15 @@ if _IMPORT_OK:
 
     # [attention backend selector, user 2026-08-27] one user-facing dropdown per loader.
     # SM-GATED: SM80+ offers the full set; SM75 (Turing) has NO int8-QK sage and NO
-    # flash_attn build, so only qfa + fp16_native are valid there. The widget VALUE is a
+    # flash_attn build, so only fp16_native is valid there. The widget VALUE is a
     # display name; _attn_backend_to_engine maps it to the engine's comp_opts string
     # ("fp16_native" -> "native"). "auto" = the engine's per-SM resolution (default), and
     # is passed through so the user's choice is always the single source of truth.
-    # [qfa = sol+qfa — user 2026-08-31 "不要新增任何开关 qfa就等于 sol+qfa"] there is NO separate
-    # "qfa-sol" option: on the video families (H3 / LTX2) selecting "qfa" routes self-attn through
-    # the engine's Sol-Attn NO-DROP arm at head_dim==128 automatically. The engine still ACCEPTS
-    # "qfa-sol" as a transparent alias, but it is deliberately NOT surfaced as a user-facing choice.
-    _ATTN_BACKEND_SM80PLUS = ["auto", "qfa", "flash", "sage", "fp16_native"]
-    _ATTN_BACKEND_SM75 = ["qfa", "fp16_native"]
+    # [qfa REMOVED as a user-facing choice — user 2026-09-13] the qfa (int8-QK + Hadamard /
+    # sol) backend is no longer offered in the dropdown. "auto" is unaffected (the engine may
+    # still resolve to qfa internally per-SM); only the explicit user choice is gone.
+    _ATTN_BACKEND_SM80PLUS = ["auto", "flash", "sage", "fp16_native"]
+    _ATTN_BACKEND_SM75 = ["fp16_native"]
 
     def _attn_backend_choices():
         choices = _ATTN_BACKEND_SM80PLUS
@@ -674,10 +684,9 @@ if _IMPORT_OK:
         return (choices, {"default": d,
                 "tooltip": "Self-attention backend. auto = engine picks per-SM (default). "
                            "flash = fp16 flash-attn (most robust; H3 high-res needs this). "
-                           "sage = int8-QK sage (fastest, SM80+). qfa = int8-QK + Hadamard "
-                           "rotation. fp16_native = portable fp16/fp32-score fallback. "
-                           "SM75 (Turing) offers only qfa + fp16_native. CREATE key — "
-                           "changing it re-creates the pipeline."})
+                           "sage = int8-QK sage (fastest, SM80+). fp16_native = portable "
+                           "fp16/fp32-score fallback. SM75 (Turing) offers only fp16_native. "
+                           "Runtime session knob — takes effect on the next run, no rebuild."})
 
     def _attn_backend_to_engine(v):
         # widget display name -> engine comp_opts attention_backend string
@@ -715,7 +724,6 @@ if _IMPORT_OK:
                                  {"tooltip": "The OFFICIAL wan model config preset (arch + VAE "
                                              "geometry + expected-file naming). "
                                              + _preset_file_expectations()}),
-                "resident_block_count": _RESIDENT_BLOCKS_INPUT,
             }, "optional": {
                 "attention_backend": _attn_backend_input(),
                 "step_cache": _STEP_CACHE_INPUT,
@@ -741,7 +749,7 @@ if _IMPORT_OK:
             "widget; both wires keep sharing the one engine. "
             + _COMMON_LIMITS)
 
-        def load(self, transformer1, transformer2, model_config, resident_block_count=999,
+        def load(self, transformer1, transformer2, model_config,
                  attention_backend="auto", step_cache=0.0, block_cache=0.0, act_scale_g32=False):
             # [#659] the sparse dial is a SESSION knob (never a create key — no rebuild
             # on change); sparse_opts carries CREATE-level keys only.
@@ -749,8 +757,8 @@ if _IMPORT_OK:
             # create key (widget change no longer re-keys the loader = no rebuild).
             sparse_opts = {"act_scale_g32": True} if act_scale_g32 else None
             pair = _run_family_load("wan", transformer1, model_config,
-                                    resident_block_count, transformer2,
-                                    sparse_opts=sparse_opts)
+                                    transformer2,
+                                    sparse_opts=(sparse_opts or None))
             eng_b = _attn_backend_to_engine(attention_backend)
             for _p in pair:
                 _mm = getattr(_p, "model", None)   # the session mixin lives on the MODEL
@@ -773,11 +781,10 @@ if _IMPORT_OK:
                 "model_config": (_model_config_choices(family="ltx2"),
                                  {"tooltip": "The OFFICIAL LTX-2 model config preset. "
                                              + _preset_file_expectations()}),
-                "resident_block_count": _RESIDENT_BLOCKS_INPUT,
             }, "optional": {
                 "attention_backend": _attn_backend_input(),
                 "sol_tau": _SOL_TAU_INPUT,
-                "token_prune": _TOKEN_PRUNE_INPUT,
+                "quality_enhance": _QUALITY_ENHANCE_INPUT,
                 "step_cache": _STEP_CACHE_INPUT,
                 "block_cache": _BLOCK_CACHE_INPUT,
             }}
@@ -791,22 +798,23 @@ if _IMPORT_OK:
                        "only consumes latents; comfy's sampler applies the frame-0 mask). "
                        + _COMMON_LIMITS)
 
-        def load(self, transformer, model_config, resident_block_count=999,
-                 attention_backend="auto", sol_tau=1.0, token_prune=1.0, step_cache=0.0, block_cache=0.0):
+        def load(self, transformer, model_config,
+                 attention_backend="auto", sol_tau=1.0, quality_enhance=False, step_cache=0.0, block_cache=0.0):
             # [aux-auto] NO aux file widgets and NO image socket (user 2026-08-22 "只保留
             # transformer/block/model_config … 只关注latent"): te/audio-vae/connectors
             # resolve from the preset manifest's aux_files inside _run_family_load; i2v is
             # the workflow's own latent conditioning (LTXVImgToVideoInplace), exactly like
             # wan's cond-latent shape.
             _p = _run_family_load("ltx2", transformer, model_config,
-                                   resident_block_count, None, sparse_opts=None)
+                                   None,
+                                   sparse_opts=None)
             _mm = getattr(_p, "model", None)
             if _mm is not None and hasattr(_mm, "set_attn_backend"):
                 _mm.set_attn_backend(_attn_backend_to_engine(attention_backend))
             if _mm is not None and hasattr(_mm, "set_sol_tau"):
                 _mm.set_sol_tau(sol_tau)
             if _mm is not None and hasattr(_mm, "set_token_prune"):
-                _mm.set_token_prune(token_prune)
+                _mm.set_token_prune(_quality_enhance_to_token_prune(quality_enhance))
             _arm_session_caches(_mm, step_cache, block_cache)
             return (_p,)
 
@@ -827,27 +835,7 @@ if _IMPORT_OK:
                                              + _preset_file_expectations()}),
             }, "optional": {
                 "attention_backend": _attn_backend_input(),
-                "resident_block_count": ("INT", {
-                    "default": 0, "min": 0, "max": 999,
-                    "tooltip": "0 = auto (engine-managed residency, the default). "
-                               ">0 = MANUAL: pin the first N transformer blocks "
-                               "GPU-resident (999 = as many as fit; never-OOM "
-                               "guarded). SESSION knob — applied at the next "
-                               "sampling run, no model rebuild."}),
-                # token-prune (CAT): image tokens only — text conditioning never
-                # pruned. SESSION knob (rides begin options), no rebuild.
-                # IMAGE-tuned range/guidance (e2e 2026-09-01, 8-step distilled @1024²,
-                # user ruling: recommend 0.75+): 0.7 measured clean vs dense (1.2x);
-                # 0.5 = subject clean but BACKGROUND mosaic patches (1.4x); 0.3 =
-                # mosaic everywhere (1.8x). A single image has no temporal masking,
-                # so stale patches show directly — hence the conservative floor.
-                "token_prune": ("FLOAT", {
-                    "default": 1.0, "min": 0.2, "max": 1.0, "step": 0.05,
-                    "tooltip": "Token-prune keep fraction (CAT). 1.0 = OFF. "
-                               "IMAGE recommendation: 0.75 or higher (clean, "
-                               "~1.2x faster). Below 0.6 expect mosaic patches "
-                               "on this 8-step distilled model (text conditioning "
-                               "never pruned; last step always full)."}),
+                "quality_enhance": _QUALITY_ENHANCE_INPUT,
             }}
 
         RETURN_TYPES = ("MODEL",)
@@ -857,26 +845,17 @@ if _IMPORT_OK:
                        "MODEL a stock sampler drives with latents. " + _COMMON_LIMITS)
 
         def load(self, transformer, model_config, attention_backend="auto",
-                 resident_block_count=0, token_prune=1.0):
-            # [runtime dials] backend + residency are SESSION knobs (engine
-            # applyAttnBackendDial / applyManualResidencyImageSessions): NOT create
-            # keys, so a widget change never re-keys the engine = no rebuild.
-            # resident_block_count 0 = auto (key omitted from begin — engine
-            # warmup/auto residency, byte-unchanged legacy); >0 = manual pin.
-            # The WIDGET value rides the BUILD kwargs (single writer): the
-            # NativeLoRA chain's internal rebuild constructs a FRESH model wrapper
-            # from the CAPTURED build kwargs, so a post-load setter alone is
-            # overwritten on the LoRA path (measured R1: begin carried the old
-            # hardcoded 999 while the widget said 0).
+                 quality_enhance=False):
+            # [runtime dials] backend + token-prune (quality_enhance) are SESSION knobs
+            # (NOT create keys — a widget change never re-keys the engine = no rebuild).
             _p = _run_family_load("krea2", transformer, model_config,
-                                  int(resident_block_count), None, sparse_opts=None)
+                                  None,
+                                  sparse_opts=None)
             _mm = getattr(_p, "model", None)
             if _mm is not None and hasattr(_mm, "set_attn_backend"):
                 _mm.set_attn_backend(_attn_backend_to_engine(attention_backend))
-            if _mm is not None and hasattr(_mm, "set_resident_block_count"):
-                _mm.set_resident_block_count(int(resident_block_count))
             if _mm is not None and hasattr(_mm, "set_token_prune"):
-                _mm.set_token_prune(token_prune)
+                _mm.set_token_prune(_quality_enhance_to_token_prune(quality_enhance))
             return (_p,)
 
 
@@ -892,17 +871,16 @@ if _IMPORT_OK:
                 "model_config": (_model_config_choices(family="minimax-h3"),
                                  {"tooltip": "The OFFICIAL MiniMax-H3 model config preset. "
                                              + _preset_file_expectations()}),
-                "resident_block_count": _RESIDENT_BLOCKS_INPUT,
             }, "optional": {
                 # [sparse, user 2026-08-25 ONE-number dial; #659 session knob — no rebuild]
                 # H3 default = flash: this model's auto resolves to sage2 int8-QK, which is
                 # BROKEN on H3's post-qk-RMSNorm γ-outliers at high-res (blank/NaN — measured
                 # 928²/S=31538: attn out absmax 0 → step-1 all-NaN → audio avcodec crash +
                 # video blur). flash (fp16) is the verified-clean default; user can still pick
-                # auto/sage/qfa/native. (Wan→auto→qfa, LTX→auto are fine → they keep 'auto'.)
+                # auto/sage/native. (Wan/LTX → auto is fine → they keep 'auto'.)
                 "attention_backend": _attn_backend_input("flash"),
                 "sol_tau": _SOL_TAU_INPUT,
-                "token_prune": _TOKEN_PRUNE_INPUT,
+                "quality_enhance": _QUALITY_ENHANCE_INPUT,
                 "step_cache": _STEP_CACHE_INPUT,
                 "block_cache": _BLOCK_CACHE_INPUT,
             }}
@@ -913,17 +891,18 @@ if _IMPORT_OK:
         DESCRIPTION = ("QuantFunc MiniMax-H3 loader (svdq, denoise_only): one native AV MODEL a "
                        "stock sampler drives with latents. " + _COMMON_LIMITS)
 
-        def load(self, transformer, model_config, resident_block_count=999,
-                 attention_backend="flash", sol_tau=1.0, token_prune=1.0, step_cache=0.0, block_cache=0.0):  # H3: flash default (auto→sage is broken)
+        def load(self, transformer, model_config,
+                 attention_backend="flash", sol_tau=1.0, quality_enhance=False, step_cache=0.0, block_cache=0.0):  # H3: flash default (auto→sage is broken)
             _p = _run_family_load("minimax-h3", transformer, model_config,
-                                   resident_block_count, None, sparse_opts=None)
+                                   None,
+                                   sparse_opts=None)
             _mm = getattr(_p, "model", None)
             if _mm is not None and hasattr(_mm, "set_attn_backend"):
                 _mm.set_attn_backend(_attn_backend_to_engine(attention_backend))
             if _mm is not None and hasattr(_mm, "set_sol_tau"):
                 _mm.set_sol_tau(sol_tau)
             if _mm is not None and hasattr(_mm, "set_token_prune"):
-                _mm.set_token_prune(token_prune)
+                _mm.set_token_prune(_quality_enhance_to_token_prune(quality_enhance))
             _arm_session_caches(_mm, step_cache, block_cache)
             return (_p,)
 

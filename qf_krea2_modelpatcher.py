@@ -36,11 +36,10 @@ def matches(pipeline_class, transformer_class=""):
 class QFKrea2Model(QFSessionModelMixin, comfy.model_base.Krea2):
     _VAE_S = 8   # AutoencoderKLQwenImage spatial scale; session W/H = latent * 8
 
-    def __init__(self, model_config, engine, device=None, resident_block_count=999):
+    def __init__(self, model_config, engine, device=None):
         super().__init__(model_config, device=device)
         self.diffusion_model = _QFStub()
         self.diffusion_model.arm_concat_shape(16)   # in==latent channels → extra 0 → no concat build
-        self.set_resident_block_count(resident_block_count)
         self._qf = engine
         self._num_steps = 0
         self._step_i = 0
@@ -93,17 +92,12 @@ class QFKrea2Model(QFSessionModelMixin, comfy.model_base.Krea2):
         bpx.cond_dtype = _qf_dtype(ctx_group.dtype)
         # IMAGE session: the video-flavored residency_opts CACHE/SPARSE keys are
         # engine-REFUSED here (E3, correctly) — send only the knobs the image seam
-        # consumes: the runtime attn-backend dial (applyAttnBackendDial) and, when
-        # the widget sets it >0, manual residency (engine
-        # applyManualResidencyImageSessions; 0/absent = engine auto residency,
-        # byte-unchanged legacy).
+        # consumes: the runtime attn-backend dial (applyAttnBackendDial) and the
+        # token-prune keep-fraction (quality_enhance switch).
         _o = {}
         ab = str(getattr(self, "_attn_backend", "auto") or "auto")
         if ab != "auto":
             _o["attention_backend"] = ab
-        _rb = int(getattr(self, "_resident_block_count", 0) or 0)
-        if _rb > 0:
-            _o["resident_block_count"] = _rb
         # token-prune (CAT): the krea2 _begin builds its own _o (video residency_opts
         # keys are engine-REFUSED here), so the mixin's generic emission never runs —
         # emit the key HERE or the widget is silently dropped (field 2026-09-01:
@@ -232,7 +226,7 @@ def register(deps):
     retire_handle = deps["retire_handle"]
     estimate_footprint = deps["estimate_footprint"]
 
-    def build(transformer1_path, transformer2_path, resident_block_count, bundle_dir=None,
+    def build(transformer1_path, transformer2_path, bundle_dir=None,
               lora_entries=(), sparse_opts=None):
         """File-based Krea-2 Turbo t2i — the H3 single-expert staging pattern: stage the
         shipped config bundle (configs/krea2-turbo-*/, minimal official skeleton) + symlink
@@ -261,12 +255,10 @@ def register(deps):
             unet_config = {"image_model": "krea2", "disable_unet_model_creation": True}
             model_config = comfy.supported_models.Krea2(unet_config)
             qfmp.ensure_model_config_attrs(model_config)
-            model = QFKrea2Model(model_config, engine, device=device,
-                                 resident_block_count=resident_block_count)
+            model = QFKrea2Model(model_config, engine, device=device)
             _register_model(model)
             patcher = QFModelPatcher(model, load_device=device, offload_device=offload)
             print(f"[qf_native] loaded QuantFuncNativeLoader (Krea-2 t2i svdq) package={model_name} "
-                  f"resident_blocks={resident_block_count} "
                   f"footprint~{engine.footprint_bytes // (1024*1024)}MB (create deferred)", flush=True)
             return qfmp.tag_lora_rebuild(patcher, lora_entries, _build)
 

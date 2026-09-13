@@ -61,14 +61,13 @@ class QFWanModel(QFSessionModelMixin, comfy.model_base.WAN21):
     _VAE_T, _VAE_S = 4, 8
     _DEFAULT_FPS = 16.0                   # wan 2.x training rate; only rides options_json (informational)
 
-    def __init__(self, model_config, engine, start_image, device=None, resident_block_count=999,
+    def __init__(self, model_config, engine, start_image, device=None,
                  xfm_in_channels=16):
         # disable_unet_model_creation is honored inside BaseModel.__init__
         super().__init__(model_config, device=device)
         self.diffusion_model = _QFStub()
         # arm comfy's stock concat machinery with the checkpoint's input width (see _QFStub)
         self.diffusion_model.arm_concat_shape(xfm_in_channels)
-        self.set_resident_block_count(resident_block_count)     # [manual-residency] generic knob (QFSessionModelMixin)
         self._qf = engine                 # QFEngineHandle (owns lib + pipeline + the open session)
         self._start_image = start_image   # comfy IMAGE tensor [B,H,W,C] float 0..1, or None (Option C)
         self._num_steps = 0               # DERIVED per run from sample_sigmas (len-1) at _begin
@@ -515,7 +514,7 @@ def register(deps):
     estimate_footprint = deps["estimate_footprint"]
     apply_checkpoint_flow_shift = deps["apply_checkpoint_flow_shift"]
 
-    def build(transformer1_path, transformer2_path, resident_block_count, bundle_dir,
+    def build(transformer1_path, transformer2_path, bundle_dir,
               lora_entries=(), sparse_opts=None):
         """wan A14B from BARE transformer FILES (INT8-Fast-aligned): transformer1 = HIGH-noise
         expert, transformer2 = LOW-noise expert — BOTH required (A14B is dual-expert; a missing
@@ -634,10 +633,8 @@ def register(deps):
             with open(os.path.join(model_dir, "transformer", "config.json"), "r", encoding="utf-8") as _fh:
                 _xfm_in_channels = int(json.load(_fh).get("in_channels", 16))
             model_high = QFWanModel(model_config, engine, None, device=device,
-                                    resident_block_count=resident_block_count,
                                     xfm_in_channels=_xfm_in_channels)
             model_low = QFWanModel(model_config, engine, None, device=device,
-                                   resident_block_count=resident_block_count,
                                    xfm_in_channels=_xfm_in_channels)
             model_low._qf_shadow = True
             # [wiring-lora] wire identity: chaining QuantFuncNativeLoRA on an output DERIVES its
@@ -655,7 +652,7 @@ def register(deps):
             print(f"[qf_native] loaded QuantFunc Wan Loader (svdq, denoise_only, dual MODEL) "
                   f"high={os.path.basename(transformer1_path)} "
                   f"low={os.path.basename(transformer2_path)} "
-                  f"resident_blocks={resident_block_count} loras={len(entries)} "
+                  f"loras={len(entries)} "
                   f"footprint~{engine.footprint_bytes // (1024*1024)}MB (create deferred)")
 
             def _lora_rebuild_dual(_entries):
@@ -674,7 +671,6 @@ def register(deps):
                 side = ((_entries[-1].get("target") if _entries else None) or "all")
                 engine.set_lora_side(side, _entries)
                 m2 = QFWanModel(model_config, engine, None, device=device,
-                                resident_block_count=resident_block_count,
                                 xfm_in_channels=_xfm_in_channels)
                 setattr(m2, qfmp.QF_EXPERT_ATTR, side)
                 if side == "low":

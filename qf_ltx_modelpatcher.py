@@ -381,11 +381,9 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
     (latents in, velocity out; the sampler owns x). No loader image socket, no plugin-side
     VAE, no engine begin_edit."""
 
-    def __init__(self, model_config, engine, connector, device=None, audio_connector=None,
-                 resident_block_count=999):
+    def __init__(self, model_config, engine, connector, device=None, audio_connector=None):
         super().__init__(model_config, device=device)   # disable_unet honored in BaseModel.__init__
         self.diffusion_model = _QFStub()
-        self.set_resident_block_count(resident_block_count)     # [manual-residency] generic knob (QFSessionModelMixin)
         self._qf = engine                    # QFEngineHandle (lib + pipeline + open session)
         self._connector = connector          # comfy Embeddings1DConnector (video), weights loaded
         self._audio_connector = audio_connector  # comfy audio_embeddings_connector (2048); None -> video-only 4096
@@ -896,13 +894,12 @@ class QFLTXAVModel(QFLTXModel):
     inner_model.latent_shapes); the only comfy isinstance on model_base.LTXAV
     (lora.py:371) tests (LTXV, LTXAV) — satisfied via the LTXV base."""
 
-    def __init__(self, model_config, engine, device=None, resident_block_count=999):
+    def __init__(self, model_config, engine, device=None):
         # i2v-AV (wan-align 2026-08-22 "只关注latent"): NO image/vae plumbing here — the
         # workflow's LTXVImgToVideoInplace conditions the VIDEO half of the joint latent
         # (encode + frame-0 write + noise_mask), and comfy's sampler applies the mask
         # outside the model. The session begin is identical to t2av.
         QFLTXModel.__init__(self, model_config, engine, connector=None,
-                            resident_block_count=resident_block_count,
                             device=device, audio_connector=None)
         self._out_audio = None            # reused packed audio velocity buffer [1,L,128] fp32
         self._ctx_unprocessed = False     # set per run by extra_conds from the TE's marker
@@ -1169,7 +1166,7 @@ def register(deps):
     estimate_footprint = deps["estimate_footprint"]
 
 
-    def build(transformer1_path, transformer2_path, resident_block_count, bundle_dir=None,
+    def build(transformer1_path, transformer2_path, bundle_dir=None,
               lora_entries=(), sparse_opts=None):
         """File-based (ComfyUI single-file) loading for LTX-2.5 — the wan staging pattern.
         CONNECTORS-SOURCE contract (user 2026-08-31 — fully support the transformer-only
@@ -1263,7 +1260,6 @@ def register(deps):
         model_dir = qfmp.stage_denoise_only_package(bundle_dir, transformer1_path, None,
                                                     extra_links=extra)
         return _build_from_package(model_dir, os.path.basename(transformer1_path),
-                                   resident_block_count,
                                    lora_entries=lora_entries,
                                    # use_pinned_memory (perf, 2026-08-23): the two-stage flow
                                    # round-trips the 18.3GB weight set between stages (comfy
@@ -1280,7 +1276,7 @@ def register(deps):
                                                  "use_pinned_memory": True,
                                                  **(sparse_opts or {})})
 
-    def _build_from_package(model_dir, model_name, resident_block_count,
+    def _build_from_package(model_dir, model_name,
               connector_ckpt="(none)", lora_entries=(), create_extra=None):
         if connector_ckpt and connector_ckpt != "(none)":
             import folder_paths as _fp
@@ -1345,12 +1341,11 @@ def register(deps):
                 unet_config = {"image_model": "ltxav", "disable_unet_model_creation": True}
                 model_config = comfy.supported_models.LTXAV(unet_config)
                 qfmp.ensure_model_config_attrs(model_config)
-                model = QFLTXAVModel(model_config, engine, device=device,
-                                     resident_block_count=resident_block_count)
+                model = QFLTXAVModel(model_config, engine, device=device)
                 _register_model(model)
                 patcher = QFModelPatcher(model, load_device=device, offload_device=offload)
                 print(f"[qf_native] loaded QuantFuncNativeLoader (LTX-2.5 JOINT-AV svdq) "
-                      f"package={model_name} resident_blocks={resident_block_count} "
+                      f"package={model_name} "
                       f"footprint~{engine.footprint_bytes // (1024*1024)}MB (create deferred)", flush=True)
                 return qfmp.tag_lora_rebuild(patcher, lora_entries, _build)
             if not connector_ckpt:
@@ -1425,12 +1420,10 @@ def register(deps):
             qfmp.ensure_model_config_attrs(model_config)
 
             model = QFLTXModel(model_config, engine, connector, device=device,
-                               audio_connector=audio_connector,
-                               resident_block_count=resident_block_count)
+                               audio_connector=audio_connector)
             _register_model(model)
             patcher = QFModelPatcher(model, load_device=device, offload_device=offload)
             print(f"[qf_native] loaded QuantFuncNativeLoader (LTX-2 svdq) package={model_name} "
-                  f"resident_blocks={resident_block_count} "
                   f"footprint~{engine.footprint_bytes // (1024*1024)}MB (create deferred)", flush=True)
             return qfmp.tag_lora_rebuild(patcher, lora_entries, _build)
 

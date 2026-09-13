@@ -305,20 +305,6 @@ class QFSessionModelMixin:
     deferred until a GPU box is available (same gate as the H3 fl2va proof).
     """
 
-    # ── [manual-residency] runtime-adjustable resident block count (GENERIC layer) ──
-    # The native seam's ONLY residency knob is a SESSION parameter, not a pipeline-identity
-    # parameter: every family merges residency_opts() into its denoise_begin options_json, and
-    # the engine re-applies it at EVERY session begin (applyManualResidentBlocks →
-    # setResidentBlockPrefix — bidirectional: shrink frees blocks [tgt,current), grow reloads
-    # [current,tgt) from backups, never-OOM-guarded). A widget change therefore takes effect on
-    # the NEXT run with NO pipeline rebuild. MEASURED (3090, wan A14B dual-expert, one resident
-    # comfy process, 2026-08-22): rb30→rb10 second run success in 88.6s (pure gen time, no
-    # create) with "MANUAL residency — 10 → target 10 of 40 (achieved 10)" on both experts and
-    # GPU used 16322 → 11806 MiB (the shed blocks really freed). The STRUCTURAL half of the
-    # guarantee — the knob never entering create_cfg/ckey (which would rebuild the pipeline on
-    # every widget change) — is enforced fail-loud by _refuse_session_knobs_in_create() at the
-    # single engine-create chokepoint (__init__._get_engine).
-    _resident_block_count = 999   # class default; families set the widget value in __init__
     # ── [step-cache] runtime step-cache threshold (SAME session-knob class as residency:
     # merged into the denoise_begin options_json below, re-read by the engine at EVERY
     # session begin → a widget change takes effect on the NEXT run with NO rebuild; the
@@ -329,9 +315,6 @@ class QFSessionModelMixin:
     _step_cache = 0.0             # class default; loaders set the widget value (step_cache)
     _block_cache = 0.0            # class default; loaders set the widget value (block_cache)
     _sparse = 1.0                 # class default; 1.0 = dense (loaders set the sparse widget)
-
-    def set_resident_block_count(self, n):
-        self._resident_block_count = int(n)
 
     def set_step_cache(self, t):
         self._step_cache = float(t)
@@ -349,14 +332,23 @@ class QFSessionModelMixin:
 
     def set_sol_tau(self, v):
         # [sol-tau dial 2026-08-31] the ONE user-facing Sol-Attn knob (user "就一个
-        # 就好"): the qfa=sol route's z-score keep threshold. LOWER = more exact
-        # blocks (denser/slower; <= -8 = the engine routes true DENSE qfa), HIGHER =
-        # sparser/faster. Same rides-residency_opts session-knob class as
-        # set_attn_backend; only meaningful under attention_backend=qfa.
+        # 就好"): the sol route's z-score keep threshold. LOWER = more exact blocks
+        # (denser/slower; <= -8 = true DENSE), HIGHER = sparser/faster. Same
+        # rides-residency_opts session-knob class as set_attn_backend.
         try:
             self._sol_tau = float(v)
         except (TypeError, ValueError):
             self._sol_tau = 1.0
+
+    def set_token_prune(self, v):
+        # [token-prune 2026-09-01] CAT keep fraction: (0,1) prunes (smaller = fewer video
+        # tokens recomputed per step = faster), 1.0 = OFF. Engine: last step always full-N
+        # (quality floor) + audio never pruned + auto-yields to an armed step-cache (the
+        # measured ghosting interlock). Same rides-residency_opts class as set_sol_tau.
+        try:
+            self._token_prune = float(v)
+        except (TypeError, ValueError):
+            self._token_prune = 1.0
 
     def residency_opts(self):
         """The begin-options fragment EVERY family merges into its options_json — the ONE
@@ -370,7 +362,7 @@ class QFSessionModelMixin:
         remaining blocks run — a step-skipped step never touches the transformer, so
         block-cache state simply carries over. An OLDER engine refuses an unknown key
         LOUD — honest, never silent."""
-        o = {"resident_block_count": int(self._resident_block_count)}
+        o = {}
         te = float(getattr(self, "_step_cache", 0.0) or 0.0)
         tf = float(getattr(self, "_block_cache", 0.0) or 0.0)
         sp = float(getattr(self, "_sparse", 1.0) or 1.0)
@@ -397,6 +389,11 @@ class QFSessionModelMixin:
         st = float(getattr(self, "_sol_tau", 1.0) or 1.0)
         if abs(st - 1.0) > 1e-6:
             o["sol_tau"] = st
+        # [token-prune] omitted at the 1.0/off default (old-engine compatible — unknown
+        # begin keys refuse LOUD); absent key = engine resets to off (anti-ghost).
+        tp = float(getattr(self, "_token_prune", 1.0) or 1.0)
+        if tp < 1.0 - 1e-6:
+            o["token_prune_keep_ratio"] = tp
         return o
 
     def _assert_wire_lora(self):
