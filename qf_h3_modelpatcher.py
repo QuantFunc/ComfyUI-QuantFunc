@@ -254,9 +254,10 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
                 f"runs its OWN internal AV schedule keyed to the full step range. Use a single "
                 f"full-range KSampler (denoise=1.0, no start_step/last_step).")
 
-    def _begin(self, x_video, x_audio, vemb, av_payload=None):
+    def _begin(self, x_video, x_audio, vemb, av_payload=None, cfg_active=False):
         """Open the joint-AV external denoise session. x_video=[1,24,T,H,W], x_audio=[1,32,2,audio_t],
-        vemb=[1,S,D] Qwen3-VL hidden states. audio_dims [B,C,K,T] + the AV sigma shifts ride options_json."""
+        vemb=[1,S,D] Qwen3-VL hidden states. audio_dims [B,C,K,T] + the AV sigma shifts ride options_json.
+        cfg_active (B>1 batched cond+uncond) → the AUTHORITATIVE audio_enhance CFG gate (design §3.4)."""
         qfmp._qf_cancel_pending_detach(self._qf)   # session begin supersedes a lazy-detach window
         lib = self._qf.lib   # MATERIALIZE FIRST: a fresh deferred wrapper (_real=None) cache-hits
         # the SAME resident engine an interrupted run may have left with an OPEN session; ending
@@ -307,7 +308,17 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
         # video K/V; the video latent/frames stay byte-identical to a no-knob run).
         if self._audio_enhance:
             _extra = _AUDIO_ENHANCE_TOTAL_STEPS - int(self._num_steps)
-            if _extra > 0:
+            if cfg_active:
+                # [audio_enhance CFG gate — design §3.4] AUTHORITATIVE CFG defense, decided at begin
+                # (before any step) for ALL num_steps incl. ==1. audio_enhance's extra audio-only
+                # refinement has NO CFG-consistent form — H3 is guidance-distilled (cfg=1 is the norm);
+                # under CFG (>1 cond group / true_cfg_scale>1) refining per-branch then letting comfy
+                # combine is a DIFFERENT algorithm, so NO-OP + warn LOUD (never send extra_audio_steps →
+                # the engine sees extra==0 → byte-identical to no knob).
+                if _extra > 0:
+                    print("[qf_native] H3 audio_enhance: CFG active (>1 cond group) — audio_enhance is a "
+                          "cfg=1/guidance-distilled feature; SKIPPING the extra audio pass (no-op).", flush=True)
+            elif _extra > 0:
                 _opts["extra_audio_steps"] = _extra
         # [fl2va/ref2va bridge] forward the pre-encoded keyframe/reference latents from the
         # per-group conditioning payload (official minimax_payload mechanism) as begin options
@@ -442,7 +453,8 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
             # H3 is joint AV — the VIDEO lane's zero-latent is the same int4 NaN factory.
             qfmp.refuse_all_zero_initial_latent(x_video, "H3")
             self._begin(x_video[0:1].contiguous(), x_audio[0:1].contiguous(), vemb[0:1].contiguous(),
-                        av_payload=kwargs.get("minimax_payload"))
+                        av_payload=kwargs.get("minimax_payload"),
+                        cfg_active=(B > 1))   # [audio_enhance CFG gate §3.4] B>1 = batched cond+uncond (CFG)
         # [C2 ordering guard] the engine binds av_conds SESSION-WIDE from the FIRST-invoked cond
         # group (_begin above). ComfyUI does not guarantee pos-before-neg invocation order, so a
         # group whose payload DIFFERS from the bound one would have its keyframes/refs silently
