@@ -614,6 +614,21 @@ if _IMPORT_OK:
                                 "ON = full quality (keep every token, prune OFF). Runtime "
                                 "session knob — takes effect next run, never rebuilds."})
 
+    # [audio_enhance switch, user 2026-09-13] H3-only. OFF (default) = byte-identical to no knob.
+    # ON = after the normal (video) denoise, run EXTRA AUDIO-ONLY sub-steps so video_steps +
+    # extra-audio steps total 16 — refining audio against the finished video at fixed per-sub-step
+    # cost (no video recompute; video latent/frames byte-identical). No-op when the video already
+    # runs >= 16 steps. Drives engine extra_audio_steps; the exact top-up is computed at session
+    # begin from the sampler's step count (qf_h3_modelpatcher.set_audio_enhance / _begin).
+    _AUDIO_ENHANCE_INPUT = ("BOOLEAN", {"default": False,
+                     "tooltip": "Audio-enhance (MiniMax-H3 only). OFF (default) = no extra audio "
+                                "denoise (byte-identical). ON = run EXTRA audio-only denoise "
+                                "sub-steps after the video denoise so the video steps + extra "
+                                "audio steps total 16 (e.g. a 4-step video gets 12 extra audio-only "
+                                "sub-steps) — sharper/cleaner AUDIO at fixed per-sub-step cost, the "
+                                "VIDEO is untouched (byte-identical). No effect when the video "
+                                "already runs >= 16 steps. Runtime session knob — next run, no rebuild."})
+
     def _quality_enhance_to_token_prune(enhance):
         """quality_enhance switch -> engine token-prune keep-fraction (user 2026-09-12):
         ON = 1.0 (keep all tokens = prune OFF, full quality); OFF (default) = 0.8 (prune,
@@ -881,6 +896,7 @@ if _IMPORT_OK:
                 "attention_backend": _attn_backend_input("flash"),
                 "sol_tau": _SOL_TAU_INPUT,
                 "quality_enhance": _QUALITY_ENHANCE_INPUT,
+                "audio_enhance": _AUDIO_ENHANCE_INPUT,
                 "step_cache": _STEP_CACHE_INPUT,
                 "block_cache": _BLOCK_CACHE_INPUT,
             }}
@@ -892,7 +908,7 @@ if _IMPORT_OK:
                        "stock sampler drives with latents. " + _COMMON_LIMITS)
 
         def load(self, transformer, model_config,
-                 attention_backend="flash", sol_tau=1.0, quality_enhance=False, step_cache=0.0, block_cache=0.0):  # H3: flash default (auto→sage is broken)
+                 attention_backend="flash", sol_tau=1.0, quality_enhance=False, audio_enhance=False, step_cache=0.0, block_cache=0.0):  # H3: flash default (auto→sage is broken)
             _p = _run_family_load("minimax-h3", transformer, model_config,
                                    None,
                                    sparse_opts=None)
@@ -903,6 +919,8 @@ if _IMPORT_OK:
                 _mm.set_sol_tau(sol_tau)
             if _mm is not None and hasattr(_mm, "set_token_prune"):
                 _mm.set_token_prune(_quality_enhance_to_token_prune(quality_enhance))
+            if _mm is not None and hasattr(_mm, "set_audio_enhance"):
+                _mm.set_audio_enhance(audio_enhance)
             _arm_session_caches(_mm, step_cache, block_cache)
             return (_p,)
 

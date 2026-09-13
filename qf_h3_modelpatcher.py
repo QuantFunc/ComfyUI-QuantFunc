@@ -52,6 +52,10 @@ from .qf_modelpatcher import (_qf_dtype, QFModelPatcher, _QFStub,
 # ── H3 geometry constants (comfy comfy_extras/nodes_minimax_h3.py + ldm/minimax/model.py) ──
 _H3_SPATIAL = 16          # video latent -> pixels (width = W_lat * 16)
 _H3_FPS = 24.0            # the H3 frame grid is defined at 24 fps (comfy_extras/nodes_minimax_h3.FPS)
+# [audio_enhance, user 2026-09-13] target TOTAL denoise steps (video + extra audio-only). When
+# audio_enhance is ON, the loader tops up extra AUDIO-ONLY sub-steps so num_video_steps + extra == 16;
+# no-op when the video already runs >= 16 steps (16 - num_steps <= 0). Drives engine extra_audio_steps.
+_AUDIO_ENHANCE_TOTAL_STEPS = 16
 
 
 def _h3_frames_from_latent_t(latent_t):
@@ -88,6 +92,7 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
         self._num_steps = 0               # DERIVED per run from sample_sigmas (len-1) at _begin
         self._num_frames = 0              # DERIVED per run from the video latent's T (see _derive_geometry)
         self._fps = _H3_FPS               # the H3 grid is defined AT 24 fps (comfy nodes_minimax_h3.FPS)
+        self._audio_enhance = False       # [audio_enhance] top up extra audio-only steps to total 16 (see _begin)
         # The AV flow shifts come from the model_sampling object — the stock
         # ModelSamplingMiniMaxH3 (MiniMaxH3SigmaShift) patches it, and model_config supplies the
         # defaults otherwise. They are read at _begin (getattr(ms, "shift"/"audio_shift")), so this
@@ -102,6 +107,13 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
         # key=0, silently disabling EC on this seam). fl2va is single-branch today; the
         # uuid-derived key stays correct if a second cond branch ever appears.
         self._ctx_key_assigner = qfmp._CtxKeyAssigner()
+
+    def set_audio_enhance(self, on):
+        """[audio_enhance, user 2026-09-13] Runtime session knob (no rebuild). ON → the engine runs
+        EXTRA audio-only denoise sub-steps so num_video_steps + extra == _AUDIO_ENHANCE_TOTAL_STEPS (16),
+        refining audio against the finished video (video output byte-identical). Computed at _begin
+        once num_steps is known; no-op when num_steps >= 16. OFF (default) → byte-identical to no knob."""
+        self._audio_enhance = bool(on)
 
     # ── honest engine working-set report (single-stage seam; brim fix 2026-08-24) ──
     # The mixin's memory_required deliberately reports ONLY comfy-side copies — right for the
@@ -288,6 +300,15 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
             "num_frames": self._num_frames,
             "fps": float(self._fps),
         }
+        # [audio_enhance, user 2026-09-13] top up EXTRA audio-only denoise sub-steps so the video
+        # steps + extra-audio steps total _AUDIO_ENHANCE_TOTAL_STEPS (16); no-op when the video already
+        # runs >= 16 steps (16 - num_steps <= 0). self._num_steps is set from sample_sigmas above,
+        # before _begin. Drives the engine's extra_audio_steps (audio-only sub-steps over the cached
+        # video K/V; the video latent/frames stay byte-identical to a no-knob run).
+        if self._audio_enhance:
+            _extra = _AUDIO_ENHANCE_TOTAL_STEPS - int(self._num_steps)
+            if _extra > 0:
+                _opts["extra_audio_steps"] = _extra
         # [fl2va/ref2va bridge] forward the pre-encoded keyframe/reference latents from the
         # per-group conditioning payload (official minimax_payload mechanism) as begin options
         # av_conds: device pointers as HEX STRINGS (borrowed until begin returns — the engine
