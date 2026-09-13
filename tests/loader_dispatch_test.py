@@ -284,7 +284,7 @@ def main():
     check("h3 node surface = latent-duo required + session-dial optionals",
           list(_h3it["required"].keys()) == ["transformer", "model_config"]
           and list(_h3it.get("optional", {}).keys()) == ["attention_backend", "sol_tau",
-                                                          "quality_enhance", "step_cache", "block_cache"],
+                                                          "quality_enhance", "audio_enhance", "step_cache", "block_cache"],
           f"-> req={list(_h3it['required'].keys())} opt={list(_h3it.get('optional', {}).keys())}")
     # (B) quality_enhance switch -> engine token-prune keep-fraction (ON = full quality, OFF = prune)
     check("quality_enhance mapper: ON->1.0 / OFF->0.8",
