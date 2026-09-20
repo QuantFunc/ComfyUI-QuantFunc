@@ -62,46 +62,6 @@ def _qf_dtype(torch_dtype):
             torch.bfloat16: qfe.QF_BF16}[torch_dtype]
 
 
-# Lazy-detach reclaim window. comfy's unload_model_clones detaches the OLD clone of this
-# SAME model milliseconds before loading the NEW clone (measured on the LTX two-stage
-# workflow: the reload began 27 ms after the full offload finished) — a bureaucratic clone
-# swap, not memory pressure. A full engine unload there costs the whole weight set round-trip
-# (measured: ~8.4 s extra in the next stage's first step). So detach() keeps the engine
-# RESIDENT and arms this one-shot window: a successor clone's load/step RECLAIMS the engine
-# (zero reload); no successor within the window ⇒ the real unload runs, so a workflow switch
-# still frees VRAM within seconds. 15 s = 500x the measured 27 ms swap gap, small enough that
-# a genuine drop frees before a human notices.
-#
-# 2026-09-05 (LTX-2.5 acceptance, measured on the user box): 15 s EXPIRED INSIDE EVERY RUN — the
-# window armed after the main sampler ran out during the refine sampler / VAE decode, so the next
-# run's main node paid the full reload (3.0 s: 12,597 per-parameter cudaMalloc + ~11 GB pageable
-# H2D, nsys W10) plus the engine's per-geometry rope rebuild (~1.2 s). Real VRAM pressure does
-# NOT depend on this timer: comfy's free_memory sweep reaches partially_unload() (engine
-# quantfunc_partial_unload sheds blocks, full unload as the fallback) and cancels the window
-# (_qf_cancel_pending_detach) — so the window only bounds how long an IDLE engine keeps VRAM
-# nobody asked for. 120 s covers a whole multi-stage run plus the gap to the next queue entry;
-# model-agnostic (the policy lives here, not in any loader).
-_QF_LAZY_DETACH_SECONDS = 120.0
-
-
-def _qf_cancel_pending_detach(eng):
-    """Reclaim a lazily-detached engine (a successor clone took over): cancel the one-shot
-    unload timer. Safe no-op when nothing is pending."""
-    if eng is None or not getattr(eng, "pending_detach", False):
-        return
-    lock = getattr(eng, "_qf_detach_lock", None)
-    if lock is None:
-        return   # pending without a lock cannot happen (detach creates the lock first)
-    with lock:
-        eng.pending_detach = False
-        t = getattr(eng, "_qf_detach_timer", None)
-        if t is not None:
-            t.cancel()
-            eng._qf_detach_timer = None
-    if os.environ.get("QF_NATIVE_PROF") == "1":
-        print("[qf_prof] lazy-detach RECLAIMED (engine stayed resident, zero reload)", flush=True)
-
-
 def _interrupt_poll_end_session_on_raise(qf):
     """SHARED per-cond-group interrupt poll that never strands an open engine session (ONE copy for
     QFWanModel + QFLTXModel — §6.5 simplicity: the session-clearing hardening was added to LTX and had
@@ -543,7 +503,6 @@ class QFSessionModelMixin:
         mid-sample error never strands a stale session. `fail_prefix` is the model-specific
         message head (e.g. 'denoise_step[step=..,group=..,key=..]' for WAN, 'LTX denoise_step[..]'
         for LTX). Verbatim-shared by QFWanModel + QFLTXModel."""
-        _qf_cancel_pending_detach(self._qf)   # an active step supersedes any lazy-detach window
         try:
             st = self._qf.lib.quantfunc_denoise_step(self._qf.current_session, ctypes.byref(p))
         except Exception:
@@ -559,7 +518,6 @@ class QFSessionModelMixin:
         session on ANY failure — the AV twin of _call_denoise_step. Shared by QFH3Model (H3
         joint AV) and QFLTXAVModel (LTX-2.5 joint AV); hoisted here from qf_h3_modelpatcher
         so the second AV consumer does not copy it (polymorphism-over-copy mandate)."""
-        _qf_cancel_pending_detach(self._qf)   # an active step supersedes any lazy-detach window
         lib = self._qf.lib
         if not hasattr(lib, "quantfunc_denoise_step_multi"):
             self._qf.end_session_if_open()
@@ -1025,25 +983,18 @@ class QFModelPatcher(comfy.model_patcher.ModelPatcher):
         return self._hold_bytes(eng)
 
     def partially_load(self, device_to, extra_memory=0, force_patch_weights=False):
-        # The engine reloads lazily inside the next denoise_begin (its ~3s-grace auto-reload). Clearing
-        # the flag lets model_size/loaded_size report the footprint again; no proactive torch load.
+        # Legacy lazy-load path: no physical allocation here. The measured
+        # loaded_size is independent of this flag. Host-budget enforcement at
+        # subsequent materialization/refault is still an integration prerequisite.
         eng = self._engine()
         if eng is not None:
-            _qf_cancel_pending_detach(eng)   # successor clone loading — reclaim a lazy detach
             eng.unloaded = False
         return 0
 
     def partially_unload(self, device_to, memory_to_free=0, force_patch_weights=False):
-        # Co-eviction (#4) + PARTIAL shed (2026-08-23 inter-stage eviction fix, ALL families —
-        # this patcher is shared by wan/ltx2/h3): comfy asks to free `memory_to_free` (a few GB
-        # for a sibling VAE/upsampler between a two-stage workflow's samplers). The old
-        # all-or-nothing path offloaded the ENTIRE weight set for that small ask (measured LTX:
-        # 18.3 GB round-tripped over pageable copies = ~10-15 s/prompt; nsys cudaMemcpyAsync =
-        # 86% of API time). Now: shed only enough trailing transformer blocks
-        # (engine quantfunc_partial_unload; backups already exist so the shed itself copies
-        # NOTHING, and the next session begin reloads just those blocks). SAFETY LADDER: if the
-        # partial shed cannot cover ~the request (old .so / monolith / refused), fall back to
-        # the full unload so comfy's ledger never over-credits.
+        # LoadedModel owns the partial→full eviction decision. Return exactly
+        # this operation's result, including zero/shortfall; do not silently
+        # replace a failed partial request with an unrequested full unload.
         if self._is_shadow():
             # A shadow never drives the SHARED engine's eviction (the primary output owns it);
             # its ledger share is the tiny constant, so comfy loses nothing by this 0.
@@ -1052,19 +1003,11 @@ class QFModelPatcher(comfy.model_patcher.ModelPatcher):
         if eng is None:
             return 0
         want = int(memory_to_free or 0)
-        _qf_cancel_pending_detach(eng)   # real pressure supersedes a lazy-detach window
+        if want <= 0:
+            return 0
         qfe._dbg_prof(f"partially_unload asked={want // (1024*1024)} MB "
                       f"(loaded={self.loaded_size() // (1024*1024)} MB)")
-        if want > 0 and hasattr(eng, "partial_unload_vram"):
-            freed = eng.partial_unload_vram(want)
-            if freed >= want:
-                print(f"[qf_native] partial VRAM shed: {freed // (1024*1024)} MB freed for a "
-                      f"{want // (1024*1024)} MB request (weights stay live)", flush=True)
-                return freed
-            # partial insufficient — full fallback keeps the honest-ledger guarantee
-            qfe._dbg_prof(f"partial shed INSUFFICIENT: freed={freed // (1024*1024)} MB < "
-                          f"want={want // (1024*1024)} MB -> full-unload fallback")
-        return eng.unload_vram()
+        return eng.partial_unload_vram(want)
 
 
     # ---- comfy lifecycle / VRAM+RAM manager integration ----------------------------------
@@ -1085,43 +1028,20 @@ class QFModelPatcher(comfy.model_patcher.ModelPatcher):
         return src.clone(model_override=override)
 
     def detach(self, unpatch_all=True):
-        """comfy is dropping this model. LAZY: keep the engine resident and arm a short one-shot
-        unload window (see _QF_LAZY_DETACH_SECONDS — the measured common caller is comfy's
-        unload_model_clones swapping clones of this SAME model between two samplers, where an
-        eager full unload costs a pointless whole-weight-set round-trip). A successor clone's
-        load/step reclaims the engine with zero reload; window expiry runs the REAL unload
-        (unload_vram keeps the CPU backup, so a later run reloads lazily; no destroy = no
-        use-after-free against a model comfy may still hold)."""
+        """Complete explicit eviction before the host removes its resource record.
+
+        False is the host's clone handoff, not a physical eviction. Preserve
+        official object-patch/callback behavior in both cases. Shared-owner
+        registration and the host's exceptional clone rollback remain separate
+        integration requirements; no timer can substitute for either.
+        """
         eng = self._engine()
-        if eng is not None and not getattr(eng, "unloaded", False):
-            import threading
-            if getattr(eng, "_qf_detach_lock", None) is None:
-                eng._qf_detach_lock = threading.Lock()
-            with eng._qf_detach_lock:
-                eng.pending_detach = True
-                old = getattr(eng, "_qf_detach_timer", None)
-                if old is not None:
-                    old.cancel()
-
-                def _materialize():
-                    try:
-                        with eng._qf_detach_lock:
-                            if not getattr(eng, "pending_detach", False) or \
-                                    getattr(eng, "unloaded", False):
-                                return
-                            eng.pending_detach = False
-                            eng._qf_detach_timer = None
-                            qfe._dbg_prof("lazy-detach window expired -> real engine unload")
-                            eng.unload_vram()
-                    except Exception:  # noqa: BLE001 — a timer thread must never raise
-                        pass
-
-                t = threading.Timer(_QF_LAZY_DETACH_SECONDS, _materialize)
-                t.daemon = True
-                eng._qf_detach_timer = t
-                t.start()
-            print(f"[qf_prof] detach -> LAZY (engine resident; {_QF_LAZY_DETACH_SECONDS:.0f}s "
-                  f"reclaim window)", flush=True)
+        if unpatch_all and eng is not None and not self._is_shadow():
+            eng.unload_vram()
+            remaining = self._hold_bytes(eng)
+            if remaining:
+                raise RuntimeError(f"QuantFunc full eviction left {remaining} bytes resident; "
+                                   "the host resource record must remain registered")
         return super().detach(unpatch_all=unpatch_all)
 
     # ── HOST-RAM reporting ────────────────────────────────────────────────────────────────

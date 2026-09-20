@@ -680,7 +680,6 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
         """Open the t2v external denoise session. x_group = [1,128,F,H,W] latent; vemb_group =
         [1,S,4096] POST-connector video_embeds. Geometry: engine derives F_lat/H_lat/W_lat from
         num_frames + width/height (spatial 32, temporal 8)."""
-        qfmp._qf_cancel_pending_detach(self._qf)   # session begin supersedes a lazy-detach window
         lib = self._qf.lib   # MATERIALIZE FIRST (see qf_h3_modelpatcher._begin: a deferred wrapper
         # no-ops the close while the cached engine still holds an interrupted run's open session)
         self._qf.end_session_if_open()

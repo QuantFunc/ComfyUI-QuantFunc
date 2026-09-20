@@ -40,14 +40,26 @@ class NativeLibrary:
         self.held = 512
         self.query_status = 0
         self.unload_calls = 0
+        self.unload_status = 1
 
     def quantfunc_resident_vram_bytes(self, pipeline, out):
         out._obj.value = self.held
         return self.query_status
 
     def quantfunc_unload_sync(self, pipeline):
+        raise AssertionError("legacy status-only unload cannot report actual bytes")
+
+    def quantfunc_unload_sync_ex(self, pipeline, out):
         self.unload_calls += 1
-        return 1
+        if self.unload_status == 0:
+            out._obj.value = self.held
+            self.held = 0
+        return self.unload_status
+
+    def quantfunc_partial_unload(self, pipeline, requested, out):
+        out._obj.value = min(requested.value, 64)
+        self.held -= out._obj.value
+        return 0
 
     def quantfunc_last_error(self):
         return b"contract: native refused"
@@ -63,7 +75,7 @@ class HostSchedulerContract(unittest.TestCase):
         self.patcher = qfm.QFModelPatcher(self.model, self.model.device, torch.device("cpu"), size=1024)
 
     def tearDown(self):
-        # Fixture teardown must not arm the pre-existing lazy-detach timer.
+        # No native calls from fixture teardown.
         self.model._qf = None
         self.patcher = None
         gc.collect()
@@ -110,7 +122,7 @@ class HostSchedulerContract(unittest.TestCase):
 
             def run(self, reclaim):
                 if reclaim:
-                    mm.free_memory(128, device)
+                    mm.free_memory(1024, device)
                 return ()
 
         events = []
@@ -143,7 +155,70 @@ class HostSchedulerContract(unittest.TestCase):
                                     for event, data in events))
         finally:
             mm.current_loaded_models[:] = previous
-            loaded.model_finalizer.detach()
+            if loaded.model_finalizer is not None:
+                loaded.model_finalizer.detach()
+
+    def test_partial_shortfall_is_returned_to_host_without_full_eviction(self):
+        self.assertEqual(self.patcher.partially_unload(torch.device("cpu"), 128), 64)
+        self.assertEqual(self.patcher.loaded_size(), 448)
+        self.assertEqual(self.library.unload_calls, 0)
+
+    def test_zero_partial_request_is_inert(self):
+        self.assertEqual(self.patcher.partially_unload(torch.device("cpu"), 0), 0)
+        self.assertEqual(self.library.held, 512)
+        self.assertEqual(self.library.unload_calls, 0)
+
+    def test_host_full_eviction_completes_before_record_is_removed(self):
+        self.library.unload_status = 0
+        self.model.contract_value = "patched"
+        self.patcher.object_patches_backup["contract_value"] = "original"
+        detached = []
+        self.patcher.add_callback(qfm.comfy.model_patcher.CallbacksMP.ON_DETACH,
+                                 lambda patcher, full: detached.append((full, self.library.held)))
+        loaded = mm.LoadedModel(self.patcher)
+        loaded.real_model = weakref.ref(self.model)
+        loaded.model_finalizer = weakref.finalize(self.model, lambda: None)
+        finalizer = loaded.model_finalizer
+        try:
+            with mock.patch("threading.Timer", side_effect=AssertionError("host eviction must not start a timer")):
+                self.assertTrue(loaded.model_unload())
+            self.assertEqual(self.library.held, 0)
+            self.assertEqual(self.library.unload_calls, 1)
+            self.assertEqual(detached, [(True, 0)])
+            self.assertEqual(self.model.contract_value, "original")
+            self.assertIsNone(loaded.real_model)
+            self.assertFalse(finalizer.alive)
+        finally:
+            finalizer.detach()
+
+    def test_clone_detach_preserves_resource_and_official_callback_without_timer(self):
+        detached = []
+        self.patcher.add_callback(qfm.comfy.model_patcher.CallbacksMP.ON_DETACH,
+                                 lambda patcher, full: detached.append(full))
+        with mock.patch("threading.Timer", side_effect=AssertionError("clone switch must not start a timer")):
+            self.assertIs(self.patcher.detach(False), self.model)
+        self.assertEqual(self.library.held, 512)
+        self.assertEqual(self.library.unload_calls, 0)
+        self.assertEqual(detached, [False])
+
+    def test_residual_residency_prevents_successful_full_detach(self):
+        def incomplete_release(pipeline, out):
+            out._obj.value = 128
+            self.library.held = 384
+            return 0
+        self.library.quantfunc_unload_sync_ex = incomplete_release
+        loaded = mm.LoadedModel(self.patcher)
+        loaded.real_model = weakref.ref(self.model)
+        loaded.model_finalizer = weakref.finalize(self.model, lambda: None)
+        try:
+            with self.assertRaisesRegex(RuntimeError, "384.*resident"):
+                loaded.model_unload()
+            self.assertIs(loaded.real_model(), self.model)
+            self.assertTrue(loaded.model_finalizer.alive)
+            self.assertEqual(self.patcher.loaded_size(), 384)
+        finally:
+            if loaded.model_finalizer is not None:
+                loaded.model_finalizer.detach()
 
 
 if __name__ == "__main__":

@@ -230,13 +230,17 @@ def _bind(lib):
     lib.quantfunc_unload.argtypes = [v]
     lib.quantfunc_unload_sync.restype = ctypes.c_int
     lib.quantfunc_unload_sync.argtypes = [v]
+    if hasattr(lib, "quantfunc_unload_sync_ex"):
+        lib.quantfunc_unload_sync_ex.restype = ctypes.c_int
+        lib.quantfunc_unload_sync_ex.argtypes = [v, ctypes.POINTER(ctypes.c_uint64)]
     # partial VRAM shed (inter-stage eviction fix; absent on older .so -> hasattr-guarded)
     if hasattr(lib, "quantfunc_partial_unload"):
         lib.quantfunc_partial_unload.restype = ctypes.c_int
         lib.quantfunc_partial_unload.argtypes = [v, ctypes.c_uint64,
                                                  ctypes.POINTER(ctypes.c_int64)]
-    # comfy-ledger pair (quantfunc.h: what the engine HOLDS / how much MORE it NEEDS for a latent shape); an older
-    # .so lacks one or both -> hasattr-guarded, the readers report 0 = UNKNOWN and comfy keeps its own estimates.
+    # Optional symbol binding permits loading older libraries for diagnostics.
+    # Residency/reclaim consumers reject missing capabilities explicitly; the
+    # separate legacy future-demand reader is not yet a precise request planner.
     if hasattr(lib, "quantfunc_resident_vram_bytes"):
         lib.quantfunc_resident_vram_bytes.restype = ctypes.c_int
         lib.quantfunc_resident_vram_bytes.argtypes = [v, ctypes.POINTER(ctypes.c_uint64)]
@@ -753,16 +757,15 @@ class QFEngineHandle:
         return (True, ok)
 
     def partial_unload_vram(self, bytes_requested):
-        """Shed ONLY ~bytes_requested of trailing transformer blocks (engine
-        quantfunc_partial_unload; family-generic Pipeline base — LTX/H3 single
-        transformer, wan main expert). Returns the engine-reported freed bytes
-        (0 = unsupported / nothing shed / old .so — caller falls back to
-        unload_vram). Never marks the handle `unloaded`: the model stays LIVE
-        with a smaller resident prefix; the next session begin restores it."""
-        if self.pipeline is None or self.unloaded or bytes_requested <= 0:
+        """Return confirmed native release bytes; failure is not a zero result.
+
+        The legacy native primitive is device-scoped. A shortfall is returned
+        to the host, which decides whether to request complete eviction.
+        """
+        if self.pipeline is None or bytes_requested <= 0:
             return 0
         if not hasattr(self.lib, "quantfunc_partial_unload"):
-            return 0
+            raise RuntimeError("QuantFunc library lacks quantfunc_partial_unload; update the native library")
         # Y vuln fix: comfy's free_memory sweep passes a HUGE "free everything" sentinel
         # (measured 1e32 as float) — int(1e32) overflows c_uint64 (OverflowError swallowed
         # -> silent 0 -> full-unload fallback worked only by coincidence). Clamp into the
@@ -774,19 +777,15 @@ class QFEngineHandle:
             # VRAM reclaim — try the end first; a genuinely open session keeps refusing.
             self.end_session_if_open()
         if self.current_session is not None:
-            _dbg_prof("partial_unload refused: session open")
-            return 0                        # mid-session: refuse (lease would too)
+            raise RuntimeError("QuantFunc cannot unload VRAM while a session is still active")
         freed = ctypes.c_int64(0)
-        try:
-            st = self.lib.quantfunc_partial_unload(self.pipeline,
-                                                   ctypes.c_uint64(int(bytes_requested)),
-                                                   ctypes.byref(freed))
-        except Exception as ex:  # noqa: BLE001
-            _dbg_prof(f"partial_unload EXCEPTION: {ex!r}")
-            return 0
+        st = self.lib.quantfunc_partial_unload(self.pipeline,
+                                               ctypes.c_uint64(bytes_requested),
+                                               ctypes.byref(freed))
         if st != QUANTFUNC_OK:
-            _dbg_prof(f"partial_unload engine status={st}: {last_err(self.lib)}")
-            return 0
+            raise RuntimeError(f"QuantFunc partial VRAM unload failed: {last_err(self.lib)}")
+        if freed.value < 0:
+            raise RuntimeError("QuantFunc partial VRAM unload returned negative released bytes")
         return int(freed.value)
 
     def resident_vram_bytes(self):
@@ -828,11 +827,16 @@ class QFEngineHandle:
         return int(out.value) if st == QUANTFUNC_OK else 0
 
     def unload_vram(self):
-        """Co-eviction (#4): free the engine's VRAM (quantfunc_unload_sync — GPU->CPU, keeps the CPU
-        backup; the pipeline auto-reloads on the next generate). Idempotent. Returns the freed byte
-        ESTIMATE (footprint) so comfy's ledger can HONESTLY credit it, or 0 if nothing was freed."""
-        if self.pipeline is None or self.unloaded:
+        """Synchronously reclaim and return native confirmed bytes, never file size.
+
+        Repeated calls still ask native: an earlier release may have left live
+        allocations or pages that have since become reclaimable. This ABI's
+        count is device-scoped and excludes unowned shared CUDA pool backing.
+        """
+        if self.pipeline is None:
             return 0
+        if not hasattr(self.lib, "quantfunc_unload_sync_ex"):
+            raise RuntimeError("QuantFunc library lacks quantfunc_unload_sync_ex; update the native library")
         import os as _os
         if _os.environ.get("QF_NATIVE_PROF") == "1":
             import traceback as _tb
@@ -843,11 +847,12 @@ class QFEngineHandle:
         self.end_session_if_open()          # a live session on unloaded VRAM would be a UAF on reuse
         if self.current_session is not None:
             raise RuntimeError("QuantFunc cannot unload VRAM while a session is still active")
-        st = self.lib.quantfunc_unload_sync(self.pipeline)
+        freed = ctypes.c_uint64(0)
+        st = self.lib.quantfunc_unload_sync_ex(self.pipeline, ctypes.byref(freed))
         if st != QUANTFUNC_OK:
             raise RuntimeError(f"QuantFunc VRAM unload failed: {last_err(self.lib)}")
         self.unloaded = True
-        return int(self.footprint_bytes)
+        return int(freed.value)
 
     def destroy(self):
         self.end_session_if_open()
