@@ -11,8 +11,17 @@ import time
 import platform
 import re
 import struct
+import operator
+import threading
+import weakref
+from typing import NamedTuple, Optional
 
 QUANTFUNC_OK = 0
+QUANTFUNC_RESOURCE_ABI_VERSION = 1
+QUANTFUNC_RESOURCE_READY = 0
+QUANTFUNC_RESOURCE_BUSY = 1
+QUANTFUNC_RESOURCE_UNKNOWN = 2
+QUANTFUNC_RESOURCE_CLOSED = 3
 # quantfunc_dtype_t: FP32=0, FP16=1, BF16=2 (matches QF_DTYPE in the harness)
 QF_FP32, QF_FP16, QF_BF16 = 0, 1, 2
 # fp8_e4m3 — a valid OUTPUT dtype request for the cloud/standalone TE encode only
@@ -67,6 +76,154 @@ class InitParams(ctypes.Structure):
         ("device_idx", ctypes.c_int),
         ("config_json", ctypes.c_char_p),
     ]
+
+
+class _ResourceSnapshot(ctypes.Structure):
+    _fields_ = [
+        ("struct_size", ctypes.c_uint32), ("abi_version", ctypes.c_uint32),
+        ("state", ctypes.c_uint32), ("capabilities", ctypes.c_uint32),
+        ("owner_epoch", ctypes.c_uint64), ("device", ctypes.c_int32),
+        ("reserved", ctypes.c_uint32),
+        ("cca_live", ctypes.c_uint64), ("cca_cached", ctypes.c_uint64),
+        ("cca_deferred", ctypes.c_uint64), ("arena_backed", ctypes.c_uint64),
+        ("arena_pinned", ctypes.c_uint64),
+    ]
+
+
+class _ResourceRelease(ctypes.Structure):
+    _fields_ = [
+        ("struct_size", ctypes.c_uint32), ("abi_version", ctypes.c_uint32),
+        ("state", ctypes.c_uint32), ("reserved", ctypes.c_uint32),
+        ("freed_bytes", ctypes.c_uint64),
+    ]
+
+
+class ResourceSnapshot(NamedTuple):
+    """Native categories, not ModelPatcher capacity or a demand estimate.
+
+    Non-Ready byte fields are None; pinned overlaps backed and is not additive.
+    """
+    state: int
+    device: int
+    owner_epoch: int
+    capabilities: int
+    cca_live: Optional[int]
+    cca_cached: Optional[int]
+    cca_deferred: Optional[int]
+    arena_backed: Optional[int]
+    arena_pinned: Optional[int]
+
+
+class ResourceRelease(NamedTuple):
+    state: int
+    freed_bytes: Optional[int]
+
+
+def _bind_resource_api(lib):
+    """Require the complete versioned interface only when it is requested."""
+    v = ctypes.c_void_p
+    signatures = {
+        "quantfunc_last_error": (ctypes.c_char_p, []),
+        "quantfunc_resource_acquire": (ctypes.c_int, [v, ctypes.c_uint32, ctypes.POINTER(v)]),
+        "quantfunc_resource_acquire_shared": (ctypes.c_int, [ctypes.c_int32, ctypes.c_uint32, ctypes.POINTER(v)]),
+        "quantfunc_resource_destroy": (None, [v]),
+        "quantfunc_resource_query": (ctypes.c_int, [v, ctypes.POINTER(_ResourceSnapshot)]),
+        "quantfunc_resource_release_eligible": (ctypes.c_int, [v, ctypes.c_uint64, ctypes.POINTER(_ResourceRelease)]),
+    }
+    for name in signatures:
+        if not hasattr(lib, name):
+            raise RuntimeError(f"QuantFunc library lacks {name}; update the native library")
+    for name, (result, args) in signatures.items():
+        function = getattr(lib, name)
+        function.restype, function.argtypes = result, args
+
+
+def _destroy_resource_view(lib, pointer):
+    # Adoption rollback and an already-registered finalizer may both run after
+    # interruption. Consume the shared holder before crossing the C boundary.
+    address = pointer.value
+    if address is not None:
+        pointer.value = None
+        lib.quantfunc_resource_destroy(ctypes.c_void_p(address))
+
+
+class NativeResource:
+    """Retained native view; no scheduler, byte policy or full-unload claim.
+
+    Acquire must be synchronized with model destruction by the model owner.
+    Afterwards the native view survives model destruction. This lock serializes
+    view operations with close because ctypes may release the GIL.
+    """
+    def __init__(self, lib, pointer):
+        self._lib, self._pointer = lib, pointer
+        self._lock = threading.Lock()
+        self._finalizer = weakref.finalize(self, _destroy_resource_view, lib, pointer)
+
+    @classmethod
+    def _adopt(cls, lib, pointer):
+        try:
+            return cls(lib, pointer)
+        except BaseException:
+            _destroy_resource_view(lib, pointer)
+            raise
+
+    @classmethod
+    def acquire(cls, lib, pipeline):
+        _bind_resource_api(lib)
+        pointer = ctypes.c_void_p()
+        status = lib.quantfunc_resource_acquire(pipeline, QUANTFUNC_RESOURCE_ABI_VERSION, ctypes.byref(pointer))
+        if status != QUANTFUNC_OK or not pointer:
+            raise RuntimeError(f"QuantFunc resource acquisition failed: {last_err(lib)}")
+        return cls._adopt(lib, pointer)
+
+    @classmethod
+    def shared(cls, lib, device):
+        device = operator.index(device)
+        if not 0 <= device < (1 << 31):
+            raise ValueError("resource device must fit nonnegative int32")
+        _bind_resource_api(lib)
+        pointer = ctypes.c_void_p()
+        status = lib.quantfunc_resource_acquire_shared(device, QUANTFUNC_RESOURCE_ABI_VERSION, ctypes.byref(pointer))
+        if status != QUANTFUNC_OK or not pointer:
+            raise RuntimeError(f"QuantFunc shared resource acquisition failed: {last_err(lib)}")
+        return cls._adopt(lib, pointer)
+
+    def _check_open(self):
+        if not self._finalizer.alive:
+            raise RuntimeError("QuantFunc resource view is closed")
+
+    def query(self):
+        with self._lock:
+            self._check_open()
+            out = _ResourceSnapshot(ctypes.sizeof(_ResourceSnapshot), QUANTFUNC_RESOURCE_ABI_VERSION)
+            if self._lib.quantfunc_resource_query(self._pointer, ctypes.byref(out)) != QUANTFUNC_OK:
+                raise RuntimeError(f"QuantFunc resource query failed: {last_err(self._lib)}")
+            counts = (out.cca_live, out.cca_cached, out.cca_deferred, out.arena_backed, out.arena_pinned)
+            return ResourceSnapshot(out.state, out.device, out.owner_epoch, out.capabilities,
+                                    *(counts if out.state == QUANTFUNC_RESOURCE_READY else (None,) * 5))
+
+    def release_eligible(self, requested):
+        requested = operator.index(requested)
+        if not 0 <= requested < (1 << 64):
+            raise ValueError("resource release request must fit uint64")
+        with self._lock:
+            self._check_open()
+            out = _ResourceRelease(ctypes.sizeof(_ResourceRelease), QUANTFUNC_RESOURCE_ABI_VERSION)
+            if self._lib.quantfunc_resource_release_eligible(self._pointer, requested, ctypes.byref(out)) != QUANTFUNC_OK:
+                raise RuntimeError(f"QuantFunc eligible release failed: {last_err(self._lib)}")
+            return ResourceRelease(out.state, out.freed_bytes if out.state == QUANTFUNC_RESOURCE_READY else None)
+
+    def close(self):
+        with self._lock:
+            self._finalizer()
+
+    def __enter__(self):
+        with self._lock:
+            self._check_open()
+        return self
+
+    def __exit__(self, *_):
+        self.close()
 
 
 class DenoiseBeginParams(ctypes.Structure):
