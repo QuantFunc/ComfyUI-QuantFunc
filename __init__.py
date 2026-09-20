@@ -899,6 +899,10 @@ if _IMPORT_OK:
                 "audio_enhance": _AUDIO_ENHANCE_INPUT,
                 "step_cache": _STEP_CACHE_INPUT,
                 "block_cache": _BLOCK_CACHE_INPUT,
+                "allow_partial_denoise": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Opt in to split/trimmed sigma schedules for intentional H3 double-sampling workflows.",
+                }),
             }}
 
         RETURN_TYPES = ("MODEL",)
@@ -908,7 +912,8 @@ if _IMPORT_OK:
                        "stock sampler drives with latents. " + _COMMON_LIMITS)
 
         def load(self, transformer, model_config,
-                 attention_backend="flash", sol_tau=1.0, quality_enhance=False, audio_enhance=False, step_cache=0.0, block_cache=0.0):  # H3: flash default (auto→sage is broken)
+                 attention_backend="flash", sol_tau=1.0, quality_enhance=False, audio_enhance=False,
+                 step_cache=0.0, block_cache=0.0, allow_partial_denoise=False):  # H3: flash default (auto→sage is broken)
             _p = _run_family_load("minimax-h3", transformer, model_config,
                                    None,
                                    sparse_opts=None)
@@ -921,6 +926,8 @@ if _IMPORT_OK:
                 _mm.set_token_prune(_quality_enhance_to_token_prune(quality_enhance))
             if _mm is not None and hasattr(_mm, "set_audio_enhance"):
                 _mm.set_audio_enhance(audio_enhance)
+            if _mm is not None and hasattr(_mm, "set_allow_partial_denoise"):
+                _mm.set_allow_partial_denoise(allow_partial_denoise)
             _arm_session_caches(_mm, step_cache, block_cache)
             return (_p,)
 
@@ -1058,5 +1065,4 @@ try:
 except Exception as _qf_cloud_te_exc:  # noqa: BLE001
     import logging as _qf_lg
     _qf_lg.warning("[qf_native] cloud-TE node not registered: %r", _qf_cloud_te_exc)
-
 

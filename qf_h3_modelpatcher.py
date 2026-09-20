@@ -52,10 +52,6 @@ from .qf_modelpatcher import (_qf_dtype, QFModelPatcher, _QFStub,
 # ── H3 geometry constants (comfy comfy_extras/nodes_minimax_h3.py + ldm/minimax/model.py) ──
 _H3_SPATIAL = 16          # video latent -> pixels (width = W_lat * 16)
 _H3_FPS = 24.0            # the H3 frame grid is defined at 24 fps (comfy_extras/nodes_minimax_h3.FPS)
-# [audio_enhance, user 2026-09-13] target TOTAL denoise steps (video + extra audio-only). When
-# audio_enhance is ON, the loader tops up extra AUDIO-ONLY sub-steps so num_video_steps + extra == 16;
-# no-op when the video already runs >= 16 steps (16 - num_steps <= 0). Drives engine extra_audio_steps.
-_AUDIO_ENHANCE_TOTAL_STEPS = 16
 
 
 def _h3_frames_from_latent_t(latent_t):
@@ -93,6 +89,7 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
         self._num_frames = 0              # DERIVED per run from the video latent's T (see _derive_geometry)
         self._fps = _H3_FPS               # the H3 grid is defined AT 24 fps (comfy nodes_minimax_h3.FPS)
         self._audio_enhance = False       # [audio_enhance] top up extra audio-only steps to total 16 (see _begin)
+        self._allow_partial_denoise = False  # explicit workflow opt-in; full-range remains the safe default
         # The AV flow shifts come from the model_sampling object — the stock
         # ModelSamplingMiniMaxH3 (MiniMaxH3SigmaShift) patches it, and model_config supplies the
         # defaults otherwise. They are read at _begin (getattr(ms, "shift"/"audio_shift")), so this
@@ -109,35 +106,26 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
         self._ctx_key_assigner = qfmp._CtxKeyAssigner()
 
     def set_audio_enhance(self, on):
-        """[audio_enhance, user 2026-09-13] Runtime session knob (no rebuild). ON → the engine runs
-        EXTRA audio-only denoise sub-steps so num_video_steps + extra == _AUDIO_ENHANCE_TOTAL_STEPS (16),
-        refining audio against the finished video (video output byte-identical). Computed at _begin
-        once num_steps is known; no-op when num_steps >= 16. OFF (default) → byte-identical to no knob."""
+        """[enhance switch, user 2026-09-19] the ONE audio-quality switch (H3). ON → the engine refines the audio
+        after the video denoise; how many extra sub-steps, over what context, and when it must not run (CFG,
+        no audio lane, already-long schedules) is ENGINE law behind the begin option `audio_enhance` — this
+        plugin carries no number for it. OFF (default) → byte-identical to no knob. Runtime session knob."""
         self._audio_enhance = bool(on)
 
-    # ── honest engine working-set report (single-stage seam; brim fix 2026-08-24) ──
-    # The mixin's memory_required deliberately reports ONLY comfy-side copies — right for the
-    # WAN TWO-stage seam, where a big stage-2 estimate made comfy evict the stage-1 ENGINE
-    # (the 2026-08-22 inter-stage thrash fix). H3 is SINGLE-stage: we are the model being
-    # loaded, so a truthful estimate makes comfy evict CO-TENANTS (the ~5 GB staged official
-    # VAE / TE), never us — exactly its native model management doing its job. MEASURED
-    # (远程-linux 3090, 124f/38k-tok, nsys qfmemo2/4): with the VAE staged through our
-    # denoise, engine allocs ran at the 24 GB brim → per-block physical-OOM → allocator
-    # sync storms (cudaFree 161 s CPU/run) ≈ 9 s/step GPU idle. Working set ≈ linear in
-    # latent volume: ~10 GB at 10.2 M latent elems ⇒ ~1.0 KB/elem + floor. Over-report is
-    # bounded (comfy just frees co-tenants it can reload for decode); under-report degrades
-    # to today's behavior.
-    _QF_H3_ENGINE_WORKING_BYTES_PER_LATENT_ELEM = 1024
-    _QF_H3_ENGINE_WORKING_FLOOR_BYTES = 1536 * 1024 * 1024
+    def set_allow_partial_denoise(self, on):
+        """Allow split/trimmed sampler schedules for explicit double-sampling workflows.
 
-    def memory_required(self, input_shape, cond_shapes=None, **_kw):
-        base = super().memory_required(input_shape, cond_shapes=cond_shapes, **_kw)
-        n_lat = 1
-        for d in list(input_shape):
-            n_lat *= max(1, int(d))
-        eng = (self._QF_H3_ENGINE_WORKING_FLOOR_BYTES +
-               n_lat * self._QF_H3_ENGINE_WORKING_BYTES_PER_LATENT_ELEM)
-        return int(base) + int(eng)
+        The external H3 seam receives the actual sigma, step index, and stage-local total step
+        count on every call.  Keep the historical full-range refusal as the default because a
+        partial schedule is only meaningful when the workflow deliberately manages both stages.
+        """
+        self._allow_partial_denoise = bool(on)
+
+    # memory_required: NO override — the base QFSessionModelMixin reports the ENGINE's own measured working set
+    # (quantfunc_vram_need_bytes) for every family. The former H3-only heuristic here (2026-08-24 "brim fix":
+    # 1 KB/latent-elem + 1.5 GB floor, stacked on top of the base) would now DOUBLE-COUNT the real number
+    # (self-CR P-1 on 1d51182: ~5.8 GB of phantom need at 800x768 B=2 on top of the measured 3.6 GB) and push
+    # comfy's `need × 1.5 < free` cond-batching rule the wrong way; the measured number covers what it estimated.
 
     # Conditioning keys this external session does NOT consume — a wired node feeding one would be
     # SILENTLY dropped -> plausible-but-wrong AV. FAIL LOUD (mirror QFLTXModel's defensive superset).
@@ -247,17 +235,21 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
             return
         ms = getattr(self, "model_sampling", None)
         s_max = float(getattr(ms, "sigma_max", s_first)) if ms is not None else s_first
-        if s_last > 1e-3 or (s_max > 0 and s_first < 0.98 * s_max):
+        partial = s_last > 1e-3 or (s_max > 0 and s_first < 0.98 * s_max)
+        if partial and not self._allow_partial_denoise:
             raise RuntimeError(
-                f"qf_native H3: partial / trimmed denoise is NOT supported (sigmas run "
-                f"{s_first:.4f}→{s_last:.4f}, full range would be {s_max:.4f}→0). The engine session "
-                f"runs its OWN internal AV schedule keyed to the full step range. Use a single "
-                f"full-range KSampler (denoise=1.0, no start_step/last_step).")
+                f"qf_native H3: partial / trimmed denoise is disabled (sigmas run "
+                f"{s_first:.4f}→{s_last:.4f}, full range would be {s_max:.4f}→0). Enable "
+                f"'allow_partial_denoise' on QuantFuncH3Loader only for an intentional split-sigma "
+                f"or double-sampling workflow; otherwise use one full-range sampler.")
+        if partial:
+            print(f"[qf_native] H3: partial denoise explicitly enabled: "
+                  f"{s_first:.4f}→{s_last:.4f}, stage_steps={self._num_steps}", flush=True)
 
-    def _begin(self, x_video, x_audio, vemb, av_payload=None, cfg_active=False):
+    def _begin(self, x_video, x_audio, vemb, av_payload=None):
         """Open the joint-AV external denoise session. x_video=[1,24,T,H,W], x_audio=[1,32,2,audio_t],
         vemb=[1,S,D] Qwen3-VL hidden states. audio_dims [B,C,K,T] + the AV sigma shifts ride options_json.
-        cfg_active (B>1 batched cond+uncond) → the AUTHORITATIVE audio_enhance CFG gate (design §3.4)."""
+        CFG handling for audio_enhance lives in the engine (step-time per-branch key detection, §3.4)."""
         qfmp._qf_cancel_pending_detach(self._qf)   # session begin supersedes a lazy-detach window
         lib = self._qf.lib   # MATERIALIZE FIRST: a fresh deferred wrapper (_real=None) cache-hits
         # the SAME resident engine an interrupted run may have left with an OPEN session; ending
@@ -301,25 +293,11 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
             "num_frames": self._num_frames,
             "fps": float(self._fps),
         }
-        # [audio_enhance, user 2026-09-13] top up EXTRA audio-only denoise sub-steps so the video
-        # steps + extra-audio steps total _AUDIO_ENHANCE_TOTAL_STEPS (16); no-op when the video already
-        # runs >= 16 steps (16 - num_steps <= 0). self._num_steps is set from sample_sigmas above,
-        # before _begin. Drives the engine's extra_audio_steps (audio-only sub-steps over the cached
-        # video K/V; the video latent/frames stay byte-identical to a no-knob run).
+        # [enhance switch] the product switch only; the engine computes the extra audio sub-steps from
+        # num_steps and disarms itself under CFG / without an audio lane (MiniMaxH3Pipeline). Sent only
+        # when ON (OFF = byte-identical to no knob; the raw extra_audio_steps key is never built here).
         if self._audio_enhance:
-            _extra = _AUDIO_ENHANCE_TOTAL_STEPS - int(self._num_steps)
-            if cfg_active:
-                # [audio_enhance CFG gate — design §3.4] AUTHORITATIVE CFG defense, decided at begin
-                # (before any step) for ALL num_steps incl. ==1. audio_enhance's extra audio-only
-                # refinement has NO CFG-consistent form — H3 is guidance-distilled (cfg=1 is the norm);
-                # under CFG (>1 cond group / true_cfg_scale>1) refining per-branch then letting comfy
-                # combine is a DIFFERENT algorithm, so NO-OP + warn LOUD (never send extra_audio_steps →
-                # the engine sees extra==0 → byte-identical to no knob).
-                if _extra > 0:
-                    print("[qf_native] H3 audio_enhance: CFG active (>1 cond group) — audio_enhance is a "
-                          "cfg=1/guidance-distilled feature; SKIPPING the extra audio pass (no-op).", flush=True)
-            elif _extra > 0:
-                _opts["extra_audio_steps"] = _extra
+            _opts["audio_enhance"] = True
         # [fl2va/ref2va bridge] forward the pre-encoded keyframe/reference latents from the
         # per-group conditioning payload (official minimax_payload mechanism) as begin options
         # av_conds: device pointers as HEX STRINGS (borrowed until begin returns — the engine
@@ -453,8 +431,7 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
             # H3 is joint AV — the VIDEO lane's zero-latent is the same int4 NaN factory.
             qfmp.refuse_all_zero_initial_latent(x_video, "H3")
             self._begin(x_video[0:1].contiguous(), x_audio[0:1].contiguous(), vemb[0:1].contiguous(),
-                        av_payload=kwargs.get("minimax_payload"),
-                        cfg_active=(B > 1))   # [audio_enhance CFG gate §3.4] B>1 = batched cond+uncond (CFG)
+                        av_payload=kwargs.get("minimax_payload"))
         # [C2 ordering guard] the engine binds av_conds SESSION-WIDE from the FIRST-invoked cond
         # group (_begin above). ComfyUI does not guarantee pos-before-neg invocation order, so a
         # group whose payload DIFFERS from the bound one would have its keyframes/refs silently
@@ -575,6 +552,7 @@ def register(deps):
     """Return the minimax-h3 family BUILDER. `deps` gives the package-level helpers (engine cache,
     liveness registry, footprint estimator, lazy-engine class) without importing __init__."""
     get_engine = deps["get_engine"]
+    peek_engine = deps.get("peek_engine")   # ledger reads: cached handle or None, never a create
     bind_pipeline_model = deps["bind_pipeline_model"]
     retire_handle = deps["retire_handle"]
     estimate_footprint = deps["estimate_footprint"]
@@ -627,7 +605,8 @@ def register(deps):
             # QFH3Model" pair, measured on the user's box). Weakref list, resolved at call.
             _factory, _register_model = qfmp.make_engine_factory(
                 lambda: get_engine(model_dir, create_cfg=(_lora_cfg or None)),
-                bind_pipeline_model)
+                bind_pipeline_model,
+                peek_engine_fn=(lambda: peek_engine(model_dir, create_cfg=(_lora_cfg or None))) if peek_engine else None)
 
             # DEFERRED create (QFLazyEngine): a chained QuantFuncNativeLoRA rebuilds for its
             # accumulated LoRA set, so an eager create here would build ONE PIPELINE PER

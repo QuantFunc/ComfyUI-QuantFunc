@@ -1161,6 +1161,7 @@ def register(deps):
     """Return the ltx2 family BUILDER. `deps` gives the package-level helpers (engine cache,
     liveness registry, footprint estimator, lazy-engine class) without importing __init__."""
     get_engine = deps["get_engine"]
+    peek_engine = deps.get("peek_engine")   # ledger reads: cached handle or None, never a create
     bind_pipeline_model = deps["bind_pipeline_model"]
     retire_handle = deps["retire_handle"]
     estimate_footprint = deps["estimate_footprint"]
@@ -1328,7 +1329,8 @@ def register(deps):
             if _is_av:
                 _factory, _register_model = qfmp.make_engine_factory(
                     lambda: get_engine(model_dir, create_cfg=(_lora_cfg or None)),
-                    bind_pipeline_model)
+                    bind_pipeline_model,
+                    peek_engine_fn=(lambda: peek_engine(model_dir, create_cfg=(_lora_cfg or None))) if peek_engine else None)
 
                 # DEFERRED create (QFLazyEngine): a chained QuantFuncNativeLoRA rebuilds for its
                 # accumulated LoRA set, so an eager create here would build ONE PIPELINE PER
@@ -1370,7 +1372,8 @@ def register(deps):
             # No fix now (adding keys back defeats minimal=True's purpose); this note is the tripwire.
             _factory, _register_model = qfmp.make_engine_factory(
                 lambda: get_engine(model_dir, create_cfg=(_lora_cfg or None)),
-                bind_pipeline_model)
+                bind_pipeline_model,
+                peek_engine_fn=(lambda: peek_engine(model_dir, create_cfg=(_lora_cfg or None))) if peek_engine else None)
 
             # DEFERRED create (QFLazyEngine): a chained QuantFuncNativeLoRA rebuilds for its
             # accumulated LoRA set, so an eager create here would build ONE PIPELINE PER

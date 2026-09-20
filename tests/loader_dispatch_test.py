@@ -269,7 +269,7 @@ def main():
     # node surface: required = latent-only duo (transformer + model_config; the manual
     # block-count widget was REMOVED 2026-09-12 — residency is arena-managed); optional =
     # the runtime SESSION dials (attention_backend 2026-08-27; sol_tau; quality_enhance
-    # [token-prune switch, replaced the raw token_prune float 2026-09-12]; step_cache +
+    # [video_enhance boolean switch 2026-09-19; was the token-prune float mapper 2026-09-12]; step_cache +
     # block_cache). Every optional is a session knob (no create key / no rebuild) — sparse is
     # deliberately NOT among them (removed 2026-08-29, only the caches came back).
     _lit = LtxL.INPUT_TYPES()
@@ -286,23 +286,25 @@ def main():
           and list(_h3it.get("optional", {}).keys()) == ["attention_backend", "sol_tau",
                                                           "quality_enhance", "audio_enhance", "step_cache", "block_cache"],
           f"-> req={list(_h3it['required'].keys())} opt={list(_h3it.get('optional', {}).keys())}")
-    # (B) quality_enhance switch -> engine token-prune keep-fraction (ON = full quality, OFF = prune)
-    check("quality_enhance mapper: ON->1.0 / OFF->0.8",
-          qfn._quality_enhance_to_token_prune(True) == 1.0
-          and qfn._quality_enhance_to_token_prune(False) == 0.8,
-          f"-> ON={qfn._quality_enhance_to_token_prune(True)} OFF={qfn._quality_enhance_to_token_prune(False)}")
-    # (B) the token_prune WIRING itself: set_token_prune -> residency_opts emits token_prune_keep_ratio
-    #     (unset/default omits it). NOTE: the pixel-level A/B (quality_enhance ON vs OFF) is the USER's
-    #     ComfyUI acceptance — this arm only proves the widget->engine key wiring, not the visual effect.
+    # (B) quality_enhance widget -> the ONE boolean begin option `video_enhance` (user 2026-09-19: the keep ratio
+    #     is engine law; the plugin carries no number). NOTE: the pixel-level A/B (quality_enhance ON vs OFF) is
+    #     the USER's ComfyUI acceptance — this arm only proves the widget->engine key wiring, not the visual effect.
     from qfn_test_pkg import qf_modelpatcher as _qmp_tp
     class _TPProbe(_qmp_tp.QFSessionModelMixin):
         pass
-    _tp_on = _TPProbe(); _tp_on.set_token_prune(0.8)
+    _tp_on = _TPProbe(); _tp_on.set_video_enhance(True)
     _d_tp_on = _tp_on.residency_opts()
+    _tp_off = _TPProbe(); _tp_off.set_video_enhance(False)
+    _d_tp_off = _tp_off.residency_opts()
     _d_tp_def = _TPProbe().residency_opts()
-    check("token_prune wiring: set_token_prune(0.8) -> residency_opts token_prune_keep_ratio=0.8; default omits",
-          _d_tp_on.get("token_prune_keep_ratio") == 0.8 and "token_prune_keep_ratio" not in _d_tp_def,
-          f"-> set={_d_tp_on.get('token_prune_keep_ratio')} default_has_key={'token_prune_keep_ratio' in _d_tp_def}")
+    check("video_enhance wiring: set_video_enhance(True/False) -> residency_opts video_enhance True/False; default False (still sent); never the raw key",
+          _d_tp_on.get("video_enhance") is True and _d_tp_off.get("video_enhance") is False
+          and _d_tp_def.get("video_enhance") is False
+          and not any("token_prune_keep_ratio" in d for d in (_d_tp_on, _d_tp_off, _d_tp_def)),
+          f"-> on={_d_tp_on.get('video_enhance')} off={_d_tp_off.get('video_enhance')} default={_d_tp_def.get('video_enhance')}")
+    check("no plugin-side keep-ratio mapper survives (the number is engine law)",
+          not hasattr(qfn, "_quality_enhance_to_token_prune") and not hasattr(_qmp_tp.QFSessionModelMixin, "set_token_prune"),
+          "-> mapper/set_token_prune still present" )
     # qfa REMOVED as a user-facing attention_backend choice (2026-09-13)
     check("attention_backend choices drop qfa (SM80+ and SM75)",
           "qfa" not in qfn._ATTN_BACKEND_SM80PLUS and "qfa" not in qfn._ATTN_BACKEND_SM75,

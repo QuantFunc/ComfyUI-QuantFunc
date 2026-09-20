@@ -93,22 +93,16 @@ class QFKrea2Model(QFSessionModelMixin, comfy.model_base.Krea2):
         # IMAGE session: the video-flavored residency_opts CACHE/SPARSE keys are
         # engine-REFUSED here (E3, correctly) — send only the knobs the image seam
         # consumes: the runtime attn-backend dial (applyAttnBackendDial) and the
-        # token-prune keep-fraction (quality_enhance switch).
+        # video_enhance switch (quality_enhance widget).
         _o = {}
         ab = str(getattr(self, "_attn_backend", "auto") or "auto")
         if ab != "auto":
             _o["attention_backend"] = ab
-        # token-prune (CAT): the krea2 _begin builds its own _o (video residency_opts
-        # keys are engine-REFUSED here), so the mixin's generic emission never runs —
-        # emit the key HERE or the widget is silently dropped (field 2026-09-01:
-        # user set 0.3, engine stayed 1.0, no ARMED line). Engine session parse is
-        # generic (denoise begin :4511); absent = engine resets to 1.0 (anti-ghost).
-        try:
-            _tp = float(getattr(self, "_token_prune", 1.0) or 1.0)
-        except Exception:
-            _tp = 1.0
-        if 0.0 < _tp < 1.0:
-            _o["token_prune_keep_ratio"] = _tp
+        # [enhance switch] the krea2 _begin builds its own _o (video residency_opts keys are
+        # engine-REFUSED here), so the mixin's generic emission never runs — emit the switch HERE
+        # or the widget is silently dropped (the field 2026-09-01 lesson). Always sent, boolean;
+        # the number behind it is engine law (never the raw token_prune_keep_ratio key).
+        _o["video_enhance"] = bool(getattr(self, "_video_enhance", False))
         bpx._opts = json.dumps(_o).encode()
         bpx.options_json = bpx._opts
         session = ctypes.c_void_p()
@@ -222,6 +216,7 @@ class QFKrea2Model(QFSessionModelMixin, comfy.model_base.Krea2):
 
 def register(deps):
     get_engine = deps["get_engine"]
+    peek_engine = deps.get("peek_engine")   # ledger reads: cached handle or None, never a create
     bind_pipeline_model = deps["bind_pipeline_model"]
     retire_handle = deps["retire_handle"]
     estimate_footprint = deps["estimate_footprint"]
@@ -247,7 +242,8 @@ def register(deps):
                 _lora_cfg["lora"] = list(lora_entries)   # engine svdq load: sidecar apply post-load
             _factory, _register_model = qfmp.make_engine_factory(
                 lambda: get_engine(model_dir, create_cfg=(_lora_cfg or None)),
-                bind_pipeline_model)
+                bind_pipeline_model,
+                peek_engine_fn=(lambda: peek_engine(model_dir, create_cfg=(_lora_cfg or None))) if peek_engine else None)
             engine = qfmp.QFLazyEngine(_factory, estimate_footprint(model_dir),
                                        retire=retire_handle)
             device = comfy.model_management.get_torch_device()

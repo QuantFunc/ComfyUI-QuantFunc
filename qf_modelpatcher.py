@@ -47,6 +47,7 @@ import json
 import os
 import tempfile
 
+import math
 import torch
 import comfy.model_base
 import comfy.model_patcher
@@ -222,7 +223,7 @@ class _QFStub(torch.nn.Module):
                            "a ComfyUI upgrade may have changed the apply-model dispatch")
 
 
-def make_engine_factory(get_engine_fn, bind_pipeline_model):
+def make_engine_factory(get_engine_fn, bind_pipeline_model, peek_engine_fn=None):
     """[P5, independent-CR 2026-08-30] The ONE deferred-create factory shape every
     family builder previously hand-copied 4x (Wan / H3 / LTX-AV / LTX-video — that
     exact drift left 3 of 4 sites unfixed in the leak class): a weakref LIST of
@@ -243,6 +244,9 @@ def make_engine_factory(get_engine_fn, bind_pipeline_model):
         return eng, ckey
     def register_model(m):
         engine_models.append(_weakref.ref(m))
+    # The peek rides on the factory so QFLazyEngine needs no new ctor arg: `factory.peek()` → the cached real
+    # handle or None (never creates). A family that passes none keeps the create-only behaviour.
+    factory.peek = peek_engine_fn
     return factory, register_model
 
 
@@ -340,15 +344,12 @@ class QFSessionModelMixin:
         except (TypeError, ValueError):
             self._sol_tau = 1.0
 
-    def set_token_prune(self, v):
-        # [token-prune 2026-09-01] CAT keep fraction: (0,1) prunes (smaller = fewer video
-        # tokens recomputed per step = faster), 1.0 = OFF. Engine: last step always full-N
-        # (quality floor) + audio never pruned + auto-yields to an armed step-cache (the
-        # measured ghosting interlock). Same rides-residency_opts class as set_sol_tau.
-        try:
-            self._token_prune = float(v)
-        except (TypeError, ValueError):
-            self._token_prune = 1.0
+    def set_video_enhance(self, on):
+        # [enhance switch, user 2026-09-19] the ONE video-quality switch: OFF (default) = the engine's speed
+        # policy, ON = full quality. What that means (which tokens are recomputed, how much, which step stays
+        # full, what yields to a step-cache) is ENGINE law behind the begin option `video_enhance` — this
+        # plugin carries no number for it. Same rides-residency_opts class as set_sol_tau.
+        self._video_enhance = bool(on)
 
     def residency_opts(self):
         """The begin-options fragment EVERY family merges into its options_json — the ONE
@@ -389,11 +390,12 @@ class QFSessionModelMixin:
         st = float(getattr(self, "_sol_tau", 1.0) or 1.0)
         if abs(st - 1.0) > 1e-6:
             o["sol_tau"] = st
-        # [token-prune] omitted at the 1.0/off default (old-engine compatible — unknown
-        # begin keys refuse LOUD); absent key = engine resets to off (anti-ghost).
-        tp = float(getattr(self, "_token_prune", 1.0) or 1.0)
-        if tp < 1.0 - 1e-6:
-            o["token_prune_keep_ratio"] = tp
+        # [enhance switch] ALWAYS sent (both states are meaningful: OFF = the engine's speed policy, ON = full
+        # quality; an absent key would leave the engine on its raw-key default, which is neither). Requires the
+        # engine that ships with this plugin (an older .so refuses unknown begin keys LOUD — by design, never
+        # silently ignored). The raw token_prune_keep_ratio key is the harness/expert surface and is never
+        # built here; the engine refuses a begin that carries both.
+        o["video_enhance"] = bool(getattr(self, "_video_enhance", False))
         return o
 
     def _assert_wire_lora(self):
@@ -412,35 +414,34 @@ class QFSessionModelMixin:
             return
         eng.set_lora_side(side, list(getattr(self, QF_LORA_STACK_ATTR, []) or []))
 
-    # ── comfy inference-memory estimate override (inter-stage thrash fix, 2026-08-22) ──
-    # comfy's load_models_gpu decides evictions from BaseModel.memory_required(input_shape),
-    # which for a torch WAN at seq_len 33600 estimates GBs of activation memory. Our engine
-    # manages its OWN working VRAM inside the session (the estimate is not just wrong — acting
-    # on it is harmful): measured on the user's 4090 log, loading the SECOND stage's 64MB
-    # shadow patcher triggered "All models offloaded to CPU" on the primary (a ~15s/prompt
-    # engine offload+reload round-trip between the two KSamplerAdvanced stages). The comfy-side
-    # truth for this wrapper is just the latent/cond tensors + conversion scratch — a fixed
-    # small cushion. Engine working memory is the ENGINE's ledger, reported via the patcher's
-    # model_size/loaded_size (already wired), not via inference estimates.
-    # D3/D4 (delta CR): the estimate is GEOMETRY-PROPORTIONAL and the signature matches the
-    # REAL call site — comfy/sampler_helpers.py estimate_memory() calls
-    # `memory_required(shape, cond_shapes=cond_shapes)` (keyword!) on EVERY standard
-    # KSampler run; the earlier positional-only `(self, input_shape)` override raised
-    # TypeError there (D4 NO-GO — the 6/6 suite arm called positionally and proved only the
-    # return value, not the calling convention). `**_kw` tolerates future comfy drift.
-    # Honest accounting (D3): comfy-side bytes for this wrapper are the latent in/out copies
-    # + cond tensors + conversion scratch — proportional to geometry, NOT the torch-WAN
-    # activation estimate (2.36 GB at 33.6k tok; acting on it evicted the engine = the
-    # measured 15 s/prompt inter-stage thrash), and NOT a flat constant that under-reports
-    # huge geometries to OTHER tenants' eviction math. K factors: input + noise + output
-    # velocity + c_concat tail + ~4x conversion/temporary copies ≈ 8 latent-sized tensors;
-    # cond tensors counted 2x (borrowed + converted). Floor keeps small runs honest.
+    # ── comfy's per-model VRAM interface (2026-09-19, user: 「与 comfyui 打通,让它知道我们需要多少显存、当前占了多少」) ──
+    # comfy asks a model TWO numbers and does the rest itself: `memory_required(shape)` — how much MORE VRAM one
+    # forward of `shape` needs (sampler_helpers.estimate_memory → load_models_gpu(memory_required=…) → free_memory
+    # unloads comfy's IDLE models, largest first, keeping the sampler's declared set; samplers.calc_cond_batch →
+    # `need × 1.5 < free` decides cond batching) — and `loaded_size()`/`model_size()` — what it holds (the patcher,
+    # below). Both are ENGINE numbers now (quantfunc_vram_need_bytes / quantfunc_resident_vram_bytes), so comfy's own
+    # allocator makes the room before the denoise starts; nothing here reaches into comfy's state (user: 「不要 hack」).
+    # What this REPLACES (git: 52ec260 / 9b6f7d3 / a6ec609): this function returned the comfy-side bytes ONLY — a
+    # deliberate under-report so comfy would never evict the engine for a stage-2 shadow load (2026-08-22: the
+    # torch-WAN activation estimate, 2.36 GB at 33.6k tok, evicted the ENGINE when the 64 MB shadow patcher loaded
+    # → 15 s/prompt inter-stage thrash) — with the side effect that on a card where comfy's idle TE/VAEs FIT, comfy
+    # kept them resident through the denoise and the engine shed its own weight pages every step (MEASURED 5090/H3
+    # 800x768: 26–50 blocks re-copied per step). H3 additionally stacked a static per-element heuristic on top
+    # (deleted with this change — it would double-count the real number). The 2026-08-22 constraint still holds for
+    # the SHADOW (a second MODEL output over ONE shared engine, wan dual-expert): it reports comfy-side bytes only —
+    # the primary is a separate LoadedModel that is NOT currently_used at the shadow's load, so a real need there
+    # would evict it. Follow-up: declare the primary via get_additional_models() so comfy keeps it, then the shadow
+    # can report the real need too.
+    # Comfy-side bytes for this wrapper (D3): the latent in/out copies + cond tensors + conversion scratch — geometry-
+    # proportional; K factors: input + noise + output velocity + c_concat tail + ~4x conversion/temporary copies ≈ 8
+    # latent-sized tensors; cond tensors counted 2x (borrowed + converted). Floor keeps small runs honest. Signature
+    # matches the REAL call site: `memory_required(shape, cond_shapes=cond_shapes)` (keyword!); `**_kw` tolerates drift.
     _QF_COMFY_SIDE_BASE_BYTES = 64 * 1024 * 1024
     _QF_COMFY_SIDE_LATENT_COPIES = 8
     _QF_COMFY_SIDE_COND_COPIES = 2
     _QF_COMFY_SIDE_ITEMSIZE = 2  # fp16/bf16 latents+conds
 
-    def memory_required(self, input_shape, cond_shapes=None, **_kw):
+    def _qf_comfy_side_bytes(self, input_shape, cond_shapes=None):
         n_lat = 1
         for d in list(input_shape):
             n_lat *= max(1, int(d))
@@ -457,6 +458,70 @@ class QFSessionModelMixin:
         return int(self._QF_COMFY_SIDE_BASE_BYTES +
                    self._QF_COMFY_SIDE_ITEMSIZE * (n_lat * self._QF_COMFY_SIDE_LATENT_COPIES +
                                                    n_cond * self._QF_COMFY_SIDE_COND_COPIES))
+
+    def _qf_engine_latent_dims(self, input_shape):
+        """The ENGINE's latent geometry for a comfy `input_shape`. A plain family's comfy latent IS the engine latent
+        ([B,C,H,W] / [B,C,T,H,W]) → as given. An AV family (H3, LTX-AV) hands comfy ONE flat packed stream [B,1,N]
+        (N = video numel | audio numel, comfy.utils.pack_latents) — the engine records its working set under the
+        VIDEO stream's key, so unpack with comfy's own `model.latent_shapes` (set by CFGGuider.inner_sample from the
+        packed latent; at memory_required time it is the previous run's — accepted only when the streams' TOTAL
+        element count equals N, which catches a changed geometry but NOT two AV geometries with the same total
+        (bounded: a wrong key → an unmeasured peak → 0, never a crash); a changed total or a first run → as given).
+        MEASURED 5090/H3: `memory_required[2, 1, 2144448]` keyed (1, 2144448) matched nothing → need UNKNOWN."""
+        dims = [int(d) for d in input_shape]
+        ls = getattr(self, "latent_shapes", None)
+        if len(dims) == 3 and dims[1] == 1 and ls:
+            try:
+                streams = [[int(d) for d in s] for s in ls]
+                if streams and sum(math.prod(s[1:]) for s in streams) == dims[2]:
+                    return [dims[0]] + streams[0][1:]
+            except (TypeError, ValueError):
+                pass
+        return dims
+
+    def memory_required(self, input_shape, cond_shapes=None, **_kw):
+        """comfy-side bytes + (PRIMARY only) the ENGINE's own "how much MORE do I need" for a forward of `input_shape`
+        — quantfunc_vram_need_bytes(latent [B,C,(T,)H,W]): the primary transformer's working set under that shape
+        (MEASURED by an earlier forward; else the same spatial shape at another batch scaled; else the config
+        estimate) + the plan margin − the allocator's cached pool it already holds. The engine is asked through the
+        CACHED real handle when one exists (a fresh lazy proxy answers 0 on its own while the cached engine already
+        holds the arena) and is NEVER created here — comfy's eviction pass runs after this call, so a create
+        here would run ahead of the room being made. Engine 0 = nothing to ask for (its cached pool already covers the
+        working set — counted in loaded_size — OR nothing measured yet: old .so / first forward of a new shape) →
+        comfy-side only; on a first forward the engine pages once, measures, and the next run is exact.
+        Accepted by the user (2026-09-19 「comfyui 路径不合并 CFG 就好」): with a real need comfy runs cond/uncond
+        un-batched on a card that cannot hold 1.5× the B=2 working set — comfy's own rule, correct for us too (a B=2
+        forward the card cannot hold pages inside the engine); our own full-pipeline path keeps CFG batched."""
+        comfy_side = self._qf_comfy_side_bytes(input_shape, cond_shapes)
+        if getattr(self, "_qf_shadow", False):
+            return comfy_side
+        eng = getattr(self, "_qf", None)
+        need = 0
+        if eng is not None:
+            try:
+                # A fresh lazy proxy over a CACHED real handle (every loader-node execution makes a new proxy;
+                # the handle is cached by config) materializes here without a create; a never-created engine
+                # stays uncreated → 0 → comfy-side only (comfy's eviction pass runs AFTER this call).
+                peek = getattr(eng, "ensure_if_cached", None)
+                if callable(peek):
+                    eng = peek() or eng
+                need = int(getattr(eng, "vram_need_bytes", lambda _s: 0)(self._qf_engine_latent_dims(input_shape)) or 0)
+            except Exception:  # noqa: BLE001 — an unqueryable engine is UNKNOWN, never a broken sampler
+                need = 0
+        total = int(comfy_side + need)
+        # One line per CHANGE of the answer (comfy asks per estimate + per cond-batch decision): the numbers comfy
+        # will act on, so a ledger question is answerable from the log, not a guess.
+        sig = (tuple(int(d) for d in input_shape), comfy_side, need)
+        if sig != getattr(self, "_qf_ledger_last", None):
+            self._qf_ledger_last = sig
+            try:
+                hold = int(getattr(eng, "resident_vram_bytes", lambda: 0)() or 0) if eng is not None else 0
+            except Exception:  # noqa: BLE001
+                hold = 0
+            print("[qf_native] VRAM ledger: memory_required%s = comfy-side %d MB + engine need %d MB%s; engine hold %d MB"
+                  % (list(sig[0]), comfy_side >> 20, need >> 20, "" if need else " (0: covered by what it holds, or nothing measured yet)",
+                     hold >> 20), flush=True)
+        return total
 
     def _sigma_step_index(self, sigma, sig_all, transformer_options):
         """SAMPLER step index from the sigma's position in the schedule — call-count-independent.
@@ -581,6 +646,17 @@ class QFLazyEngine:
     @property
     def materialized(self):
         return self._real is not None
+
+    def ensure_if_cached(self):
+        """Materialize ONLY if the real handle already exists in the pipeline cache (a cache HIT: no create) —
+        the ledger reads (comfy's memory_required / loaded_size run BEFORE comfy's own eviction pass) must never
+        run a create ahead of comfy making room (self-CR P-2). Returns the real handle or None."""
+        if self._real is not None:
+            return self._real
+        peek = getattr(self._factory, "peek", None)
+        if callable(peek) and peek() is not None:
+            return self.ensure()   # the factory hits the cache → binds models, no create
+        return None
 
     # ---- [wiring-lora] per-side LoRA registry (see __init__ docblock) ----
     # DUAL-OUTPUT FAMILY ONBOARDING (wan = the reference implementation): a new multi-output
@@ -710,6 +786,9 @@ class QFLazyEngine:
 
     def resident_vram_bytes(self):
         return 0 if self._real is None else self._real.resident_vram_bytes()
+
+    def vram_need_bytes(self, latent_shape):
+        return 0 if self._real is None else self._real.vram_need_bytes(latent_shape)
 
     # NOTE: deliberately NO destroy() on the wrapper. The raw ungated destroy was dead code with
     # zero callers, and any future caller reaching for it would reproduce the shared-handle UAF the
@@ -912,33 +991,40 @@ class QFModelPatcher(comfy.model_patcher.ModelPatcher):
     def _is_shadow(self):
         return bool(getattr(getattr(self, "model", None), "_qf_shadow", False))
 
-    def _footprint(self):
+    def _hold_bytes(self, eng):
+        """What the engine HOLDS on the card right now (quantfunc_resident_vram_bytes: arena mapped pages + the
+        allocator's reserved bytes incl. its cached pool + the async mempool reservation). 0 = the engine cannot tell
+        (old .so / unmaterialized) — the callers fall back to the on-disk estimate."""
+        try:
+            return int(getattr(eng, "resident_vram_bytes", lambda: 0)() or 0)
+        except Exception:  # noqa: BLE001
+            return 0
+
+    def model_size(self):
+        # comfy's "full size": the on-disk ESTIMATE under-reports a resident engine (the coalesced pack is larger
+        # than the file; workspaces/caches are not in it — measured 12,688 vs 16,928+ MB), so never less than the
+        # live hold. model_size − loaded_size is comfy's "still to load" → the shed-page deficit when the engine
+        # holds less than its weights (comfy then frees room for the re-fault), 0 once it holds them.
         if self._is_shadow():
             return self._QF_SHADOW_LEDGER_BYTES
         eng = self._engine()
         if eng is None:
             return 1
-        # The on-disk ESTIMATE under-reports a resident engine (the coalesced pack is larger than the file;
-        # workspaces/activations are not in it — measured 12,688 vs 16,928+ MB): comfy then over-commits the
-        # card for its own dynamic models and the arena thrashes. Report the LIVE residency when the engine
-        # can tell it, never less than the estimate (the estimate is the load-time need while unloaded).
-        live = 0
-        try:
-            live = int(getattr(eng, "resident_vram_bytes", lambda: 0)() or 0)
-        except Exception:  # noqa: BLE001
-            live = 0
-        return max(1, int(eng.footprint_bytes), live)
-
-    def model_size(self):
-        return self._footprint()
+        return max(1, int(eng.footprint_bytes), self._hold_bytes(eng))
 
     def loaded_size(self):
-        # 0 while unloaded (VRAM genuinely freed) so comfy's ledger is honest across a co-eviction;
-        # the footprint while resident.
+        # What the engine HOLDS: 0 while unloaded (VRAM genuinely freed) so comfy's ledger is honest across a
+        # co-eviction — checked BEFORE the shadow constant (a shadow over an unloaded engine holds nothing either);
+        # the live hold when the engine can tell it; the estimate for an engine that cannot (old .so).
         eng = self._engine()
         if eng is not None and getattr(eng, "unloaded", False):
             return 0
-        return self._footprint()
+        if self._is_shadow():
+            return self._QF_SHADOW_LEDGER_BYTES
+        if eng is None:
+            return 1
+        live = self._hold_bytes(eng)
+        return live if live > 0 else max(1, int(eng.footprint_bytes))
 
     def partially_load(self, device_to, extra_memory=0, force_patch_weights=False):
         # The engine reloads lazily inside the next denoise_begin (its ~3s-grace auto-reload). Clearing

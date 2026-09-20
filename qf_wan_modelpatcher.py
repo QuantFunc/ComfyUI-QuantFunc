@@ -602,6 +602,20 @@ def register(deps):
                         bind_pipeline_model(ckey, _m)
                 return eng, ckey
 
+            # Ledger PEEK (mirrors _factory's identity: same device + the same late-bound LoRA union) —
+            # the cached handle or None, never a create (see qfmp.make_engine_factory / QFLazyEngine.ensure_if_cached).
+            _peek_engine = deps.get("peek_engine")
+            def _peek():
+                if _peek_engine is None:
+                    return None
+                dev = comfy.model_management.get_torch_device()
+                cfg2 = dict(cfg)
+                _union = engine.lora_union()
+                if _union:
+                    cfg2["lora"] = _union
+                return _peek_engine(model_dir, create_cfg=cfg2, device_idx=getattr(dev, "index", 0) or 0)
+            _factory.peek = _peek
+
             # DEFERRED create (QFLazyEngine): a chained QuantFuncNativeLoRA rebuilds for its
             # accumulated set, so an eager create here would build ONE PIPELINE PER CHAIN LINK.
             engine = qfmp.QFLazyEngine(_factory, estimate_footprint(model_dir),

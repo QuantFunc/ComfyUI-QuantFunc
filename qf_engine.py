@@ -7,6 +7,7 @@ import re as _re_soname
 _SONAME_RE = _re_soname.compile(r"lib[^/]*\.so(?:\.\d+[a-z]?)*")   # lib*.so, lib*.so.5, libopencv_core.so.4.5d
 import json
 import os
+import time
 import platform
 import re
 import struct
@@ -234,6 +235,15 @@ def _bind(lib):
         lib.quantfunc_partial_unload.restype = ctypes.c_int
         lib.quantfunc_partial_unload.argtypes = [v, ctypes.c_uint64,
                                                  ctypes.POINTER(ctypes.c_int64)]
+    # comfy-ledger pair (quantfunc.h: what the engine HOLDS / how much MORE it NEEDS for a latent shape); an older
+    # .so lacks one or both -> hasattr-guarded, the readers report 0 = UNKNOWN and comfy keeps its own estimates.
+    if hasattr(lib, "quantfunc_resident_vram_bytes"):
+        lib.quantfunc_resident_vram_bytes.restype = ctypes.c_int
+        lib.quantfunc_resident_vram_bytes.argtypes = [v, ctypes.POINTER(ctypes.c_uint64)]
+    if hasattr(lib, "quantfunc_vram_need_bytes"):
+        lib.quantfunc_vram_need_bytes.restype = ctypes.c_int
+        lib.quantfunc_vram_need_bytes.argtypes = [v, ctypes.POINTER(ctypes.c_int64), ctypes.c_int,
+                                                  ctypes.POINTER(ctypes.c_uint64)]
     # Cloud TE encode + tensor readout (design v11). hasattr-gated: an older .so
     # simply lacks these and the cloud-TE node then refuses with clear guidance.
     if hasattr(lib, "quantfunc_te_cloud_encode"):
@@ -488,9 +498,17 @@ def load_lib():
         # 2026-09-12 showed THREE builds of libquantfunc_attention.so mapped into one ComfyUI
         # process (the real one + two backups), and the process aborted at exit with
         # "double free or corruption" from their colliding static destructors.
+        # A per-SM kernel .so (QF_SPLIT_KERNEL_SO two-.so build: libquantfunc_kernels_sm<NN>.so)
+        # is NOT preloaded as a sidecar. The engine .so DT_NEEDEDs it and finds it via its own
+        # $ORIGIN rpath, so it loads as a member of the ENGINE's dlopen group — where the host<->kernel
+        # symbols (engine's kernel launchers + the kernel's cachedConvPlanWorkspaceCap) resolve
+        # bidirectionally in-group. Eagerly preloading it here (before the engine) would fail: its
+        # host symbol is not yet available. Keeping it OUT of a preload also keeps the kernel's many
+        # exported symbols out of the process-global scope (no clash with torch's own kernels).
         pending = sorted(
             f for f in entries
             if _SONAME_RE.fullmatch(f) and f != base
+            and not f.startswith("libquantfunc_kernels_sm")
         )
         for _ in range(max(1, len(pending))):
             still = []
@@ -504,7 +522,35 @@ def load_lib():
                 break
             pending = still
         _LIB = _bind(ctypes.CDLL(so_path, mode=ctypes.RTLD_GLOBAL))
+        _log_lib_fingerprint(_LIB, so_path)
     return _LIB
+
+
+def _log_lib_fingerprint(lib, so_path):
+    """[F6, 2026-09-19] ONE line naming the engine library this process actually dlopen'd — path, size, mtime,
+    md5, and the engine's own quantfunc_version(). MEASURED need: the 远程-linux 5090 box ran a 4-day-old engine
+    for days, and later a deployed library was silently replaced by an older file (found from a backup's mtime,
+    not from any log). With this line the ComfyUI log states which binary produced every run. Never raises."""
+    try:
+        import hashlib
+        st = os.stat(so_path)
+        h = hashlib.md5()
+        with open(so_path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+        ver = "?"
+        try:
+            fn = lib.quantfunc_version
+            fn.restype = ctypes.c_char_p
+            fn.argtypes = []
+            ver = (fn() or b"?").decode("utf-8", "replace")
+        except Exception:  # noqa: BLE001 — an old .so without the symbol still gets the file fingerprint
+            pass
+        print("[qf_native] engine lib: %s  size=%d  mtime=%s  md5=%s  quantfunc_version=%s"
+              % (so_path, st.st_size, time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st.st_mtime)),
+                 h.hexdigest(), ver), flush=True)
+    except Exception as e:  # noqa: BLE001
+        print("[qf_native] engine lib: %s (fingerprint unavailable: %r)" % (so_path, e), flush=True)
 
 
 def last_err(lib):
@@ -754,6 +800,26 @@ class QFEngineHandle:
         out = ctypes.c_uint64(0)
         try:
             st = self.lib.quantfunc_resident_vram_bytes(self.pipeline, ctypes.byref(out))
+        except Exception:  # noqa: BLE001
+            return 0
+        return int(out.value) if st == QUANTFUNC_OK else 0
+
+    def vram_need_bytes(self, latent_shape):
+        """How much MORE VRAM the engine needs beyond what it holds for ONE forward of `latent_shape`
+        ([B,C,H,W] image / [B,C,T,H,W] video — the exact latent the session will step on) via
+        quantfunc_vram_need_bytes: the primary transformer's MEASURED working set under that shape (else the same
+        spatial shape at another batch scaled, else the model's config estimate) + the engine's plan margin − the
+        allocator's cached pool it already holds. 0 = UNKNOWN (old .so / unloaded / no pipeline / nothing measured
+        yet) — the caller treats it as "no extra number", never as "needs nothing"."""
+        if self.pipeline is None or self.unloaded or not hasattr(self.lib, "quantfunc_vram_need_bytes"):
+            return 0
+        dims = [int(d) for d in latent_shape]
+        if not dims or any(d <= 0 for d in dims):
+            return 0
+        arr = (ctypes.c_int64 * len(dims))(*dims)
+        out = ctypes.c_uint64(0)
+        try:
+            st = self.lib.quantfunc_vram_need_bytes(self.pipeline, arr, len(dims), ctypes.byref(out))
         except Exception:  # noqa: BLE001
             return 0
         return int(out.value) if st == QUANTFUNC_OK else 0
