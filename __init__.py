@@ -285,10 +285,9 @@ def _apply_checkpoint_flow_shift(model, model_dir):
 
 
 # Pipeline CACHE: reuse the created engine handle for a repeated config → a re-executed workflow does
-# NOT leak a fresh pipeline. Keyed by the create-determining inputs. TWO bounds:
-#  • VRAM (at most ONE pipeline resident): `_evict_other_pipelines` frees every OTHER cached handle's
-#    VRAM via quantfunc_unload_sync — the handles STAY VALID (reload lazily on their next generate).
-#    NO destroy of a LIVE handle → no use-after-destroy against a QFModelPatcher comfy still holds.
+# NOT leak a fresh pipeline. Keyed by the create-determining inputs.
+#  • VRAM residency is scheduled by ComfyUI. Cache selection must not independently
+#    evict other live handles; their resource adapters execute host reclaim requests.
 #  • HOST RAM (bounded by the set of LIVE patchers): `_sweep_dead_pipelines` DESTROYS a handle only
 #    once its QFWanModel has been garbage-collected (comfy dropped the patcher) — a dead model cannot
 #    be use-after-freed, so destroy is safe there. Without this the unload_vram-only design leaks a
@@ -309,8 +308,8 @@ _PIPELINE_MODELS = {}    # ckey -> [weakref.ref(model), ...] — ALL live consum
 #    defensive wiring for an unreachable race. Revisit IF comfy ever executes nodes concurrently.
 #  • If load() raises AFTER _get_engine caches the handle but BEFORE it binds the weakref
 #    (_PIPELINE_MODELS[ckey]=), that handle reads as "unbound" to _sweep_dead_pipelines forever (never
-#    destroyed). Its VRAM is still freed by _evict_other_pipelines; only a DISTINCT config that fails
-#    mid-load AND is never retried leaks ONE CPU-backup handle. A retry of the SAME config REUSES the
+#    destroyed). A DISTINCT config that fails mid-load AND is never retried can
+#    retain an unbound handle. A retry of the SAME config REUSES the
 #    cached handle (faster) and, on success, binds the weakref → it becomes sweepable — so the pin is a
 #    reuse-on-retry feature except in the never-retried case; evicting on failure would forfeit it.
 
@@ -372,19 +371,9 @@ def _retire_handle(ckey, eng, requester=None, *, keep_binding=False, reason=""):
     return True
 
 
-def _evict_other_pipelines(keep_key):
-    """Free the VRAM of every OTHER cached pipeline (unload_sync → CPU backup; handle stays valid)."""
-    for k, e in list(_PIPELINE_CACHE.items()):
-        if k != keep_key and e is not None and e.pipeline is not None and not e.unloaded:
-            try:
-                e.unload_vram()
-            except Exception:  # noqa: BLE001
-                pass
-
-
 def _sweep_dead_pipelines(keep_key):
     """Reclaim HOST RAM: destroy any cached handle whose model comfy has GC'd (no live reference → no
-    UAF). A still-live model is kept (its VRAM is freed separately by _evict_other_pipelines). Never
+    UAF). A still-live model is kept; ComfyUI decides its VRAM residency. Never
     touches keep_key or a handle not yet bound to a model (its load() may still be in flight)."""
     for k in list(_PIPELINE_CACHE.keys()):
         if k == keep_key:
@@ -425,7 +414,6 @@ def _get_engine(model_dir, create_cfg=None, device_idx=0):
     ckey = (qfe.resolve_so_path(), model_dir, "svdq", int(device_idx),
             json.dumps(create_cfg or {}, sort_keys=True))
     _sweep_dead_pipelines(ckey)        # reclaim host RAM from configs whose patchers comfy dropped
-    _evict_other_pipelines(ckey)       # keep only THIS config's VRAM resident (others reload lazily)
     eng = _PIPELINE_CACHE.get(ckey)
     if eng is not None and eng.pipeline is not None:
         return eng, ckey
@@ -1065,4 +1053,3 @@ try:
 except Exception as _qf_cloud_te_exc:  # noqa: BLE001
     import logging as _qf_lg
     _qf_lg.warning("[qf_native] cloud-TE node not registered: %r", _qf_cloud_te_exc)
-
