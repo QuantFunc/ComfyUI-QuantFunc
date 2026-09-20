@@ -192,6 +192,12 @@ def main():
         fake_cache[ck] = eng
         return eng, ck
     qfn._get_engine = fake_get_engine
+    # This is a routing/liveness fixture: its 16-byte transformer files are not
+    # native-loadable checkpoints. Stub the capacity ABI boundary explicitly,
+    # just as creation is stubbed above; never depend on a production fallback
+    # to file size (or a bundled engine .so) to keep later assertions running.
+    qfn.qfe.load_lib = lambda *args, **kwargs: _DummyEngine.lib
+    qfn.qfe.estimate_resident_bytes = lambda *args, **kwargs: _DummyEngine.footprint_bytes
     # Builders CAPTURE deps at registration — re-register so they hold the stub.
     qfn._FAMILY_BUILDERS.clear()
     qfn._FAMILY_MATCHERS.clear()
