@@ -39,6 +39,20 @@ class NativeLibrary:
 
 
 class HostLoaderContract(unittest.TestCase):
+    def test_capacity_query_failure_does_not_fall_back_to_file_size(self):
+        with mock.patch.object(plugin.qfe, "load_lib", return_value=object()), \
+             mock.patch.object(plugin.qfe, "estimate_resident_bytes", side_effect=RuntimeError("capacity unsupported")), \
+             mock.patch.object(plugin.qfe, "estimate_footprint_bytes", return_value=999999):
+            with self.assertRaisesRegex(RuntimeError, "capacity unsupported"):
+                plugin._estimate_package_footprint("not-a-real-package")
+
+    def test_zero_capacity_is_not_promoted_to_fake_positive_bytes(self):
+        with mock.patch.object(plugin.qfe, "load_lib", return_value=object()), \
+             mock.patch.object(plugin.qfe, "estimate_resident_bytes", return_value=0), \
+             mock.patch.object(plugin.qfe, "estimate_footprint_bytes", return_value=999999):
+            with self.assertRaisesRegex(RuntimeError, "zero"):
+                plugin._estimate_package_footprint("not-a-real-package")
+
     def test_cache_selection_does_not_evict_a_live_other_engine(self):
         other_lib, selected_lib = NativeLibrary(), NativeLibrary()
         other = plugin.qfe.QFEngineHandle(other_lib, ctypes.c_void_p(1), 512)

@@ -35,33 +35,18 @@ except Exception as _fp_exc:  # noqa: BLE001 — never break registration
 _NO_LORA_HINT = "(no LoRA in models/loras)"
 
 
-def _package_weight_paths(pkg):
-    """The svdq transformer weight files inside a package (footprint estimate)."""
-    outs = []
-    for sub in ("transformer", "transformer_2"):
-        d = os.path.join(pkg, sub)
-        if os.path.isdir(d):
-            for f in os.listdir(d):
-                if f.endswith(".safetensors"):
-                    outs.append(os.path.join(d, f))
-    return outs
-
-
 def _estimate_package_footprint(pkg, device_idx=0, server_url=None, api_key=None):
-    """Engine-resident transformer weight bytes for a package, so the memory ledger has a real number
-    before the pipeline is created (QFLazyEngine). EXACT when the engine offers it (the loader-law
-    estimate, SM-aware + page-rounded — the disk size under-reports a packed svdq transformer by ~41 %
-    on SM89), else the on-disk proxy."""
-    try:
-        exact = qfe.estimate_resident_bytes(qfe.load_lib(), pkg, device_idx=device_idx, server_url=server_url, api_key=api_key)
-        if exact > 0:
-            return exact
-    except Exception:  # noqa: BLE001 — fall through to the disk proxy
-        pass
-    try:
-        return qfe.estimate_footprint_bytes(*_package_weight_paths(pkg))
-    except Exception:  # noqa: BLE001 — a bad estimate must not break loading
-        return 1
+    """Preserve the native transformer's capacity result; no disk-size fallback.
+
+    Native capability/coverage errors must reach the loader before creation.
+    Multi-component/LoRA capacity coverage remains a separate native planning
+    requirement, not something a file-size multiplier can supply.
+    """
+    size = qfe.estimate_resident_bytes(qfe.load_lib(), pkg, device_idx=device_idx,
+                                     server_url=server_url, api_key=api_key)
+    if size <= 0:
+        raise RuntimeError("QuantFunc returned zero transformer capacity; cannot admit this model")
+    return size
 
 
 _CONFIGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs")

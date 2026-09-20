@@ -45,6 +45,35 @@ class NativeLibrary:
 
 
 class HostReclaimContract(unittest.TestCase):
+    def test_missing_or_refused_capacity_estimate_is_not_zero(self):
+        with self.assertRaisesRegex(RuntimeError, "quantfunc_estimate_resident_bytes"):
+            qfe.estimate_resident_bytes(NativeLibrary(), "model")
+        for status in (1, 8):
+            library = NativeLibrary()
+            library.quantfunc_estimate_resident_bytes = lambda params, out: status
+            with self.subTest(status=status), self.assertRaisesRegex(RuntimeError, "pipeline busy"):
+                qfe.estimate_resident_bytes(library, "model")
+
+    def test_capacity_estimate_preserves_native_bytes_and_device(self):
+        library = NativeLibrary()
+        def estimate(params, out):
+            self.assertEqual(params._obj.model_dir, b"model")
+            self.assertEqual(params._obj.device_idx, 1)
+            out._obj.value = 123456789
+            return 0
+        library.quantfunc_estimate_resident_bytes = estimate
+        self.assertEqual(qfe.estimate_resident_bytes(library, "model", device_idx=1), 123456789)
+
+    def test_capacity_ffi_failure_and_missing_input_are_explicit(self):
+        library = NativeLibrary()
+        def estimate(params, out):
+            raise OSError("estimate ABI failed")
+        library.quantfunc_estimate_resident_bytes = estimate
+        with self.assertRaisesRegex(OSError, "estimate ABI failed"):
+            qfe.estimate_resident_bytes(library, "model")
+        with self.assertRaises(ValueError):
+            qfe.estimate_resident_bytes(library, None)
+
     def test_missing_residency_query_is_not_zero(self):
         engine = qfe.QFEngineHandle(NativeLibrary(), ctypes.c_void_p(1))
         with self.assertRaisesRegex(RuntimeError, "quantfunc_resident_vram_bytes"):

@@ -652,30 +652,28 @@ class ResidentEstimateParams(ctypes.Structure):
 
 
 def estimate_resident_bytes(lib, model_dir, device_idx=0, transformer_path=None, server_url=None, api_key=None):
-    """EXACT pre-load resident-VRAM estimate from the ENGINE's own loader law (quantfunc_estimate_resident_bytes:
-    safetensors header x the per-slot packed forms of this device's SM tier, arena-page-rounded, + non-block residents;
-    header-only, no model load, no VRAM). This is what comfy's ledger should charge BEFORE create — the on-disk size
-    under-reports a packed svdq transformer by ~41 % on SM89 (measured; see estimate_footprint_bytes). Returns 0 when
-    the .so predates the API, the call fails, or the law does not model the checkpoint (QUANTFUNC_ERROR_UNSUPPORTED —
-    never a silently sized guess); callers then fall back to the disk proxy and the live post-load measurement."""
+    """Query the native pre-load transformer pack law, preserving unsupported/error.
+
+    This is model capacity, not current residency or complete request peak.
+    Coverage is defined by the native ABI's checkpoint/tier contract; never
+    substitute a file size when that contract cannot model the input.
+    """
+    if not model_dir and not transformer_path:
+        raise ValueError("model_dir or transformer_path is required for the capacity estimate")
     fn = getattr(lib, "quantfunc_estimate_resident_bytes", None)
-    if fn is None or not model_dir:
-        return 0
-    try:
-        fn.restype = ctypes.c_int
-        fn.argtypes = [ctypes.POINTER(ResidentEstimateParams), ctypes.POINTER(ctypes.c_uint64)]
-        p = ResidentEstimateParams(model_dir=_enc(model_dir), transformer_weights=_enc(transformer_path) if transformer_path else None,
-                                   server_url=_enc(server_url) if server_url else None, api_key=_enc(api_key) if api_key else None,
-                                   device_idx=int(device_idx))
-        out = ctypes.c_uint64(0)
-        st = fn(ctypes.byref(p), ctypes.byref(out))
-        if st != 0:
-            _dbg_prof(f"resident-estimate unavailable (status {st}): {last_err(lib)}")
-            return 0
-        return int(out.value)
-    except Exception as ex:  # noqa: BLE001 — an estimate must never break loading
-        _dbg_prof(f"resident-estimate failed: {ex!r}")
-        return 0
+    if fn is None:
+        raise RuntimeError("QuantFunc library lacks quantfunc_estimate_resident_bytes; update the native library")
+    fn.restype = ctypes.c_int
+    fn.argtypes = [ctypes.POINTER(ResidentEstimateParams), ctypes.POINTER(ctypes.c_uint64)]
+    p = ResidentEstimateParams(model_dir=_enc(model_dir) if model_dir else None,
+                               transformer_weights=_enc(transformer_path) if transformer_path else None,
+                               server_url=_enc(server_url) if server_url else None,
+                               api_key=_enc(api_key) if api_key else None, device_idx=int(device_idx))
+    out = ctypes.c_uint64(0)
+    st = fn(ctypes.byref(p), ctypes.byref(out))
+    if st != QUANTFUNC_OK:
+        raise RuntimeError(f"QuantFunc capacity estimate failed (status {st}): {last_err(lib)}")
+    return int(out.value)
 
 
 def estimate_footprint_bytes(*paths):
