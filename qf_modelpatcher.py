@@ -992,13 +992,14 @@ class QFModelPatcher(comfy.model_patcher.ModelPatcher):
         return bool(getattr(getattr(self, "model", None), "_qf_shadow", False))
 
     def _hold_bytes(self, eng):
-        """What the engine HOLDS on the card right now (quantfunc_resident_vram_bytes: arena mapped pages + the
-        allocator's reserved bytes incl. its cached pool + the async mempool reservation). 0 = the engine cannot tell
-        (old .so / unmaterialized) — the callers fall back to the on-disk estimate."""
-        try:
-            return int(getattr(eng, "resident_vram_bytes", lambda: 0)() or 0)
-        except Exception:  # noqa: BLE001
+        """Preserve native zero/error semantics; file size is not live residency.
+
+        This remains the legacy device-scoped query. Shared-owner registration
+        must be completed before treating this adapter as a per-engine ledger.
+        """
+        if eng is None:
             return 0
+        return int(eng.resident_vram_bytes())
 
     def model_size(self):
         # comfy's "full size": the on-disk ESTIMATE under-reports a resident engine (the coalesced pack is larger
@@ -1013,18 +1014,15 @@ class QFModelPatcher(comfy.model_patcher.ModelPatcher):
         return max(1, int(eng.footprint_bytes), self._hold_bytes(eng))
 
     def loaded_size(self):
-        # What the engine HOLDS: 0 while unloaded (VRAM genuinely freed) so comfy's ledger is honest across a
-        # co-eviction — checked BEFORE the shadow constant (a shadow over an unloaded engine holds nothing either);
-        # the live hold when the engine can tell it; the estimate for an engine that cannot (old .so).
+        # A successful query returning zero is not "unknown". Conversely, an
+        # unload flag cannot hide residual native allocations. Cold lazy handles
+        # return zero without materializing a pipeline ahead of host admission.
         eng = self._engine()
-        if eng is not None and getattr(eng, "unloaded", False):
-            return 0
         if self._is_shadow():
+            if eng is not None and getattr(eng, "unloaded", False):
+                return 0
             return self._QF_SHADOW_LEDGER_BYTES
-        if eng is None:
-            return 1
-        live = self._hold_bytes(eng)
-        return live if live > 0 else max(1, int(eng.footprint_bytes))
+        return self._hold_bytes(eng)
 
     def partially_load(self, device_to, extra_memory=0, force_patch_weights=False):
         # The engine reloads lazily inside the next denoise_begin (its ~3s-grace auto-reload). Clearing

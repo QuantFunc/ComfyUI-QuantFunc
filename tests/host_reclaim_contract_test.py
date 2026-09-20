@@ -38,6 +38,40 @@ class NativeLibrary:
 
 
 class HostReclaimContract(unittest.TestCase):
+    def test_missing_residency_query_is_not_zero(self):
+        engine = qfe.QFEngineHandle(NativeLibrary(), ctypes.c_void_p(1))
+        with self.assertRaisesRegex(RuntimeError, "quantfunc_resident_vram_bytes"):
+            engine.resident_vram_bytes()
+
+    def test_residency_refusal_and_ffi_errors_are_not_zero(self):
+        for error in (None, OSError("query ABI failed")):
+            library = NativeLibrary()
+            def query(pipeline, out):
+                if error is not None:
+                    raise error
+                return 1
+            library.quantfunc_resident_vram_bytes = query
+            engine = qfe.QFEngineHandle(library, ctypes.c_void_p(1))
+            with self.subTest(error=error), self.assertRaises((RuntimeError, OSError)):
+                engine.resident_vram_bytes()
+
+    def test_residency_queries_zero_and_held_bytes_even_after_unload_flag(self):
+        library = NativeLibrary()
+        values = iter((0, 4096))
+        def query(pipeline, out):
+            self.assertEqual(pipeline.value, 1)
+            out._obj.value = next(values)
+            return 0
+        library.quantfunc_resident_vram_bytes = query
+        engine = qfe.QFEngineHandle(library, ctypes.c_void_p(1))
+        self.assertEqual(engine.resident_vram_bytes(), 0)
+        engine.unloaded = True
+        self.assertEqual(engine.resident_vram_bytes(), 4096)
+
+    def test_unmaterialized_residency_is_a_known_zero_without_native_query(self):
+        engine = qfe.QFEngineHandle(NativeLibrary(), None)
+        self.assertEqual(engine.resident_vram_bytes(), 0)
+
     def test_native_refusal_propagates_without_changing_residency_state(self):
         engine = qfe.QFEngineHandle(NativeLibrary(status=1), ctypes.c_void_p(1), footprint_bytes=1024)
         with self.assertRaisesRegex(RuntimeError, "pipeline busy"):

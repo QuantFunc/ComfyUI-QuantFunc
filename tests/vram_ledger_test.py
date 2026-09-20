@@ -12,8 +12,8 @@ Every branch, BOTH directions, against fake engine handles (no GPU, no comfy mod
   5. engine raises                          -> comfy-side only (swallowed)
   6. ledger: hold < weights                 -> model_size = weights, loaded_size = hold (comfy sees the deficit)
      ledger: hold >= weights                -> both = hold
-     ledger: unloaded                       -> loaded_size = 0
-     ledger: engine cannot tell (old .so)   -> loaded_size = weights estimate
+     ledger: unloaded flag with residual    -> loaded_size = measured residual
+     ledger: measured zero                  -> loaded_size = 0, never weights estimate
      ledger: shadow                         -> the small constant, both
   7. ONE source of truth: no family class overrides the ledger methods; QFH3Model (packed AV) == base exactly
 
@@ -27,6 +27,8 @@ from types import SimpleNamespace
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _PLUGIN = os.path.dirname(_HERE)
+if os.environ.get("COMFY_ROOT"):
+    sys.path.insert(0, os.environ["COMFY_ROOT"])
 
 
 def _skip(reason):
@@ -172,9 +174,11 @@ check(p.model_size() == 14380 * MB and p.loaded_size() == 10073 * MB,
 m._qf = _engine(hold_mb=23000, footprint_mb=14380)
 check(p.model_size() == 23000 * MB and p.loaded_size() == 23000 * MB, "arm6b: hold ≥ weights → both = hold")
 m._qf = _engine(hold_mb=23000, footprint_mb=14380, unloaded=True)
-check(p.loaded_size() == 0 and p.model_size() == 23000 * MB, "arm6c: unloaded → loaded_size 0")
+check(p.loaded_size() == 23000 * MB and p.model_size() == 23000 * MB,
+      "arm6c: unloaded flag cannot hide measured residual residency")
 m._qf = _engine(hold_mb=0, footprint_mb=14380)
-check(p.loaded_size() == 14380 * MB and p.model_size() == 14380 * MB, "arm6d: engine cannot tell → the estimate")
+check(p.loaded_size() == 0 and p.model_size() == 14380 * MB,
+      "arm6d: a measured zero is zero, not the weights estimate")
 m._qf_shadow = True
 check(p.loaded_size() == Patcher._QF_SHADOW_LEDGER_BYTES and p.model_size() == Patcher._QF_SHADOW_LEDGER_BYTES,
       "arm6e: shadow → the small constant, both")

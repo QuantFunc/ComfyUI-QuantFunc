@@ -790,19 +790,22 @@ class QFEngineHandle:
         return int(freed.value)
 
     def resident_vram_bytes(self):
-        """LIVE device residency of the engine (paged weight arena mapped pages + the caching allocator's
-        footprint) via quantfunc_resident_vram_bytes; 0 when unsupported (old .so) / unloaded / no pipeline.
-        MEASURED (2026-09-05, LTX-2.5 acceptance box): the on-disk ESTIMATE reported 12,688 MB while the engine
-        held 16,928 MB of pack + activations — comfy's dynamic TE loader filled the ~4 GB the ledger did not
-        see, and the arena thrashed (page-out/page-in inside every forward of the first run)."""
-        if self.pipeline is None or self.unloaded or not hasattr(self.lib, "quantfunc_resident_vram_bytes"):
+        """Query the native device-scoped residency counter; failure is not zero.
+
+        A missing pipeline is known to hold nothing. An unload flag is not a
+        measurement: native full release may leave live or pinned allocations.
+        The current ABI selects a device, not an individual pipeline owner;
+        callers must not sum this value once per shared model/engine.
+        """
+        if self.pipeline is None:
             return 0
+        if not hasattr(self.lib, "quantfunc_resident_vram_bytes"):
+            raise RuntimeError("QuantFunc library lacks quantfunc_resident_vram_bytes; update the native library")
         out = ctypes.c_uint64(0)
-        try:
-            st = self.lib.quantfunc_resident_vram_bytes(self.pipeline, ctypes.byref(out))
-        except Exception:  # noqa: BLE001
-            return 0
-        return int(out.value) if st == QUANTFUNC_OK else 0
+        st = self.lib.quantfunc_resident_vram_bytes(self.pipeline, ctypes.byref(out))
+        if st != QUANTFUNC_OK:
+            raise RuntimeError(f"QuantFunc residency query failed: {last_err(self.lib)}")
+        return int(out.value)
 
     def vram_need_bytes(self, latent_shape):
         """How much MORE VRAM the engine needs beyond what it holds for ONE forward of `latent_shape`
