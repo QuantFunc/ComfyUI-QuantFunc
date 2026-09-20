@@ -7,6 +7,8 @@ the CUDA device object is an identity, never an allocation target.
 import ctypes
 import gc
 import importlib
+import contextlib
+import io
 import os
 from pathlib import Path
 import sys
@@ -39,10 +41,12 @@ class NativeLibrary:
     def __init__(self):
         self.held = 512
         self.query_status = 0
+        self.query_calls = 0
         self.unload_calls = 0
         self.unload_status = 1
 
     def quantfunc_resident_vram_bytes(self, pipeline, out):
+        self.query_calls += 1
         out._obj.value = self.held
         return self.query_status
 
@@ -104,6 +108,14 @@ class HostSchedulerContract(unittest.TestCase):
         self.assertEqual(creates, [])
 
     def test_failed_unload_preserves_registration_and_next_prompt_runs(self):
+        self._assert_failed_reclaim_preserves_registration(expected_unloads=1)
+
+    def test_query_failure_in_eviction_sizing_preserves_registration_and_next_prompt_runs(self):
+        self.library.query_status = 1
+        self._assert_failed_reclaim_preserves_registration(expected_unloads=0)
+        self.assertGreater(self.library.query_calls, 0)
+
+    def _assert_failed_reclaim_preserves_registration(self, expected_unloads):
         loaded = mm.LoadedModel(self.patcher)
         loaded.real_model = weakref.ref(self.model)
         loaded.model_finalizer = weakref.finalize(self.model, lambda: None)
@@ -143,7 +155,7 @@ class HostSchedulerContract(unittest.TestCase):
                 errors = [data for event, data in events if event == "execution_error"]
                 self.assertEqual(len(errors), 1)
                 self.assertIn("native refused", errors[0]["exception_message"])
-                self.assertEqual(self.library.unload_calls, 1)
+                self.assertEqual(self.library.unload_calls, expected_unloads)
                 self.assertFalse(self.engine.unloaded)
                 self.assertEqual(mm.current_loaded_models, [loaded])
                 self.assertIs(loaded.real_model(), self.model)
@@ -219,6 +231,18 @@ class HostSchedulerContract(unittest.TestCase):
         finally:
             if loaded.model_finalizer is not None:
                 loaded.model_finalizer.detach()
+
+    def test_ledger_log_does_not_label_failed_residency_query_as_zero(self):
+        class Model(qfm.QFSessionModelMixin):
+            pass
+        model = Model()
+        model._qf = self.engine
+        self.library.query_status = 1
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            model.memory_required([1, 16, 1, 8, 8])
+        self.assertIn("engine hold unknown", output.getvalue())
+        self.assertNotIn("engine hold 0 MB", output.getvalue())
 
 
 if __name__ == "__main__":

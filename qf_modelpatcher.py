@@ -448,7 +448,8 @@ class QFSessionModelMixin:
         holds the arena) and is NEVER created here — comfy's eviction pass runs after this call, so a create
         here would run ahead of the room being made. Engine 0 = nothing to ask for (its cached pool already covers the
         working set — counted in loaded_size — OR nothing measured yet: old .so / first forward of a new shape) →
-        comfy-side only; on a first forward the engine pages once, measures, and the next run is exact.
+        comfy-side only. This legacy estimate is not a complete cold-request
+        peak bound; prior measurements do not make a later request exact.
         Accepted by the user (2026-09-19 「comfyui 路径不合并 CFG 就好」): with a real need comfy runs cond/uncond
         un-batched on a card that cannot hold 1.5× the B=2 working set — comfy's own rule, correct for us too (a B=2
         forward the card cannot hold pages inside the engine); our own full-pipeline path keeps CFG batched."""
@@ -475,12 +476,12 @@ class QFSessionModelMixin:
         if sig != getattr(self, "_qf_ledger_last", None):
             self._qf_ledger_last = sig
             try:
-                hold = int(getattr(eng, "resident_vram_bytes", lambda: 0)() or 0) if eng is not None else 0
-            except Exception:  # noqa: BLE001
-                hold = 0
-            print("[qf_native] VRAM ledger: memory_required%s = comfy-side %d MB + engine need %d MB%s; engine hold %d MB"
+                hold = f"{int(eng.resident_vram_bytes()) >> 20} MB" if eng is not None else "0 MB"
+            except Exception as error:  # diagnostic only; never invent a measured zero
+                hold = f"unknown ({type(error).__name__}: {error})"
+            print("[qf_native] VRAM ledger: memory_required%s = comfy-side %d MB + engine need %d MB%s; engine hold %s"
                   % (list(sig[0]), comfy_side >> 20, need >> 20, "" if need else " (0: covered by what it holds, or nothing measured yet)",
-                     hold >> 20), flush=True)
+                     hold), flush=True)
         return total
 
     def _sigma_step_index(self, sigma, sig_all, transformer_options):
