@@ -772,12 +772,11 @@ class QFEngineHandle:
                                 for f in reversed(frames))
             print(f"[qf_prof] unload_vram CALLER: {chain}", flush=True)
         self.end_session_if_open()          # a live session on unloaded VRAM would be a UAF on reuse
-        try:
-            st = self.lib.quantfunc_unload_sync(self.pipeline)
-        except Exception:  # noqa: BLE001
-            return 0
+        if self.current_session is not None:
+            raise RuntimeError("QuantFunc cannot unload VRAM while a session is still active")
+        st = self.lib.quantfunc_unload_sync(self.pipeline)
         if st != QUANTFUNC_OK:
-            return 0
+            raise RuntimeError(f"QuantFunc VRAM unload failed: {last_err(self.lib)}")
         self.unloaded = True
         return int(self.footprint_bytes)
 
