@@ -1,5 +1,48 @@
 # Host memory integration checkpoint
 
+## 2026-09-21: retained native resource -> actual Comfy scheduler adapter
+
+`QFNativeResourcePatcher` now exposes an already-existing `NativeResource` to
+the actual host scheduling protocol. It derives CUDA device identity from
+native metadata, forwards native aggregate occupancy and confirmed eligible
+release counts, rejects non-Ready results, and saturates the host's oversized
+release sentinel without uint64 wrapping. It contains no byte ledger, model
+family formula or native model creation. The caller must strongly retain one
+canonical adapter per resource; clone returns that same adapter. Default
+QFModelPatcher and lazy/native creation paths remain unchanged and undeployed.
+
+This is a non-loading occupancy dependency, NOT model capacity/demand/grants.
+Full detach deliberately refuses even at Ready zero: a sampled zero does not
+fence subsequent native growth. Automatic identity/lifetime binding and the
+native eviction/restore/admission handshake remain required before rollout.
+
+Remote `remote-native-resource-host-final-20260921.log`: 23 actual-Comfy CPU
+contract tests pass (12 existing + 11 resource-adapter tests), plus the existing
+13 NativeResource tests. Only the native C calls are doubled, not LoadedModel,
+ModelPatcher or the host load/free loop. No GPU model inference is claimed.
+Plugin syntax also passes Python3.9 grammar parsing. Source hashes:
+qf_modelpatcher `6b16502a352580999436b06e35820e2b8762b734bd9d5290b2ee3331df19f8fa`;
+host test `3aab54f7ab971837b66babffdf8c40f1cdaa4b4c3ffa9d1c1a40bf1ffc8106b3`.
+Remote Comfy is not a Git checkout; tested model_management hash
+`ddf5fe6399398d9101850d42604dce20eec0a6b6cba18135ea4ad5d3da3de99e`,
+model_patcher `ac214200ea7991b9903c24f28457e2924357b025dbb9e353f1d3d2d397a9bd17`.
+
+**Separate acceptance failure, not hidden in the passing count:** run the
+same host test with `--probe-clone-handoff`. A native Busy result after official
+detach(False) causes the host to lose its prior resource record. The explicit
+probe fails with `[] != [original]`, recorded in
+`remote-native-resource-host-green-handoff-20260921.log` (controller exit1).
+Setting is_clone=False is not a workaround: actual repeat-load testing produced
+four records instead of two because the host inserts reused records again.
+The adapter therefore keeps the standard clone predicate. A separate request
+for authority to fix an independent Comfy core worktree is pending. No core
+edit, monkeypatch, private-list production mutation or deployment was made.
+The final constructor revision also reproduces the same acceptance failure in
+`remote-native-resource-host-handoff-probe-final-20260921.log`; its controller
+checks the expected failing probe status, not a successful integration.
+Independent scoped implementation CR is GO with no residual scoped blocker.
+That verdict does not cover automatic integration or the final six reviews.
+
 ## 2026-09-21: native accounted-residency aggregate (not host integration)
 
 `NativeResource.residency()` forwards the additive native query without summing

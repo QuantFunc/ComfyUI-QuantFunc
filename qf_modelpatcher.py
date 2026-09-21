@@ -926,6 +926,67 @@ def rebuild_of(patcher):
     return getattr(getattr(patcher, "model", None), QF_LORA_REBUILD_ATTR, None)
 
 
+class QFNativeResourcePatcher(comfy.model_patcher.ModelPatcher):
+    """Host adapter for an existing native resource, not a model-load estimate.
+
+    The caller owns one canonical adapter per resource and must retain it while
+    registered: ComfyUI holds patchers weakly. No native model is created here.
+    Current backing is the entire size of this *residency-only* dependency;
+    model capacity, inference demand and load grants belong to their distinct
+    native contracts. Do not substitute this adapter for a lazy model loader.
+    Full detach is deliberately unsupported until native can fence subsequent
+    growth: even a Ready zero snapshot does not authorize deregistration.
+    """
+    def __init__(self, resource):
+        load_device = torch.device("cuda", resource.query().device)
+        model = torch.nn.Module()
+        model.device = load_device
+        super().__init__(model, load_device, torch.device("cpu"))
+        self._resource = resource
+
+    def loaded_size(self):
+        result = self._resource.residency()
+        if result.state != qfe.QUANTFUNC_RESOURCE_READY:
+            raise RuntimeError(f"QuantFunc resource residency unavailable (state={result.state})")
+        return result.resident_bytes
+
+    def model_size(self):
+        return self.loaded_size()
+
+    def partially_load(self, device_to, extra_memory=0, force_patch_weights=False):
+        # This dependency exposes existing backing, not a weight/refault grant.
+        if device_to != self.load_device:
+            raise ValueError("a native resource cannot migrate to another device")
+        return 0
+
+    def partially_unload(self, device_to, memory_to_free=0, force_patch_weights=False):
+        want = max(0, min(int(memory_to_free), (1 << 64) - 1))
+        if not want:
+            return 0
+        result = self._resource.release_eligible(want)
+        if result.state != qfe.QUANTFUNC_RESOURCE_READY:
+            raise RuntimeError(f"QuantFunc resource release unavailable (state={result.state})")
+        return result.freed_bytes
+
+    def clone(self, disable_dynamic=False, model_override=None, force_deepcopy=False):
+        if model_override is not None or force_deepcopy:
+            raise ValueError("a native resource identity cannot be copied or replaced")
+        return self
+
+    def add_patches(self, patches, strength_patch=1.0, strength_model=1.0):
+        raise ValueError("a native resource has no patchable model weights")
+
+    def add_object_patch(self, name, obj):
+        raise ValueError("a native resource identity cannot be patched")
+
+    def detach(self, unpatch_all=True):
+        if unpatch_all:
+            raise RuntimeError("QuantFunc native resource full eviction is unsupported until "
+                               "the native lifetime/admission handshake is available; "
+                               "the host resource record must remain registered")
+        return super().detach(unpatch_all=False)
+
+
 class QFModelPatcher(comfy.model_patcher.ModelPatcher):
     """ModelPatcher over an engine-managed pipeline. The engine owns + moves its own VRAM, so the
     weight-move overrides are no-ops — but model_size/loaded_size REPORT the engine's real footprint

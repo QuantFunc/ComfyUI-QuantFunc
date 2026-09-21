@@ -17,6 +17,7 @@ import unittest
 import weakref
 from unittest import mock
 
+PROBE_CLONE_HANDOFF = "--probe-clone-handoff" in sys.argv
 root = os.environ.get("COMFY_ROOT")
 if not root or not (Path(root) / "comfy/model_management.py").is_file():
     print("[SKIP] host_scheduler_contract: set COMFY_ROOT to the tested host")
@@ -245,5 +246,214 @@ class HostSchedulerContract(unittest.TestCase):
         self.assertNotIn("engine hold 0 MB", output.getvalue())
 
 
+class NativeResourceSchedulerContract(unittest.TestCase):
+    def make_resource(self, held=1536, eligible=1536, device=0):
+        # Only the external C calls are doubled. Use the actual retained Python
+        # view, adapter, ModelPatcher, LoadedModel and host scheduling loop.
+        lib = types.SimpleNamespace(held=held, eligible=eligible, state=0,
+                                    status=0, requests=[], closed=[], device=device)
+        def acquire(pipeline, version, out):
+            out._obj.value = 17
+            return 0
+        def residency(pointer, out):
+            out._obj.state = lib.state
+            out._obj.resident_bytes = lib.held
+            return lib.status
+        def release(pointer, requested, out):
+            lib.requests.append(requested)
+            out._obj.state = lib.state
+            out._obj.freed_bytes = min(requested, lib.eligible)
+            if lib.state == 0 and lib.status == 0:
+                lib.held -= out._obj.freed_bytes
+                lib.eligible -= out._obj.freed_bytes
+            return lib.status
+        def query(pointer, out):
+            out._obj.state, out._obj.device = lib.state, lib.device
+            out._obj.owner_epoch, out._obj.capabilities = 123, 3
+            # Deliberately unlike the aggregate: these fields may identify
+            # the resource's device but must never become Python byte policy.
+            out._obj.cca_live, out._obj.arena_backed = 7000, 9000
+            return lib.status
+        lib.quantfunc_resource_acquire = acquire
+        lib.quantfunc_resource_acquire_shared = acquire
+        lib.quantfunc_resource_query_residency = residency
+        lib.quantfunc_resource_release_eligible = release
+        lib.quantfunc_resource_query = query
+        lib.quantfunc_resource_destroy = lambda pointer: lib.closed.append(pointer.value)
+        lib.quantfunc_last_error = lambda: b"resource contract refused"
+        resource = qfe.NativeResource.acquire(lib, ctypes.c_void_p(1))
+        self.addCleanup(resource.close)
+        return lib, qfm.QFNativeResourcePatcher(resource)
+
+    @contextlib.contextmanager
+    def host_registry(self):
+        previous = mm.current_loaded_models[:]
+        mm.current_loaded_models[:] = []
+        try:
+            yield
+        finally:
+            for loaded in mm.current_loaded_models:
+                if loaded.model_finalizer is not None:
+                    loaded.model_finalizer.detach()
+            mm.current_loaded_models[:] = previous
+
+    def load(self, *patchers):
+        with mock.patch.object(mm, "get_free_memory", side_effect=self.free_memory(1 << 40)):
+            mm.load_models_gpu(list(patchers))
+
+    @staticmethod
+    def free_memory(amount):
+        return lambda device, torch_free_too=False: (amount, amount) if torch_free_too else amount
+
+    def test_native_resource_residency_reaches_real_loaded_model(self):
+        # Breaking the adapter's native forwarding must change the host's
+        # observable loaded bytes; no file-size or Python category sum allowed.
+        self.assertTrue(hasattr(qfm, "QFNativeResourcePatcher"),
+                        "native resource has no ComfyUI scheduling adapter")
+        lib, patcher = self.make_resource()
+        lib.quantfunc_resource_query = lambda *_: self.fail("loaded bytes require only native aggregate")
+        loaded = mm.LoadedModel(patcher)
+        self.assertEqual(loaded.model_loaded_memory(), 1536)
+
+    def test_registration_device_comes_from_native_identity(self):
+        lib, patcher = self.make_resource(device=2)
+        self.assertEqual(patcher.load_device, torch.device("cuda:2"))
+        self.assertEqual(mm.LoadedModel(patcher).device, torch.device("cuda:2"))
+        self.assertEqual(patcher.current_loaded_device(), torch.device("cuda:2"))
+
+    def test_release_count_is_not_reconstructed_from_residency_delta(self):
+        lib, patcher = self.make_resource()
+        def release(pointer, requested, out):
+            out._obj.state, out._obj.freed_bytes = 0, 64
+            lib.held = 1024  # other work changed occupancy across the call
+            return 0
+        lib.quantfunc_resource_release_eligible = release
+        self.assertEqual(patcher.partially_unload(torch.device("cpu"), 128), 64)
+        self.assertEqual(patcher.loaded_size(), 1024)
+
+    def test_host_partial_reclaim_reports_native_confirmed_count(self):
+        lib, patcher = self.make_resource(held=1536, eligible=64)
+        self.assertEqual(patcher.partially_unload(torch.device("cpu"), 128), 64)
+        self.assertEqual(patcher.loaded_size(), 1472)
+        self.assertEqual(lib.requests, [128])
+
+    def test_host_sentinel_saturates_and_zero_request_is_inert(self):
+        lib, patcher = self.make_resource()
+        self.assertEqual(patcher.partially_unload(torch.device("cpu"), 0), 0)
+        self.assertEqual(lib.requests, [])
+        self.assertEqual(patcher.partially_unload(torch.device("cpu"), 1e32), 1536)
+        self.assertEqual(lib.requests, [(1 << 64) - 1])
+
+    def test_canonical_dependency_clone_is_deduplicated_by_actual_host(self):
+        lib, patcher = self.make_resource()
+        peer_lib, peer = self.make_resource(held=2048, eligible=2048)
+        with self.host_registry():
+            self.load(patcher, patcher.clone(), peer, patcher)
+            self.assertEqual(len(mm.current_loaded_models), 2)
+            self.assertEqual(sorted(item.model_loaded_memory() for item in mm.current_loaded_models),
+                             [1536, 2048])
+            self.assertIs(patcher.clone(), patcher)
+            original = next(item for item in mm.current_loaded_models if item.model is patcher)
+            finalizer = original.model_finalizer
+            self.load(patcher.clone(), peer)
+            self.assertEqual(len(mm.current_loaded_models), 2)
+            # This host replaces the finalizer even for a repeat load of the
+            # same patcher. Its clone handoff removes the old list entry before
+            # unconditional insertion; opting out would duplicate registration.
+            self.assertFalse(finalizer.alive)
+            self.assertTrue(original.model_finalizer.alive)
+        self.assertEqual(lib.requests + peer_lib.requests, [])
+
+    def test_even_zero_backing_cannot_authorize_full_host_detach(self):
+        # A sampled zero is not a native lifetime/admission fence. Until that
+        # handshake exists this adapter must keep its record, including at zero.
+        for held in (0, 1536):
+            with self.subTest(held=held):
+                lib, patcher = self.make_resource(held=held, eligible=held)
+                with self.host_registry():
+                    self.load(patcher)
+                    original = mm.current_loaded_models[0]
+                    with mock.patch.object(mm, "get_free_memory", side_effect=self.free_memory(0)):
+                        with self.assertRaisesRegex(RuntimeError, "full eviction.*unsupported"):
+                            mm.free_memory(4096, patcher.load_device)
+                    self.assertEqual(mm.current_loaded_models, [original])
+                    self.assertTrue(original.model_finalizer.alive)
+                    self.assertIs(original.real_model(), patcher.model)
+                self.assertEqual(lib.requests, [])
+
+    def test_partial_full_shortfall_cannot_remove_host_registration(self):
+        lib, patcher = self.make_resource(held=1536, eligible=64)
+        with self.host_registry():
+            self.load(patcher)
+            original = mm.current_loaded_models[0]
+            with mock.patch.object(mm, "get_free_memory", side_effect=self.free_memory(0)):
+                with self.assertRaisesRegex(RuntimeError, "full eviction.*unsupported"):
+                    mm.free_memory(128, patcher.load_device)
+            self.assertEqual(mm.current_loaded_models, [original])
+            self.assertTrue(original.model_finalizer.alive)
+            self.assertIs(original.real_model(), patcher.model)
+        self.assertEqual(lib.requests, [128])
+        self.assertEqual(patcher.loaded_size(), 1472)
+
+    def test_nonready_and_native_error_never_become_zero_or_drop_record(self):
+        for state, status in ((1, 0), (2, 0), (3, 0), (0, 1)):
+            with self.subTest(state=state, status=status):
+                lib, patcher = self.make_resource()
+                with self.host_registry():
+                    self.load(patcher)
+                    original = mm.current_loaded_models[0]
+                    lib.state, lib.status = state, status
+                    with mock.patch.object(mm, "get_free_memory", side_effect=self.free_memory(0)):
+                        with self.assertRaises(RuntimeError):
+                            mm.free_memory(4096, patcher.load_device)
+                    self.assertEqual(mm.current_loaded_models, [original])
+                    with self.assertRaises(RuntimeError):
+                        patcher.partially_unload(torch.device("cpu"), 128)
+
+    def test_clone_handoff_does_not_request_physical_release(self):
+        lib, patcher = self.make_resource()
+        patcher.detach(False)
+        self.assertEqual(lib.requests, [])
+        self.assertEqual(patcher.loaded_size(), 1536)
+
+    def test_resource_cannot_be_moved_or_copied_as_model_weights(self):
+        lib, patcher = self.make_resource()
+        with self.assertRaisesRegex(ValueError, "device"):
+            patcher.partially_load(torch.device("cuda:1"), 4096)
+        with self.assertRaisesRegex(ValueError, "resource"):
+            patcher.clone(model_override=(torch.nn.Module(), ({}, {}, {}, set())))
+        with self.assertRaisesRegex(ValueError, "resource"):
+            patcher.clone(force_deepcopy=True)
+        with self.assertRaisesRegex(ValueError, "resource"):
+            patcher.add_patches({"weight": (torch.ones(1),)})
+        with self.assertRaisesRegex(ValueError, "resource"):
+            patcher.add_object_patch("device", torch.device("cuda:1"))
+        self.assertEqual(lib.requests, [])
+
+    def probe_clone_handoff_preserves_record_after_native_becomes_busy(self):
+        """Separate acceptance probe: expected host invariant, currently broken.
+
+        Run explicitly with --probe-clone-handoff. Not part of the adapter's
+        passing scoped contract: correcting the host transaction needs separate
+        ComfyUI-core authority. The callback models native becoming Busy in the
+        interval between successful detach(False) and the next size query.
+        """
+        lib, patcher = self.make_resource()
+        with self.host_registry():
+            self.load(patcher)
+            original = mm.current_loaded_models[0]
+            patcher.add_callback(qfm.comfy.model_patcher.CallbacksMP.ON_DETACH,
+                                 lambda p, full: setattr(lib, "state", 1))
+            with self.assertRaisesRegex(RuntimeError, "residency unavailable"):
+                self.load(patcher)
+            self.assertEqual(mm.current_loaded_models, [original],
+                             "host lost the native resource after clone handoff query failure")
+
+
 if __name__ == "__main__":
+    if PROBE_CLONE_HANDOFF:
+        result = unittest.TextTestRunner().run(unittest.TestSuite([
+            NativeResourceSchedulerContract(
+                "probe_clone_handoff_preserves_record_after_native_becomes_busy")]))
+        raise SystemExit(not result.wasSuccessful())
     unittest.main(argv=[sys.argv[0]])
