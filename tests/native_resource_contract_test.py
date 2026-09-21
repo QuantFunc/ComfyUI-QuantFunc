@@ -48,6 +48,46 @@ def library():
 
 
 class ResourceContract(unittest.TestCase):
+    def test_residency_uses_native_aggregate_and_preserves_unknown(self):
+        lib = library()
+        self.assertTrue(hasattr(qfe.NativeResource, "residency"), "native aggregate bridge missing")
+        calls = []
+        def residency(handle, out):
+            value = out._obj
+            self.assertEqual((value.struct_size, value.abi_version), (24, 1))
+            calls.append(handle.value)
+            value.state, value.resident_bytes = lib.state, 123456789
+            return lib.status
+        lib.quantfunc_resource_query_residency = residency
+        lib.quantfunc_resource_query = lambda *_: self.fail("must not sum category snapshots in Python")
+        with qfe.NativeResource.shared(lib, 0) as resource:
+            self.assertEqual(resource.residency().resident_bytes, 123456789)
+            for state in (1, 2, 3):
+                lib.state = state
+                result = resource.residency()
+                self.assertEqual(result.state, state)
+                self.assertIsNone(result.resident_bytes)
+            lib.status = 1
+            with self.assertRaisesRegex(RuntimeError, "native resource failure"):
+                resource.residency()
+            def broken(*_):
+                raise OSError("residency ABI call failed")
+            lib.quantfunc_resource_query_residency = broken
+            with self.assertRaisesRegex(OSError, "residency ABI call failed"):
+                resource.residency()
+        self.assertEqual(calls, [18] * 5)
+        with self.assertRaisesRegex(RuntimeError, "closed"):
+            resource.residency()
+
+    def test_missing_residency_extension_keeps_v1_queries_usable(self):
+        self.assertTrue(hasattr(qfe.NativeResource, "residency"), "native aggregate bridge missing")
+        lib = library()
+        with qfe.NativeResource.shared(lib, 0) as resource:
+            with self.assertRaisesRegex(RuntimeError, "quantfunc_resource_query_residency"):
+                resource.residency()
+            self.assertEqual(resource.query().cca_live, 4096)
+            self.assertEqual(resource.release_eligible(0).freed_bytes, 0)
+
     def test_python_adoption_failure_releases_the_acquired_native_view(self):
         lib = library()
         with patch.object(qfe.weakref, "finalize", side_effect=MemoryError("finalizer allocation")):
@@ -87,11 +127,17 @@ class ResourceContract(unittest.TestCase):
         self.assertEqual(lib.requests, [])
 
     def test_close_waits_for_an_inflight_view_query(self):
+        for operation, native_name in (("query", "quantfunc_resource_query"),
+                                       ("residency", "quantfunc_resource_query_residency")):
+            with self.subTest(operation=operation):
+                self._check_close_waits(operation, native_name)
+
+    def _check_close_waits(self, operation, native_name):
         lib = library()
         resource = qfe.NativeResource.shared(lib, 0)
         entered, finish, closing, closed = (threading.Event() for _ in range(4))
         errors = []
-        query = lib.quantfunc_resource_query
+        query = getattr(lib, native_name, lambda *_: 0)
         def waiting_query(*args):
             entered.set()
             if not finish.wait(3):
@@ -99,10 +145,10 @@ class ResourceContract(unittest.TestCase):
             if lib.destroyed:
                 raise AssertionError("view freed during query")
             return query(*args)
-        lib.quantfunc_resource_query = waiting_query
+        setattr(lib, native_name, waiting_query)
         def querying():
             try:
-                resource.query()
+                getattr(resource, operation)()
             except BaseException as error:
                 errors.append(error)
         def closing_view():
@@ -206,6 +252,8 @@ if __name__ == "__main__":
             assert snapshot.state == 0 and snapshot.device == 0 and snapshot.owner_epoch == 0
             assert snapshot.capabilities == 3
             assert all(v == 0 for v in snapshot[4:]), snapshot
+            residency = resource.residency()
+            assert residency == qfe.ResourceResidency(0, 0), residency
             released = resource.release_eligible(0)
             assert released == qfe.ResourceRelease(0, 0), released
         try:

@@ -18,6 +18,7 @@ from typing import NamedTuple, Optional
 
 QUANTFUNC_OK = 0
 QUANTFUNC_RESOURCE_ABI_VERSION = 1
+QUANTFUNC_RESOURCE_RESIDENCY_ABI_VERSION = 1
 QUANTFUNC_RESOURCE_READY = 0
 QUANTFUNC_RESOURCE_BUSY = 1
 QUANTFUNC_RESOURCE_UNKNOWN = 2
@@ -96,6 +97,20 @@ class _ResourceRelease(ctypes.Structure):
         ("state", ctypes.c_uint32), ("reserved", ctypes.c_uint32),
         ("freed_bytes", ctypes.c_uint64),
     ]
+
+
+class _ResourceResidency(ctypes.Structure):
+    _fields_ = [
+        ("struct_size", ctypes.c_uint32), ("abi_version", ctypes.c_uint32),
+        ("state", ctypes.c_uint32), ("reserved", ctypes.c_uint32),
+        ("resident_bytes", ctypes.c_uint64),
+    ]
+
+
+class ResourceResidency(NamedTuple):
+    """Native accounted occupancy; not demand, capacity or complete backend coverage."""
+    state: int
+    resident_bytes: Optional[int]
 
 
 class ResourceSnapshot(NamedTuple):
@@ -201,6 +216,19 @@ class NativeResource:
             counts = (out.cca_live, out.cca_cached, out.cca_deferred, out.arena_backed, out.arena_pinned)
             return ResourceSnapshot(out.state, out.device, out.owner_epoch, out.capabilities,
                                     *(counts if out.state == QUANTFUNC_RESOURCE_READY else (None,) * 5))
+
+    def residency(self):
+        with self._lock:
+            self._check_open()
+            function = getattr(self._lib, "quantfunc_resource_query_residency", None)
+            if function is None:
+                raise RuntimeError("QuantFunc library lacks quantfunc_resource_query_residency; update the native library")
+            function.restype = ctypes.c_int
+            function.argtypes = [ctypes.c_void_p, ctypes.POINTER(_ResourceResidency)]
+            out = _ResourceResidency(ctypes.sizeof(_ResourceResidency), QUANTFUNC_RESOURCE_RESIDENCY_ABI_VERSION)
+            if function(self._pointer, ctypes.byref(out)) != QUANTFUNC_OK:
+                raise RuntimeError(f"QuantFunc resource residency query failed: {last_err(self._lib)}")
+            return ResourceResidency(out.state, out.resident_bytes if out.state == QUANTFUNC_RESOURCE_READY else None)
 
     def release_eligible(self, requested):
         requested = operator.index(requested)

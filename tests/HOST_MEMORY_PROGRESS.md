@@ -1,5 +1,30 @@
 # Host memory integration checkpoint
 
+## 2026-09-21: native accounted-residency aggregate (not host integration)
+
+`NativeResource.residency()` forwards the additive native query without summing
+categories in Python. Ready zero is valid; Busy/Unknown/Closed have None bytes;
+native/FFI errors propagate. Old V1 category/release operations remain usable
+when the additional export is absent. The aggregate covers accounted CCA live,
+cache, deferred and arena backing only, excludes overlapping pins, and is not
+a capacity/demand/full-unload or complete-backend-coverage certificate.
+
+Evidence: 13 Python tests pass on Python3.9 and default local Python; existing
+16 host-reclaim tests pass. Remote final source/test hashes match and 13 tests
+plus actual-library residency query pass. Actual engine host SHA256
+`f00ae0ad901fbcc87d4a41dc35c1e68bfcb027bf71a292572d056f30039f2096`;
+kernel `66a3fd49241dabe17d86a632d062ad8763a5d0b6d6f92aebfa3e59ff0346166c`.
+Native validation: 64/64 tests, zero-error CUDA memcheck, fresh actual-DSO
+C11/C++20 consumers, shared allocator/TLS identity and real split-runtime test.
+Expanded tests cover real pinned/deferred/cache categories and checked overflow
+through the actual C result-publication boundary. Scoped independent CR: GO.
+
+No ModelPatcher/Shared registration path has been switched or deployed by this
+slice. Complete unload/restore, full-request demand/grants, all-model execution,
+the exact-ratio 768x448 -> 1920x1120 H3 double sample and final six-dimensional
+review remain open. Prior full-suite failures below are not erased or resolved
+by the narrow test results above.
+
 ## 2026-09-21: standalone retained-resource bridge (not host integration)
 
 `qf_engine.NativeResource` wraps native ABI version1: independent owned/Shared
