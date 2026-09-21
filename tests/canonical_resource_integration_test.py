@@ -309,7 +309,10 @@ class CanonicalIntegration(unittest.TestCase):
             detach_thread = threading.Thread(target=detach_shared, daemon=True)
             detach_thread.start()
             self.assertTrue(release_entered.wait(3), "Shared detach never reached release_all")
-            self.assertEqual(self.lib.resources[1]["limit"], 0)
+            # First revoke, observed while release_all is still blocked: nothing but
+            # production's own pre-release revoke can have produced this state.
+            self.assertEqual((self.lib.resources[1]["limit"], self.lib.device_limit), (0, 0))
+            self.assertTrue(shared._domain.shared_growth_fenced)
             self.assertIs(mm.current_loaded_models[0], loaded_shared)
 
             growth = []
@@ -340,13 +343,51 @@ class CanonicalIntegration(unittest.TestCase):
             self.assertIn(loaded_shared, mm.current_loaded_models)
             self.assertIs(loaded_shared.model_finalizer, loaded_finalizer)
 
-        qfm._revoke_domain_growth(owner)
-        self.assertEqual(self.lib.resources[1]["limit"], 0)
-        self.assertTrue(shared._domain.shared_growth_fenced)
+        # The test must NOT revoke here. _revoke_domain_growth writes exactly the values
+        # asserted below, so calling it would hide a detach that restored permission
+        # after release_all. Observe what production's own detach left behind.
+        self.assert_release_left_growth_revoked(shared, lazy)
+        self.assertTrue(shared._resource._finalizer.alive)
+
+    RESTORED_PERMISSION = "production restored growth permission after release_all"
+
+    def assert_release_left_growth_revoked(self, shared, lazy):
+        released = self.lib.events.index(("full", 1))
+        regranted = [event for event in self.lib.events[released + 1:]
+                     if (event[0] in ("grant", "device_grant") and event[2])
+                     or (event[0] == "domain_grants" and any(event[3:]))]
+        self.assertEqual(regranted, [], self.RESTORED_PERMISSION)
+        self.assertEqual((self.lib.resources[1]["limit"], self.lib.device_limit), (0, 0),
+                         self.RESTORED_PERMISSION)
+        self.assertTrue(shared._domain.shared_growth_fenced, self.RESTORED_PERMISSION)
         with self.assertRaises(qfe.NativeContractUnavailable):
             lazy.ensure()
-        self.assertEqual(self.lib.resources[1]["limit"], 0)
-        self.assertTrue(shared._resource._finalizer.alive)
+        self.assertEqual((self.lib.resources[1]["limit"], self.lib.device_limit), (0, 0),
+                         self.RESTORED_PERMISSION)
+
+    def exercise_restoring_detach_is_caught(self, state):
+        """Death rule for the oracle above.
+
+        Mutate production so a failing release_all re-publishes growth, and require
+        exercise_shared_full_detach_state to go red for THAT reason. If this ever stops
+        failing, the full-detach tests no longer see a restored grant.
+        """
+        production_detach = qfm.QFNativeResourcePatcher.detach
+        restored = []
+
+        def restoring_detach(adapter, unpatch_all=True):
+            try:
+                return production_detach(adapter, unpatch_all)
+            except RuntimeError:
+                qfm._publish_domain_grants(adapter, growth_allowance=4096)
+                restored.append(adapter)
+                raise
+
+        with mock.patch.object(qfm.QFNativeResourcePatcher, "detach", restoring_detach):
+            with self.assertRaisesRegex(self.failureException, self.RESTORED_PERMISSION):
+                self.exercise_shared_full_detach_state(state)
+        # A mutation that never ran proves nothing about the oracle.
+        self.assertEqual(len(restored), 1, "mutation never reached the failing release")
 
     def test_cold_factory_graph_is_canonical_before_any_model_create(self):
         a, same, b = self.wrapper(), self.wrapper(), self.wrapper("B")
@@ -1080,14 +1121,25 @@ class CanonicalIntegration(unittest.TestCase):
     def test_shared_full_detach_unknown_keeps_zero_grant(self):
         self.exercise_shared_full_detach_state(qfe.QUANTFUNC_RESOURCE_UNKNOWN)
 
+    # The three arms above are the controls for these two: same exercise, production
+    # unmutated, must stay green.
+    def test_shared_full_detach_busy_oracle_dies_if_permission_is_restored(self):
+        self.exercise_restoring_detach_is_caught(qfe.QUANTFUNC_RESOURCE_BUSY)
+
+    def test_shared_full_detach_unknown_oracle_dies_if_permission_is_restored(self):
+        self.exercise_restoring_detach_is_caught(qfe.QUANTFUNC_RESOURCE_UNKNOWN)
+
     def test_fenced_shared_reopens_only_by_atomic_all_or_none_domain_grant(self):
         patcher, owner, shared = self.warm_native_model()
         lazy = patcher.model._qf
         self.lib.capabilities = 7
         shared.detach(True)
-        qfm._revoke_domain_growth(owner)
-        self.assertEqual(self.lib.resources[1]["limit"], 0)
+        # Production's detach alone must leave Shared revoked; assert BEFORE the setup
+        # revoke below, which would otherwise satisfy these assertions by itself.
+        self.assertEqual((self.lib.resources[1]["limit"], self.lib.device_limit), (0, 0))
         self.assertTrue(shared._domain.shared_growth_fenced)
+        qfm._revoke_domain_growth(owner)  # setup only: also zero the warm Owner grant
+        self.assertEqual(self.lib.resources[owner._resource._pointer.value]["limit"], 0)
 
         # A newly prepared owner starts at zero. Busy/Unknown from the native
         # atomic command leaves all three authorization layers unchanged.
@@ -1199,6 +1251,11 @@ class CanonicalIntegration(unittest.TestCase):
                 self.lib.domain_grant_state = qfe.QUANTFUNC_RESOURCE_READY
                 patcher = self.wrapper(f"post-grant-rollback-{rollback_state}")
                 owner, shared = patcher.model_patches_models()
+                # Independent lazy alias of the SAME canonical Owner: its own
+                # QFLazyEngine, never prepared or materialized before the failure.
+                alias = self.wrapper(f"post-grant-rollback-{rollback_state}")
+                alias_engine = alias.model._qf
+                self.assertIsNot(alias_engine, patcher.model._qf)
                 peer = self.wrapper(f"post-grant-rollback-peer-{rollback_state}")
                 peer_owner, _ = peer.model_patches_models()
                 peer_key = peer_owner._resource._pointer.value
@@ -1229,9 +1286,17 @@ class CanonicalIntegration(unittest.TestCase):
                     patcher.model._qf.ensure()
                 with self.assertRaisesRegex(qfe.NativeContractUnavailable, "Shared host grant"):
                     peer.model._qf.ensure()
-                last = patcher, owner, shared, key
+                # The alias is refused by the canonical Owner's failed-admission fence
+                # (not merely the domain's Shared fence that stops the peer above), so
+                # the fence is keyed by Owner identity rather than by lazy engine.
+                self.assertFalse(alias_engine.materialized)
+                with self.assertRaisesRegex(qfe.NativeContractUnavailable, "failed host admission"):
+                    alias_engine.ensure()
+                self.assertFalse(alias_engine.materialized)
+                self.assertIs(alias_engine._prepared_entry, patcher.model._qf._prepared_entry)
+                last = patcher, owner, shared, key, alias_engine
 
-        patcher, owner, shared, key = last
+        patcher, owner, shared, key, alias_engine = last
         self.lib.domain_grant_state = qfe.QUANTFUNC_RESOURCE_READY
 
         def create(lib, *, capacity_bytes, prepared_resource, create_params):
@@ -1245,6 +1310,8 @@ class CanonicalIntegration(unittest.TestCase):
         self.assertFalse(owner._admission_failed)
         self.assertFalse(shared._domain.shared_growth_fenced)
         self.assertIsNotNone(patcher.model._qf.ensure())
+        # Only that formal admission reopens the alias, and onto the same live handle.
+        self.assertIs(alias_engine.ensure(), patcher.model._qf.ensure())
 
     def test_preflight_busy_fails_before_pop_and_ready_hot_repeat_has_one_record(self):
         patcher, owner, _ = self.warm_native_model("official-handoff")
