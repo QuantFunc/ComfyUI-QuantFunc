@@ -1592,6 +1592,8 @@ class QFNativeResourcePatcher(comfy.model_patcher.ModelPatcher):
                 # row died at session begin on "requires a positive Owned host grant". The shrink is now followed
                 # by the same formal admission as any load, with no weights budget of its own: the ceiling is
                 # what Comfy left free (its inference reserve), which is exactly the room it made for this run.
+                print(f"[qf_native] Comfy's budget is negative: shrinking {-allowance >> 20} MB, then admitting "
+                      "the run without a weights budget", flush=True)
                 self.partially_unload(device_to, -allowance,
                                       force_patch_weights=force_patch_weights)
                 allowance = 0
