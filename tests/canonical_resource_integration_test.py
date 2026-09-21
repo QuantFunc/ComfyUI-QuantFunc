@@ -203,6 +203,9 @@ class CanonicalIntegration(unittest.TestCase):
             mock.patch.object(qfe, "resolve_so_path", return_value="contract.so"),
             mock.patch.object(plugin, "_read_auth", return_value=("", "")),
             mock.patch.object(mm, "get_total_memory", return_value=64 << 30),
+            # No free memory unless a test says otherwise: growth is then exactly Comfy's allowance, so
+            # every number pinned before the inference-reserve term existed stays as it was.
+            mock.patch.object(mm, "get_free_memory", return_value=0),
             mock.patch.object(mm, "current_loaded_models", []),
         ):
             patch.start()
@@ -674,6 +677,29 @@ class CanonicalIntegration(unittest.TestCase):
         self.assertEqual(self.lib.device_limit, 15)
         self.assertEqual(self.lib.resources[peer_key]["limit"], 5)
         self.assertEqual(self.lib.resources[1]["limit"], 5)
+
+    def test_ceiling_is_what_comfy_left_free_never_below_its_own_weights_budget(self):
+        """Comfy's extra_memory = free - minimum_memory_required: the inference reserve is taken OUT.
+
+        Native activations live under the same ceiling as native weights, so the published growth is
+        what Comfy left free at this admission. Both directions: free above the budget wins (the
+        reserve is granted), free below it never lowers Comfy's own number.
+        """
+        for free, growth in ((30, 30), (3, 5)):
+            with self.subTest(comfy_free=free):
+                patcher = self.wrapper(f"inference-reserve-{free}")
+                owner, _ = patcher.model_patches_models()
+                key = owner._resource._pointer.value
+                self.lib.resources[key].update(held=10, limit=0,
+                                               phase=qfe.QUANTFUNC_RESOURCE_PHASE_ATTACHED)
+                self.lib.resources[1].update(held=0, limit=0)
+                self.lib.device_limit = 0
+                with mock.patch.object(mm, "get_free_memory", return_value=free):
+                    self.assertEqual(owner.partially_load(owner.load_device, 5), 0)
+                # owner: own residency + growth; Shared: 0 + growth; Device: domain residency + growth
+                self.assertEqual((self.lib.resources[key]["limit"], self.lib.resources[1]["limit"],
+                                  self.lib.device_limit), (10 + growth, growth, 10 + growth))
+                self.lib.resources[key].update(held=0)  # keep the next subTest's domain residency its own
 
     def test_negative_allowance_requests_shrink_without_authorizing_growth(self):
         patcher = self.wrapper("negative-allowance")

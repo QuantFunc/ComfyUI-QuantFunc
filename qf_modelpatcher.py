@@ -1195,8 +1195,9 @@ def _publish_domain_grants(adapter, *, publish_owner=False, growth_allowance=0):
     """Publish one formal Comfy admission from exact native residency.
 
     Owner and Shared each use their own current residency plus the one official
-    allowance.  Only the aggregate Device ceiling uses coherent domain
-    residency.  The Device ceiling bounds both resource ceilings.
+    growth (Comfy's allowance, or what Comfy left free when that is more: see
+    below).  Only the aggregate Device ceiling uses coherent domain residency.
+    The Device ceiling bounds both resource ceilings.
     """
     with _domain_transaction(adapter):
         domain = adapter._domain
@@ -1213,7 +1214,15 @@ def _publish_domain_grants(adapter, *, publish_owner=False, growth_allowance=0):
             allowance = int(growth_allowance)
             if allowance < 0:
                 raise ValueError("domain grant growth allowance must be nonnegative")
-            allowance = min(allowance, total)
+            # Comfy's extra_memory is its WEIGHTS budget: load_models_gpu computes it as
+            # free - minimum_memory_required, i.e. with the inference reserve it holds for THIS model's
+            # sampling taken out. A Torch model spends that reserve on activations outside any ceiling;
+            # native weights, activations and cache all live under this one, so publishing the budget
+            # alone refuses the engine the room Comfy freed for it. MEASURED (H3, 32 GB): 24017 MB free,
+            # 20951 MB budget, 14270 MB of weights -> step 0 refused with ~10 GB physically free.
+            # The ceiling is what Comfy left free at this admission, never less than its own budget.
+            free = max(0, int(comfy.model_management.get_free_memory(shared.load_device)))
+            allowance = min(max(allowance, free), total)
             device_limit = min(total, domain_actual + allowance)
 
         def resource_limit(resource_adapter):
