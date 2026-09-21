@@ -718,8 +718,27 @@ class CanonicalIntegration(unittest.TestCase):
                                                phase=qfe.QUANTFUNC_RESOURCE_PHASE_ATTACHED)
                 self.lib.device_limit = 128
                 del self.lib.events[:]
-                with mock.patch.object(mm, "get_free_memory", return_value=free):
+
+                class OutermostCount:   # every use of the domain lock is a `with`; count depth-0 entries
+                    def __init__(self, inner):
+                        self.inner, self.depth, self.outermost = inner, 0, 0
+
+                    def __enter__(self):
+                        self.inner.acquire()
+                        self.outermost += self.depth == 0
+                        self.depth += 1
+
+                    def __exit__(self, *exc):
+                        self.depth -= 1
+                        self.inner.release()
+
+                counted = OutermostCount(owner._domain.transaction_lock)
+                with mock.patch.object(owner._domain, "transaction_lock", counted), \
+                        mock.patch.object(mm, "get_free_memory", return_value=free):
                     self.assertEqual(owner.partially_load(owner.load_device, -32), 0)
+                # The shrink revokes growth DOMAIN-wide; a second acquisition would expose that fenced state to a
+                # peer between the release and the re-admission. One Comfy operation = one critical section.
+                self.assertEqual(counted.outermost, 1, "shrink and re-admission must share one domain transaction")
                 self.assertEqual(self.lib.resources[key]["held"], 32)
                 revoke, release = ("domain_grants", key, 7, 0, 0, 0), ("release", key, 32)
                 self.assertLess(self.lib.events.index(revoke), self.lib.events.index(release),
