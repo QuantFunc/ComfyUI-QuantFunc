@@ -1581,9 +1581,17 @@ class QFNativeResourcePatcher(comfy.model_patcher.ModelPatcher):
             raise ValueError("a native resource cannot migrate to another device")
         allowance = _host_allowance(extra_memory)
         if allowance is not None and allowance < 0:
+            # Comfy's negative budget means "shrink by this much, THEN RUN" (load_models_gpu computes
+            # max(0, free - minimum_memory_required, ...) - loaded_memory; a stock patcher unloads that much and
+            # samples in low-VRAM mode). The release revokes growth, so returning here left the engine fenced
+            # with nothing to re-open it before the sampler starts. MEASURED (host-vram-h3 measure-10): stage 2
+            # of the double-sample asks 17 GB, Comfy shrank the engine 15.7 -> 11.7 GB, and seven runs in a
+            # row died at session begin on "requires a positive Owned host grant". The shrink is now followed
+            # by the same formal admission as any load, with no weights budget of its own: the ceiling is
+            # what Comfy left free (its inference reserve), which is exactly the room it made for this run.
             self.partially_unload(device_to, -allowance,
                                   force_patch_weights=force_patch_weights)
-            return 0
+            allowance = 0
         with _domain_transaction(self):
             self.require_load_contract()
             identity = self._resource.query()

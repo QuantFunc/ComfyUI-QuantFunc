@@ -701,18 +701,35 @@ class CanonicalIntegration(unittest.TestCase):
                                   self.lib.device_limit), (10 + growth, growth, 10 + growth))
                 self.lib.resources[key].update(held=0)  # keep the next subTest's domain residency its own
 
-    def test_negative_allowance_requests_shrink_without_authorizing_growth(self):
-        patcher = self.wrapper("negative-allowance")
-        owner, _ = patcher.model_patches_models()
-        key = owner._resource._pointer.value
-        self.lib.resources[key].update(held=64, limit=128,
-                                       phase=qfe.QUANTFUNC_RESOURCE_PHASE_ATTACHED)
-        self.lib.device_limit = 128
-        self.assertEqual(owner.partially_load(owner.load_device, -32), 0)
-        self.assertEqual(self.lib.resources[key]["held"], 32)
-        self.assertEqual((self.lib.resources[key]["limit"],
-                          self.lib.resources[1]["limit"], self.lib.device_limit), (0, 0, 0))
-        self.assertTrue(owner._domain.shared_growth_fenced)
+    def test_negative_allowance_shrinks_then_admits_the_run_without_a_weights_budget(self):
+        """Comfy's negative budget = "shrink by this much, THEN RUN" (a stock patcher samples in low-VRAM mode).
+
+        MEASURED (host-vram-h3 measure-10): returning after the shrink left growth revoked, and stage 2 of the
+        double-sample died seven runs in a row on "requires a positive Owned host grant". Both halves are pinned:
+        the release still happens FIRST and under a revoked grant, and the call then ends in a formal admission
+        whose growth is what Comfy left free - never a weights budget of its own (free = 0 => limit == residency).
+        """
+        for free, growth in ((0, 0), (24, 24)):
+            with self.subTest(comfy_free=free):
+                patcher = self.wrapper(f"negative-allowance-{free}")
+                owner, _ = patcher.model_patches_models()
+                key = owner._resource._pointer.value
+                self.lib.resources[key].update(held=64, limit=128,
+                                               phase=qfe.QUANTFUNC_RESOURCE_PHASE_ATTACHED)
+                self.lib.device_limit = 128
+                del self.lib.events[:]
+                with mock.patch.object(mm, "get_free_memory", return_value=free):
+                    self.assertEqual(owner.partially_load(owner.load_device, -32), 0)
+                self.assertEqual(self.lib.resources[key]["held"], 32)
+                revoke, release = ("domain_grants", key, 7, 0, 0, 0), ("release", key, 32)
+                self.assertLess(self.lib.events.index(revoke), self.lib.events.index(release),
+                                "the shrink must run under a revoked grant")
+                # then the formal admission: own residency + growth; Shared 0 + growth; Device = domain + growth
+                self.assertEqual((self.lib.resources[key]["limit"], self.lib.resources[1]["limit"],
+                                  self.lib.device_limit), (32 + growth, growth, 32 + growth))
+                self.assertGreater(self.lib.resources[key]["limit"], 0, "a fenced engine cannot sample")
+                self.assertFalse(owner._domain.shared_growth_fenced)
+                self.lib.resources[key].update(held=0)  # keep the next subTest's domain residency its own
 
     def test_same_domain_lock_serializes_concurrent_owner_load_and_unload(self):
         a, b = self.wrapper(), self.wrapper("B")
