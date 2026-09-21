@@ -220,7 +220,12 @@ class HostSchedulerContract(unittest.TestCase):
                 qfm.ensure_model_config_attrs(cfg)
                 model = getattr(module, class_name)(cfg, self.engine, device=torch.device("cpu"), **kwargs)
                 patcher = module.QFModelPatcher(model, torch.device("cpu"), torch.device("cpu"))
-                model.contract_weight = torch.nn.Parameter(torch.ones(8, dtype=torch.float32))
+                # In a LEAF module: Comfy's load list manages only leaf-module parameters. One set
+                # directly on the root is skipped as "default weights in a non-leaf module" once
+                # the root has a parameterized child - Wan/Krea2 arm the stub's 0-byte concat-shape
+                # carrier, so a root-level weight there is never loaded and never reclaimed.
+                model.contract = torch.nn.Module()
+                model.contract.weight = torch.nn.Parameter(torch.ones(8, dtype=torch.float32))
                 torch_bytes = mm.module_size(model)
                 # Comfy's own loader, not a hand-written byte counter: it also marks each
                 # module comfy_patched_weights, the only state its partial unload frees.
