@@ -3,7 +3,7 @@
 
 WHY THIS EXISTS (the self-CR regression/correctness NEEDS-EVIDENCE): reject_list_completeness.py proves the
 reject-LIST is COMPLETE (a static textual scan of comfy's consumed keys vs the tuple), but nothing EXECUTED
-the ported methods — extra_conds / scale_latent_inpaint / _derive_geometry and the Interrupt session-clearing
+the ported methods — extra_conds / _derive_geometry (+ the scale_latent_inpaint inheritance) and the Interrupt session-clearing
 guard. "4/4 pass" read as if the safety layer was exercised when it was not. This file closes that: it drives
 the REAL on-disk method bodies and asserts raise / no-raise on both directions.
 
@@ -394,12 +394,21 @@ def _t_shared_interrupt_helper(src):
 
 
 def _t_scale_latent_inpaint(src):
-    fn, _ = _bind(src, "scale_latent_inpaint")
-    try:
-        fn(_mock_self(), object(), object(), object())
-        print("  [FAIL] scale_latent_inpaint did NOT raise"); return 1
-    except RuntimeError:
-        print("  scale_latent_inpaint: OK (a wired denoise mask fails loud)"); return 0
+    """2026-08-22 wan-align pivot: LTX INHERITS BaseModel.scale_latent_inpaint (comfy blends the masked
+    latent OUTSIDE the model; exact because the engine step is stateless in x) — the Inplace i2v route rides
+    it, so the seam must NOT override it (the old loud-fail override would break i2v). Positive control: the
+    WAN seam, whose session does its own i2v conditioning, still overrides it."""
+    def overrides(text, cls):
+        try:
+            _extract_method(text, cls, "scale_latent_inpaint"); return True
+        except AssertionError:
+            return False
+    for cls in ("QFLTXModel", "QFLTXAVModel"):
+        if overrides(src, cls):
+            print(f"  [FAIL] {cls} overrides scale_latent_inpaint (must be inherited since the 2026-08-22 pivot)"); return 1
+    if not overrides(open(_WAN_SRC, errors="replace").read(), "QFWanModel"):
+        print("  [FAIL] positive control: QFWanModel no longer overrides scale_latent_inpaint"); return 1
+    print("  scale_latent_inpaint: OK (inherited by LTX/LTXAV, overridden by WAN)"); return 0
 
 
 def _t_derive_geometry(src):
@@ -435,21 +444,29 @@ def _t_derive_geometry(src):
         except RuntimeError:
             pass
 
-    # 3) a TRIMMED range must refuse, both directions:
-    #    end trimmed (denoise<1 / last_step<steps) and start trimmed (start_step>0).
+    # 3) a TRIMMED range is ACCEPTED, both directions (two-stage official workflows: stage-A 1.0->0.975,
+    #    stage-B 0.85->0 after the latent upsample): the session is purely sigma-driven, so the step count
+    #    is len(sigmas)-1. Only a NON-DECREASING schedule is refused (it would drive the session backwards).
     trims = {
         "end-trimmed":   [1.0 - i / steps for i in range(steps + 1)][:-1] + [0.3],
         "start-trimmed": [0.5 - i * (0.5 / steps) for i in range(steps)] + [0.0],
     }
     for name, sig in trims.items():
+        me = _mock_self(_num_frames=0, _num_steps=0, model_sampling=ms)
         try:
-            fn(_mock_self(_num_frames=0, _num_steps=0, model_sampling=ms), x, {"sample_sigmas": sig})
-            print(f"  [FAIL] _derive_geometry did NOT raise on a {name} schedule"); bad += 1
-        except RuntimeError:
-            pass
+            fn(me, x, {"sample_sigmas": sig})
+            if me._num_steps != len(sig) - 1:
+                print(f"  [FAIL] _derive_geometry: {name} num_steps {me._num_steps} != {len(sig) - 1}"); bad += 1
+        except RuntimeError as e:
+            print(f"  [FAIL] _derive_geometry refused a {name} schedule: {e}"); bad += 1
+    try:
+        fn(_mock_self(_num_frames=0, _num_steps=0, model_sampling=ms), x, {"sample_sigmas": [0.3, 0.6, 1.0]})
+        print("  [FAIL] _derive_geometry did NOT raise on a non-decreasing schedule"); bad += 1
+    except RuntimeError:
+        pass
 
     print(f"  _derive_geometry: {'OK' if bad == 0 else 'FAIL'} (derives frames+steps from the graph; "
-          "missing/short/trimmed schedules each refuse)")
+          "missing/short/non-decreasing refuse; trimmed ranges accepted)")
     return bad
 
 

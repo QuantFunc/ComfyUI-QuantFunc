@@ -704,16 +704,12 @@ if _IMPORT_OK:
                                      "Runtime session knob — takes effect next run, never "
                                      "rebuilds. COMPOSABLE with step_cache (EC skips whole "
                                      "steps; FBC skips blocks inside computed steps)."})
-    # [quality_enhance switch, user 2026-09-12] abstracts the raw token_prune float behind a
-    # BOOLEAN: OFF (default) = token-prune ON @0.8 keep (~1.2x faster; last step always full,
-    # audio never pruned), ON = keep every token (full quality, prune OFF). The engine is
-    # unchanged — it still receives token_prune_keep_ratio via set_token_prune/residency_opts.
+    # [quality_enhance widget -> the mixin's ONE video_enhance switch, user 2026-09-19] OFF (default) = the
+    # engine's speed policy, ON = full quality; what that means is ENGINE law, this plugin carries no number.
     _QUALITY_ENHANCE_INPUT = ("BOOLEAN", {"default": False,
-                     "tooltip": "Quality-enhance. OFF (default) = faster: token-prune ON at "
-                                "keep-fraction 0.8 (recompute 80% of VIDEO tokens per step, "
-                                "~1.2x; last step always full, audio never pruned). "
-                                "ON = full quality (keep every token, prune OFF). Runtime "
-                                "session knob — takes effect next run, never rebuilds."})
+                     "tooltip": "Quality-enhance. OFF (default) = the engine's faster speed policy. "
+                                "ON = full quality. Runtime session knob — takes effect next run, "
+                                "never rebuilds."})
 
     # [audio_enhance switch, user 2026-09-13] H3-only. OFF (default) = byte-identical to no knob.
     # ON = after the normal (video) denoise, run EXTRA AUDIO-ONLY sub-steps so video_steps +
@@ -729,13 +725,6 @@ if _IMPORT_OK:
                                 "sub-steps) — sharper/cleaner AUDIO at fixed per-sub-step cost, the "
                                 "VIDEO is untouched (byte-identical). No effect when the video "
                                 "already runs >= 16 steps. Runtime session knob — next run, no rebuild."})
-
-    def _quality_enhance_to_token_prune(enhance):
-        """quality_enhance switch -> engine token-prune keep-fraction (user 2026-09-12):
-        ON = 1.0 (keep all tokens = prune OFF, full quality); OFF (default) = 0.8 (prune,
-        ~1.2x faster). The engine still receives the float via set_token_prune ->
-        residency_opts token_prune_keep_ratio; only the plugin-exposed widget changed."""
-        return 1.0 if enhance else 0.8
 
     # [sol-tau dial 2026-08-31] the ONE user-facing Sol-Attn knob (user "就一个就好"). Applies to
     # the flash/sage backends — the engine's applySolTauDial engages the Sol-Attn keep-ratio per
@@ -929,8 +918,7 @@ if _IMPORT_OK:
                 _mm.set_attn_backend(_attn_backend_to_engine(attention_backend))
             if _mm is not None and hasattr(_mm, "set_sol_tau"):
                 _mm.set_sol_tau(sol_tau)
-            if _mm is not None and hasattr(_mm, "set_token_prune"):
-                _mm.set_token_prune(_quality_enhance_to_token_prune(quality_enhance))
+            _mm.set_video_enhance(quality_enhance)
             _arm_session_caches(_mm, step_cache, block_cache)
             return (_p,)
 
@@ -970,8 +958,7 @@ if _IMPORT_OK:
             _mm = getattr(_p, "model", None)
             if _mm is not None and hasattr(_mm, "set_attn_backend"):
                 _mm.set_attn_backend(_attn_backend_to_engine(attention_backend))
-            if _mm is not None and hasattr(_mm, "set_token_prune"):
-                _mm.set_token_prune(_quality_enhance_to_token_prune(quality_enhance))
+            _mm.set_video_enhance(quality_enhance)
             return (_p,)
 
 
@@ -1023,8 +1010,7 @@ if _IMPORT_OK:
                 _mm.set_attn_backend(_attn_backend_to_engine(attention_backend))
             if _mm is not None and hasattr(_mm, "set_sol_tau"):
                 _mm.set_sol_tau(sol_tau)
-            if _mm is not None and hasattr(_mm, "set_token_prune"):
-                _mm.set_token_prune(_quality_enhance_to_token_prune(quality_enhance))
+            _mm.set_video_enhance(quality_enhance)
             if _mm is not None and hasattr(_mm, "set_audio_enhance"):
                 _mm.set_audio_enhance(audio_enhance)
             _mm.set_allow_partial_denoise(bool(allow_partial_denoise))
