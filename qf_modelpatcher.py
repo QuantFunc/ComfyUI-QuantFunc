@@ -1841,14 +1841,3 @@ class QFModelPatcher(comfy.model_patcher.ModelPatcher):
         except Exception:  # noqa: BLE001
             return 0
         return freed
-
-    def patch_model(self, device_to=None, lowvram_model_memory=0, load_weights=True,
-                    force_patch_weights=False):
-        # The engine weights are absent from this Torch module and stay on the
-        # canonical native dependencies. Ordinary plugin-owned Torch parameters
-        # (for example a connector) follow the official ModelPatcher path.
-        return super().patch_model(device_to=device_to, lowvram_model_memory=lowvram_model_memory,
-                                   load_weights=load_weights, force_patch_weights=force_patch_weights)
-
-    def unpatch_model(self, device_to=None, unpatch_weights=True):
-        return super().unpatch_model(device_to=device_to, unpatch_weights=unpatch_weights)

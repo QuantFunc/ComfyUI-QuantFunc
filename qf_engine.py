@@ -1232,33 +1232,6 @@ def estimate_resident_bytes(lib, model_dir, device_idx=0, transformer_path=None,
     return int(out.value)
 
 
-def estimate_footprint_bytes(*paths):
-    """ESTIMATE (NOT a live-VRAM measurement) of the engine's resident footprint, from the ON-DISK
-    packed size (os.path.getsize) of the given weight file(s)/dir(s). qf_modelpatcher's model_size()/
-    loaded_size() report this to ComfyUI's memory ledger so a sibling native model is not placed into
-    VRAM the engine already holds. HONEST scope, to avoid the "measured the wrong quantity" trap: this
-    is a DISK-SIZE PROXY, not comfy's own convention (live state_dict().nbytes) — for a packed quantized
-    transformer the on-disk bytes track resident VRAM closely, but call it an estimate, never 'measured'.
-    Pass ONLY engine-resident components (the transformer dir); VAE/TE stay native comfy nodes that
-    comfy already accounts for, so the caller MUST NOT include them (an over-report evicts fitting
-    siblings)."""
-    total = 0
-    for pth in paths:
-        if not pth or not os.path.exists(pth):
-            continue
-        if os.path.isfile(pth):
-            total += os.path.getsize(pth)
-        else:
-            for root, _dirs, files in os.walk(pth):
-                for f in files:
-                    if f.endswith((".safetensors", ".bin", ".pt")) or "transformer" in f:
-                        try:
-                            total += os.path.getsize(os.path.join(root, f))
-                        except OSError:
-                            pass
-    return total
-
-
 class QFEngineHandle:
     """Owns the .so + created pipeline + the (single, per-pipeline) open denoise session.
     Tracks the session HERE (not only on the model shim) so a stale session from a failed run is
