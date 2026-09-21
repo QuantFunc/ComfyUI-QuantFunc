@@ -6,15 +6,12 @@ Every branch, BOTH directions, against fake engine handles (no GPU, no comfy mod
 
   1. primary + engine knows its need        -> comfy-side bytes + engine need (engine asked with the LATENT shape)
   2. primary + engine UNKNOWN (0)           -> comfy-side only (never "needs nothing", never a broken sampler)
-  3. shadow patcher's model                 -> comfy-side only, the engine is NOT asked
+  3. shadow patcher's model                 -> same shared-engine demand as every logical output
   4. lazy proxy                             -> a CACHED handle answers (peek → materialize without create); an
                                                uncreated engine is NEVER created here (comfy evicts AFTER this call)
-  5. engine raises                          -> comfy-side only (swallowed)
-  6. ledger: hold < weights                 -> model_size = weights, loaded_size = hold (comfy sees the deficit)
-     ledger: hold >= weights                -> both = hold
-     ledger: unloaded flag with residual    -> loaded_size = measured residual
-     ledger: measured zero                  -> loaded_size = 0, never weights estimate
-     ledger: shadow                         -> the small constant, both
+  5. engine raises                          -> failure reaches host (not a zero estimate)
+  6. logical ledger                         -> ordinary Torch model_size/loaded_size only;
+                                               native residency stays on canonical dependencies
   7. ONE source of truth: no family class overrides the ledger methods; QFH3Model (packed AV) == base exactly
 
 Run:  python tests/vram_ledger_test.py   (needs comfy importable — the ComfyUI env; SKIPs (77) without it)
@@ -50,6 +47,7 @@ except Exception as e:  # noqa: BLE001
     _skip(f"plugin package not importable as {_pkg} ({e!r})")
 
 Mixin, Patcher = qfmp.QFSessionModelMixin, qfmp.QFModelPatcher
+torch = qfmp.torch
 MB = 1 << 20
 SHAPE = [2, 16, 31, 48, 50]          # comfy's [B*2, C, T, H, W] at estimate time
 COND = {"c_crossattn": [(2, 616, 5120)]}
@@ -84,15 +82,9 @@ def _quiet(fn, *a, **k):
     return r, out.getvalue()
 
 
-class _LedgerOnlyPatcher(Patcher):
-    def __del__(self):   # comfy's ModelPatcher.__del__ unpins/detaches ctor state this bare instance never had
-        pass
-
-
 def _patcher(model):
-    p = _LedgerOnlyPatcher.__new__(_LedgerOnlyPatcher)   # ledger methods only read self.model — no comfy ctor needed
-    p.model = model
-    return p
+    model.device = torch.device("cpu")
+    return Patcher(model, model.device, model.device)
 
 
 m = _Model(); m._qf = _engine(need_mb=12000)
@@ -114,25 +106,35 @@ _quiet(m.memory_required, PACKED, cond_shapes=COND)
 check(m._qf.vram_need_bytes.asked == [[2, 24, 31, 48, 50]],
       "arm1b: packed [B,1,N] + comfy latent_shapes → engine asked with [B] + video stream dims")
 m = _Model(); m._qf = _engine(need_mb=12000); m.latent_shapes = [(1, 24, 31, 48, 51), (1, 32, 2, 207)]  # stale/other geometry
-_quiet(m.memory_required, PACKED, cond_shapes=COND)
-check(m._qf.vram_need_bytes.asked == [PACKED], "arm1b: latent_shapes whose numel ≠ N (stale geometry) → as given")
+try:
+    _quiet(m.memory_required, PACKED, cond_shapes=COND)
+except RuntimeError:
+    check(m._qf.vram_need_bytes.asked == [], "arm1b: stale geometry refuses before native query")
+else:
+    check(False, "arm1b: stale packed geometry was accepted")
 m = _Model(); m._qf = _engine(need_mb=12000)                                                  # first run: unset
-_quiet(m.memory_required, PACKED, cond_shapes=COND)
-check(m._qf.vram_need_bytes.asked == [PACKED], "arm1b: no latent_shapes yet (first run) → as given")
+try:
+    _quiet(m.memory_required, PACKED, cond_shapes=COND)
+except RuntimeError:
+    check(m._qf.vram_need_bytes.asked == [], "arm1b: missing geometry refuses before native query")
+else:
+    check(False, "arm1b: missing packed geometry was accepted")
 
 # ---- arm 2: engine UNKNOWN -----------------------------------------------------------------------------------
 m = _Model(); m._qf = _engine(need_mb=0)
 r, log = _quiet(m.memory_required, SHAPE, cond_shapes=COND)
 check(r == side and "nothing measured yet" in log, "arm2: engine 0 → comfy-side only, logged as covered-or-unmeasured")
 
-# ---- arm 3: shadow model → engine not asked --------------------------------------------------------------------
+# ---- arm 3: every logical output declares the shared engine's inference demand ---------------------------------
 m = _Model(); m._qf = _engine(need_mb=12000); m._qf_shadow = True
 r, _ = _quiet(m.memory_required, SHAPE, cond_shapes=COND)
-check(r == side and m._qf.vram_need_bytes.asked == [], "arm3: shadow → comfy-side only, engine never asked")
+check(r == side + 12000 * MB and m._qf.vram_need_bytes.asked == [SHAPE],
+      "arm3: shadow → same canonical engine demand as the primary")
 
 # ---- arm 4: lazy proxy — a CACHED handle is used; an uncreated engine is NEVER created here ---------------------
 # (self-CR P-2: comfy calls memory_required BEFORE its own eviction pass, so a create here would run ahead of the
-#  room being made. The proxy materializes only over a cache HIT — QFLazyEngine.ensure_if_cached / factory.peek.)
+#  room being made. The proxy discovers cache hits through the canonical
+#  prepare_resource/Prepared cache path.)
 real = _engine(need_mb=9000)
 proxy = SimpleNamespace(vram_need_bytes=lambda s: 0, footprint_bytes=1, ensure_if_cached=lambda: real, current_session=None)
 m = _Model(); m._qf = proxy
@@ -145,46 +147,47 @@ m = _Model(); m._qf = proxy
 r, log = _quiet(m.memory_required, SHAPE, cond_shapes=COND)
 check(r == side and created == [] and "nothing measured yet" in log,
       "arm4b: cache MISS → comfy-side only, ensure() NOT called (no create ahead of comfy's eviction)")
-# the real QFLazyEngine: peek None → stays unmaterialized; peek hit → the factory (a cache hit) materializes it
+# the real QFLazyEngine demand surface: cold native demand is zero while the
+# model-level ordinary Comfy estimate remains the request floor; a hot retained
+# handle supplies native need without a create.
 Lazy = qfmp.QFLazyEngine
 calls = []
 def _fac():
     calls.append(1)
     return SimpleNamespace(pipeline=1, footprint_bytes=14380 * MB, step_count=0, sampler_step_count=0,
                            unloaded=False, current_session=None, vram_need_bytes=lambda s: 7 * MB), "ckey"
-lz = Lazy(_fac, 13694 * MB)                       # no factory.peek → a ledger read can never create
-check(lz.ensure_if_cached() is None and calls == [] and not lz.materialized and lz.vram_need_bytes(SHAPE) == 0,
-      "arm4c: QFLazyEngine without a peek → ensure_if_cached None, factory NOT called, need 0")
-_fac.peek = lambda: None
-check(lz.ensure_if_cached() is None and calls == [], "arm4d: peek MISS → factory NOT called")
-_fac.peek = lambda: object()
-check(lz.ensure_if_cached() is not None and calls == [1] and lz.materialized and lz.vram_need_bytes(SHAPE) == 7 * MB,
-      "arm4e: peek HIT → materialized through the (cache-hitting) factory once; need now comes from the real handle")
-check(lz.ensure_if_cached() is not None and calls == [1], "arm4f: already materialized → no second factory call")
+lz = Lazy(_fac)
+lz.ensure_if_cached = lambda: None
+check(not lz.materialized and lz.vram_need_bytes(SHAPE) == 0 and calls == [],
+      "arm4c: cold QFLazyEngine → native need 0, factory NOT called")
+hot = _fac()[0]
+lz.ensure_if_cached = lambda: hot
+check(lz.vram_need_bytes(SHAPE) == 7 * MB and calls == [1],
+      "arm4d: hot retained handle → native need is used without another create")
 
-# ---- arm 5: engine raises → comfy-side ------------------------------------------------------------------------
+# ---- arm 5: engine raises → host sees failure, not a zero estimate ---------------------------------------------
 m = _Model(); m._qf = _engine(raise_need=True)
-r, _ = _quiet(m.memory_required, SHAPE, cond_shapes=COND)
-check(r == side, "arm5: an engine exception is swallowed → comfy-side only")
+try:
+    _quiet(m.memory_required, SHAPE, cond_shapes=COND)
+except RuntimeError as error:
+    check(str(error) == "boom", "arm5: engine demand failure reaches host")
+else:
+    check(False, "arm5: engine demand failure was hidden")
 
-# ---- arm 6: the patcher ledger --------------------------------------------------------------------------------
-m = _Model(); m._qf = _engine(hold_mb=10073, footprint_mb=14380); p = _patcher(m)
-check(p.model_size() == 14380 * MB and p.loaded_size() == 10073 * MB,
-      "arm6a: hold < weights → model_size = weights, loaded_size = hold (deficit visible to comfy)")
-m._qf = _engine(hold_mb=23000, footprint_mb=14380)
-check(p.model_size() == 23000 * MB and p.loaded_size() == 23000 * MB, "arm6b: hold ≥ weights → both = hold")
-m._qf = _engine(hold_mb=23000, footprint_mb=14380, unloaded=True)
-check(p.loaded_size() == 23000 * MB and p.model_size() == 23000 * MB,
-      "arm6c: unloaded flag cannot hide measured residual residency")
-m._qf = _engine(hold_mb=0, footprint_mb=14380)
-check(p.loaded_size() == 0 and p.model_size() == 14380 * MB,
-      "arm6d: a measured zero is zero, not the weights estimate")
-m._qf_shadow = True
-check(p.loaded_size() == Patcher._QF_SHADOW_LEDGER_BYTES and p.model_size() == Patcher._QF_SHADOW_LEDGER_BYTES,
-      "arm6e: shadow → the small constant, both")
-m._qf = _engine(hold_mb=0, footprint_mb=14380, unloaded=True)
-check(p.loaded_size() == 0 and p.model_size() == Patcher._QF_SHADOW_LEDGER_BYTES,
-      "arm6f: shadow over an UNLOADED engine → loaded_size 0 (the pre-change order), model_size the constant")
+# ---- arm 6: logical patchers own only ordinary Torch bytes ------------------------------------------------------
+logical = torch.nn.Module()
+logical.weight = torch.nn.Parameter(torch.ones(4, dtype=torch.float32))
+logical._qf = _engine(hold_mb=23000, footprint_mb=14380)
+logical._qf_shadow = False
+p = _patcher(logical)
+check(p.model_size() == 16 and p.loaded_size() == 0,
+      "arm6a: logical patcher reports Torch parameters, not native capacity/residency")
+logical.model_loaded_weight_memory = 8
+check(p.model_size() == 16 and p.loaded_size() == 8,
+      "arm6b: logical loaded_size follows the official Torch loaded-weight ledger")
+logical._qf_shadow = True
+check(p.model_size() == 16 and p.loaded_size() == 8,
+      "arm6c: shadow flag does not replace the ordinary Torch ledger")
 
 # ---- arm 7: ONE source of truth — no family overrides the ledger interface; H3 (packed AV) gets exactly base ---------
 # (self-CR P-1 on 1d51182 found QFH3Model.memory_required stacking a 2026-08-24 heuristic ON TOP of the base's real

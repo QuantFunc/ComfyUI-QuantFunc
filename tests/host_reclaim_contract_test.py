@@ -45,6 +45,42 @@ class NativeLibrary:
 
 
 class HostReclaimContract(unittest.TestCase):
+    def test_demand_query_failure_is_not_successful_zero(self):
+        for status in (1, 8):
+            library = NativeLibrary()
+            library.quantfunc_vram_need_bytes = lambda *args: status
+            engine = qfe.QFEngineHandle(library, ctypes.c_void_p(1))
+            with self.subTest(status=status), self.assertRaisesRegex(RuntimeError, "pipeline busy"):
+                engine.vram_need_bytes([1, 24, 37, 28, 48])
+
+    def test_demand_ffi_failure_is_not_successful_zero(self):
+        library = NativeLibrary()
+        def demand(*args):
+            raise OSError("demand ABI failed")
+        library.quantfunc_vram_need_bytes = demand
+        engine = qfe.QFEngineHandle(library, ctypes.c_void_p(1))
+        with self.assertRaisesRegex(OSError, "demand ABI failed"):
+            engine.vram_need_bytes([1, 16, 64, 64])
+
+    def test_missing_demand_query_is_not_successful_zero(self):
+        engine = qfe.QFEngineHandle(NativeLibrary(), ctypes.c_void_p(1))
+        with self.assertRaisesRegex(RuntimeError, "quantfunc_vram_need_bytes"):
+            engine.vram_need_bytes([1, 16, 64, 64])
+
+    def test_successful_demand_preserves_native_zero_and_positive_count(self):
+        library = NativeLibrary()
+        values = iter((0, 987654321))
+        def demand(pipeline, dims, ndim, out):
+            self.assertEqual(pipeline.value, 1)
+            self.assertEqual(list(dims), [1, 16, 64, 64])
+            self.assertEqual(ndim, 4)
+            out._obj.value = next(values)
+            return 0
+        library.quantfunc_vram_need_bytes = demand
+        engine = qfe.QFEngineHandle(library, ctypes.c_void_p(1))
+        self.assertEqual(engine.vram_need_bytes([1, 16, 64, 64]), 0)
+        self.assertEqual(engine.vram_need_bytes([1, 16, 64, 64]), 987654321)
+
     def test_missing_or_refused_capacity_estimate_is_not_zero(self):
         with self.assertRaisesRegex(RuntimeError, "quantfunc_estimate_resident_bytes"):
             qfe.estimate_resident_bytes(NativeLibrary(), "model")

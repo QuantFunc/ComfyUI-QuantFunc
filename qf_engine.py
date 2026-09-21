@@ -3,6 +3,7 @@ native ComfyUI loader. Structs mirror include/quantfunc.h (session structs copie
 verbatim from the PROVEN tests/scripts/native_session_t1.py). No tests/lib dependency.
 """
 import ctypes
+from contextvars import ContextVar
 import re as _re_soname
 _SONAME_RE = _re_soname.compile(r"lib[^/]*\.so(?:\.\d+[a-z]?)*")   # lib*.so, lib*.so.5, libopencv_core.so.4.5d
 import json
@@ -20,10 +21,25 @@ QUANTFUNC_OK = 0
 QUANTFUNC_RESOURCE_ABI_VERSION = 1
 QUANTFUNC_RESOURCE_CREATION_ABI_VERSION = 1
 QUANTFUNC_RESOURCE_RESIDENCY_ABI_VERSION = 1
+QUANTFUNC_RESOURCE_DOMAIN_ABI_VERSION = 1
+QUANTFUNC_RESOURCE_CAPACITY_ABI_VERSION = 1
+QUANTFUNC_RESOURCE_GRANT_ABI_VERSION = 1
+QUANTFUNC_RESOURCE_DOMAIN_GRANTS_ABI_VERSION = 1
+QUANTFUNC_RESOURCE_LIFECYCLE_ABI_VERSION = 1
+QUANTFUNC_ERROR_UNSUPPORTED = 8
 QUANTFUNC_RESOURCE_READY = 0
 QUANTFUNC_RESOURCE_BUSY = 1
 QUANTFUNC_RESOURCE_UNKNOWN = 2
 QUANTFUNC_RESOURCE_CLOSED = 3
+QUANTFUNC_RESOURCE_CAPACITY_UNSUPPORTED = 4
+QUANTFUNC_RESOURCE_CAP_RELEASE_ALL = 4
+QUANTFUNC_RESOURCE_GRANT_OWNER = 1
+QUANTFUNC_RESOURCE_GRANT_SHARED = 2
+QUANTFUNC_RESOURCE_GRANT_DEVICE = 4
+QUANTFUNC_RESOURCE_PHASE_SHARED = 1
+QUANTFUNC_RESOURCE_PHASE_PREPARED = 2
+QUANTFUNC_RESOURCE_PHASE_ATTACHED = 3
+QUANTFUNC_RESOURCE_PHASE_CLOSED = 4
 # quantfunc_dtype_t: FP32=0, FP16=1, BF16=2 (matches QF_DTYPE in the harness)
 QF_FP32, QF_FP16, QF_BF16 = 0, 1, 2
 # fp8_e4m3 — a valid OUTPUT dtype request for the cloud/standalone TE encode only
@@ -108,10 +124,87 @@ class _ResourceResidency(ctypes.Structure):
     ]
 
 
+class _ResourceDomain(ctypes.Structure):
+    _fields_ = [
+        ("struct_size", ctypes.c_uint32), ("abi_version", ctypes.c_uint32),
+        ("state", ctypes.c_uint32), ("reserved", ctypes.c_uint32),
+        ("resident_bytes", ctypes.c_uint64),
+    ]
+
+
+class _ResourceCapacity(ctypes.Structure):
+    _fields_ = [
+        ("struct_size", ctypes.c_uint32), ("abi_version", ctypes.c_uint32),
+        ("state", ctypes.c_uint32), ("component_count", ctypes.c_uint32),
+        ("required_persistent_bytes", ctypes.c_uint64),
+    ]
+
+
+class _ResourceGrant(ctypes.Structure):
+    _fields_ = [
+        ("struct_size", ctypes.c_uint32), ("abi_version", ctypes.c_uint32),
+        ("state", ctypes.c_uint32), ("enrolled", ctypes.c_uint32),
+        ("limit_bytes", ctypes.c_uint64), ("pending_bytes", ctypes.c_uint64),
+    ]
+
+
+class _ResourceDomainGrants(ctypes.Structure):
+    _fields_ = [
+        ("struct_size", ctypes.c_uint32), ("abi_version", ctypes.c_uint32),
+        ("mask", ctypes.c_uint32), ("reserved", ctypes.c_uint32),
+        ("owner_limit_bytes", ctypes.c_uint64),
+        ("shared_limit_bytes", ctypes.c_uint64),
+        ("device_limit_bytes", ctypes.c_uint64),
+    ]
+
+
+class _ResourceDomainGrantsResult(ctypes.Structure):
+    _fields_ = [
+        ("struct_size", ctypes.c_uint32), ("abi_version", ctypes.c_uint32),
+        ("state", ctypes.c_uint32), ("applied_mask", ctypes.c_uint32),
+    ]
+
+
+class ResourceGrant(NamedTuple):
+    """Native finite permission; non-Ready or unenrolled bytes are not usable."""
+    state: int
+    enrolled: Optional[bool]
+    limit_bytes: Optional[int]
+    pending_bytes: Optional[int]
+
+
+class ResourceDomainGrantsResult(NamedTuple):
+    state: int
+    applied_mask: int
+
+
+class _ResourceLifecycle(ctypes.Structure):
+    _fields_ = [
+        ("struct_size", ctypes.c_uint32), ("abi_version", ctypes.c_uint32),
+        ("state", ctypes.c_uint32), ("phase", ctypes.c_uint32),
+    ]
+
+
+class ResourceLifecycle(NamedTuple):
+    state: int
+    phase: Optional[int]
+
+
 class ResourceResidency(NamedTuple):
     """Native accounted occupancy; not demand, capacity or complete backend coverage."""
     state: int
     resident_bytes: Optional[int]
+
+
+class ResourceDomainResidency(NamedTuple):
+    state: int
+    resident_bytes: int
+
+
+class ResourceCapacity(NamedTuple):
+    state: int
+    component_count: int
+    required_persistent_bytes: int
 
 
 class ResourceSnapshot(NamedTuple):
@@ -161,6 +254,19 @@ def _destroy_resource_view(lib, pointer):
     if address is not None:
         pointer.value = None
         lib.quantfunc_resource_destroy(ctypes.c_void_p(address))
+
+
+FACTORY_PREPARE_ONLY = ContextVar("quantfunc_factory_prepare_only", default=False)
+
+
+class NativeContractUnavailable(RuntimeError):
+    """A required native authority is absent; never substitute a numeric zero."""
+
+
+def library_identity(lib):
+    """Loaded image identity, not its filename (load_lib retains the CDLL)."""
+    handle = getattr(lib, "_handle", None)
+    return ("dso", int(handle)) if handle is not None else ("library", lib)
 
 
 class NativeResource:
@@ -226,6 +332,47 @@ class NativeResource:
         if not self._finalizer.alive:
             raise RuntimeError("QuantFunc resource view is closed")
 
+    def configure(self, params):
+        """Bind entry options, not a capacity estimate or load grant."""
+        if not isinstance(params, InitParams):
+            raise TypeError("resource configuration requires InitParams")
+        _refuse_session_knobs_in_create(params.config_json)
+        with self._lock:
+            self._check_open()
+            function = getattr(self._lib, "quantfunc_resource_configure", None)
+            if function is None:
+                raise NativeContractUnavailable("QuantFunc library lacks quantfunc_resource_configure")
+            function.restype = ctypes.c_int
+            function.argtypes = [ctypes.POINTER(InitParams), ctypes.c_void_p]
+            if function(ctypes.byref(params), self._pointer) != QUANTFUNC_OK:
+                raise RuntimeError(f"QuantFunc resource configuration failed: {last_err(self._lib)}")
+
+    def query_capacity(self):
+        """Configured Prepared persistent capacity; every non-Ready result is nonnumeric."""
+        with self._lock:
+            self._check_open()
+            function = getattr(self._lib, "quantfunc_resource_query_capacity", None)
+            if function is None:
+                raise NativeContractUnavailable(
+                    "QuantFunc library lacks quantfunc_resource_query_capacity")
+            function.restype = ctypes.c_int
+            function.argtypes = [ctypes.c_void_p, ctypes.POINTER(_ResourceCapacity)]
+            out = _ResourceCapacity(ctypes.sizeof(_ResourceCapacity),
+                                    QUANTFUNC_RESOURCE_CAPACITY_ABI_VERSION)
+            status = function(self._pointer, ctypes.byref(out))
+            if status == QUANTFUNC_ERROR_UNSUPPORTED or out.state == QUANTFUNC_RESOURCE_CAPACITY_UNSUPPORTED:
+                raise NativeContractUnavailable(
+                    f"QuantFunc prepared capacity is unsupported: {last_err(self._lib)}")
+            if status != QUANTFUNC_OK:
+                raise RuntimeError(f"QuantFunc resource capacity query failed: {last_err(self._lib)}")
+            if out.state != QUANTFUNC_RESOURCE_READY:
+                raise RuntimeError(f"QuantFunc resource capacity unavailable (state={out.state})")
+            if out.component_count == 0 or out.required_persistent_bytes == 0:
+                raise NativeContractUnavailable(
+                    "QuantFunc prepared capacity returned no complete persistent components")
+            return ResourceCapacity(out.state, int(out.component_count),
+                                    int(out.required_persistent_bytes))
+
     def query(self):
         with self._lock:
             self._check_open()
@@ -249,6 +396,146 @@ class NativeResource:
                 raise RuntimeError(f"QuantFunc resource residency query failed: {last_err(self._lib)}")
             return ResourceResidency(out.state, out.resident_bytes if out.state == QUANTFUNC_RESOURCE_READY else None)
 
+    def query_domain_residency(self):
+        """One coherent Shared-domain actual snapshot; Busy/Unknown/Closed never become zero."""
+        with self._lock:
+            self._check_open()
+            function = getattr(self._lib, "quantfunc_resource_query_domain_residency", None)
+            if function is None:
+                raise NativeContractUnavailable(
+                    "QuantFunc library lacks quantfunc_resource_query_domain_residency")
+            function.restype = ctypes.c_int
+            function.argtypes = [ctypes.c_void_p, ctypes.POINTER(_ResourceDomain)]
+            out = _ResourceDomain(ctypes.sizeof(_ResourceDomain),
+                                  QUANTFUNC_RESOURCE_DOMAIN_ABI_VERSION)
+            if function(self._pointer, ctypes.byref(out)) != QUANTFUNC_OK:
+                raise RuntimeError(
+                    f"QuantFunc domain residency query failed: {last_err(self._lib)}")
+            if out.state != QUANTFUNC_RESOURCE_READY:
+                raise RuntimeError(f"QuantFunc domain residency unavailable (state={out.state})")
+            return ResourceDomainResidency(out.state, int(out.resident_bytes))
+
+    def lifecycle(self):
+        with self._lock:
+            self._check_open()
+            function = getattr(self._lib, "quantfunc_resource_query_lifecycle", None)
+            if function is None:
+                raise NativeContractUnavailable("QuantFunc library lacks quantfunc_resource_query_lifecycle")
+            function.restype = ctypes.c_int
+            function.argtypes = [ctypes.c_void_p, ctypes.POINTER(_ResourceLifecycle)]
+            out = _ResourceLifecycle(ctypes.sizeof(_ResourceLifecycle), QUANTFUNC_RESOURCE_LIFECYCLE_ABI_VERSION)
+            if function(self._pointer, ctypes.byref(out)) != QUANTFUNC_OK:
+                raise RuntimeError(f"QuantFunc resource lifecycle query failed: {last_err(self._lib)}")
+            return ResourceLifecycle(out.state, out.phase if out.state == QUANTFUNC_RESOURCE_READY else None)
+
+    def _grant_call(self, name, limit=None):
+        with self._lock:
+            self._check_open()
+            function = getattr(self._lib, name, None)
+            if function is None:
+                raise RuntimeError(f"QuantFunc library lacks {name}; update the native library")
+            function.restype = ctypes.c_int
+            function.argtypes = [ctypes.c_void_p] + ([ctypes.c_uint64] if limit is not None else []) + [ctypes.POINTER(_ResourceGrant)]
+            out = _ResourceGrant(ctypes.sizeof(_ResourceGrant), QUANTFUNC_RESOURCE_GRANT_ABI_VERSION)
+            args = [self._pointer] + ([limit] if limit is not None else []) + [ctypes.byref(out)]
+            if function(*args) != QUANTFUNC_OK:
+                raise RuntimeError(f"QuantFunc {name} failed: {last_err(self._lib)}")
+            if out.state != QUANTFUNC_RESOURCE_READY:
+                return ResourceGrant(out.state, None, None, None)
+            return ResourceGrant(out.state, bool(out.enrolled),
+                                 out.limit_bytes if out.enrolled else None,
+                                 out.pending_bytes if out.enrolled else None)
+
+    def enroll_host(self):
+        return self._grant_call("quantfunc_resource_enroll_host")
+
+    def query_grant(self):
+        return self._grant_call("quantfunc_resource_query_grant")
+
+    def set_grant(self, limit):
+        limit = operator.index(limit)
+        if not 0 <= limit < (1 << 64):
+            raise ValueError("resource grant must fit uint64")
+        return self._grant_call("quantfunc_resource_set_grant", limit)
+
+    def query_device_grant(self):
+        """Read the device-wide QuantFunc admission ceiling.
+
+        Native accepts only a Shared resource view. The ceiling covers Shared
+        plus every Owned identity on that device; it is permission, not
+        occupancy or a reservation.
+        """
+        return self._grant_call("quantfunc_resource_query_device_grant")
+
+    def set_device_grant(self, limit):
+        limit = operator.index(limit)
+        if not 0 <= limit < (1 << 64):
+            raise ValueError("device grant must fit uint64")
+        return self._grant_call("quantfunc_resource_set_device_grant", limit)
+
+    def set_domain_grants(self, owned, mask, *, owner_limit_bytes=0,
+                          shared_limit_bytes=0, device_limit_bytes=0):
+        """Atomically publish selected Owner/Shared/device limits through a Shared view."""
+        mask = operator.index(mask)
+        known = (QUANTFUNC_RESOURCE_GRANT_OWNER | QUANTFUNC_RESOURCE_GRANT_SHARED |
+                 QUANTFUNC_RESOURCE_GRANT_DEVICE)
+        if mask == 0 or mask & ~known:
+            raise ValueError("domain grant mask must select only Owner/Shared/device")
+        if bool(mask & QUANTFUNC_RESOURCE_GRANT_OWNER) != (owned is not None):
+            raise ValueError("domain grant Owner selection and owned resource must match")
+        if owned is not None:
+            if not isinstance(owned, NativeResource):
+                raise TypeError("owned domain grant target must be a NativeResource")
+            if owned is self:
+                raise ValueError("domain grant Owner target cannot be the Shared view")
+            if library_identity(owned._lib) != library_identity(self._lib):
+                raise ValueError("domain grant views belong to different native libraries")
+
+        limits = [operator.index(value) for value in
+                  (owner_limit_bytes, shared_limit_bytes, device_limit_bytes)]
+        if any(value < 0 or value >= (1 << 64) for value in limits):
+            raise ValueError("domain grant limits must fit uint64")
+        selections = (QUANTFUNC_RESOURCE_GRANT_OWNER, QUANTFUNC_RESOURCE_GRANT_SHARED,
+                      QUANTFUNC_RESOURCE_GRANT_DEVICE)
+        if any(not mask & bit and value != 0 for bit, value in zip(selections, limits)):
+            raise ValueError("unselected domain grant limits must be zero")
+
+        resources = [self] if owned is None else sorted((self, owned), key=id)
+
+        def call():
+            for resource in resources:
+                resource._check_open()
+            function = getattr(self._lib, "quantfunc_resource_set_domain_grants", None)
+            if function is None:
+                raise NativeContractUnavailable(
+                    "QuantFunc library lacks quantfunc_resource_set_domain_grants")
+            function.restype = ctypes.c_int
+            function.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                 ctypes.POINTER(_ResourceDomainGrants),
+                                 ctypes.POINTER(_ResourceDomainGrantsResult)]
+            command = _ResourceDomainGrants(
+                ctypes.sizeof(_ResourceDomainGrants),
+                QUANTFUNC_RESOURCE_DOMAIN_GRANTS_ABI_VERSION, mask, 0, *limits)
+            out = _ResourceDomainGrantsResult(
+                ctypes.sizeof(_ResourceDomainGrantsResult),
+                QUANTFUNC_RESOURCE_DOMAIN_GRANTS_ABI_VERSION)
+            owned_pointer = ctypes.c_void_p() if owned is None else owned._pointer
+            if function(self._pointer, owned_pointer, ctypes.byref(command),
+                        ctypes.byref(out)) != QUANTFUNC_OK:
+                raise RuntimeError(f"QuantFunc atomic domain grant failed: {last_err(self._lib)}")
+            if out.state != QUANTFUNC_RESOURCE_READY or out.applied_mask != mask:
+                raise RuntimeError(
+                    f"QuantFunc atomic domain grant unavailable (state={out.state}, "
+                    f"applied_mask={out.applied_mask}, requested_mask={mask})")
+            return ResourceDomainGrantsResult(out.state, out.applied_mask)
+
+        if len(resources) == 1:
+            with resources[0]._lock:
+                return call()
+        with resources[0]._lock:
+            with resources[1]._lock:
+                return call()
+
     def release_eligible(self, requested):
         requested = operator.index(requested)
         if not 0 <= requested < (1 << 64):
@@ -258,6 +545,25 @@ class NativeResource:
             out = _ResourceRelease(ctypes.sizeof(_ResourceRelease), QUANTFUNC_RESOURCE_ABI_VERSION)
             if self._lib.quantfunc_resource_release_eligible(self._pointer, requested, ctypes.byref(out)) != QUANTFUNC_OK:
                 raise RuntimeError(f"QuantFunc eligible release failed: {last_err(self._lib)}")
+            return ResourceRelease(out.state, out.freed_bytes if out.state == QUANTFUNC_RESOURCE_READY else None)
+
+    def release_all(self):
+        """Checked exact-resource full release; Ready alone carries freed bytes.
+
+        Does not change grants or revive a Closed identity. A retained Closed
+        view is deliberately forwarded to native for final old-owner cleanup.
+        """
+        with self._lock:
+            self._check_open()
+            function = getattr(self._lib, "quantfunc_resource_release_all", None)
+            if function is None:
+                raise NativeContractUnavailable("QuantFunc native resource full eviction is unsupported: "
+                                                "quantfunc_resource_release_all is unavailable")
+            function.restype = ctypes.c_int
+            function.argtypes = [ctypes.c_void_p, ctypes.POINTER(_ResourceRelease)]
+            out = _ResourceRelease(ctypes.sizeof(_ResourceRelease), QUANTFUNC_RESOURCE_ABI_VERSION)
+            if function(self._pointer, ctypes.byref(out)) != QUANTFUNC_OK:
+                raise RuntimeError(f"QuantFunc full resource release failed: {last_err(self._lib)}")
             return ResourceRelease(out.state, out.freed_bytes if out.state == QUANTFUNC_RESOURCE_READY else None)
 
     def close(self):
@@ -780,7 +1086,7 @@ def _refuse_session_knobs_in_create(config_json):
     pipeline cache identity upstream and silently reintroduce a full model rebuild on every
     widget change — refuse loud, both the dict and the pre-serialized-string form."""
     cfg = config_json
-    if isinstance(cfg, str):
+    if isinstance(cfg, (str, bytes, bytearray)):
         try:
             cfg = json.loads(cfg)
         except Exception:  # noqa: BLE001 — unparseable JSON: the engine's own create refuses it loudly
@@ -810,27 +1116,20 @@ def _refuse_session_knobs_in_create(config_json):
             "the whole pipeline on every widget change.")
 
 
-def create_pipeline(lib, *, model_dir, transformer_path=None, model_backend="svdq",
-                    device_idx=0, config_json=None, prepared_resource=None):
-    """Optionally borrow a pre-registered native identity for model creation.
+def make_create_params(*, model_dir, transformer_path=None, model_backend="svdq",
+                       device_idx=0, config_json=None):
+    """Normalize one retained recipe for both configuration and creation.
 
-    The resource view is serialized against close throughout the native call.
-    As with other view operations, same-thread reentry is unsupported.
-    Native code remains authoritative for device, lifecycle and owner adoption.
+    Does not load a library or model. Caller dictionaries are not mutated.
+    The returned structure owns its encoded strings; never log it because the
+    config may contain authentication credentials.
     """
-    if prepared_resource is not None:
-        if prepared_resource._lib is not lib:
-            raise ValueError("prepared resource belongs to a different native library wrapper")
-        device_idx = operator.index(device_idx)
-        if not 0 <= device_idx < (1 << 31):
-            raise ValueError("resource device must fit nonnegative int32")
-        create_with_resource = getattr(lib, "quantfunc_create_with_resource", None)
-        if create_with_resource is None:
-            raise RuntimeError("QuantFunc library lacks quantfunc_create_with_resource; update the native library")
-        create_with_resource.restype = ctypes.c_int
-        create_with_resource.argtypes = [ctypes.POINTER(InitParams), ctypes.c_void_p,
-                                         ctypes.POINTER(ctypes.c_void_p)]
+    device_idx = operator.index(device_idx)
+    if not 0 <= device_idx < (1 << 31):
+        raise ValueError("resource device must fit nonnegative int32")
     _refuse_session_knobs_in_create(config_json)   # [session-knobs] session knob ≠ create key
+    if isinstance(config_json, dict):
+        config_json = dict(config_json)
     # [metadata-KV disk cache — user 2026-09-01 "为啥metadata每次都重新请求后端 不是有缓存吗"]
     # The engine HAS a two-tier keymap/metadata cache (process mem → disk CIPHERTEXT at
     # <_cache_dir>/.quantfunc_keymap_cache/), but the disk tier arms only when create passes
@@ -860,6 +1159,34 @@ def create_pipeline(lib, *, model_dir, transformer_path=None, model_backend="svd
         cj = json.dumps(config_json) if isinstance(config_json, dict) else config_json
         p._keep.append(_enc(cj))
         p.config_json = p._keep[-1]
+    return p
+
+
+def create_pipeline(lib, *, prepared_resource=None, create_params=None, **create_kwargs):
+    """Create from one recipe; serialize the resource view against close.
+
+    Native code remains authoritative for device, lifecycle and owner adoption.
+    Explicit params cannot be combined with a second, potentially different
+    recipe. Same-thread resource reentry is unsupported.
+    """
+    if FACTORY_PREPARE_ONLY.get():
+        raise RuntimeError("QuantFunc factory attempted model creation during dependency preparation")
+    if create_params is not None and create_kwargs:
+        raise ValueError("use retained create_params or create keywords, not both")
+    p = make_create_params(**create_kwargs) if create_params is None else create_params
+    if not isinstance(p, InitParams):
+        raise TypeError("creation requires InitParams")
+    # Explicit structs must not bypass the common session/create boundary.
+    _refuse_session_knobs_in_create(p.config_json)
+    if prepared_resource is not None:
+        if prepared_resource._lib is not lib:
+            raise ValueError("prepared resource belongs to a different native library wrapper")
+        create_with_resource = getattr(lib, "quantfunc_create_with_resource", None)
+        if create_with_resource is None:
+            raise NativeContractUnavailable("QuantFunc library lacks quantfunc_create_with_resource")
+        create_with_resource.restype = ctypes.c_int
+        create_with_resource.argtypes = [ctypes.POINTER(InitParams), ctypes.c_void_p,
+                                         ctypes.POINTER(ctypes.c_void_p)]
     handle = ctypes.c_void_p()
     if prepared_resource is not None:
         with prepared_resource._lock:
@@ -936,9 +1263,43 @@ class QFEngineHandle:
     """Owns the .so + created pipeline + the (single, per-pipeline) open denoise session.
     Tracks the session HERE (not only on the model shim) so a stale session from a failed run is
     cleaned up before the next begin, and destroy() always closes it."""
-    def __init__(self, lib, pipeline, footprint_bytes=0):
+    @classmethod
+    def create(cls, lib, *, capacity_bytes=0, footprint_bytes=0, prepared_resource=None,
+               create_params=None, **create_kwargs):
+        """Consume a retained cold identity, or prepare one for standalone use.
+
+        A caller-provided view remains caller-owned on failure. Retaining this
+        same Python object lets host resource adapters outlive pipeline teardown;
+        the existing NativeResource finalizer closes its view at last ownership.
+        No host registration or grant is implied by this factory.
+        """
+        if create_params is not None and create_kwargs:
+            raise ValueError("use retained create_params or create keywords, not both")
+        if create_params is not None and not isinstance(create_params, InitParams):
+            raise TypeError("creation requires InitParams")
+        device = create_params.device_idx if create_params is not None else create_kwargs.get("device_idx", 0)
+        resource = (NativeResource.prepare(lib, device)
+                    if prepared_resource is None else prepared_resource)
+        pipeline = None
+        try:
+            pipeline = create_pipeline(lib, prepared_resource=resource,
+                                       create_params=create_params, **create_kwargs)
+            return cls(lib, pipeline, footprint_bytes=footprint_bytes, resource=resource,
+                       capacity_bytes=capacity_bytes)
+        except BaseException:
+            try:
+                if pipeline is not None:
+                    lib.quantfunc_destroy(pipeline)
+            finally:
+                if prepared_resource is None:
+                    resource.close()
+            raise
+
+    def __init__(self, lib, pipeline, footprint_bytes=0, resource=None, capacity_bytes=0):
         self.lib = lib
         self.pipeline = pipeline
+        self.resource = resource
+        self.capacity_bytes = int(capacity_bytes)
         self.footprint_bytes = int(footprint_bytes)
         self.current_session = None          # ctypes.c_void_p of the open session, or None
         self.step_count = 0                  # total denoise_step calls (instrument)
@@ -1038,20 +1399,22 @@ class QFEngineHandle:
         ([B,C,H,W] image / [B,C,T,H,W] video — the exact latent the session will step on) via
         quantfunc_vram_need_bytes: the primary transformer's MEASURED working set under that shape (else the same
         spatial shape at another batch scaled, else the model's config estimate) + the engine's plan margin − the
-        allocator's cached pool it already holds. 0 = UNKNOWN (old .so / unloaded / no pipeline / nothing measured
-        yet) — the caller treats it as "no extra number", never as "needs nothing"."""
-        if self.pipeline is None or self.unloaded or not hasattr(self.lib, "quantfunc_vram_need_bytes"):
+        allocator's cached pool it already holds. This legacy estimate is not a
+        complete cold-request peak bound. A successful zero remains ambiguous
+        (covered or not measured); an ABI error/missing query is never that zero."""
+        if self.pipeline is None or self.unloaded:
             return 0
+        if not hasattr(self.lib, "quantfunc_vram_need_bytes"):
+            raise RuntimeError("QuantFunc library lacks quantfunc_vram_need_bytes; update the native library")
         dims = [int(d) for d in latent_shape]
         if not dims or any(d <= 0 for d in dims):
             return 0
         arr = (ctypes.c_int64 * len(dims))(*dims)
         out = ctypes.c_uint64(0)
-        try:
-            st = self.lib.quantfunc_vram_need_bytes(self.pipeline, arr, len(dims), ctypes.byref(out))
-        except Exception:  # noqa: BLE001
-            return 0
-        return int(out.value) if st == QUANTFUNC_OK else 0
+        st = self.lib.quantfunc_vram_need_bytes(self.pipeline, arr, len(dims), ctypes.byref(out))
+        if st != QUANTFUNC_OK:
+            raise RuntimeError(f"QuantFunc demand query failed: {last_err(self.lib)}")
+        return int(out.value)
 
     def unload_vram(self):
         """Synchronously reclaim and return native confirmed bytes, never file size.
@@ -1078,6 +1441,13 @@ class QFEngineHandle:
         st = self.lib.quantfunc_unload_sync_ex(self.pipeline, ctypes.byref(freed))
         if st != QUANTFUNC_OK:
             raise RuntimeError(f"QuantFunc VRAM unload failed: {last_err(self.lib)}")
+        if _os.environ.get("QF_NATIVE_PROF") == "1" and self.resource is not None:
+            try:
+                owner = self.resource.query()
+                with NativeResource.shared(self.lib, owner.device) as shared:
+                    _dbg_prof(f"unload resource owner={owner} shared={shared.query()} confirmed_freed={freed.value}")
+            except Exception as diagnostic_error:
+                _dbg_prof(f"unload resource snapshot unavailable ({type(diagnostic_error).__name__})")
         self.unloaded = True
         return int(freed.value)
 
@@ -1089,3 +1459,8 @@ class QFEngineHandle:
             except Exception:  # noqa: BLE001
                 pass
             self.pipeline = None
+        if self.resource is not None:
+            # Drop this handle's reference, not another consumer's native view.
+            # NativeResource's existing finalizer closes the last retained view;
+            # neither this nor view destruction certifies physical GPU release.
+            self.resource = None

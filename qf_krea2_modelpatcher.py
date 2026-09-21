@@ -215,10 +215,8 @@ class QFKrea2Model(QFSessionModelMixin, comfy.model_base.Krea2):
 
 def register(deps):
     get_engine = deps["get_engine"]
-    peek_engine = deps.get("peek_engine")   # ledger reads: cached handle or None, never a create
     bind_pipeline_model = deps["bind_pipeline_model"]
     retire_handle = deps["retire_handle"]
-    estimate_footprint = deps["estimate_footprint"]
 
     def build(transformer1_path, transformer2_path, bundle_dir=None,
               lora_entries=(), sparse_opts=None):
@@ -239,13 +237,12 @@ def register(deps):
             _lora_cfg = dict(create_extra or {})
             if lora_entries:
                 _lora_cfg["lora"] = list(lora_entries)   # engine svdq load: sidecar apply post-load
+            device, device_idx = qfmp.current_torch_device()
             _factory, _register_model = qfmp.make_engine_factory(
-                lambda: get_engine(model_dir, create_cfg=(_lora_cfg or None)),
-                bind_pipeline_model,
-                peek_engine_fn=(lambda: peek_engine(model_dir, create_cfg=(_lora_cfg or None))) if peek_engine else None)
-            engine = qfmp.QFLazyEngine(_factory, estimate_footprint(model_dir),
-                                       retire=retire_handle)
-            device = comfy.model_management.get_torch_device()
+                lambda: get_engine(model_dir, create_cfg=(_lora_cfg or None),
+                                   device_idx=device_idx),
+                bind_pipeline_model)
+            engine = qfmp.QFLazyEngine(_factory, retire=retire_handle)
             offload = comfy.model_management.unet_offload_device()
             unet_config = {"image_model": "krea2", "disable_unet_model_creation": True}
             model_config = comfy.supported_models.Krea2(unet_config)
@@ -254,7 +251,7 @@ def register(deps):
             _register_model(model)
             patcher = QFModelPatcher(model, load_device=device, offload_device=offload)
             print(f"[qf_native] loaded QuantFuncNativeLoader (Krea-2 t2i svdq) package={model_name} "
-                  f"footprint~{engine.footprint_bytes // (1024*1024)}MB (create deferred)", flush=True)
+                  f"capacity=native Prepared query (create deferred)", flush=True)
             return qfmp.tag_lora_rebuild(patcher, lora_entries, _build)
 
         return _build(list(lora_entries))

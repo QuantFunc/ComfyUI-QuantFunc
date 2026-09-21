@@ -17,7 +17,7 @@ import unittest
 import weakref
 from unittest import mock
 
-PROBE_CLONE_HANDOFF = "--probe-clone-handoff" in sys.argv
+PROBE_OWNER_LEDGER = "--probe-owner-ledger" in sys.argv
 root = os.environ.get("COMFY_ROOT")
 if not root or not (Path(root) / "comfy/model_management.py").is_file():
     print("[SKIP] host_scheduler_contract: set COMFY_ROOT to the tested host")
@@ -27,8 +27,6 @@ sys.argv = [sys.argv[0], "--cpu"]
 import comfy.options
 comfy.options.enable_args_parsing()
 import torch
-import execution
-import nodes
 import comfy.model_management as mm
 
 pkg = types.ModuleType("qf_host_contract")
@@ -69,15 +67,21 @@ class NativeLibrary:
     def quantfunc_last_error(self):
         return b"contract: native refused"
 
+    def quantfunc_vram_need_bytes(self, pipeline, dims, ndim, out):
+        out._obj.value = 0
+        return 0
+
 
 class HostSchedulerContract(unittest.TestCase):
     def setUp(self):
         self.library = NativeLibrary()
         self.engine = qfe.QFEngineHandle(self.library, ctypes.c_void_p(1), footprint_bytes=1024)
         self.model = torch.nn.Module()
+        self.model.contract_weight = torch.nn.Parameter(torch.ones(32, dtype=torch.float32))
         self.model.device = torch.device("cuda:0")
         self.model._qf = self.engine
-        self.patcher = qfm.QFModelPatcher(self.model, self.model.device, torch.device("cpu"), size=1024)
+        self.patcher = qfm.QFModelPatcher(self.model, self.model.device, torch.device("cpu"))
+        self.model.model_loaded_weight_memory = mm.module_size(self.model)
 
     def tearDown(self):
         # No native calls from fixture teardown.
@@ -85,104 +89,216 @@ class HostSchedulerContract(unittest.TestCase):
         self.patcher = None
         gc.collect()
 
-    def test_zero_residency_is_not_replaced_with_file_size(self):
-        self.library.held = 0
-        self.assertEqual(self.patcher.loaded_size(), 0)
+    def probe_owned_residency_excludes_peers_and_shared_cache(self):
+        """Production-base acceptance RED, separate from the passing bridge suite.
 
-    def test_query_failure_is_not_replaced_with_file_size(self):
-        self.library.query_status = 1
-        with self.assertRaisesRegex(RuntimeError, "native refused"):
-            self.patcher.loaded_size()
-
-    def test_native_measurement_wins_over_unloaded_flag(self):
-        self.engine.unloaded = True
-        self.assertEqual(self.patcher.loaded_size(), 512)
-
-    def test_cold_lazy_handle_is_zero_without_creating_engine(self):
-        creates = []
-        def factory():
-            creates.append(True)
-            return self.engine, "key"
-        self.model._qf = qfm.QFLazyEngine(factory, 1024)
-        self.patcher.partially_load(self.model.device, 1)
-        self.assertEqual(self.patcher.loaded_size(), 0)
-        self.assertEqual(creates, [])
-
-    def test_failed_unload_preserves_registration_and_next_prompt_runs(self):
-        self._assert_failed_reclaim_preserves_registration(expected_unloads=1)
-
-    def test_query_failure_in_eviction_sizing_preserves_registration_and_next_prompt_runs(self):
-        self.library.query_status = 1
-        self._assert_failed_reclaim_preserves_registration(expected_unloads=0)
-        self.assertGreater(self.library.query_calls, 0)
-
-    def _assert_failed_reclaim_preserves_registration(self, expected_unloads):
-        loaded = mm.LoadedModel(self.patcher)
-        loaded.real_model = weakref.ref(self.model)
-        loaded.model_finalizer = weakref.finalize(self.model, lambda: None)
-        previous = mm.current_loaded_models[:]
-        mm.current_loaded_models[:] = [loaded]
-        device = self.model.device
-
-        class ProbeNode:
-            RETURN_TYPES = ()
-            FUNCTION = "run"
-            OUTPUT_NODE = True
-
-            @classmethod
-            def INPUT_TYPES(cls):
-                return {"required": {"reclaim": ("BOOLEAN",)}}
-
-            def run(self, reclaim):
-                if reclaim:
-                    mm.free_memory(1024, device)
-                return ()
-
-        events = []
-        server = types.SimpleNamespace(
-            client_id=None, last_node_id=None,
-            send_sync=lambda event, data, sid: events.append((event, data)),
-        )
-        executor = execution.PromptExecutor(server, cache_type=execution.CacheType.NONE,
-                                            cache_args={"ram": 0, "ram_inactive": 0})
+        Two real handles/patchers share a device. Only the native ABI is doubled;
+        each owner has a different measured count and the device includes Shared.
+        Querying an owner must not report its peer or the Shared dependency.
+        """
+        counts = {11: 512, 22: 1024, 33: 2048}
+        self.library.held = 512 + 1024 + 2048
+        def residency(pointer, out):
+            out._obj.state = qfe.QUANTFUNC_RESOURCE_READY
+            out._obj.resident_bytes = counts[pointer.value]
+            return 0
+        def query(pointer, out):
+            out._obj.state = qfe.QUANTFUNC_RESOURCE_READY
+            out._obj.device = 0
+            out._obj.owner_epoch = 0 if pointer.value == 33 else pointer.value
+            out._obj.capabilities = 3
+            return 0
+        def lifecycle(pointer, out):
+            out._obj.state = qfe.QUANTFUNC_RESOURCE_READY
+            out._obj.phase = (qfe.QUANTFUNC_RESOURCE_PHASE_SHARED
+                              if pointer.value == 33 else qfe.QUANTFUNC_RESOURCE_PHASE_ATTACHED)
+            return 0
+        def domain(pointer, out):
+            out._obj.state = qfe.QUANTFUNC_RESOURCE_READY
+            out._obj.resident_bytes = sum(counts.values())
+            return 0
+        def grant(pointer, out):
+            out._obj.state = qfe.QUANTFUNC_RESOURCE_READY
+            out._obj.enrolled = 1
+            out._obj.limit_bytes = counts.get(pointer.value, sum(counts.values()))
+            out._obj.pending_bytes = 0
+            return 0
+        def shared(device, version, out):
+            out._obj.value = 33
+            return 0
+        def unexpected(*args):
+            raise AssertionError("read-only graph expansion must not acquire an attached owner or release backing")
+        self.library.quantfunc_resource_acquire = unexpected
+        self.library.quantfunc_resource_release_eligible = unexpected
+        self.library.quantfunc_last_error = lambda: b"owner graph boundary refused"
+        self.library.quantfunc_resource_query = query
+        self.library.quantfunc_resource_query_lifecycle = lifecycle
+        self.library.quantfunc_resource_query_residency = residency
+        self.library.quantfunc_resource_query_domain_residency = domain
+        self.library.quantfunc_resource_query_grant = grant
+        self.library.quantfunc_resource_query_device_grant = grant
+        self.library.quantfunc_resource_acquire_shared = shared
+        self.library.quantfunc_resource_destroy = lambda _: None
+        # Validate the full production binder before the intended missing-graph
+        # assertion, so future wiring cannot be blocked by an incomplete double.
+        with qfe.NativeResource.shared(self.library, 0) as shared_view:
+            self.assertEqual(shared_view.residency().resident_bytes, 2048)
+        resources = [qfe.NativeResource(self.library, ctypes.c_void_p(key))
+                     for key in (11, 22)]
         try:
-            with mock.patch.dict(nodes.NODE_CLASS_MAPPINGS, {"QFHostContract": ProbeNode}), mock.patch.object(
-                mm, "get_free_memory", return_value=0
-            ):
-                with self.assertLogs(level="ERROR"):
-                    executor.execute({"1": {"class_type": "QFHostContract", "inputs": {"reclaim": True}}},
-                                     "failed-unload", {"client_id": "contract"}, ["1"])
-                self.assertFalse(executor.success)
-                errors = [data for event, data in events if event == "execution_error"]
-                self.assertEqual(len(errors), 1)
-                self.assertIn("native refused", errors[0]["exception_message"])
-                self.assertEqual(self.library.unload_calls, expected_unloads)
-                self.assertFalse(self.engine.unloaded)
-                self.assertEqual(mm.current_loaded_models, [loaded])
-                self.assertIs(loaded.real_model(), self.model)
-                self.assertTrue(loaded.model_finalizer.alive)
-                executor.execute({"2": {"class_type": "QFHostContract", "inputs": {"reclaim": False}}},
-                                 "next-prompt", {"client_id": "contract"}, ["2"])
-                self.assertTrue(executor.success)
-                self.assertTrue(any(event == "execution_success" and data["prompt_id"] == "next-prompt"
-                                    for event, data in events))
+            models, patchers = [], []
+            for index, resource in enumerate(resources):
+                model = torch.nn.Module()
+                model.device = torch.device("cuda:0")
+                model._qf = qfe.QFEngineHandle(
+                    self.library, ctypes.c_void_p(index + 1), 4096, resource=resource)
+                models.append(model)
+                patchers.append(qfm.QFModelPatcher(model, model.device, torch.device("cpu")))
+            # Physical records belong to canonical dependencies, not logical
+            # MODEL wrappers. Both official host expansion paths must see them.
+            published = [p.model_patches_models() for p in patchers]
+            self.assertEqual([len(group) for group in published], [2, 2])
+            dependencies = [set(group) for group in published]
+            self.assertEqual([sorted(d.loaded_size() for d in group) for group in dependencies],
+                             [[512, 2048], [1024, 2048]],
+                             "each MODEL must expose its owner plus canonical Shared")
+            for patcher, expected in zip(patchers, dependencies):
+                self.assertEqual(set(patcher.get_nested_additional_models()), expected)
+                self.assertEqual(set(patcher.clone().model_patches_models()), expected)
+            common = dependencies[0] & dependencies[1]
+            self.assertEqual(len(common), 1)
+            self.assertEqual(next(iter(common)).loaded_size(), 2048)
+            self.assertEqual([p.loaded_size() for p in patchers], [0, 0],
+                             "logical wrappers must not double-charge dependencies")
+            self.assertEqual(sum(d.loaded_size() for d in set.union(*dependencies)), 3584)
+            counts[11] = 0
+            self.assertEqual([sorted(d.loaded_size() for d in group) for group in dependencies],
+                             [[0, 2048], [1024, 2048]])
         finally:
-            mm.current_loaded_models[:] = previous
-            if loaded.model_finalizer is not None:
-                loaded.model_finalizer.detach()
+            for resource in resources:
+                resource.close()
 
-    def test_partial_shortfall_is_returned_to_host_without_full_eviction(self):
-        self.assertEqual(self.patcher.partially_unload(torch.device("cpu"), 128), 64)
-        self.assertEqual(self.patcher.loaded_size(), 448)
-        self.assertEqual(self.library.unload_calls, 0)
+    def test_logical_patcher_reports_only_official_torch_bytes(self):
+        torch_bytes = self.model.contract_weight.nbytes
+        self.library.held = 8192
+        self.library.query_status = 1
+        self.engine.unloaded = True
+        self.assertEqual(self.patcher.model_size(), torch_bytes)
+        self.assertEqual(self.patcher.loaded_size(), torch_bytes)
+        self.assertEqual(mm.LoadedModel(self.patcher).model_loaded_memory(), torch_bytes)
+        self.assertEqual(self.library.query_calls, 0)
 
-    def test_zero_partial_request_is_inert(self):
-        self.assertEqual(self.patcher.partially_unload(torch.device("cpu"), 0), 0)
+    def test_common_model_demand_failure_reaches_host(self):
+        class Model(qfm.QFSessionModelMixin):
+            pass
+        model = Model()
+        model._qf = self.engine
+        def demand(*args):
+            raise RuntimeError("native demand unavailable")
+        self.library.quantfunc_vram_need_bytes = demand
+        with self.assertRaisesRegex(RuntimeError, "native demand unavailable"):
+            model.memory_required([1, 16, 64, 64])
+
+    def test_real_family_models_share_demand_failure_and_torch_only_reclaim(self):
+        # Real constructors/MRO, not extracted methods or renamed dummy models.
+        # Only the native CUDA library is replaced, as in the other host tests.
+        import comfy.supported_models as supported
+        cases = (
+            ("qf_wan_modelpatcher", "QFWanModel", "WAN21_I2V", "wan2.1", {"start_image": None}),
+            ("qf_h3_modelpatcher", "QFH3Model", "MiniMaxH3", "minimax_h3", {}),
+            ("qf_krea2_modelpatcher", "QFKrea2Model", "Krea2", "krea2", {}),
+            ("qf_ltx_modelpatcher", "QFLTXModel", "LTXV", "ltxv", {"connector": None}),
+            ("qf_ltx_modelpatcher", "QFLTXAVModel", "LTXAV", "ltxav", {}),
+        )
+        for module_name, class_name, config_name, image_model, kwargs in cases:
+            with self.subTest(model=class_name):
+                module = importlib.import_module(f"qf_host_contract.{module_name}")
+                cfg = getattr(supported, config_name)({
+                    "image_model": image_model, "model_type": "i2v",
+                    "disable_unet_model_creation": True,
+                })
+                qfm.ensure_model_config_attrs(cfg)
+                model = getattr(module, class_name)(cfg, self.engine, device=torch.device("cpu"), **kwargs)
+                patcher = module.QFModelPatcher(model, torch.device("cpu"), torch.device("cpu"))
+                model.contract_weight = torch.nn.Parameter(torch.ones(8, dtype=torch.float32))
+                torch_bytes = mm.module_size(model)
+                model.model_loaded_weight_memory = torch_bytes
+                self.library.held = 512
+                self.assertEqual(mm.LoadedModel(patcher).model_loaded_memory(), torch_bytes)
+                freed = patcher.partially_unload(torch.device("cpu"), 1)
+                self.assertGreater(freed, 0)
+                self.assertEqual(patcher.loaded_size(), torch_bytes - freed)
+                self.assertEqual(self.library.held, 512)
+                self.assertEqual(self.library.unload_calls, 0)
+                def demand(*args):
+                    raise RuntimeError("family demand unavailable")
+                self.library.quantfunc_vram_need_bytes = demand
+                with self.assertRaisesRegex(RuntimeError, "family demand unavailable"):
+                    model.memory_required([1, 16, 64, 64])
+
+    def test_official_outer_sample_supplies_current_av_geometry_before_admission(self):
+        import comfy.samplers
+        import comfy.nested_tensor
+        import comfy.supported_models as supported
+
+        # Use the real sample/pack/wrapper dispatch. Only the GPU sampling body
+        # is replaced with an admission probe, before inner_sample writes shapes.
+        class AdmissionProbe(comfy.samplers.CFGGuider):
+            cancel = False
+            def outer_sample(self, noise, latent_image, *args, **kwargs):
+                self.model_patcher.model.memory_required(list(noise.shape))
+                if self.cancel:
+                    raise KeyboardInterrupt("cancel admission probe")
+                return latent_image
+
+        for modname, clsname, cfgname, image_model, channels in (
+            ("qf_h3_modelpatcher", "QFH3Model", "MiniMaxH3", "minimax_h3", 24),
+            ("qf_ltx_modelpatcher", "QFLTXAVModel", "LTXAV", "ltxav", 128),
+        ):
+            with self.subTest(model=clsname):
+                cfg = getattr(supported, cfgname)({"image_model": image_model, "disable_unet_model_creation": True})
+                qfm.ensure_model_config_attrs(cfg)
+                cls = getattr(importlib.import_module(f"qf_host_contract.{modname}"), clsname)
+                model = cls(cfg, self.engine, device=torch.device("cpu"))
+                patcher = qfm.QFModelPatcher(model, torch.device("cpu"), torch.device("cpu"))
+                observed = []
+                def native_demand(pipeline, dims, ndim, out):
+                    observed.append(list(dims))
+                    if any(d <= 0 or d > 32768 for d in dims):
+                        return 1  # actual native API's extent validation
+                    out._obj.value = 4096
+                    return 0
+                self.library.quantfunc_vram_need_bytes = native_demand
+                # Missing metadata; changed N; same N but a different aspect.
+                for height, width in ((28, 48), (32, 48), (24, 64)):
+                    video = torch.zeros((1, channels, 37, height, width))
+                    audio = torch.zeros((1, 8, 16, 16))
+                    latent = comfy.nested_tensor.NestedTensor((video, audio))
+                    # Clone must retain exactly the same common hook semantics.
+                    guider = AdmissionProbe(patcher.clone())
+                    result = guider.sample(latent, latent, None, torch.tensor([1.0, 0.0]))
+                    self.assertEqual(observed[-1], [1, channels, 37, height, width])
+                    self.assertEqual(tuple(result.unbind()[0].shape), tuple(video.shape))
+                    # A direct caller's metadata is visible again after scope
+                    # exit; leaking the request context makes this return H/W.
+                    alternate = (1, channels, 37, 1, height * width)
+                    model.latent_shapes = [alternate, audio.shape]
+                    packed = [1, 1, video.numel() + audio.numel()]
+                    self.assertEqual(model._qf_engine_latent_dims(packed), list(alternate))
+                guider.cancel = True
+                with self.assertRaisesRegex(KeyboardInterrupt, "cancel admission probe"):
+                    guider.sample(latent, latent, None, torch.tensor([1.0, 0.0]))
+                self.assertEqual(model._qf_engine_latent_dims(packed), list(alternate))
+
+    def test_logical_partial_unload_reclaims_only_torch_weights(self):
+        torch_bytes = self.patcher.loaded_size()
+        self.assertEqual(self.patcher.partially_unload(torch.device("cpu"), 1), torch_bytes)
+        self.assertEqual(self.patcher.loaded_size(), 0)
         self.assertEqual(self.library.held, 512)
+        self.assertEqual(self.library.query_calls, 0)
         self.assertEqual(self.library.unload_calls, 0)
 
-    def test_host_full_eviction_completes_before_record_is_removed(self):
-        self.library.unload_status = 0
+    def test_logical_full_unload_leaves_native_reclaim_to_dependencies(self):
         self.model.contract_value = "patched"
         self.patcher.object_patches_backup["contract_value"] = "original"
         detached = []
@@ -195,9 +311,10 @@ class HostSchedulerContract(unittest.TestCase):
         try:
             with mock.patch("threading.Timer", side_effect=AssertionError("host eviction must not start a timer")):
                 self.assertTrue(loaded.model_unload())
-            self.assertEqual(self.library.held, 0)
-            self.assertEqual(self.library.unload_calls, 1)
-            self.assertEqual(detached, [(True, 0)])
+            self.assertEqual(self.library.held, 512)
+            self.assertEqual(self.library.query_calls, 0)
+            self.assertEqual(self.library.unload_calls, 0)
+            self.assertEqual(detached, [(True, 512)])
             self.assertEqual(self.model.contract_value, "original")
             self.assertIsNone(loaded.real_model)
             self.assertFalse(finalizer.alive)
@@ -213,25 +330,6 @@ class HostSchedulerContract(unittest.TestCase):
         self.assertEqual(self.library.held, 512)
         self.assertEqual(self.library.unload_calls, 0)
         self.assertEqual(detached, [False])
-
-    def test_residual_residency_prevents_successful_full_detach(self):
-        def incomplete_release(pipeline, out):
-            out._obj.value = 128
-            self.library.held = 384
-            return 0
-        self.library.quantfunc_unload_sync_ex = incomplete_release
-        loaded = mm.LoadedModel(self.patcher)
-        loaded.real_model = weakref.ref(self.model)
-        loaded.model_finalizer = weakref.finalize(self.model, lambda: None)
-        try:
-            with self.assertRaisesRegex(RuntimeError, "384.*resident"):
-                loaded.model_unload()
-            self.assertIs(loaded.real_model(), self.model)
-            self.assertTrue(loaded.model_finalizer.alive)
-            self.assertEqual(self.patcher.loaded_size(), 384)
-        finally:
-            if loaded.model_finalizer is not None:
-                loaded.model_finalizer.detach()
 
     def test_ledger_log_does_not_label_failed_residency_query_as_zero(self):
         class Model(qfm.QFSessionModelMixin):
@@ -255,9 +353,12 @@ class NativeResourceSchedulerContract(unittest.TestCase):
         def acquire(pipeline, version, out):
             out._obj.value = 17
             return 0
+        def shared(device_index, version, out):
+            out._obj.value = 18
+            return 0
         def residency(pointer, out):
             out._obj.state = lib.state
-            out._obj.resident_bytes = lib.held
+            out._obj.resident_bytes = lib.held if pointer.value == 17 else 0
             return lib.status
         def release(pointer, requested, out):
             lib.requests.append(requested)
@@ -269,21 +370,52 @@ class NativeResourceSchedulerContract(unittest.TestCase):
             return lib.status
         def query(pointer, out):
             out._obj.state, out._obj.device = lib.state, lib.device
-            out._obj.owner_epoch, out._obj.capabilities = 123, 3
+            out._obj.owner_epoch = 123 if pointer.value == 17 else 0
+            out._obj.capabilities = 3
             # Deliberately unlike the aggregate: these fields may identify
             # the resource's device but must never become Python byte policy.
             out._obj.cca_live, out._obj.arena_backed = 7000, 9000
             return lib.status
+        def lifecycle(pointer, out):
+            out._obj.state = lib.state
+            out._obj.phase = (qfe.QUANTFUNC_RESOURCE_PHASE_ATTACHED
+                              if pointer.value == 17 else qfe.QUANTFUNC_RESOURCE_PHASE_SHARED)
+            return lib.status
+        def domain(pointer, out):
+            out._obj.state = lib.state
+            out._obj.resident_bytes = lib.held
+            return lib.status
+        def grant(pointer, out):
+            out._obj.state, out._obj.enrolled = lib.state, 1
+            out._obj.limit_bytes, out._obj.pending_bytes = lib.held, 0
+            return lib.status
         lib.quantfunc_resource_acquire = acquire
-        lib.quantfunc_resource_acquire_shared = acquire
+        lib.quantfunc_resource_acquire_shared = shared
         lib.quantfunc_resource_query_residency = residency
+        lib.quantfunc_resource_query_domain_residency = domain
         lib.quantfunc_resource_release_eligible = release
         lib.quantfunc_resource_query = query
+        lib.quantfunc_resource_query_lifecycle = lifecycle
+        lib.quantfunc_resource_query_grant = grant
+        lib.quantfunc_resource_query_device_grant = grant
         lib.quantfunc_resource_destroy = lambda pointer: lib.closed.append(pointer.value)
         lib.quantfunc_last_error = lambda: b"resource contract refused"
         resource = qfe.NativeResource.acquire(lib, ctypes.c_void_p(1))
+        shared_resource = qfe.NativeResource.shared(lib, device)
         self.addCleanup(resource.close)
-        return lib, qfm.QFNativeResourcePatcher(resource)
+        self.addCleanup(shared_resource.close)
+        patcher = qfm.QFNativeResourcePatcher(resource)
+        shared_patcher = qfm.QFNativeResourcePatcher(shared_resource)
+        domain_state = qfm._CanonicalResourceDomain(shared_patcher)
+        shared_patcher._domain = domain_state
+        shared_patcher._shared_adapter = shared_patcher
+        shared_patcher._domain_key = (qfe.library_identity(lib), device)
+        patcher._domain = domain_state
+        patcher._shared_adapter = shared_patcher
+        patcher._domain_key = shared_patcher._domain_key
+        patcher._owner_epoch = 123
+        domain_state.owners[123] = patcher
+        return lib, patcher
 
     @contextlib.contextmanager
     def host_registry(self):
@@ -355,8 +487,9 @@ class NativeResourceSchedulerContract(unittest.TestCase):
             self.assertIs(patcher.clone(), patcher)
             original = next(item for item in mm.current_loaded_models if item.model is patcher)
             finalizer = original.model_finalizer
-            self.load(patcher.clone(), peer)
-            self.assertEqual(len(mm.current_loaded_models), 2)
+            for _ in range(10):
+                self.load(patcher.clone(), peer)
+                self.assertEqual(len(mm.current_loaded_models), 2)
             # This host replaces the finalizer even for a repeat load of the
             # same patcher. Its clone handoff removes the old list entry before
             # unconditional insertion; opting out would duplicate registration.
@@ -430,30 +563,24 @@ class NativeResourceSchedulerContract(unittest.TestCase):
             patcher.add_object_patch("device", torch.device("cuda:1"))
         self.assertEqual(lib.requests, [])
 
-    def probe_clone_handoff_preserves_record_after_native_becomes_busy(self):
-        """Separate acceptance probe: expected host invariant, currently broken.
-
-        Run explicitly with --probe-clone-handoff. Not part of the adapter's
-        passing scoped contract: correcting the host transaction needs separate
-        ComfyUI-core authority. The callback models native becoming Busy in the
-        interval between successful detach(False) and the next size query.
-        """
+    def test_clone_handoff_preflight_busy_preserves_record_before_detach(self):
+        """Observable QF failure is rejected during dependency expansion."""
         lib, patcher = self.make_resource()
         with self.host_registry():
             self.load(patcher)
             original = mm.current_loaded_models[0]
-            patcher.add_callback(qfm.comfy.model_patcher.CallbacksMP.ON_DETACH,
-                                 lambda p, full: setattr(lib, "state", 1))
-            with self.assertRaisesRegex(RuntimeError, "residency unavailable"):
+            finalizer = original.model_finalizer
+            lib.state = qfe.QUANTFUNC_RESOURCE_BUSY
+            with self.assertRaisesRegex(RuntimeError, "preflight.*unavailable"):
                 self.load(patcher)
-            self.assertEqual(mm.current_loaded_models, [original],
-                             "host lost the native resource after clone handoff query failure")
+            self.assertEqual(mm.current_loaded_models, [original])
+            self.assertIs(original.model_finalizer, finalizer)
+            self.assertTrue(finalizer.alive)
 
 
 if __name__ == "__main__":
-    if PROBE_CLONE_HANDOFF:
+    if PROBE_OWNER_LEDGER:
         result = unittest.TextTestRunner().run(unittest.TestSuite([
-            NativeResourceSchedulerContract(
-                "probe_clone_handoff_preserves_record_after_native_becomes_busy")]))
+            HostSchedulerContract("probe_owned_residency_excludes_peers_and_shared_cache")]))
         raise SystemExit(not result.wasSuccessful())
     unittest.main(argv=[sys.argv[0]])

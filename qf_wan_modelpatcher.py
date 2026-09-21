@@ -491,14 +491,15 @@ class QFWanModel(QFSessionModelMixin, comfy.model_base.WAN21):
         return super().process_latent_out(latent)
 
 
-def _wan_device_sm():
+def _wan_device_sm(device=None):
     """The compute-capability tier (major*10+minor) of comfy's torch device, for the OLD-.so
     compat pin's SM gate. Monkeypatchable in the suite (the SM80-never-pins arm). Returns 0
     when CUDA is unavailable/unqueryable — the pin then stays OFF (AUTO decides, fail-safe)."""
     try:
-        import comfy.model_management as _mm
-        dev = _mm.get_torch_device()
-        cap = torch.cuda.get_device_capability(dev)
+        if device is None:
+            import comfy.model_management as _mm
+            device = _mm.get_torch_device()
+        cap = torch.cuda.get_device_capability(device)
         return cap[0] * 10 + cap[1]
     except Exception:  # noqa: BLE001 — no CUDA / CPU device: no pin
         return 0
@@ -506,11 +507,10 @@ def _wan_device_sm():
 
 def register(deps):
     """Return the wan family BUILDER. `deps` gives the package-level helpers (engine cache,
-    liveness registry, footprint estimator, lazy-engine class) without importing __init__."""
+    liveness registry, lazy-engine class) without importing __init__."""
     get_engine = deps["get_engine"]
     bind_pipeline_model = deps["bind_pipeline_model"]
     retire_handle = deps["retire_handle"]
-    estimate_footprint = deps["estimate_footprint"]
     apply_checkpoint_flow_shift = deps["apply_checkpoint_flow_shift"]
 
     def build(transformer1_path, transformer2_path, bundle_dir,
@@ -527,6 +527,7 @@ def register(deps):
                 "preset needs its own config bundle + a single-expert model_config manifest.")
 
         def _build(entries):
+            device, device_idx = qfmp.current_torch_device()
             # One staged, config-complete package per (bundle, file-pair): shipped A14B configs +
             # weight symlinks. Weights stay where the user put them (no copy).
             model_dir = qfmp.stage_denoise_only_package(bundle_dir, transformer1_path,
@@ -550,7 +551,7 @@ def register(deps):
             # everywhere this plugin runs. Gate mirrors the engine's exclusions: never on the
             # SM80 fault tier (falls back to AUTO = the pre-pin behavior there), and only on
             # tiers today's qfa consumable ships kernels for (sm86/89).
-            _sm = _wan_device_sm()
+            _sm = _wan_device_sm(device)
             if _sm in (86, 89):
                 cfg["attention_backend"] = "qfa"
             if sparse_opts:
@@ -576,15 +577,12 @@ def register(deps):
             engine_models = []
 
             def _factory():
-                # comfy's device (0 when CUDA_VISIBLE_DEVICES pins one card; the real index on a
-                # multi-visible setup) — the engine must create on the SAME card comfy computes on.
-                dev = comfy.model_management.get_torch_device()
                 cfg2 = dict(cfg)
                 _union = engine.lora_union()          # late-bound: `engine` is defined below
                 if _union:
                     cfg2["lora"] = _union
                 eng, ckey = get_engine(model_dir, create_cfg=cfg2,
-                                       device_idx=getattr(dev, "index", 0) or 0)
+                                       device_idx=device_idx)
                 # Liveness tracker for the host-RAM sweep: EVERY still-live consumer of the ONE
                 # shared handle (loader pair + any LoRA-rebuilt side models) — bind each, so the
                 # sweep keeps the handle while ANY survives (the registry holds a weakref LIST
@@ -601,24 +599,9 @@ def register(deps):
                         bind_pipeline_model(ckey, _m)
                 return eng, ckey
 
-            # Ledger PEEK (mirrors _factory's identity: same device + the same late-bound LoRA union) —
-            # the cached handle or None, never a create (see qfmp.make_engine_factory / QFLazyEngine.ensure_if_cached).
-            _peek_engine = deps.get("peek_engine")
-            def _peek():
-                if _peek_engine is None:
-                    return None
-                dev = comfy.model_management.get_torch_device()
-                cfg2 = dict(cfg)
-                _union = engine.lora_union()
-                if _union:
-                    cfg2["lora"] = _union
-                return _peek_engine(model_dir, create_cfg=cfg2, device_idx=getattr(dev, "index", 0) or 0)
-            _factory.peek = _peek
-
             # DEFERRED create (QFLazyEngine): a chained QuantFuncNativeLoRA rebuilds for its
             # accumulated set, so an eager create here would build ONE PIPELINE PER CHAIN LINK.
-            engine = qfmp.QFLazyEngine(_factory, estimate_footprint(model_dir),
-                                      retire=retire_handle)
+            engine = qfmp.QFLazyEngine(_factory, retire=retire_handle)
             if entries:
                 engine.set_lora_side("loader", list(entries))   # create-time loader-level set
 
@@ -630,7 +613,6 @@ def register(deps):
             model_config = comfy.supported_models.WAN21_I2V(unet_config)
             qfmp.ensure_model_config_attrs(model_config)
 
-            device = comfy.model_management.get_torch_device()
             offload = comfy.model_management.unet_offload_device()
             # DUAL MODEL outputs over ONE shared engine (user 2026-08-21 pivot: the wan loader
             # mirrors the official two-UNETLoader workflow shape — model_high wires to the
@@ -666,7 +648,7 @@ def register(deps):
                   f"high={os.path.basename(transformer1_path)} "
                   f"low={os.path.basename(transformer2_path)} "
                   f"loras={len(entries)} "
-                  f"footprint~{engine.footprint_bytes // (1024*1024)}MB (create deferred)")
+                  f"capacity=native Prepared query (create deferred)")
 
             def _lora_rebuild_dual(_entries):
                 # [wiring-lora] v2 — retires the v1 refusal. The chained node tagged each entry

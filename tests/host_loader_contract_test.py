@@ -39,19 +39,16 @@ class NativeLibrary:
 
 
 class HostLoaderContract(unittest.TestCase):
-    def test_capacity_query_failure_does_not_fall_back_to_file_size(self):
-        with mock.patch.object(plugin.qfe, "load_lib", return_value=object()), \
-             mock.patch.object(plugin.qfe, "estimate_resident_bytes", side_effect=RuntimeError("capacity unsupported")), \
-             mock.patch.object(plugin.qfe, "estimate_footprint_bytes", return_value=999999):
-            with self.assertRaisesRegex(RuntimeError, "capacity unsupported"):
-                plugin._estimate_package_footprint("not-a-real-package")
-
-    def test_zero_capacity_is_not_promoted_to_fake_positive_bytes(self):
-        with mock.patch.object(plugin.qfe, "load_lib", return_value=object()), \
-             mock.patch.object(plugin.qfe, "estimate_resident_bytes", return_value=0), \
-             mock.patch.object(plugin.qfe, "estimate_footprint_bytes", return_value=999999):
-            with self.assertRaisesRegex(RuntimeError, "zero"):
-                plugin._estimate_package_footprint("not-a-real-package")
+    def test_every_family_has_exited_the_legacy_capacity_estimator_path(self):
+        self.assertNotIn("estimate_footprint", plugin._register_families.__code__.co_consts)
+        for name in plugin._FAMILY_MODULES:
+            source = (plugin_root / f"{name}.py").read_text()
+            self.assertNotIn('deps["estimate_footprint"]', source, name)
+            self.assertNotIn("estimate_footprint(model_dir)", source, name)
+            self.assertNotIn("footprint~", source, name)
+        substrate = (plugin_root / "qf_modelpatcher.py").read_text()
+        self.assertNotIn("._resource.set_grant(", substrate)
+        self.assertNotIn("._resource.set_device_grant(", substrate)
 
     def test_cache_selection_does_not_evict_a_live_other_engine(self):
         other_lib, selected_lib = NativeLibrary(), NativeLibrary()
@@ -68,9 +65,13 @@ class HostLoaderContract(unittest.TestCase):
              mock.patch.object(plugin.qfe, "load_lib", return_value=selected_lib), \
              mock.patch.object(plugin.qfe, "create_pipeline", side_effect=AssertionError("cache hit must not create")):
             plugin._bind_pipeline_model(other_key, consumer)
-            engine, key = plugin._get_engine("selected-package")
+            selected_consumer = plugin.qfmp.QFLazyEngine(
+                lambda: plugin._get_engine("selected-package"))
+            with plugin.qfmp._engine_cache_acquisition(selected_consumer):
+                engine, key = plugin._get_engine("selected-package")
             self.assertIs(engine, selected)
             self.assertEqual(key, selected_key)
+            self.assertIn(selected_consumer, plugin._live_pipeline_models(selected_key))
             self.assertEqual(other_lib.held, 512)
             self.assertEqual(other_lib.unloads, 0)
             self.assertIs(plugin._PIPELINE_CACHE[other_key], other)
