@@ -1671,8 +1671,15 @@ class QFNativeResourcePatcher(comfy.model_patcher.ModelPatcher):
                 # cleanup but this never makes their identity reusable.
                 result = self._resource.release_all()
                 if result.state != qfe.QUANTFUNC_RESOURCE_READY:
-                    raise RuntimeError(f"QuantFunc full eviction incomplete (state={result.state}); "
-                                       "keep the host resource record")
+                    # Comfy's unload hook has no failure channel: unload_all_models() runs unguarded on the
+                    # prompt worker (its OOM handler and POST /free), so an error escaping here ends the
+                    # server's only worker and every later prompt hangs. Native Busy is also the ORDINARY
+                    # answer for a live pipeline: release_all certifies ZERO backing, and the non-paged
+                    # floor never reaches zero. Everything eligible is already released; growth was revoked
+                    # above and is revoked again below, so nothing regrows before the next formal admission,
+                    # which re-reads native residency. What remains is physically visible to Comfy.
+                    print(f"[qf_native] full eviction left native backing (state={result.state}); "
+                          "growth stays fenced until the next formal admission", flush=True)
                 if self._host_managed and not closed:
                     _revoke_domain_growth(self)
         # Keep the view and canonical object alive across host deregistration.

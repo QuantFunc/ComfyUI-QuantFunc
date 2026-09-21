@@ -279,7 +279,6 @@ class CanonicalIntegration(unittest.TestCase):
         patcher, owner, shared = self.warm_native_model()
         lazy = patcher.model._qf
         loaded_shared = self.official_loaded_model(shared)
-        loaded_finalizer = loaded_shared.model_finalizer
         self.assertIn(loaded_shared, mm.current_loaded_models)
         self.assertEqual(loaded_shared.model_loaded_memory(), 1024)
         self.lib.capabilities = 7
@@ -333,15 +332,12 @@ class CanonicalIntegration(unittest.TestCase):
             detach_thread.join(3)
             self.assertFalse(detach_thread.is_alive(), "Shared detach deadlocked")
         self.lib.quantfunc_resource_release_all = original_release
-        if state == qfe.QUANTFUNC_RESOURCE_READY:
-            self.assertEqual(errors, [])
-            self.assertNotIn(loaded_shared, mm.current_loaded_models)
-            self.assertIsNone(loaded_shared.model_finalizer)
-        else:
-            self.assertEqual(len(errors), 1)
-            self.assertIsInstance(errors[0], RuntimeError)
-            self.assertIn(loaded_shared, mm.current_loaded_models)
-            self.assertIs(loaded_shared.model_finalizer, loaded_finalizer)
+        # Comfy's unload hook has no failure channel: free_memory() runs unguarded on the prompt worker
+        # (OOM handler, POST /free). Whatever native answered, nothing may escape it, and Comfy completes
+        # its own deregistration. MEASURED (host-vram-h3 attempt 8): the old raise ended the worker thread.
+        self.assertEqual(errors, [], "an incomplete native release escaped Comfy's unload hook")
+        self.assertNotIn(loaded_shared, mm.current_loaded_models)
+        self.assertIsNone(loaded_shared.model_finalizer)
 
         # The test must NOT revoke here. _revoke_domain_growth writes exactly the values
         # asserted below, so calling it would hide a detach that restored permission
@@ -376,12 +372,11 @@ class CanonicalIntegration(unittest.TestCase):
         restored = []
 
         def restoring_detach(adapter, unpatch_all=True):
-            try:
-                return production_detach(adapter, unpatch_all)
-            except RuntimeError:
+            result = production_detach(adapter, unpatch_all)
+            if unpatch_all:
                 qfm._publish_domain_grants(adapter, growth_allowance=4096)
                 restored.append(adapter)
-                raise
+            return result
 
         with mock.patch.object(qfm.QFNativeResourcePatcher, "detach", restoring_detach):
             with self.assertRaisesRegex(self.failureException, self.RESTORED_PERMISSION):
@@ -1439,7 +1434,7 @@ class CanonicalIntegration(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "unavailable"):
                 p.model_patches_models()
 
-    def test_full_detach_fences_growth_and_requires_native_zero_certificate(self):
+    def test_full_detach_fences_growth_and_an_incomplete_native_release_stays_inside_the_hook(self):
         p = self.wrapper()
         owner, shared = p.model_patches_models()
         self.lib.capabilities = 7
@@ -1448,9 +1443,8 @@ class CanonicalIntegration(unittest.TestCase):
         owner.detach(False)
         self.assertFalse(any(e[0] in ("grant", "full") for e in self.lib.events))
         self.lib.full_state = 1
-        with self.assertRaisesRegex(RuntimeError, "incomplete"):
-            owner.detach(True)
-        self.assertEqual(owner.loaded_size(), 512)
+        owner.detach(True)  # native Busy is the ordinary answer for a live pipeline; it must not raise
+        self.assertEqual(owner.loaded_size(), 512)  # and it is never reported as released
         self.assertTrue(owner._resource._finalizer.alive)
         self.lib.full_state = 0
         owner.detach(True)
@@ -1458,9 +1452,7 @@ class CanonicalIntegration(unittest.TestCase):
         self.assertEqual([e for e in self.lib.events if e[0] == "full"],
                          [("full", 2), ("full", 2)])
         self.assertEqual([e for e in self.lib.events if e[0] == "domain_grants"],
-                         [("domain_grants", 2, 7, 0, 0, 0),
-                          ("domain_grants", 2, 7, 0, 0, 0),
-                          ("domain_grants", 2, 7, 0, 0, 0)])
+                         [("domain_grants", 2, 7, 0, 0, 0)] * 4)  # before + after release_all, per detach
         self.assertEqual(self.lib.resources[1]["limit"], 0)
         self.assertEqual(self.lib.device_limit, 0)
         self.assertTrue(shared._domain.shared_growth_fenced)
@@ -1496,8 +1488,7 @@ class CanonicalIntegration(unittest.TestCase):
         self.lib.resources[2]["held"] = 512
         for state in (1, 2):
             self.lib.full_state = state
-            with self.assertRaisesRegex(RuntimeError, "incomplete"):
-                owner.detach(True)
+            owner.detach(True)
             self.assertEqual(owner.loaded_size(), 512)
             self.assertEqual(owner.model_size(), 4096)
             self.assertEqual(self.lib.resources[2]["limit"], 0)
