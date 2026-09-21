@@ -18,6 +18,7 @@ from typing import NamedTuple, Optional
 
 QUANTFUNC_OK = 0
 QUANTFUNC_RESOURCE_ABI_VERSION = 1
+QUANTFUNC_RESOURCE_CREATION_ABI_VERSION = 1
 QUANTFUNC_RESOURCE_RESIDENCY_ABI_VERSION = 1
 QUANTFUNC_RESOURCE_READY = 0
 QUANTFUNC_RESOURCE_BUSY = 1
@@ -201,6 +202,24 @@ class NativeResource:
         status = lib.quantfunc_resource_acquire_shared(device, QUANTFUNC_RESOURCE_ABI_VERSION, ctypes.byref(pointer))
         if status != QUANTFUNC_OK or not pointer:
             raise RuntimeError(f"QuantFunc shared resource acquisition failed: {last_err(lib)}")
+        return cls._adopt(lib, pointer)
+
+    @classmethod
+    def prepare(cls, lib, device):
+        """Create owned identity before loading; no budget or grant is implied."""
+        device = operator.index(device)
+        if not 0 <= device < (1 << 31):
+            raise ValueError("resource device must fit nonnegative int32")
+        _bind_resource_api(lib)
+        function = getattr(lib, "quantfunc_resource_prepare", None)
+        if function is None:
+            raise RuntimeError("QuantFunc library lacks quantfunc_resource_prepare; update the native library")
+        function.restype = ctypes.c_int
+        function.argtypes = [ctypes.c_int32, ctypes.c_uint32, ctypes.POINTER(ctypes.c_void_p)]
+        pointer = ctypes.c_void_p()
+        status = function(device, QUANTFUNC_RESOURCE_CREATION_ABI_VERSION, ctypes.byref(pointer))
+        if status != QUANTFUNC_OK or not pointer:
+            raise RuntimeError(f"QuantFunc resource preparation failed: {last_err(lib)}")
         return cls._adopt(lib, pointer)
 
     def _check_open(self):
@@ -792,7 +811,25 @@ def _refuse_session_knobs_in_create(config_json):
 
 
 def create_pipeline(lib, *, model_dir, transformer_path=None, model_backend="svdq",
-                    device_idx=0, config_json=None):
+                    device_idx=0, config_json=None, prepared_resource=None):
+    """Optionally borrow a pre-registered native identity for model creation.
+
+    The resource view is serialized against close throughout the native call.
+    As with other view operations, same-thread reentry is unsupported.
+    Native code remains authoritative for device, lifecycle and owner adoption.
+    """
+    if prepared_resource is not None:
+        if prepared_resource._lib is not lib:
+            raise ValueError("prepared resource belongs to a different native library wrapper")
+        device_idx = operator.index(device_idx)
+        if not 0 <= device_idx < (1 << 31):
+            raise ValueError("resource device must fit nonnegative int32")
+        create_with_resource = getattr(lib, "quantfunc_create_with_resource", None)
+        if create_with_resource is None:
+            raise RuntimeError("QuantFunc library lacks quantfunc_create_with_resource; update the native library")
+        create_with_resource.restype = ctypes.c_int
+        create_with_resource.argtypes = [ctypes.POINTER(InitParams), ctypes.c_void_p,
+                                         ctypes.POINTER(ctypes.c_void_p)]
     _refuse_session_knobs_in_create(config_json)   # [session-knobs] session knob ≠ create key
     # [metadata-KV disk cache — user 2026-09-01 "为啥metadata每次都重新请求后端 不是有缓存吗"]
     # The engine HAS a two-tier keymap/metadata cache (process mem → disk CIPHERTEXT at
@@ -824,6 +861,13 @@ def create_pipeline(lib, *, model_dir, transformer_path=None, model_backend="svd
         p._keep.append(_enc(cj))
         p.config_json = p._keep[-1]
     handle = ctypes.c_void_p()
+    if prepared_resource is not None:
+        with prepared_resource._lock:
+            prepared_resource._check_open()
+            st = create_with_resource(ctypes.byref(p), prepared_resource._pointer, ctypes.byref(handle))
+            if st != QUANTFUNC_OK or not handle:
+                raise RuntimeError(f"quantfunc_create_with_resource failed st={st}: {last_err(lib)}")
+        return handle
     st = lib.quantfunc_create(ctypes.byref(p), ctypes.byref(handle))
     if st != QUANTFUNC_OK:
         raise RuntimeError(f"quantfunc_create failed st={st}: {last_err(lib)}")
