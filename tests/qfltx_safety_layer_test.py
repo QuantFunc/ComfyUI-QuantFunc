@@ -394,10 +394,11 @@ def _t_shared_interrupt_helper(src):
 
 
 def _t_scale_latent_inpaint(src):
-    """2026-08-22 wan-align pivot: LTX INHERITS BaseModel.scale_latent_inpaint (comfy blends the masked
-    latent OUTSIDE the model; exact because the engine step is stateless in x) — the Inplace i2v route rides
-    it, so the seam must NOT override it (the old loud-fail override would break i2v). Positive control: the
-    WAN seam, whose session does its own i2v conditioning, still overrides it."""
+    """2026-08-22 wan-align pivot: the LTX seam INHERITS comfy's own LTXV.scale_latent_inpaint (model_base.py:
+    `return latent_image` — the masked latent is blended OUTSIDE the model by KSamplerX0Inpaint; exact because
+    the engine step is stateless in x) — the Inplace i2v route rides it, so the plugin must NOT override it
+    (the old loud-fail override would break i2v). Positive control: the WAN seam, whose session does its own
+    i2v conditioning, still overrides it."""
     def overrides(text, cls):
         try:
             _extract_method(text, cls, "scale_latent_inpaint"); return True

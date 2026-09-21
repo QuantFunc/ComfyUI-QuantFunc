@@ -950,7 +950,7 @@ if _IMPORT_OK:
 
         def load(self, transformer, model_config, attention_backend="auto",
                  quality_enhance=False):
-            # [runtime dials] backend + token-prune (quality_enhance) are SESSION knobs
+            # [runtime dials] backend + video_enhance (quality_enhance) are SESSION knobs
             # (NOT create keys — a widget change never re-keys the engine = no rebuild).
             _p = _run_family_load("krea2", transformer, model_config,
                                   None,

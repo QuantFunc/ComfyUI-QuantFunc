@@ -101,10 +101,10 @@ _AUDITED_MODELS = (
     # Krea-2 t2i (QFKrea2Model) — found UNAUDITED by the roster derivation on the first real run of this file.
     # Reject-list: reference_latents(+_method) (the ref2img channel) + cross_attn_controlnet / noise_concat.
     # Documented-ACCEPTED keys, each with a VERIFIED reason:
-    #  • concat_latent_image / concat_mask — BaseModel.concat_cond builds a concat ONLY when the unet has
-    #    more input channels than the latent (concat_keys non-empty). Stock Krea2 has in == latent == 16, and
-    #    the seam's stub arms exactly that shape (_QFStub.arm_concat_shape(16) -> c_concat None), so stock
-    #    comfy drops these for this model too: parity, not a plugin-introduced drop.
+    #  • concat_latent_image / concat_mask — BaseModel.concat_cond reads them ONLY when `self.concat_keys`
+    #    is non-empty; that is a fixed per-class tuple (BaseModel sets `()`, only inpaint/i2v subclasses set
+    #    keys) and Krea2 never sets it, so stock comfy drops these for this model too: parity, not a
+    #    plugin-introduced drop. (The seam's stub, _QFStub.arm_concat_shape(16), matches that no-concat shape.)
     #  • denoise_mask — ACCEPTED BY INHERITANCE, the LTXV argument verbatim: it reaches the SAMPLER
     #    (KSamplerX0Inpaint), QFKrea2Model inherits BaseModel.scale_latent_inpaint, and comfy blends x against
     #    the clean latent OUTSIDE the model — exact because the engine step is stateless in x.

@@ -479,6 +479,9 @@ class _LoaderModel:
     def set_audio_enhance(self, _value):
         pass
 
+    def set_video_enhance(self, _value):   # the ONE video switch every loader must reach (mandatory, unguarded)
+        pass
+
     def set_allow_partial_denoise(self, value):
         self.partial_values.append(value)
 
@@ -498,7 +501,6 @@ _loader_namespace = {
     "_BLOCK_CACHE_INPUT": ("FLOAT", {"default": 0.0}),
     "_run_family_load": lambda *_args, **_kwargs: _loader_patcher,
     "_attn_backend_to_engine": lambda value: value,
-    "_quality_enhance_to_token_prune": lambda value: value,
     "_arm_session_caches": lambda *_args: None,
 }
 QuantFuncH3LoaderContract = _subset_class(
