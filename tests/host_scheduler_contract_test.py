@@ -222,7 +222,9 @@ class HostSchedulerContract(unittest.TestCase):
                 patcher = module.QFModelPatcher(model, torch.device("cpu"), torch.device("cpu"))
                 model.contract_weight = torch.nn.Parameter(torch.ones(8, dtype=torch.float32))
                 torch_bytes = mm.module_size(model)
-                model.model_loaded_weight_memory = torch_bytes
+                # Comfy's own loader, not a hand-written byte counter: it also marks each
+                # module comfy_patched_weights, the only state its partial unload frees.
+                patcher.load(torch.device("cpu"), full_load=True)
                 self.library.held = 512
                 self.assertEqual(mm.LoadedModel(patcher).model_loaded_memory(), torch_bytes)
                 freed = patcher.partially_unload(torch.device("cpu"), 1)
@@ -291,7 +293,11 @@ class HostSchedulerContract(unittest.TestCase):
                 self.assertEqual(model._qf_engine_latent_dims(packed), list(alternate))
 
     def test_logical_partial_unload_reclaims_only_torch_weights(self):
+        # Reach "loaded" through Comfy's own loader (see the family test): setUp's byte
+        # counter alone describes a model Comfy never produces, and its unload frees 0 of it.
+        self.patcher.load(torch.device("cpu"), full_load=True)
         torch_bytes = self.patcher.loaded_size()
+        self.assertEqual(torch_bytes, self.model.contract_weight.nbytes)  # never a vacuous 0 == 0
         self.assertEqual(self.patcher.partially_unload(torch.device("cpu"), 1), torch_bytes)
         self.assertEqual(self.patcher.loaded_size(), 0)
         self.assertEqual(self.library.held, 512)

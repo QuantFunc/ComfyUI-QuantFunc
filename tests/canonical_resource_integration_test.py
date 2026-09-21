@@ -472,8 +472,10 @@ class CanonicalIntegration(unittest.TestCase):
 
         with mock.patch.object(qfe.QFEngineHandle, "create", side_effect=create), \
             mock.patch.object(mm, "load_models_gpu", side_effect=admit):
+            # model_options as Comfy's only caller passes it (CFGGuider: the patcher's own);
+            # the None default is dereferenced before _prepare_sampling is ever reached.
             real_model, conds, models = sampler_helpers.prepare_sampling(
-                patcher, noise_shape, {})
+                patcher, noise_shape, {}, model_options=patcher.model_options)
 
         self.assertIs(real_model, model)
         self.assertEqual(conds, {})
@@ -487,24 +489,36 @@ class CanonicalIntegration(unittest.TestCase):
     def test_domain_actual_and_load_delta_never_sum_per_resource_residency(self):
         patcher = self.wrapper("coherent-domain")
         owner, _ = patcher.model_patches_models()
+        owner_key = owner._resource._pointer.value
         self.lib.resources[1]["held"] = 512
+        # Domain backing that no Python-side member reports: only the coherent native snapshot
+        # sees it, so a policy that sums per-resource residency produces DIFFERENT numbers below.
+        # (Forbidding NativeResource.residency outright would be wrong: each resource's OWN
+        # ceiling is its own residency + the allowance, and must read it.)
+        peer = max(self.lib.resources) + 1
+        self.lib.resources[peer] = dict(epoch=peer, device=0, held=256, enrolled=False,
+                                        limit=0, state=0)
 
         def create(lib, *, capacity_bytes, prepared_resource, create_params):
             key = prepared_resource._pointer.value
             self.lib.resources[key]["held"] = 3072
             self.lib.resources[1]["held"] = 1024
+            self.lib.resources[peer]["held"] = 384
             self.lib.resources[key]["phase"] = qfe.QUANTFUNC_RESOURCE_PHASE_ATTACHED
             return qfe.QFEngineHandle(lib, ctypes.c_void_p(520 + key),
                                       resource=prepared_resource, capacity_bytes=capacity_bytes)
 
         before_queries = len([event for event in self.lib.events
                               if event[0] == "domain_residency"])
-        with mock.patch.object(qfe.NativeResource, "residency",
-                               side_effect=AssertionError("domain policy must not sum owner residency")), \
-             mock.patch.object(qfe.QFEngineHandle, "create", side_effect=create):
-            self.assertEqual(owner.partially_load(owner.load_device, 4096), 3584)
+        with mock.patch.object(qfe.QFEngineHandle, "create", side_effect=create):
+            # Coherent delta (3072 + 1024 + 384) - (0 + 512 + 256); a per-resource sum says 3584.
+            self.assertEqual(owner.partially_load(owner.load_device, 4096), 3712)
+        # Owner 0 + 4096, Shared 512 + 4096, Device = domain actual 768 + 4096.
+        # A per-resource sum would publish a Device ceiling of 512 + 4096 = 4608.
+        self.assertIn(("domain_grants", owner_key, 7, 4096, 4608, 4864), self.lib.events)
         domain_queries = [event for event in self.lib.events if event[0] == "domain_residency"]
-        self.assertEqual(len(domain_queries) - before_queries, 2)
+        # before-load snapshot, the admission's domain actual, after-load snapshot
+        self.assertEqual(len(domain_queries) - before_queries, 3)
         self.assertTrue(all(event[1] == 1 for event in domain_queries[before_queries:]))
 
     def test_foreign_additional_models_and_patches_are_preserved(self):
@@ -567,8 +581,10 @@ class CanonicalIntegration(unittest.TestCase):
             self.assertEqual(shared.loaded_size(), 1024)
             owner_grant = self.lib.resources[2]["limit"]
             shared_grant = self.lib.resources[1]["limit"]
+            # Allowance 0: every ceiling IS its residency, so Device == Owner + Shared here is the
+            # true identity, not a summing defect. The no-sum property is pinned at the 4096
+            # admission below: Device 4608 = domain 512 + 4096, where summed ceilings give 8704.
             self.assertEqual((owner_grant, shared_grant, self.lib.device_limit), (3072, 1024, 4096))
-            self.assertNotEqual(self.lib.device_limit, owner_grant + shared_grant)
             self.assertIs(p.model._qf.ensure(), plugin._PIPELINE_CACHE[next(iter(plugin._PIPELINE_CACHE))])
         self.assertEqual(materialized, [2])
         materialize_index = self.lib.events.index(("materialize", 2))
@@ -582,6 +598,10 @@ class CanonicalIntegration(unittest.TestCase):
         owner_a, shared = a.model_patches_models()
         owner_b, same_shared = b.model_patches_models()
         self.assertIs(shared, same_shared)
+        # Nonzero Shared residency is what makes the last assertion of this block able to fail:
+        # with Shared at 0 the correct Device ceiling (domain actual + allowance) and the sum of
+        # the Owner ceilings are both 8192, so "not the sum" could not be told from "the sum".
+        self.lib.resources[1]["held"] = 512
         materialized = []
 
         def create(lib, *, capacity_bytes, prepared_resource, create_params):
@@ -596,13 +616,14 @@ class CanonicalIntegration(unittest.TestCase):
 
         with mock.patch.object(qfe.QFEngineHandle, "create", side_effect=create):
             self.assertEqual(owner_a.partially_load(owner_a.load_device, 4096), 4096)
-            self.assertEqual(self.lib.device_limit, 4096)
+            self.assertEqual(self.lib.device_limit, 512 + 4096)
             self.assertEqual(owner_b.partially_load(owner_b.load_device, 4096), 4096)
         owner_limits = [self.lib.resources[key]["limit"] for key in (2, 3)]
         self.assertEqual(materialized, [2, 3])
         self.assertEqual(owner_limits, [4096, 4096])
-        self.assertEqual(self.lib.resources[1]["limit"], 4096)
-        self.assertEqual(self.lib.device_limit, 8192)
+        self.assertEqual(self.lib.resources[1]["limit"], 512 + 4096)
+        # domain actual (512 Shared + 4096 owner A) + this admission's allowance
+        self.assertEqual(self.lib.device_limit, 4608 + 4096)
         self.assertNotEqual(self.lib.device_limit, sum(owner_limits))
 
         self.assertEqual(owner_a.partially_unload(torch.device("cpu"), 1024), 1024)
@@ -1020,12 +1041,13 @@ class CanonicalIntegration(unittest.TestCase):
 
         def checked_close(resource):
             self.assertFalse(lock.held_by_current_thread())
-            closes.append(resource._pointer.value)
+            key = resource._pointer.value  # close() consumes the pointer holder (value -> None)
+            closes.append(key)
             close_entered.set()
             if not allow_close.wait(3):
                 raise AssertionError("loser close barrier was not continued")
             result = original_close(resource)
-            self.lib.resources[resource._pointer.value]["state"] = qfe.QUANTFUNC_RESOURCE_CLOSED
+            self.lib.resources[key]["state"] = qfe.QUANTFUNC_RESOURCE_CLOSED
             return result
 
         self.lib.quantfunc_resource_prepare = gated_prepare
