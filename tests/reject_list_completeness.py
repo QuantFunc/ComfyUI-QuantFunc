@@ -98,6 +98,16 @@ _AUDITED_MODELS = (
            {"minimax_keyframes", "minimax_refs", "minimax_token_tags", "minimax_payload",
             "latent_shapes", "seed"},
            ("concat_cond", "encode_adm")),
+    # Krea-2 t2i (QFKrea2Model) — was UNAUDITED (the roster scan flagged it red on every run, blocking the
+    # per-model report for every other row). Its reject-list = reference_latents/reference_latents_method
+    # (the krea2 ref2img channel) + the BaseModel controlnet/noise_concat channels; nothing covered elsewhere.
+    _Model("Krea2", "qf_krea2_modelpatcher.py", set(), ("concat_cond", "encode_adm")),
+    # Qwen-Image-2.1 t2i (QFQwenImage21Model) — the image seam registered WITH its audit row from day one.
+    # Its reject-list is the defensive superset: image_slots (comfy.model_base.QwenImage21's own key) +
+    # reference_latents/reference_latents_method/attention_mask (the QwenImage parent's edit + mask channels
+    # the generic step ABI has no field for) + the BaseModel controlnet/noise_concat channels. No
+    # covered-elsewhere keys: every consumable it cannot honour is refused loud in extra_conds.
+    _Model("QwenImage21", "qf_qwenimage21_modelpatcher.py", set(), ("concat_cond", "encode_adm")),
 )
 
 

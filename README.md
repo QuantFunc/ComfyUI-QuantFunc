@@ -233,7 +233,7 @@ QuantFunc has pre-exported commonly used models (runtime-quantized and ready to 
 
 ### 3.4 LoRA Format Conversion (Native Loaders)
 
-The native loaders (Krea-2 / LTX-2 / MiniMax-H3) adapt ONE LoRA format — diffusers/PEFT
+The native loaders (Krea-2 / Qwen-Image-2.1 / LTX-2 / MiniMax-H3) adapt ONE LoRA format — diffusers/PEFT
 canonical. Convert kohya / ai-toolkit LoRAs once with the bundled pure-Python tool (no
 torch, no GPU, lossless byte-copy):
 

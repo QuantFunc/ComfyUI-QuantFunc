@@ -1,0 +1,12 @@
+{
+ "_class_name": "QwenImage21Pipeline",
+ "image_model": "qwen_image21",
+ "transformer": [
+  "diffusers",
+  "QwenImage21Transformer2DModel"
+ ],
+ "scheduler": [
+  "diffusers",
+  "FlowMatchEulerDiscreteScheduler"
+ ]
+}

@@ -1,0 +1,13 @@
+{
+ "family": "qwenimage21",
+ "display": "Qwen-Image-2.1 (t2i, INT4)",
+ "dual_expert": false,
+ "notes": "Qwen-Image-2.1 single-stream MMDiT (32 blocks, Qwen3-VL-8B last-hidden cond, 64-ch latent, 16x); engine denoise_only skips TE/VAE weights — comfy owns TextEncodeQwenImage21/VAE/sampler; expected file: qwen-image-2.1 QuantFunc int4 export",
+ "file_hints": {
+  "transformer1": [
+   "*qwen-image-2.1*quantfunc*int4*",
+   "*qwen_image_2.1*quantfunc*int4*",
+   "*qwen-image-2.1*quantfunc*"
+  ]
+ }
+}
