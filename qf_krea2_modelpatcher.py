@@ -173,7 +173,10 @@ class QFKrea2Model(QFSessionModelMixin, comfy.model_base.Krea2):
                 or self._out.device != xin.device:
             self._out = torch.empty_like(xin)
         self._max_batch = max(self._max_batch, B)
-        cuuids = transformer_options.get("cond_uuids", None)
+        # comfy's key is "uuids" (samplers.py:324/511 — what the wan/ltx/h3 seams read); "cond_uuids" never
+        # existed, so every Krea2 ctx key was 0 = the engine's step caches OFF (found 2026-09-22 via the
+        # QI2.1 seam cloned from this file: the engine logged cfg_context_key=0).
+        cuuids = transformer_options.get("uuids") if isinstance(transformer_options, dict) else None
         step_index = self._sigma_step_index(sigma, sig_all, transformer_options)
         for i in range(B):
             _interrupt_poll_end_session_on_raise(self._qf)

@@ -166,7 +166,10 @@ class QFQwenImage21Model(QFSessionModelMixin, comfy.model_base.QwenImage21):
                 or self._out.device != xin.device:
             self._out = torch.empty_like(xin)
         self._max_batch = max(self._max_batch, B)
-        cuuids = transformer_options.get("cond_uuids", None)
+        # comfy carries the per-conditioning uuids as transformer_options["uuids"] (samplers.py:324/511 —
+        # the key the wan/ltx/h3 seams read); a wrong key silently yields ctx key 0 = caches OFF (measured:
+        # the engine logged "cfg_context_key=0 — prefix K/V cache OFF" on the first QI2.1 native run).
+        cuuids = transformer_options.get("uuids") if isinstance(transformer_options, dict) else None
         step_index = self._sigma_step_index(sigma, sig_all, transformer_options)
         for i in range(B):
             _interrupt_poll_end_session_on_raise(self._qf)
