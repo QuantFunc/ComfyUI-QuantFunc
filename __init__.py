@@ -1151,3 +1151,17 @@ try:
 except Exception as _qf_cloud_te_exc:  # noqa: BLE001
     import logging as _qf_lg
     _qf_lg.warning("[qf_native] cloud-TE node not registered: %r", _qf_cloud_te_exc)
+# ── QuantFunc LTX-2.5 AV ancestral-sampler audio fix ─────────────────────────────
+# The engine's STATELESS flow-match forward requires a non-re-noised trajectory; comfy's
+# ancestral samplers (euler_ancestral auto-routes to *_RF for CONST/flow models) re-noise x
+# every step, which collapses the low-dim AV AUDIO lane to silence. Neutralize the audio-lane
+# re-noise for QF LTX-2.5 AV models ONLY (video ancestral stochasticity preserved). Fully
+# guarded — a failure must never break plugin import.
+try:
+    from . import qf_ltx_ancestral_audio_fix as _qf_ltx_afix
+    _qf_ltx_afix.install()
+except Exception as _qf_ltx_afix_exc:  # noqa: BLE001
+    import logging as _qf_lg2
+    _qf_lg2.warning("[qf_native] LTX-2.5 AV audio fix not installed: %r", _qf_ltx_afix_exc)
+
+
