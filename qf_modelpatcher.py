@@ -101,6 +101,9 @@ def _qf_arm_lazy_detach(eng):
     unless a reclaim (_qf_cancel_pending_detach) cleared the flag first — both under the same lock."""
     import threading
     eng = _qf_detach_anchor(eng)
+    if isinstance(eng, QFLazyEngine) and getattr(eng, "_real", None) is None:
+        return   # an UNMATERIALIZED wrapper holds nothing to unload — and a window keyed on it would be missed by every
+        # cancel once it materializes (they anchor to the real handle), then fire into that handle later
     if getattr(eng, "_qf_detach_lock", None) is None:
         eng._qf_detach_lock = threading.Lock()
     with eng._qf_detach_lock:
@@ -131,12 +134,13 @@ def _qf_cancel_pending_detach(eng):
     """Reclaim a lazily-detached engine (a successor clone took over, or ANY sampler step on the same
     real handle): cancel the one-shot unload timer. Safe no-op when nothing is pending."""
     eng = _qf_detach_anchor(eng)
-    if eng is None or not getattr(eng, "pending_detach", False):
-        return
-    lock = getattr(eng, "_qf_detach_lock", None)
+    lock = getattr(eng, "_qf_detach_lock", None) if eng is not None else None
     if lock is None:
-        return   # pending without a lock cannot happen (detach creates the lock first)
-    with lock:
+        return   # never armed on this handle
+    with lock:   # ALWAYS taken: an expiry already inside unload_vram holds it, and a begin must wait for that unload to
+        # finish (the engine then reloads lazily) instead of racing it into "pipeline busy"
+        if not getattr(eng, "pending_detach", False):
+            return
         eng.pending_detach = False
         t = getattr(eng, "_qf_detach_timer", None)
         if t is not None:

@@ -17,6 +17,10 @@ AST-extracted from qf_modelpatcher.py (pure Python: no comfy / torch / GPU), wit
   A5 a FRESH sibling (a new loader output, materialized by its first begin through the real ensure() onto the cached
      shared handle) reclaims the displaced sibling's pending window — its begin's cancel ran before materialization
   A6 mutation: with ensure()'s reclaim line removed, A5's scenario DOES unload (proves A5 can fail)
+  A7 arming through an UNMATERIALIZED wrapper creates no window at all (it holds nothing; a wrapper-keyed window would be
+     missed by every later cancel, which anchor to the real handle once it materializes)
+  A8 a cancel that lands while an expiry is already inside unload_vram WAITS for that unload (a begin must not race it)
+  A9 control: the previous cancel (pending check before the lock) returns while the unload is still running (A8 can fail)
 
 Run: python3 tests/lazy_detach_shared_engine_test.py   (exit 0 = pass, 1 = the contract is broken)
 """
@@ -152,6 +156,52 @@ f6.ensure()
 _settle()
 check("A6 mutant (no reclaim in ensure) unloads the shared engine under the fresh sibling (A5 can fail)", m6.unload_calls == 1,
       f"unload_calls={m6.unload_calls}")
+
+# A7 — no window on an unmaterialized wrapper
+r7 = _Real()
+w7 = ns["QFLazyEngine"](factory=lambda: (r7, "ckey"), footprint_bytes=0)
+w7._unloaded = False                             # what partially_load() sets on a not-yet-created wrapper
+ns["_qf_arm_lazy_detach"](w7)
+check("A7 arming an unmaterialized wrapper creates no window", not getattr(w7, "pending_detach", False)
+      and getattr(w7, "_qf_detach_timer", None) is None)
+w7.ensure()
+_settle()
+check("A7 ...and nothing fires into the handle it later materializes onto", r7.unload_calls == 0, f"unload_calls={r7.unload_calls}")
+
+
+class _SlowReal(_Real):
+    def unload_vram(self):
+        self.started = True
+        time.sleep(0.3)
+        self.finished = True
+        return super().unload_vram()
+
+
+def _in_flight(cancel):
+    r = _SlowReal(); r.started = r.finished = False
+    ns["_qf_arm_lazy_detach"](_wrapper(ns, r))
+    t0 = time.time()
+    while not r.started and time.time() - t0 < 2.0:
+        time.sleep(0.005)
+    cancel(_wrapper(ns, r))                      # a sibling's begin/step arrives while the expiry is unloading
+    return r.started, r.finished
+
+
+st, fin = _in_flight(ns["_qf_cancel_pending_detach"])
+check("A8 a cancel during an in-flight expiry waits for the unload to finish", st and fin, f"started={st} finished={fin}")
+
+
+def _old_cancel(eng):                            # the b07302f body: pending checked BEFORE taking the lock
+    eng = ns["_qf_detach_anchor"](eng)
+    if eng is None or not getattr(eng, "pending_detach", False):
+        return
+    with eng._qf_detach_lock:
+        eng.pending_detach = False
+
+
+st, fin = _in_flight(_old_cancel)
+_settle(); time.sleep(0.3)
+check("A9 control: the previous cancel returns mid-unload (A8 can fail)", st and not fin, f"started={st} finished={fin}")
 
 print("ALL PASS" if not FAILS else f"{len(FAILS)} FAILED: {FAILS}")
 sys.exit(1 if FAILS else 0)
