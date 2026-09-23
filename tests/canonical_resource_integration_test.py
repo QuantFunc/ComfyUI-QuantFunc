@@ -1566,6 +1566,122 @@ class CanonicalIntegration(unittest.TestCase):
         with self.assertRaises(qfe.NativeContractUnavailable):
             lazy.ensure()
 
+    # --- issue #704: native queries never wait. BUSY means another thread held the lock at that instant; the
+    # identity stays valid on BUSY (the engine fills it before its reader runs), values do not. ---
+
+    def answer(self, name, *, times=None, skip=0, status=None, **fields):
+        """Override lib.quantfunc_resource_<name>: after `skip` normal calls, the next `times` calls (None = all)
+        keep the normal output but set `fields` on it (and return `status` if given). Returns a call counter."""
+        attr = "quantfunc_resource_" + name
+        original = getattr(self.lib, attr)
+        calls, left = [0], [times]
+
+        def overridden(*args):
+            calls[0] += 1
+            result = original(*args)
+            if calls[0] > skip and (left[0] is None or left[0] > 0):
+                if left[0] is not None:
+                    left[0] -= 1
+                for key, value in fields.items():
+                    setattr(args[-1]._obj, key, value)
+                if status is not None:
+                    return status
+            return result
+
+        setattr(self.lib, attr, overridden)
+        self.addCleanup(setattr, self.lib, attr, original)
+        return calls
+
+    def short_busy_deadline(self):
+        patch = mock.patch.object(qfm, "_NATIVE_BUSY_DEADLINE_S", 0.05, create=True)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_704_per_step_ensure_proceeds_on_busy_identity(self):
+        patcher, _owner, _shared = self.warm_native_model("704-ensure")
+        lazy = patcher.model._qf
+        real = lazy.ensure()
+        self.answer("query", state=qfe.QUANTFUNC_RESOURCE_BUSY)
+        self.assertIs(lazy.ensure(), real)
+
+    def test_704_full_detach_proceeds_on_busy_identity(self):
+        """Comfy's unload hook has no failure channel: a raise here ends the server's only prompt worker."""
+        _patcher, owner, _shared = self.warm_native_model("704-detach")
+        self.lib.capabilities = 7
+        self.answer("query", state=qfe.QUANTFUNC_RESOURCE_BUSY)
+        owner.detach(True)
+        self.assertIn(("full", 2), self.lib.events)
+
+    def test_704_shared_identity_with_epoch_zero_passes_and_a_zeroed_answer_fails(self):
+        _patcher, owner, shared = self.warm_native_model("704-identity")
+        self.assertEqual((shared._resource.query().owner_epoch, owner._resource.query().owner_epoch), (0, 2))
+        busy = self.answer("query", state=qfe.QUANTFUNC_RESOURCE_BUSY)
+        shared.preflight_host_load()
+        owner.preflight_host_load()
+        self.assertGreater(busy[0], 0)
+        # An answer the engine never populated: UNKNOWN with every identity field zero. For the Shared view on
+        # device 0 that matches the expected epoch and device, so only the missing CAP_QUERY can refuse it.
+        self.answer("query", state=qfe.QUANTFUNC_RESOURCE_UNKNOWN, device=0, owner_epoch=0, capabilities=0)
+        for adapter in (shared, owner):
+            with self.subTest(adapter="shared" if adapter is shared else "owner"):
+                with self.assertRaisesRegex(RuntimeError, "identity"):
+                    adapter.preflight_host_load()
+
+    def test_704_value_reads_busy_then_ready_proceed(self):
+        patcher, _owner, _shared = self.warm_native_model("704-values")
+        lazy = patcher.model._qf
+        real = lazy.ensure()
+        for name in ("query_grant", "query_device_grant", "query_lifecycle"):
+            with self.subTest(read=name):
+                calls = self.answer(name, times=3, state=qfe.QUANTFUNC_RESOURCE_BUSY)
+                self.assertIs(lazy.ensure(), real)
+                self.assertGreaterEqual(calls[0], 4)
+
+    def test_704_value_read_busy_past_the_deadline_is_refused_honestly(self):
+        patcher, _owner, _shared = self.warm_native_model("704-deadline")
+        lazy = patcher.model._qf
+        lazy.ensure()
+        self.short_busy_deadline()
+        self.answer("query_grant", state=qfe.QUANTFUNC_RESOURCE_BUSY)
+        with self.assertRaisesRegex(RuntimeError, r"host grant stayed BUSY for \d+ ms"):
+            lazy.ensure()
+
+    def test_704_value_read_closed_or_unknown_is_refused_without_retry(self):
+        patcher, _owner, _shared = self.warm_native_model("704-closed")
+        lazy = patcher.model._qf
+        lazy.ensure()
+        for state in (qfe.QUANTFUNC_RESOURCE_CLOSED, qfe.QUANTFUNC_RESOURCE_UNKNOWN):
+            with self.subTest(state=state):
+                calls = self.answer("query_grant", state=state)
+                with self.assertRaisesRegex(RuntimeError, "host grant unavailable"):
+                    lazy.ensure()
+                self.assertEqual(calls[0], 1)
+
+    def test_704_query_api_error_is_refused(self):
+        patcher, _owner, _shared = self.warm_native_model("704-api-error")
+        lazy = patcher.model._qf
+        lazy.ensure()
+        self.answer("query", status=5)
+        with self.assertRaisesRegex(RuntimeError, "resource query failed"):
+            lazy.ensure()
+
+    def test_704_byte_readers_still_refuse_busy(self):
+        _patcher, owner, _shared = self.warm_native_model("704-bytes")
+        self.answer("query_residency", state=qfe.QUANTFUNC_RESOURCE_BUSY)
+        with self.assertRaisesRegex(RuntimeError, "residency unavailable"):
+            owner.loaded_size()
+
+    def test_704_admission_refuses_a_non_ready_prepared_lifecycle(self):
+        """A non-READY lifecycle carries no phase; admission read None as "not Prepared" and skipped materialize()."""
+        patcher = self.wrapper("704-admission")
+        owner, _shared = patcher.model_patches_models()
+        # require_load_contract's read stays normal; the admission's own Prepared-phase read answers UNKNOWN.
+        self.answer("query_lifecycle", skip=1, state=qfe.QUANTFUNC_RESOURCE_UNKNOWN)
+        with mock.patch.object(qfe.QFEngineHandle, "create") as create:
+            with self.assertRaisesRegex(RuntimeError, "admission lifecycle unavailable"):
+                owner.partially_load(owner.load_device, 4096)
+        create.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main(argv=[sys.argv[0]])

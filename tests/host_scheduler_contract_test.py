@@ -582,7 +582,9 @@ class NativeResourceSchedulerContract(unittest.TestCase):
             original = mm.current_loaded_models[0]
             finalizer = original.model_finalizer
             lib.state = qfe.QUANTFUNC_RESOURCE_BUSY
-            with self.assertRaisesRegex(RuntimeError, "preflight.*unavailable"):
+            # Identity survives BUSY (#704); a value read that STAYS busy is refused after the bounded retry.
+            with mock.patch.object(qfm, "_NATIVE_BUSY_DEADLINE_S", 0.05, create=True), \
+                    self.assertRaisesRegex(RuntimeError, "preflight.*unavailable|stayed BUSY"):
                 self.load(patcher)
             self.assertEqual(mm.current_loaded_models, [original])
             self.assertIs(original.model_finalizer, finalizer)
