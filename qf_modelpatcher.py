@@ -1734,13 +1734,11 @@ class QFNativeResourcePatcher(comfy.model_patcher.ModelPatcher):
                 # vram_manager/HostMemory.cpp:145-181), so the retry can free more than `want`: a reload-time cost only.
                 # `freed` is only what a READY answer reports, never an estimate; it errs low and Comfy then falls back
                 # to its own full detach.
-                result = _read_past_busy(lambda: self._resource.release_eligible(want), "resource release")
+                result = _ready_read(lambda: self._resource.release_eligible(want), "resource release")
             except _NativeStillBusy as busy:
                 # Comfy's unload path has no failure channel: vouch for no freed bytes instead of raising.
                 _log.warning("[qf_native] %s; reporting 0 freed, Comfy falls back to a full detach", busy)
                 return 0
-            if result.state != qfe.QUANTFUNC_RESOURCE_READY:
-                raise RuntimeError(f"QuantFunc resource release unavailable (state={result.state})")
             return result.freed_bytes
 
     def clone(self, disable_dynamic=False, model_override=None, force_deepcopy=False):
@@ -1761,32 +1759,43 @@ class QFNativeResourcePatcher(comfy.model_patcher.ModelPatcher):
                 if not identity.capabilities & qfe.QUANTFUNC_RESOURCE_CAP_RELEASE_ALL:
                     raise qfe.NativeContractUnavailable("QuantFunc native resource full eviction is unsupported "
                                                         "without CAP_RELEASE_ALL; keep the host record")
-                lifecycle = _ready_read(self._resource.lifecycle, "full eviction lifecycle")
-                closed = lifecycle.phase == qfe.QUANTFUNC_RESOURCE_PHASE_CLOSED
-                self._closed_identity = closed
-                if not closed:
-                    _ready_grant(self._resource)
-                    # Even a failing foreign call may already have changed the
-                    # grant. Do not allow a cache hit to undo this admission fence.
+                try:
+                    lifecycle = _ready_read(self._resource.lifecycle, "full eviction lifecycle")
+                    closed = lifecycle.phase == qfe.QUANTFUNC_RESOURCE_PHASE_CLOSED
+                    self._closed_identity = closed
+                    if not closed:
+                        _ready_grant(self._resource)
+                        # Even a failing foreign call may already have changed the
+                        # grant. Do not allow a cache hit to undo this admission fence.
+                        if identity.owner_epoch:
+                            self._needs_readmission = True
+                        _revoke_domain_growth(self)
+                        self._host_managed = True
+                    # Closed targets cannot grow; native permits final exact-old-owner
+                    # cleanup but this never makes their identity reusable.
+                    result = self._resource.release_all()
+                    if result.state != qfe.QUANTFUNC_RESOURCE_READY:
+                        # Comfy's unload hook has no failure channel: unload_all_models() runs unguarded on the
+                        # prompt worker (its OOM handler and POST /free), so an error escaping here ends the
+                        # server's only worker and every later prompt hangs. Native Busy is also the ORDINARY
+                        # answer for a live pipeline: release_all certifies ZERO backing, and the non-paged
+                        # floor never reaches zero. Everything eligible is already released; growth was revoked
+                        # above and is revoked again below, so nothing regrows before the next formal admission,
+                        # which re-reads native residency. What remains is physically visible to Comfy.
+                        print(f"[qf_native] full eviction left native backing (state={result.state}); "
+                              "growth stays fenced until the next formal admission", flush=True)
+                    if self._host_managed and not closed:
+                        _revoke_domain_growth(self)
+                except _NativeStillBusy as busy:
+                    # The unload hook has no failure channel (see the release_all comment above): a lock held past the
+                    # deadline stops the eviction where it is - nothing more is released - instead of raising, the same
+                    # outcome as release_all's non-READY branch. Growth stays fenced and an Owned adapter is
+                    # re-admitted formally. Every other refusal (API error, UNKNOWN, not enrolled) still raises.
+                    self._domain.shared_growth_fenced = True
                     if identity.owner_epoch:
                         self._needs_readmission = True
-                    _revoke_domain_growth(self)
-                    self._host_managed = True
-                # Closed targets cannot grow; native permits final exact-old-owner
-                # cleanup but this never makes their identity reusable.
-                result = self._resource.release_all()
-                if result.state != qfe.QUANTFUNC_RESOURCE_READY:
-                    # Comfy's unload hook has no failure channel: unload_all_models() runs unguarded on the
-                    # prompt worker (its OOM handler and POST /free), so an error escaping here ends the
-                    # server's only worker and every later prompt hangs. Native Busy is also the ORDINARY
-                    # answer for a live pipeline: release_all certifies ZERO backing, and the non-paged
-                    # floor never reaches zero. Everything eligible is already released; growth was revoked
-                    # above and is revoked again below, so nothing regrows before the next formal admission,
-                    # which re-reads native residency. What remains is physically visible to Comfy.
-                    print(f"[qf_native] full eviction left native backing (state={result.state}); "
-                          "growth stays fenced until the next formal admission", flush=True)
-                if self._host_managed and not closed:
-                    _revoke_domain_growth(self)
+                    _log.warning("[qf_native] %s; full eviction stopped, growth stays fenced until the next formal "
+                                 "admission", busy)
         # Keep the view and canonical object alive across host deregistration.
         return super().detach(unpatch_all=unpatch_all)
 
