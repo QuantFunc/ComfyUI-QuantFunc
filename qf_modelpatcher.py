@@ -46,9 +46,11 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 import hashlib
 import json
+import logging
 import os
 import tempfile
 import threading
+import time
 import weakref
 
 import math
@@ -1107,8 +1109,72 @@ class _CanonicalResourceDomain:
         self.transaction_lock = threading.RLock()
 
 
+_log = logging.getLogger(__name__)
+
+# Native queries never wait (quantfunc.h). The engine answers QUANTFUNC_RESOURCE_BUSY whenever another thread holds
+# the allocator's or the target's lock at that instant, which is ordinary while native work runs. MEASURED (issue
+# #704, 远程-linux-c): an LTX-2.5 run died before step 2 on one such answer, 1 run in 4 under card contention.
+# Identity survives BUSY: the engine fills device, owner_epoch and capabilities before its reader runs. Values
+# (grants, lifecycle phase, bytes) do not.
+_IDENTITY_STATES = (qfe.QUANTFUNC_RESOURCE_READY, qfe.QUANTFUNC_RESOURCE_BUSY, qfe.QUANTFUNC_RESOURCE_UNKNOWN)
+# A value read that answers BUSY is re-read until this deadline, then refused. BUSY lasts one native critical
+# section; the bound is far above that and only stops a lock that never frees.
+_NATIVE_BUSY_DEADLINE_S = 2.0
+_NATIVE_BUSY_FIRST_BACKOFF_S = 0.001
+_NATIVE_BUSY_MAX_BACKOFF_S = 0.05
+
+
+def _query_identity(resource, *, owner_epoch=None, device=None, allow_closed=False):
+    """Identity (state, device, owner_epoch, capabilities) of one native view; byte fields are None unless READY.
+
+    NativeResource.query() raises on any non-OK status, and an answer the engine never populated carries no
+    CAP_QUERY. owner_epoch and device, when given, must match exactly: an Owned view's own epoch, 0 for the
+    device's Shared view. CLOSED is refused unless allow_closed (full eviction treats a Closed target as done).
+    """
+    snapshot = resource.query()
+    states = _IDENTITY_STATES + ((qfe.QUANTFUNC_RESOURCE_CLOSED,) if allow_closed else ())
+    if snapshot.state not in states or not snapshot.capabilities & qfe.QUANTFUNC_RESOURCE_CAP_QUERY:
+        raise RuntimeError(f"QuantFunc resource identity unavailable (state={snapshot.state})")
+    if ((owner_epoch is not None and snapshot.owner_epoch != owner_epoch) or
+            (device is not None and snapshot.device != device)):
+        raise RuntimeError(f"QuantFunc resource identity changed: epoch {snapshot.owner_epoch} on device "
+                           f"{snapshot.device}, expected epoch {owner_epoch} on device {device}")
+    if snapshot.state != qfe.QUANTFUNC_RESOURCE_READY:
+        _log.debug("[qf_native] resource identity answered state=%d; identity used, bytes not", snapshot.state)
+    return snapshot
+
+
+def _read_past_busy(read, what):
+    """One native VALUE read, re-read while it answers BUSY, until _NATIVE_BUSY_DEADLINE_S.
+
+    Only BUSY is retried. Any other state (READY, UNKNOWN, CLOSED) returns at once for the caller to judge, and an
+    API error raises from `read` unchanged.
+    """
+    started = time.monotonic()
+    busy_reads = 0
+    backoff = _NATIVE_BUSY_FIRST_BACKOFF_S
+    while True:
+        result = read()
+        waited = time.monotonic() - started
+        if result.state != qfe.QUANTFUNC_RESOURCE_BUSY:
+            if busy_reads:
+                _log.debug("[qf_native] %s answered BUSY %d time(s) for %.1f ms, then state=%d (deadline %.0f ms)",
+                           what, busy_reads, waited * 1e3, result.state, _NATIVE_BUSY_DEADLINE_S * 1e3)
+            return result
+        busy_reads += 1
+        if waited >= _NATIVE_BUSY_DEADLINE_S:
+            raise RuntimeError(f"QuantFunc {what} stayed BUSY for {waited * 1e3:.0f} ms ({busy_reads} reads, "
+                               f"deadline {_NATIVE_BUSY_DEADLINE_S * 1e3:.0f} ms): another native thread held "
+                               "the lock the whole time")
+        time.sleep(min(backoff, _NATIVE_BUSY_DEADLINE_S - waited))
+        backoff = min(backoff * 2, _NATIVE_BUSY_MAX_BACKOFF_S)
+
+
 def _ready_grant(resource, *, enroll=False):
-    result = resource.enroll_host() if enroll else resource.query_grant()
+    result = resource.enroll_host() if enroll else _read_past_busy(resource.query_grant, "host grant")
+    if result.state == qfe.QUANTFUNC_RESOURCE_BUSY:
+        # Only enrollment reaches here: it is a native transaction, so a BUSY answer is refused, never re-issued.
+        raise RuntimeError("QuantFunc host enrollment answered BUSY: another native thread held the lock")
     if result.state != qfe.QUANTFUNC_RESOURCE_READY or not result.enrolled:
         raise RuntimeError(f"QuantFunc host grant unavailable (state={result.state}, "
                            f"enrolled={result.enrolled}); an Attached engine cannot be migrated")
@@ -1116,7 +1182,7 @@ def _ready_grant(resource, *, enroll=False):
 
 
 def _ready_device_grant(resource):
-    result = resource.query_device_grant()
+    result = _read_past_busy(resource.query_device_grant, "device grant")
     if result.state != qfe.QUANTFUNC_RESOURCE_READY or not result.enrolled:
         raise RuntimeError(f"QuantFunc device grant unavailable (state={result.state}, "
                            f"enrolled={result.enrolled})")
@@ -1307,9 +1373,7 @@ def canonical_resource_adapters(engine):
     resource = getattr(engine, "resource", None)
     if resource is None:
         raise RuntimeError("QuantFunc engine has no retained native owner identity")
-    snapshot = resource.query()
-    if snapshot.state != qfe.QUANTFUNC_RESOURCE_READY:
-        raise RuntimeError(f"QuantFunc resource identity unavailable (state={snapshot.state})")
+    snapshot = _query_identity(resource)
     if snapshot.owner_epoch == 0:
         raise RuntimeError("QuantFunc model requires an Owned resource, not Shared")
     shared, owners, transaction_lock = _resource_domain(resource._lib, snapshot.device)
@@ -1318,7 +1382,6 @@ def canonical_resource_adapters(engine):
         if owner is None:
             owner = QFNativeResourcePatcher(resource)
             owners[snapshot.owner_epoch] = owner
-            owner._owner_epoch = snapshot.owner_epoch
             owner._domain_key = (qfe.library_identity(resource._lib), int(snapshot.device))
             owner._domain = shared._domain
             owner._shared_adapter = shared
@@ -1478,7 +1541,9 @@ class QFNativeResourcePatcher(comfy.model_patcher.ModelPatcher):
     already Closed target). A plain zero snapshot never authorizes deregistration.
     """
     def __init__(self, resource):
-        load_device = torch.device("cuda", resource.query().device)
+        # The adapter's own identity, fixed for the life of its native view; every later check must see exactly it.
+        identity = _query_identity(resource)
+        load_device = torch.device("cuda", identity.device)
         model = torch.nn.Module()
         model.device = load_device
         super().__init__(model, load_device, torch.device("cpu"))
@@ -1487,7 +1552,7 @@ class QFNativeResourcePatcher(comfy.model_patcher.ModelPatcher):
         self._host_managed = False
         self._needs_readmission = False
         self._closed_identity = False
-        self._owner_epoch = None
+        self._owner_epoch = identity.owner_epoch  # 0 for the device's Shared view
         self._domain_key = None
         self._domain = None
         self._shared_adapter = None
@@ -1495,6 +1560,10 @@ class QFNativeResourcePatcher(comfy.model_patcher.ModelPatcher):
         self._capacity_bytes = None
         self._admission_failed = False
         self._admitting_thread = None
+
+    def _identity(self, *, allow_closed=False):
+        return _query_identity(self._resource, owner_epoch=self._owner_epoch,
+                               device=self.load_device.index, allow_closed=allow_closed)
 
     def preflight_host_load(self):
         """Read-only fail-before-pop validation used during dependency expansion.
@@ -1504,11 +1573,8 @@ class QFNativeResourcePatcher(comfy.model_patcher.ModelPatcher):
         engine-cache operation.
         """
         with _domain_transaction(self):
-            identity = self._resource.query()
-            if identity.state != qfe.QUANTFUNC_RESOURCE_READY:
-                raise RuntimeError(
-                    f"QuantFunc host preflight identity unavailable (state={identity.state})")
-            lifecycle = self._resource.lifecycle()
+            identity = self._identity()
+            lifecycle = _read_past_busy(self._resource.lifecycle, "resource lifecycle")
             if lifecycle.state != qfe.QUANTFUNC_RESOURCE_READY:
                 raise RuntimeError(
                     f"QuantFunc host preflight lifecycle unavailable (state={lifecycle.state})")
@@ -1553,7 +1619,7 @@ class QFNativeResourcePatcher(comfy.model_patcher.ModelPatcher):
 
     def require_load_contract(self):
         with _domain_transaction(self):
-            lifecycle = self._resource.lifecycle()
+            lifecycle = _read_past_busy(self._resource.lifecycle, "resource lifecycle")
             if lifecycle.state != qfe.QUANTFUNC_RESOURCE_READY:
                 raise RuntimeError(f"QuantFunc resource lifecycle unavailable (state={lifecycle.state})")
             self._closed_identity = lifecycle.phase == qfe.QUANTFUNC_RESOURCE_PHASE_CLOSED
@@ -1598,9 +1664,7 @@ class QFNativeResourcePatcher(comfy.model_patcher.ModelPatcher):
                                       force_patch_weights=force_patch_weights)
                 allowance = 0
             self.require_load_contract()
-            identity = self._resource.query()
-            if identity.state != qfe.QUANTFUNC_RESOURCE_READY:
-                raise RuntimeError(f"QuantFunc resource identity unavailable (state={identity.state})")
+            identity = self._identity()
             before_domain = _domain_loaded_size(self)
             prior = (_capture_domain_grants(self, identity)
                      if self._host_managed else None)
@@ -1613,7 +1677,10 @@ class QFNativeResourcePatcher(comfy.model_patcher.ModelPatcher):
                         growth_allowance=allowance)
                     published = True
                 if self._prepared_entry is not None:
-                    lifecycle = self._resource.lifecycle()
+                    lifecycle = _read_past_busy(self._resource.lifecycle, "resource lifecycle")
+                    if lifecycle.state != qfe.QUANTFUNC_RESOURCE_READY:
+                        # A non-READY answer carries no phase; reading None as "not Prepared" skipped materialize().
+                        raise RuntimeError(f"QuantFunc admission lifecycle unavailable (state={lifecycle.state})")
                     if lifecycle.phase == qfe.QUANTFUNC_RESOURCE_PHASE_PREPARED:
                         self._prepared_entry.materialize()
                 self._prepared = False
@@ -1669,13 +1736,11 @@ class QFNativeResourcePatcher(comfy.model_patcher.ModelPatcher):
     def detach(self, unpatch_all=True):
         if unpatch_all:
             with _domain_transaction(self):
-                identity = self._resource.query()
-                if identity.state not in (qfe.QUANTFUNC_RESOURCE_READY, qfe.QUANTFUNC_RESOURCE_CLOSED):
-                    raise RuntimeError(f"QuantFunc full eviction identity unavailable (state={identity.state})")
+                identity = self._identity(allow_closed=True)
                 if not identity.capabilities & qfe.QUANTFUNC_RESOURCE_CAP_RELEASE_ALL:
                     raise qfe.NativeContractUnavailable("QuantFunc native resource full eviction is unsupported "
                                                         "without CAP_RELEASE_ALL; keep the host record")
-                lifecycle = self._resource.lifecycle()
+                lifecycle = _read_past_busy(self._resource.lifecycle, "resource lifecycle")
                 if lifecycle.state != qfe.QUANTFUNC_RESOURCE_READY:
                     raise RuntimeError(f"QuantFunc full eviction lifecycle unavailable (state={lifecycle.state})")
                 closed = lifecycle.phase == qfe.QUANTFUNC_RESOURCE_PHASE_CLOSED
