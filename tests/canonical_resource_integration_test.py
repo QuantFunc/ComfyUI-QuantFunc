@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Batch CPU integration: actual plugin factories + official host; only native ABI doubled."""
+import ast
 import ctypes
 import os
 import sys
@@ -1494,8 +1495,12 @@ class CanonicalIntegration(unittest.TestCase):
         refused = "unavailable|stayed BUSY"
         for state in (1, 2):
             self.lib.resources[2]["state"] = state
-            with self.assertRaisesRegex(RuntimeError, refused):  # bytes too: refused, never zero
-                owner.loaded_size()
+            if state == qfe.QUANTFUNC_RESOURCE_BUSY:  # never admitted, so nothing materialized: the logged 0
+                with self.assertLogs(qfm._log.name, "WARNING"):
+                    self.assertEqual(owner.loaded_size(), 0)
+            else:
+                with self.assertRaisesRegex(RuntimeError, refused):  # UNKNOWN still refuses, never zero
+                    owner.loaded_size()
             if state == qfe.QUANTFUNC_RESOURCE_BUSY:  # a release that stays BUSY vouches for no freed bytes
                 self.assertEqual(owner.partially_unload(torch.device("cpu"), 64), 0)
             else:
@@ -1871,6 +1876,70 @@ class CanonicalIntegration(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "host enrollment answered BUSY"):
                     self.wrapper(f"704-enroll-{site}").model_patches_models()
                 self.assertEqual(calls[0], skip + 1)
+
+    def test_704_every_comfy_facing_override_declares_a_busy_policy(self):
+        """ComfyUI's memory manager calls these on a loaded model; the set is re-derived from the INSTALLED comfy
+        source, so a ComfyUI that starts calling another override fails here until that override declares a policy."""
+        tree = ast.parse(open(mm.__file__, encoding="utf-8").read())
+        called = {node.func.attr for node in ast.walk(tree)
+                  if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)}
+        base = qfm.comfy.model_patcher.ModelPatcher
+        declared = set(qfm._COMFY_BUSY_POLICY)
+        for cls in (qfm.QFNativeResourcePatcher, qfm.QFModelPatcher):
+            overrides = {name for name, value in vars(cls).items()
+                         if callable(value) and not name.startswith("__") and hasattr(base, name) and name in called}
+            with self.subTest(cls=cls.__name__):
+                self.assertTrue(overrides)
+                self.assertEqual({f"{cls.__name__}.{name}" for name in overrides} - declared, set())
+
+    def sizing_busy(self, name):
+        self.short_busy_deadline()
+        return self.busy_first(name)
+
+    def test_704_loaded_size_busy_answers_the_last_ready_residency(self):
+        _patcher, owner, _shared = self.warm_native_model("704-size-seeded")
+        seen = owner.loaded_size()
+        self.sizing_busy("query_residency")
+        with self.assertLogs(qfm._log.name, "WARNING") as logs:
+            self.assertEqual(owner.loaded_size(), seen)
+        self.assertRegex("\n".join(logs.output), r"resource residency stayed BUSY for \d+ ms.*last READY")
+
+    def test_704_loaded_size_busy_never_admitted_answers_a_logged_zero(self):
+        owner, _shared = self.wrapper("704-size-fresh").model_patches_models()
+        self.sizing_busy("query_residency")
+        with self.assertLogs(qfm._log.name, "WARNING") as logs:
+            self.assertEqual(owner.loaded_size(), 0)
+        self.assertRegex("\n".join(logs.output), r"no READY residency")
+
+    def test_704_model_size_busy_owned_answers_its_prepared_capacity(self):
+        _patcher, owner, _shared = self.warm_native_model("704-size-owned")
+        self.sizing_busy("query_lifecycle")
+        with self.assertLogs(qfm._log.name, "WARNING") as logs:
+            self.assertEqual(owner.model_size(), self.lib.capacity_bytes)
+        self.assertRegex("\n".join(logs.output), r"lifecycle stayed BUSY")
+
+    def test_704_model_size_busy_shared_answers_the_last_ready_residency(self):
+        _patcher, _owner, shared = self.warm_native_model("704-size-shared")
+        seen = shared.loaded_size()
+        self.sizing_busy("query_lifecycle")
+        with self.assertLogs(qfm._log.name, "WARNING"):
+            self.assertEqual(shared.model_size(), seen)
+
+    def test_704_shared_detach_never_raises_on_a_persistent_busy(self):
+        _patcher, _owner, shared = self.warm_native_model("704-detach-shared")
+        self.lib.capabilities = 7  # CAP_RELEASE_ALL
+        self.sizing_busy("query_lifecycle")
+        with self.assertLogs(qfm._log.name, "WARNING"):
+            shared.detach(True)
+        self.assertTrue(shared._domain.shared_growth_fenced)
+        self.assertFalse(shared._needs_readmission)  # only an Owned view is re-admitted
+
+    def test_704_model_load_path_refuses_a_persistent_busy(self):
+        """The load path runs only for the model a prompt asked for, and that prompt reports the failure."""
+        patcher, _owner, _shared = self.warm_native_model("704-load-refuses")
+        self.sizing_busy("query_lifecycle")
+        with self.assertRaisesRegex(RuntimeError, "stayed BUSY"):
+            patcher.partially_load(patcher.load_device, 4096)
 
     def test_704_capacity_busy_past_the_deadline_refuses_the_prepare(self):
         """A target still Creating answers BUSY for its whole create: a legitimate refusal, never a zero capacity."""
