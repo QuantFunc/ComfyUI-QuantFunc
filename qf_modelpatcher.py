@@ -1260,13 +1260,16 @@ def _busy_zero_freed(adapter, busy, *_args, **_kwargs):
 
 def _busy_stop_eviction(adapter, busy, unpatch_all=True):
     """The eviction stops where it is (nothing more is released), like release_all's non-READY branch: growth stays
-    fenced, an Owned view is re-admitted formally, and ComfyUI's record is dropped as usual."""
-    domain = getattr(adapter, "_domain", None)
-    if domain is not None:
-        with domain.transaction_lock:
-            domain.shared_growth_fenced = True
-    if adapter._owner_epoch:
-        adapter._needs_readmission = True
+    fenced, an Owned view is re-admitted formally, and ComfyUI's record is dropped as usual.
+
+    This runs after detach's transaction has released the domain lock, and that is safe. The BUSY answer applied
+    nothing, and detach's earlier writes only fence and mark. A peer that takes the lock in between runs its whole
+    transaction first. Both writes below then land in one hold of that lock, so the result is the peer's transaction
+    followed by this eviction."""
+    with _domain_transaction(adapter):
+        adapter._domain.shared_growth_fenced = True
+        if adapter._owner_epoch:
+            adapter._needs_readmission = True
     _log.warning("[qf_native] %s; full eviction stopped, growth stays fenced until the next formal admission", busy)
     return comfy.model_patcher.ModelPatcher.detach(adapter, unpatch_all=unpatch_all)
 
