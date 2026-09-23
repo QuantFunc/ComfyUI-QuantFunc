@@ -359,7 +359,7 @@ class NativeResourceSchedulerContract(unittest.TestCase):
     def make_resource(self, held=1536, eligible=1536, device=0):
         # Only the external C calls are doubled. Use the actual retained Python
         # view, adapter, ModelPatcher, LoadedModel and host scheduling loop.
-        lib = types.SimpleNamespace(held=held, eligible=eligible, state=0,
+        lib = types.SimpleNamespace(held=held, eligible=eligible, state=0, capabilities=3,
                                     status=0, requests=[], closed=[], device=device)
         def acquire(pipeline, version, out):
             out._obj.value = 17
@@ -382,7 +382,7 @@ class NativeResourceSchedulerContract(unittest.TestCase):
         def query(pointer, out):
             out._obj.state, out._obj.device = lib.state, lib.device
             out._obj.owner_epoch = 123 if pointer.value == 17 else 0
-            out._obj.capabilities = 3
+            out._obj.capabilities = lib.capabilities
             # Deliberately unlike the aggregate: these fields may identify
             # the resource's device but must never become Python byte policy.
             out._obj.cca_live, out._obj.arena_backed = 7000, 9000
@@ -540,10 +540,7 @@ class NativeResourceSchedulerContract(unittest.TestCase):
         self.assertEqual(patcher.loaded_size(), 1472)
 
     def test_nonready_and_native_error_never_become_zero_or_drop_record(self):
-        short = mock.patch.object(qfm, "_NATIVE_BUSY_DEADLINE_S", 0.05, create=True)
-        short.start()
-        self.addCleanup(short.stop)
-        for state, status in ((1, 0), (2, 0), (3, 0), (0, 1)):
+        for state, status in ((2, 0), (3, 0), (0, 1)):
             with self.subTest(state=state, status=status):
                 lib, patcher = self.make_resource()
                 with self.host_registry():
@@ -554,15 +551,30 @@ class NativeResourceSchedulerContract(unittest.TestCase):
                         with self.assertRaises(RuntimeError):
                             mm.free_memory(4096, patcher.load_device)
                     self.assertEqual(mm.current_loaded_models, [original])
-                    if (state, status) == (1, 0):
-                        # #704: a release that stays BUSY vouches for no freed bytes. partially_unload runs inside
-                        # Comfy's unload path (no failure channel), so it reports 0 (logged) and Comfy falls back to
-                        # its own full detach; Unknown, Closed and a native error still refuse.
-                        self.assertEqual(patcher.partially_unload(torch.device("cpu"), 128), 0)
-                    else:
-                        with self.assertRaises(RuntimeError):
-                            patcher.partially_unload(torch.device("cpu"), 128)
-                    self.assertEqual(mm.current_loaded_models, [original])
+                    with self.assertRaises(RuntimeError):
+                        patcher.partially_unload(torch.device("cpu"), 128)
+
+    def test_704_free_memory_completes_past_a_persistent_busy(self):
+        """#704: Comfy's own free_memory sizes and unloads this model while native stays BUSY. It runs on every
+        load_models_gpu, and in unload_all_models behind POST /free and the OOM handler. Each method answers by its
+        declared policy (qfm._COMFY_BUSY_POLICY), so nothing escapes:
+        - sizing answers the last READY residency, never 0;
+        - no release is issued;
+        - the eviction stops with growth fenced;
+        - the owner is re-admitted formally on its next load."""
+        lib, patcher = self.make_resource()
+        lib.capabilities |= qfe.QUANTFUNC_RESOURCE_CAP_RELEASE_ALL  # without it detach refuses on the capability
+        with self.host_registry(), mock.patch.object(qfm, "_NATIVE_BUSY_DEADLINE_S", 0.05, create=True):
+            self.load(patcher)
+            requests = list(lib.requests)
+            self.assertFalse(patcher._domain.shared_growth_fenced or patcher._needs_readmission)
+            lib.state = qfe.QUANTFUNC_RESOURCE_BUSY
+            with mock.patch.object(mm, "get_free_memory", side_effect=self.free_memory(0)):
+                mm.free_memory(4096, patcher.load_device)
+            self.assertEqual(mm.current_loaded_models, [])
+            self.assertEqual(lib.requests, requests)
+            self.assertTrue(patcher._domain.shared_growth_fenced and patcher._needs_readmission)
+            self.assertEqual(patcher.loaded_size(), 1536)
 
     def test_clone_handoff_does_not_request_physical_release(self):
         lib, patcher = self.make_resource()

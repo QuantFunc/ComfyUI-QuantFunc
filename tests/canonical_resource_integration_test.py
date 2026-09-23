@@ -1716,8 +1716,10 @@ class CanonicalIntegration(unittest.TestCase):
     def test_704_byte_reads_busy_past_the_deadline_are_refused_never_zero(self):
         _patcher, owner, _shared = self.warm_native_model("704-bytes-deadline")
         self.short_busy_deadline()
-        # Different native functions AND consumers: one override never reaches the other read.
-        for name, what, read in (("query_residency", "resource residency", owner.loaded_size),
+        # Different native functions AND consumers: one override never reaches the other read. The plugin's own math
+        # reads strictly (_resident_bytes feeds the grant limits); ComfyUI-facing sizing answers by its declared
+        # policy instead (test_704_loaded_size_busy_answers_the_last_ready_residency).
+        for name, what, read in (("query_residency", "resource residency", owner._resident_bytes),
                                  ("query_domain_residency", "domain residency",
                                   lambda: qfm._domain_loaded_size(owner))):
             with self.subTest(read=name):
@@ -1727,8 +1729,10 @@ class CanonicalIntegration(unittest.TestCase):
 
     def test_704_a_concurrent_detach_waits_at_most_the_deadline(self):
         """The re-reads sleep inside _domain_transaction: a concurrent detach on the same device domain (Comfy's
-        /free) waits for them, bounded by the deadline, then proceeds (native code never takes this lock: no deadlock)."""
+        /free) waits for them, bounded by the deadline, then proceeds (native code never takes this lock: no deadlock).
+        The retrying reader is Comfy's own sizing call, which then answers by its policy, outside the lock."""
         _patcher, owner, _shared = self.warm_native_model("704-lock")
+        last_ready = owner.loaded_size()
         self.lib.capabilities = 7  # CAP_RELEASE_ALL
         deadline = 0.2
         patch = mock.patch.object(qfm, "_NATIVE_BUSY_DEADLINE_S", deadline, create=True)
@@ -1744,11 +1748,11 @@ class CanonicalIntegration(unittest.TestCase):
 
         self.lib.quantfunc_resource_query_residency = busy
         self.addCleanup(setattr, self.lib, "quantfunc_resource_query_residency", original)
-        errors = []
+        answers, errors = [], []
 
         def holder():
             try:
-                owner.loaded_size()
+                answers.append(owner.loaded_size())
             except RuntimeError as error:
                 errors.append(error)
 
@@ -1761,7 +1765,7 @@ class CanonicalIntegration(unittest.TestCase):
         self.assertIn(("full", owner._resource._pointer.value), self.lib.events)
         thread.join(3)
         self.assertFalse(thread.is_alive(), "the retrying holder never finished")
-        self.assertRegex(str(errors[0]), r"resource residency stayed BUSY for \d+ ms")
+        self.assertEqual((answers, errors), ([last_ready], []))
         self.assertGreater(waited, deadline / 4)   # it really waited behind the held transaction lock ...
         self.assertLess(waited, deadline + 1.0)    # ... and only for about one deadline
 
