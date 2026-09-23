@@ -1195,17 +1195,23 @@ def _ready_read(read, what):
 #   detach                LoadedModel.model_unload :841, load_models_gpu :988 (unpatch_all=False)
 #   partially_load        LoadedModel.model_use_more_vram :848 <- model_load :820 <- load_models_gpu :1033
 #   model_patches_models  load_models_gpu :954
+#   get_additional_models ModelPatcher.get_nested_additional_models (model_patcher.py:1405) <- unload_model_and_clones
+#                         :2130 and sampler_helpers._prepare_sampling :193, both for a prompt's own model
+#   loaded_ram_size       load_models_gpu :1036, only when model.is_dynamic()
+#   partially_unload_ram  free_model_pins :682 (models_for_pin_eviction :667) and reset_cast_buffers :1483, only when
+#                         model.is_dynamic(); no QuantFunc patcher is dynamic, so these two are declared, not reached
 # free_memory (:893) sizes EVERY loaded model (:902-907) before it decides anything. It runs on every load_models_gpu
 # (:1001, :1010), including prompts that never touch a QuantFunc model, and from unload_all_models (:2121), which
 # main.py:390 (POST /free), execution.py:644 (the OOM handler) and execution.py:837 call with no failure channel. So a
 # sizing or unload method never lets a persistent BUSY escape: it answers by its policy. A load method runs only for
-# the model a prompt asked for, and that prompt reports the failure, so it refuses honestly.
+# the model a prompt asked for, and that prompt reports the failure, so it refuses honestly. A method that makes no
+# resource read cannot meet a BUSY; it is declared "no resource read" so the completeness test still accounts for it.
 _COMFY_BUSY_POLICY = {}
 
 
 def _comfy_facing(policy):
     """Declare a ComfyUI-facing method and its persistent-BUSY policy: a function that answers in its place (called
-    with the adapter, the _NativeStillBusy, then the method's arguments), or "refuses" / "no native call"."""
+    with the adapter, the _NativeStillBusy, then the method's arguments), or "refuses" / "no resource read"."""
     def declare(method):
         _COMFY_BUSY_POLICY[method.__qualname__] = getattr(policy, "__name__", policy)
         if not callable(policy):
@@ -1922,11 +1928,11 @@ class QFModelPatcher(comfy.model_patcher.ModelPatcher):
     def _is_shadow(self):
         return bool(getattr(getattr(self, "model", None), "_qf_shadow", False))
 
-    @_comfy_facing("no native call")
+    @_comfy_facing("no resource read")
     def model_size(self):
         return super().model_size()
 
-    @_comfy_facing("no native call")
+    @_comfy_facing("no resource read")
     def loaded_size(self):
         return super().loaded_size()
 
@@ -1942,7 +1948,7 @@ class QFModelPatcher(comfy.model_patcher.ModelPatcher):
         return super().partially_load(device_to, extra_memory,
                                       force_patch_weights=force_patch_weights)
 
-    @_comfy_facing("no native call")
+    @_comfy_facing("no resource read")
     def partially_unload(self, device_to, memory_to_free=0, force_patch_weights=False):
         return super().partially_unload(device_to, memory_to_free,
                                         force_patch_weights=force_patch_weights)
@@ -1965,7 +1971,7 @@ class QFModelPatcher(comfy.model_patcher.ModelPatcher):
                                  self.object_patches_backup, self.pinned))
         return src.clone(model_override=override)
 
-    @_comfy_facing("no native call")
+    @_comfy_facing("no resource read")
     def detach(self, unpatch_all=True):
         """Detach logical patches only; canonical dependencies own native eviction."""
         # Only logical patches belong here. Native adapters retain their own
@@ -1974,7 +1980,7 @@ class QFModelPatcher(comfy.model_patcher.ModelPatcher):
 
     # ── HOST-RAM reporting ────────────────────────────────────────────────────────────────
     # REACHABILITY, stated honestly (measured in this ComfyUI): comfy calls loaded_ram_size() and
-    # partially_unload_ram() ONLY behind `model.is_dynamic()` (model_management.py:665/1006/1451;
+    # partially_unload_ram() ONLY behind `model.is_dynamic()` (0.37.0 model_management.py:667/1036/1471;
     # base ModelPatcher.is_dynamic() returns False and comfy's own comment says "Loaded RAM
     # pressure tracking is only implemented for DynamicVram loading"). This patcher is NOT dynamic
     # — opting in would mean implementing comfy's whole DynamicVram surface (weight pinning, VBAR,
@@ -2002,6 +2008,7 @@ class QFModelPatcher(comfy.model_patcher.ModelPatcher):
             return False, eng
         return True, eng
 
+    @_comfy_facing("no resource read")
     def loaded_ram_size(self):
         """HOST-RAM this model is actually responsible for: the engine's CPU backup after a
         co-eviction, else 0 (including for a handle that was never created)."""
@@ -2010,6 +2017,7 @@ class QFModelPatcher(comfy.model_patcher.ModelPatcher):
         holds, eng = self._engine_holds_cpu_backup()
         return max(0, int(getattr(eng, "footprint_bytes", 0))) if holds else 0
 
+    @_comfy_facing(_busy_zero_freed)
     def partially_unload_ram(self, ram_to_unload, subsets=None):
         """comfy's RAM manager asking for host memory back. Releasing the engine handle frees the
         CPU backup; the lazy handle re-creates from disk on the next use, so this is a real
