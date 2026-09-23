@@ -1608,15 +1608,15 @@ class CanonicalIntegration(unittest.TestCase):
         patch.start()
         self.addCleanup(patch.stop)
 
-    def busy_first(self, name, times=None):
-        """lib.quantfunc_resource_<name> answers BUSY having done NOTHING (a lock miss) for its first `times` calls
-        (None = all), then behaves normally. Returns a call counter."""
+    def busy_first(self, name, times=None, skip=0):
+        """After `skip` normal calls, lib.quantfunc_resource_<name> answers BUSY having done NOTHING (a lock miss) for
+        `times` calls (None = all), then behaves normally again. Returns a call counter."""
         attr = "quantfunc_resource_" + name
         original, calls = getattr(self.lib, attr), [0]
 
         def busy(*args):
             calls[0] += 1
-            if times is not None and calls[0] > times:
+            if calls[0] <= skip or (times is not None and calls[0] > skip + times):
                 return original(*args)
             args[-1]._obj.state = qfe.QUANTFUNC_RESOURCE_BUSY
             return 0
@@ -1835,6 +1835,42 @@ class CanonicalIntegration(unittest.TestCase):
         self.assertGreater(grants[0], 1)
         self.assertFalse(any(event[:2] == ("release", key) for event in self.lib.events))
         self.assertTrue(owner._domain.shared_growth_fenced)
+
+    def detach_stops_on_busy(self, name, what):
+        """detach runs inside Comfy's unload hook (no failure channel). A read that stays BUSY past the deadline stops
+        the full eviction where it is: nothing more is released, growth stays fenced, the Owned adapter must be
+        re-admitted and the BUSY is logged - never a raise."""
+        _patcher, owner, _shared = self.warm_native_model(f"704-detach-{name}")
+        self.lib.capabilities = 7  # CAP_RELEASE_ALL
+        key = owner._resource._pointer.value
+        self.short_busy_deadline()
+        calls = self.busy_first(name)
+        with self.assertLogs(qfm._log.name, "WARNING") as logs:
+            owner.detach(True)
+        self.assertRegex("\n".join(logs.output), what + r" stayed BUSY for \d+ ms")
+        self.assertGreater(calls[0], 1)
+        self.assertNotIn(("full", key), self.lib.events)  # nothing released after the stop
+        self.assertTrue(owner._domain.shared_growth_fenced)
+        self.assertTrue(owner._needs_readmission)
+
+    def test_704_detach_lifecycle_busy_never_raises(self):
+        self.detach_stops_on_busy("query_lifecycle", "full eviction lifecycle")
+
+    def test_704_detach_grant_busy_never_raises(self):
+        self.detach_stops_on_busy("query_grant", "host grant")
+
+    def test_704_detach_revoke_busy_never_raises(self):
+        self.detach_stops_on_busy("set_domain_grants", "atomic domain grant")
+
+    def test_704_enrollment_busy_is_refused_once_never_reissued(self):
+        """Enrollment is a native transaction on the create/prepare paths (Shared at domain setup, Owned in the
+        Prepared entry), which do have a failure channel: a BUSY answer is refused at once and never re-issued."""
+        for site, skip in (("shared", 0), ("owned", 1)):
+            with self.subTest(site=site):
+                calls = self.busy_first("enroll_host", times=1, skip=skip)
+                with self.assertRaisesRegex(RuntimeError, "host enrollment answered BUSY"):
+                    self.wrapper(f"704-enroll-{site}").model_patches_models()
+                self.assertEqual(calls[0], skip + 1)
 
     def test_704_capacity_busy_past_the_deadline_refuses_the_prepare(self):
         """A target still Creating answers BUSY for its whole create: a legitimate refusal, never a zero capacity."""
