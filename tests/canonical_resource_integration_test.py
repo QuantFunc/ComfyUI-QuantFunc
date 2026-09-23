@@ -1882,12 +1882,28 @@ class CanonicalIntegration(unittest.TestCase):
                 self.assertEqual(calls[0], skip + 1)
 
     def test_704_every_comfy_facing_override_declares_a_busy_policy(self):
-        """ComfyUI's memory manager calls these on a loaded model; the set is re-derived from the INSTALLED comfy
+        """ComfyUI's memory manager calls these on a loaded model, directly or through the base ModelPatcher methods it
+        calls (get_nested_additional_models -> get_additional_models). The set is re-derived from the INSTALLED comfy
         source, so a ComfyUI that starts calling another override fails here until that override declares a policy."""
-        tree = ast.parse(open(mm.__file__, encoding="utf-8").read())
-        called = {node.func.attr for node in ast.walk(tree)
-                  if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)}
+        def parse(path):
+            with open(path, encoding="utf-8") as source:
+                return ast.parse(source.read())
+
+        def attr_calls(node, on_self=False):
+            return {call.func.attr for call in ast.walk(node)
+                    if isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+                    and (not on_self or getattr(call.func.value, "id", None) == "self")}
+
         base = qfm.comfy.model_patcher.ModelPatcher
+        called = attr_calls(parse(mm.__file__))
+        patcher_class = next(node for node in parse(qfm.comfy.model_patcher.__file__).body
+                             if isinstance(node, ast.ClassDef) and node.name == base.__name__)
+        bodies = {node.name: node for node in patcher_class.body if isinstance(node, ast.FunctionDef)}
+        frontier = list(called & bodies.keys())
+        while frontier:
+            reached = (attr_calls(bodies[frontier.pop()], on_self=True) & bodies.keys()) - called
+            called |= reached
+            frontier += reached
         declared = set(qfm._COMFY_BUSY_POLICY)
         for cls in (qfm.QFNativeResourcePatcher, qfm.QFModelPatcher):
             overrides = {name for name, value in vars(cls).items()
