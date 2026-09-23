@@ -77,9 +77,9 @@ def _qf_dtype(torch_dtype):
 # H2D, nsys W10) plus the engine's per-geometry rope rebuild (~1.2 s). Real VRAM pressure does
 # NOT depend on this timer: comfy's free_memory sweep reaches partially_unload() when it asks for
 # less than this model's loaded size (engine quantfunc_partial_unload sheds blocks, full unload as
-# the fallback), and detach(unpatch_all=True) when it asks for all of it — that one unloads NOW
-# (_qf_detach_engine); both cancel the window — so the window only bounds how long an IDLE engine
-# keeps VRAM nobody asked for. 120 s covers a whole multi-stage run plus the gap to the next queue entry;
+# the fallback), and detach(unpatch_all=True) when it asks for all of it or the shed fell short —
+# that one unloads NOW (_qf_detach_engine; a refused unload re-arms the window); both cancel the
+# window — so the window only bounds how long an IDLE engine keeps VRAM nobody asked for. 120 s covers a whole multi-stage run plus the gap to the next queue entry;
 # model-agnostic (the policy lives here, not in any loader).
 _QF_LAZY_DETACH_SECONDS = 120.0
 
@@ -155,16 +155,23 @@ def _qf_detach_engine(eng, unpatch_all, shadow):
     """QFModelPatcher.detach's engine side (module level so tests/lazy_detach_shared_engine_test.py drives it).
     comfy passes unpatch_all=False when the model's weights stay valid for a successor: the clone swap in
     load_models_gpu and a dropped patcher's __del__ -> keep the engine resident and arm the lazy window.
-    unpatch_all=True comes from LoadedModel.model_unload, i.e. free_memory asked for at least this model's whole
-    loaded size (so it skipped partially_unload) and drops the model from its ledger -> free the VRAM NOW. A lazy
-    window there left the engine resident while comfy counted it free (measured 2026-09-23, 远程-linux-c 5090,
-    LTX-2.5 t2av: comfy's own VAE decode OOMed on both prompts). A shadow never drives the shared engine's
-    eviction (see partially_unload), so it only arms the window. Returns "unload" | "lazy" | None (nothing held)."""
-    if eng is None or getattr(eng, "unloaded", False):
+    unpatch_all=True comes from LoadedModel.model_unload: free_memory asked for at least this model's whole loaded
+    size (partially_unload skipped), or a partial shed fell short (partially_unload's own full-unload fallback then
+    already freed it and this finds nothing held); either way comfy drops the model from its ledger -> free the VRAM
+    NOW. A lazy window there left the engine resident while comfy counted it free (measured 2026-09-23, 远程-linux-c
+    5090, LTX-2.5 t2av: comfy's own VAE decode OOMed on both prompts). If the engine REFUSES the unload (busy /
+    error: unload_vram returns 0 with the engine still resident) the window is armed so its expiry retries, and
+    nothing claims the VRAM was freed. A shadow never drives the shared engine's eviction (see partially_unload),
+    so it only arms the window. Returns "unload" | "refused" | "lazy" | None (nothing held — no engine, a wrapper
+    that never materialized, or already unloaded; `pipeline` never materializes a wrapper)."""
+    if eng is None or getattr(eng, "pipeline", None) is None or getattr(eng, "unloaded", False):
         return None
     if unpatch_all and not shadow:
         _qf_cancel_pending_detach(eng)
         eng.unload_vram()
+        if not getattr(eng, "unloaded", False):   # refused: VRAM still held -> retry at the window's expiry
+            _qf_arm_lazy_detach(eng)
+            return "refused"
         return "unload"
     _qf_arm_lazy_detach(eng)
     return "lazy"
@@ -1088,6 +1095,9 @@ class QFModelPatcher(comfy.model_patcher.ModelPatcher):
                   f"reclaim window)", flush=True)
         elif how == "unload":
             print("[qf_prof] detach -> engine VRAM freed (comfy memory-pressure unload)", flush=True)
+        elif how == "refused":
+            print("[qf_native] detach: the engine REFUSED comfy's memory-pressure unload (busy or error) — its VRAM "
+                  f"is still held; retrying at the {_QF_LAZY_DETACH_SECONDS:.0f}s window expiry", flush=True)
         return super().detach(unpatch_all=unpatch_all)
 
     # ── HOST-RAM reporting ────────────────────────────────────────────────────────────────

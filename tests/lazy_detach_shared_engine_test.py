@@ -26,6 +26,10 @@ AST-extracted from qf_modelpatcher.py (pure Python: no comfy / torch / GPU), wit
   A12 a shadow's unpatch_all=True detach only arms the window (a shadow never drives the shared engine's eviction)
   A13 mutation: with the pre-fix always-lazy detach, A10's scenario leaves the engine resident (A10 can fail)
   A14 nothing held (no engine / already unloaded): no unload, no window
+  A15 the engine REFUSES the pressure unload (unload_vram -> 0, still resident): "refused", the window is armed and its
+      expiry retries the unload — never a silent 'freed'
+  A16 a pressure detach through an UNMATERIALIZED wrapper holds nothing: no materialization, no unload, no window
+  A17 mutation: without the refusal check, A15's scenario reports "unload" and arms no retry (A15 can fail)
 
 Run: python3 tests/lazy_detach_shared_engine_test.py   (exit 0 = pass, 1 = the contract is broken)
 """
@@ -54,8 +58,14 @@ _RECLAIM_LINE = "            _qf_cancel_pending_detach(self._real)\n"
 _EAGER_LINE = "    if unpatch_all and not shadow:\n"
 
 
-def _load(anchor_mutant=False, ensure_mutant=False, detach_mutant=False):
+_REFUSE_LINE = "        if not getattr(eng, \"unloaded\", False):   # refused: VRAM still held -> retry at the window's expiry\n"
+
+
+def _load(anchor_mutant=False, ensure_mutant=False, detach_mutant=False, refuse_mutant=False):
     src = open(_SRC, encoding="utf-8").read()
+    if refuse_mutant:
+        assert src.count(_REFUSE_LINE) == 1, "_qf_detach_engine's refusal check not found exactly once"
+        src = src.replace(_REFUSE_LINE, "        if False:\n")
     if detach_mutant:
         assert src.count(_EAGER_LINE) == 1, "_qf_detach_engine's eager branch not found exactly once"
         src = src.replace(_EAGER_LINE, "    if False:\n")
@@ -252,6 +262,38 @@ mns13["_qf_cancel_pending_detach"](r13)
 r14 = _Real(); r14.unloaded = True
 check("A14 nothing held: no unload, no window", ns["_qf_detach_engine"](None, True, False) is None and
       ns["_qf_detach_engine"](r14, True, False) is None and r14.unload_calls == 0 and not getattr(r14, "pending_detach", False))
+
+
+class _RefusingReal(_Real):
+    """quantfunc_unload_sync refused (busy / error): unload_vram returns 0 and the engine stays resident."""
+    def unload_vram(self):
+        self.unload_calls += 1
+        return 0
+
+
+def _refused(nsx):
+    r = _RefusingReal()
+    how = nsx["_qf_detach_engine"](_wrapper(nsx, r), True, False)
+    return r, how, r.unload_calls, getattr(r, "pending_detach", False)
+
+
+r15, how15, now15, pend15 = _refused(ns)
+check("A15 a refused pressure unload reports 'refused' and arms the retry window",
+      how15 == "refused" and now15 == 1 and pend15 is True, f"how={how15} unload_calls={now15} pending={pend15}")
+_settle()
+check("A15 ...whose expiry retries the unload", r15.unload_calls == 2, f"unload_calls={r15.unload_calls}")
+
+made16 = []
+w16 = ns["QFLazyEngine"](factory=lambda: made16.append(1) or (_Real(), "ckey"), footprint_bytes=0)
+w16._unloaded = False                            # what partially_load() sets on a not-yet-created wrapper
+how16 = ns["_qf_detach_engine"](w16, True, False)
+check("A16 an unmaterialized wrapper under pressure: nothing held, nothing created, no window",
+      how16 is None and not made16 and not getattr(w16, "pending_detach", False), f"how={how16} created={len(made16)}")
+
+mns17 = _load(refuse_mutant=True)
+r17, how17, now17, pend17 = _refused(mns17)
+check("A17 mutant (no refusal check) reports 'unload' with no retry window (A15 can fail)",
+      how17 == "unload" and pend17 is False, f"how={how17} pending={pend17}")
 
 print("ALL PASS" if not FAILS else f"{len(FAILS)} FAILED: {FAILS}")
 sys.exit(1 if FAILS else 0)
