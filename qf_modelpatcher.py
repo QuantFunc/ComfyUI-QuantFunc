@@ -618,6 +618,10 @@ class QFLazyEngine:
         self.reconcile_lora()
         if self._real is None:
             self._real, self._ckey = self._factory()
+            # Materializing onto a (cached, possibly SHARED) real handle is a reclaim: a displaced sibling's pending
+            # lazy-detach window on that handle must not expire under this wrapper's first begin. The begin's own cancel
+            # ran BEFORE this point, on the then-unmaterialized wrapper (which anchors to itself) — the fresh-sibling gap.
+            _qf_cancel_pending_detach(self._real)
             self._real.step_count = self.step_count
             self._real.sampler_step_count = self.sampler_step_count
             self.footprint_bytes = int(self._real.footprint_bytes)

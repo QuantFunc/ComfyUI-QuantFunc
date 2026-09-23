@@ -14,6 +14,9 @@ AST-extracted from qf_modelpatcher.py (pure Python: no comfy / torch / GPU), wit
   A3 mutation: with the anchor reverted to the wrapper itself (the pre-fix keying), A1's scenario DOES
      unload the shared handle — proves A1 can fail
   A4 an unmaterialized wrapper anchors to itself (nothing created, nothing to unload)
+  A5 a FRESH sibling (a new loader output, materialized by its first begin through the real ensure() onto the cached
+     shared handle) reclaims the displaced sibling's pending window — its begin's cancel ran before materialization
+  A6 mutation: with ensure()'s reclaim line removed, A5's scenario DOES unload (proves A5 can fail)
 
 Run: python3 tests/lazy_detach_shared_engine_test.py   (exit 0 = pass, 1 = the contract is broken)
 """
@@ -36,9 +39,15 @@ class _Qfe:   # the one qf_engine member the timer body touches
         pass
 
 
-def _load(anchor_mutant=False):
+_RECLAIM_LINE = "            _qf_cancel_pending_detach(self._real)\n"
+
+
+def _load(anchor_mutant=False, ensure_mutant=False):
     src = open(_SRC, encoding="utf-8").read()
-    ns = {"os": os, "threading": threading, "qfe": _Qfe}
+    if ensure_mutant:
+        assert src.count(_RECLAIM_LINE) == 1, "ensure()'s reclaim line not found exactly once"
+        src = src.replace(_RECLAIM_LINE, "")
+    ns = {"os": os, "threading": threading, "qfe": _Qfe, "json": __import__("json")}
     for node in ast.parse(src).body:
         if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name in _WANT:
             exec(compile(ast.Module([node], []), f"<{node.name}>", "exec"), ns)   # noqa: S102
@@ -59,6 +68,7 @@ class _Real:
         self.unload_calls = 0
         self.pipeline = object()
         self.current_session = None
+        self.footprint_bytes = 0
 
     def unload_vram(self):
         self.unload_calls += 1
@@ -118,6 +128,30 @@ check("A3 mutant (anchor = wrapper) unloads the shared engine under the sibling 
 u = ns["QFLazyEngine"](factory=lambda: (_Real(), "ckey"), footprint_bytes=0)
 check("A4 an unmaterialized wrapper anchors to itself", ns["_qf_detach_anchor"](u) is u)
 ns["_qf_cancel_pending_detach"](u)   # no pending state: a no-op, never raises
+
+# A5 — the FRESH sibling (a new loader output: `_real is None` until its first begin materializes it through the REAL
+# ensure(), onto the cached shared handle). Its begin's cancel runs on the unmaterialized wrapper (anchors to itself), so the
+# reclaim must come from the materialization itself — else the displaced sibling's window expires inside that begin.
+fresh_shared = _Real()
+old_sib = _wrapper(ns, fresh_shared)
+ns["_qf_arm_lazy_detach"](old_sib)
+fresh = ns["QFLazyEngine"](factory=lambda: (fresh_shared, "ckey"), footprint_bytes=0)
+ns["_qf_cancel_pending_detach"](fresh)          # the begin's cancel, BEFORE materialization: touches nothing
+fresh.ensure()                                   # the begin's `lib = self._qf.lib` materialization
+_settle()
+check("A5 materializing a fresh sibling onto the shared handle reclaims it (no unload)", fresh_shared.unload_calls == 0,
+      f"unload_calls={fresh_shared.unload_calls}")
+
+# A6 — mutation: ensure() without the reclaim reproduces the fresh-sibling gap
+ens = _load(ensure_mutant=True)
+m6 = _Real()
+ens["_qf_arm_lazy_detach"](_wrapper(ens, m6))
+f6 = ens["QFLazyEngine"](factory=lambda: (m6, "ckey"), footprint_bytes=0)
+ens["_qf_cancel_pending_detach"](f6)
+f6.ensure()
+_settle()
+check("A6 mutant (no reclaim in ensure) unloads the shared engine under the fresh sibling (A5 can fail)", m6.unload_calls == 1,
+      f"unload_calls={m6.unload_calls}")
 
 print("ALL PASS" if not FAILS else f"{len(FAILS)} FAILED: {FAILS}")
 sys.exit(1 if FAILS else 0)
