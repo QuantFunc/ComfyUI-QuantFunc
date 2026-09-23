@@ -83,9 +83,54 @@ def _qf_dtype(torch_dtype):
 _QF_LAZY_DETACH_SECONDS = 120.0
 
 
+def _qf_detach_anchor(eng):
+    """The object a lazy detach unloads: the REAL handle behind a QFLazyEngine (a plain handle is its own anchor;
+    so is an unmaterialized wrapper, which holds nothing). Sibling wrappers share ONE real handle through the
+    engine cache (e.g. two loader outputs that differ only in a per-session knob such as quality_enhance), so the
+    pending flag, lock and timer must live on that shared handle: keyed on a wrapper, the sibling's sampler steps
+    never cancel the window and its expiry unloads the shared engine under the sibling's LIVE session (measured
+    2026-09-23, QI2.1 native self-test: the quality_enhance-ON model displaced at t, a quality_enhance-OFF batch-2
+    run at t+120 s -> 'denoise begin refused: pipeline busy')."""
+    real = getattr(eng, "_real", None) if isinstance(eng, QFLazyEngine) else None
+    return real if real is not None else eng
+
+
+def _qf_arm_lazy_detach(eng):
+    """(Re-)arm the one-shot lazy-detach unload window on eng's SHARED real handle (the detach() body; module
+    level so tests/lazy_detach_shared_engine_test.py drives the production code). Expiry runs the real unload
+    unless a reclaim (_qf_cancel_pending_detach) cleared the flag first — both under the same lock."""
+    import threading
+    eng = _qf_detach_anchor(eng)
+    if getattr(eng, "_qf_detach_lock", None) is None:
+        eng._qf_detach_lock = threading.Lock()
+    with eng._qf_detach_lock:
+        eng.pending_detach = True
+        old = getattr(eng, "_qf_detach_timer", None)
+        if old is not None:
+            old.cancel()
+
+        def _materialize():
+            try:
+                with eng._qf_detach_lock:
+                    if not getattr(eng, "pending_detach", False) or getattr(eng, "unloaded", False):
+                        return
+                    eng.pending_detach = False
+                    eng._qf_detach_timer = None
+                    qfe._dbg_prof("lazy-detach window expired -> real engine unload")
+                    eng.unload_vram()
+            except Exception:  # noqa: BLE001 — a timer thread must never raise
+                pass
+
+        t = threading.Timer(_QF_LAZY_DETACH_SECONDS, _materialize)
+        t.daemon = True
+        eng._qf_detach_timer = t
+        t.start()
+
+
 def _qf_cancel_pending_detach(eng):
-    """Reclaim a lazily-detached engine (a successor clone took over): cancel the one-shot
-    unload timer. Safe no-op when nothing is pending."""
+    """Reclaim a lazily-detached engine (a successor clone took over, or ANY sampler step on the same
+    real handle): cancel the one-shot unload timer. Safe no-op when nothing is pending."""
+    eng = _qf_detach_anchor(eng)
     if eng is None or not getattr(eng, "pending_detach", False):
         return
     lock = getattr(eng, "_qf_detach_lock", None)
@@ -1011,32 +1056,7 @@ class QFModelPatcher(comfy.model_patcher.ModelPatcher):
         use-after-free against a model comfy may still hold)."""
         eng = self._engine()
         if eng is not None and not getattr(eng, "unloaded", False):
-            import threading
-            if getattr(eng, "_qf_detach_lock", None) is None:
-                eng._qf_detach_lock = threading.Lock()
-            with eng._qf_detach_lock:
-                eng.pending_detach = True
-                old = getattr(eng, "_qf_detach_timer", None)
-                if old is not None:
-                    old.cancel()
-
-                def _materialize():
-                    try:
-                        with eng._qf_detach_lock:
-                            if not getattr(eng, "pending_detach", False) or \
-                                    getattr(eng, "unloaded", False):
-                                return
-                            eng.pending_detach = False
-                            eng._qf_detach_timer = None
-                            qfe._dbg_prof("lazy-detach window expired -> real engine unload")
-                            eng.unload_vram()
-                    except Exception:  # noqa: BLE001 — a timer thread must never raise
-                        pass
-
-                t = threading.Timer(_QF_LAZY_DETACH_SECONDS, _materialize)
-                t.daemon = True
-                eng._qf_detach_timer = t
-                t.start()
+            _qf_arm_lazy_detach(eng)
             print(f"[qf_prof] detach -> LAZY (engine resident; {_QF_LAZY_DETACH_SECONDS:.0f}s "
                   f"reclaim window)", flush=True)
         return super().detach(unpatch_all=unpatch_all)
