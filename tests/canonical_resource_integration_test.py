@@ -1702,10 +1702,17 @@ class CanonicalIntegration(unittest.TestCase):
         """A target still Creating answers BUSY for its whole create: a legitimate refusal, never a zero capacity."""
         self.short_busy_deadline()
         self.answer("query_capacity", state=qfe.QUANTFUNC_RESOURCE_BUSY)
-        with self.assertRaisesRegex(RuntimeError, r"resource capacity stayed BUSY for \d+ ms"):
-            self.wrapper("704-capacity-deadline").model_patches_models()
+        original_close, closed = qfe.NativeResource.close, []
+
+        def close(resource):  # the explicit close; the view's GC finalizer would also emit a native destroy
+            closed.append(resource._pointer.value)
+            return original_close(resource)
+
+        with mock.patch.object(qfe.NativeResource, "close", close):
+            with self.assertRaisesRegex(RuntimeError, r"resource capacity stayed BUSY for \d+ ms"):
+                self.wrapper("704-capacity-deadline").model_patches_models()
         key = next(event[1] for event in self.lib.events if event[0] == "prepare")
-        self.assertIn(("close", key), self.lib.events)
+        self.assertIn(key, closed)
         self.assertNotIn(("enroll", key), self.lib.events)
 
     def test_704_admission_refuses_a_non_ready_prepared_lifecycle(self):
