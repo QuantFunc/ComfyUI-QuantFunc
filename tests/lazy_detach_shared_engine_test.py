@@ -21,6 +21,11 @@ AST-extracted from qf_modelpatcher.py (pure Python: no comfy / torch / GPU), wit
      missed by every later cancel, which anchor to the real handle once it materializes)
   A8 a cancel that lands while an expiry is already inside unload_vram WAITS for that unload (a begin must not race it)
   A9 control: the previous cancel (pending check before the lock) returns while the unload is still running (A8 can fail)
+  A10 comfy's memory-pressure unload (detach unpatch_all=True, primary) frees the engine NOW and clears a pending window
+  A11 a clone swap / dropped patcher (unpatch_all=False) stays lazy: no unload until the window expires
+  A12 a shadow's unpatch_all=True detach only arms the window (a shadow never drives the shared engine's eviction)
+  A13 mutation: with the pre-fix always-lazy detach, A10's scenario leaves the engine resident (A10 can fail)
+  A14 nothing held (no engine / already unloaded): no unload, no window
 
 Run: python3 tests/lazy_detach_shared_engine_test.py   (exit 0 = pass, 1 = the contract is broken)
 """
@@ -33,7 +38,7 @@ import time
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _SRC = os.path.join(os.path.dirname(_HERE), "qf_modelpatcher.py")
 _WINDOW = 0.05
-_WANT = ("_qf_detach_anchor", "_qf_arm_lazy_detach", "_qf_cancel_pending_detach", "QFLazyEngine")
+_WANT = ("_qf_detach_anchor", "_qf_arm_lazy_detach", "_qf_cancel_pending_detach", "_qf_detach_engine", "QFLazyEngine")
 FAILS = []
 
 
@@ -46,8 +51,14 @@ class _Qfe:   # the one qf_engine member the timer body touches
 _RECLAIM_LINE = "            _qf_cancel_pending_detach(self._real)\n"
 
 
-def _load(anchor_mutant=False, ensure_mutant=False):
+_EAGER_LINE = "    if unpatch_all and not shadow:\n"
+
+
+def _load(anchor_mutant=False, ensure_mutant=False, detach_mutant=False):
     src = open(_SRC, encoding="utf-8").read()
+    if detach_mutant:
+        assert src.count(_EAGER_LINE) == 1, "_qf_detach_engine's eager branch not found exactly once"
+        src = src.replace(_EAGER_LINE, "    if False:\n")
     if ensure_mutant:
         assert src.count(_RECLAIM_LINE) == 1, "ensure()'s reclaim line not found exactly once"
         src = src.replace(_RECLAIM_LINE, "")
@@ -202,6 +213,45 @@ def _old_cancel(eng):                            # the b07302f body: pending che
 st, fin = _in_flight(_old_cancel)
 _settle(); time.sleep(0.3)
 check("A9 control: the previous cancel returns mid-unload (A8 can fail)", st and not fin, f"started={st} finished={fin}")
+
+
+def _pressure_unload(nsx):
+    """A primary detach(unpatch_all=True) over a materialized wrapper whose shared handle carries a displaced sibling's window."""
+    r = _Real()
+    nsx["_qf_arm_lazy_detach"](_wrapper(nsx, r))
+    how = nsx["_qf_detach_engine"](_wrapper(nsx, r), True, False)
+    return r, how, r.unload_calls
+
+
+r10, how10, now10 = _pressure_unload(ns)
+check("A10 memory-pressure detach unloads immediately", how10 == "unload" and now10 == 1, f"how={how10} unload_calls={now10}")
+check("A10 ...and clears the pending window", getattr(r10, "pending_detach", True) is False and
+      getattr(r10, "_qf_detach_timer", "x") is None)
+_settle()
+check("A10 ...so nothing fires later", r10.unload_calls == 1, f"unload_calls={r10.unload_calls}")
+
+r11 = _Real()
+how11 = ns["_qf_detach_engine"](_wrapper(ns, r11), False, False)
+check("A11 a clone swap stays lazy (no unload yet, window armed)", how11 == "lazy" and r11.unload_calls == 0 and
+      getattr(r11, "pending_detach", False) is True, f"how={how11} unload_calls={r11.unload_calls}")
+_settle()
+check("A11 ...and the window's expiry runs the real unload", r11.unload_calls == 1, f"unload_calls={r11.unload_calls}")
+
+r12 = _Real()
+how12 = ns["_qf_detach_engine"](_wrapper(ns, r12), True, True)
+check("A12 a shadow's pressure detach only arms the window", how12 == "lazy" and r12.unload_calls == 0,
+      f"how={how12} unload_calls={r12.unload_calls}")
+ns["_qf_cancel_pending_detach"](r12)
+
+mns13 = _load(detach_mutant=True)
+r13, how13, now13 = _pressure_unload(mns13)
+check("A13 mutant (always lazy) leaves the engine resident under pressure (A10 can fail)", how13 == "lazy" and now13 == 0,
+      f"how={how13} unload_calls={now13}")
+mns13["_qf_cancel_pending_detach"](r13)
+
+r14 = _Real(); r14.unloaded = True
+check("A14 nothing held: no unload, no window", ns["_qf_detach_engine"](None, True, False) is None and
+      ns["_qf_detach_engine"](r14, True, False) is None and r14.unload_calls == 0 and not getattr(r14, "pending_detach", False))
 
 print("ALL PASS" if not FAILS else f"{len(FAILS)} FAILED: {FAILS}")
 sys.exit(1 if FAILS else 0)

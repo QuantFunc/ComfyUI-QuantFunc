@@ -75,10 +75,11 @@ def _qf_dtype(torch_dtype):
 # window armed after the main sampler ran out during the refine sampler / VAE decode, so the next
 # run's main node paid the full reload (3.0 s: 12,597 per-parameter cudaMalloc + ~11 GB pageable
 # H2D, nsys W10) plus the engine's per-geometry rope rebuild (~1.2 s). Real VRAM pressure does
-# NOT depend on this timer: comfy's free_memory sweep reaches partially_unload() (engine
-# quantfunc_partial_unload sheds blocks, full unload as the fallback) and cancels the window
-# (_qf_cancel_pending_detach) — so the window only bounds how long an IDLE engine keeps VRAM
-# nobody asked for. 120 s covers a whole multi-stage run plus the gap to the next queue entry;
+# NOT depend on this timer: comfy's free_memory sweep reaches partially_unload() when it asks for
+# less than this model's loaded size (engine quantfunc_partial_unload sheds blocks, full unload as
+# the fallback), and detach(unpatch_all=True) when it asks for all of it — that one unloads NOW
+# (_qf_detach_engine); both cancel the window — so the window only bounds how long an IDLE engine
+# keeps VRAM nobody asked for. 120 s covers a whole multi-stage run plus the gap to the next queue entry;
 # model-agnostic (the policy lives here, not in any loader).
 _QF_LAZY_DETACH_SECONDS = 120.0
 
@@ -148,6 +149,25 @@ def _qf_cancel_pending_detach(eng):
             eng._qf_detach_timer = None
     if os.environ.get("QF_NATIVE_PROF") == "1":
         print("[qf_prof] lazy-detach RECLAIMED (engine stayed resident, zero reload)", flush=True)
+
+
+def _qf_detach_engine(eng, unpatch_all, shadow):
+    """QFModelPatcher.detach's engine side (module level so tests/lazy_detach_shared_engine_test.py drives it).
+    comfy passes unpatch_all=False when the model's weights stay valid for a successor: the clone swap in
+    load_models_gpu and a dropped patcher's __del__ -> keep the engine resident and arm the lazy window.
+    unpatch_all=True comes from LoadedModel.model_unload, i.e. free_memory asked for at least this model's whole
+    loaded size (so it skipped partially_unload) and drops the model from its ledger -> free the VRAM NOW. A lazy
+    window there left the engine resident while comfy counted it free (measured 2026-09-23, 远程-linux-c 5090,
+    LTX-2.5 t2av: comfy's own VAE decode OOMed on both prompts). A shadow never drives the shared engine's
+    eviction (see partially_unload), so it only arms the window. Returns "unload" | "lazy" | None (nothing held)."""
+    if eng is None or getattr(eng, "unloaded", False):
+        return None
+    if unpatch_all and not shadow:
+        _qf_cancel_pending_detach(eng)
+        eng.unload_vram()
+        return "unload"
+    _qf_arm_lazy_detach(eng)
+    return "lazy"
 
 
 def _interrupt_poll_end_session_on_raise(qf):
@@ -1055,18 +1075,19 @@ class QFModelPatcher(comfy.model_patcher.ModelPatcher):
         return src.clone(model_override=override)
 
     def detach(self, unpatch_all=True):
-        """comfy is dropping this model. LAZY: keep the engine resident and arm a short one-shot
-        unload window (see _QF_LAZY_DETACH_SECONDS — the measured common caller is comfy's
-        unload_model_clones swapping clones of this SAME model between two samplers, where an
-        eager full unload costs a pointless whole-weight-set round-trip). A successor clone's
-        load/step reclaims the engine with zero reload; window expiry runs the REAL unload
-        (unload_vram keeps the CPU backup, so a later run reloads lazily; no destroy = no
-        use-after-free against a model comfy may still hold)."""
-        eng = self._engine()
-        if eng is not None and not getattr(eng, "unloaded", False):
-            _qf_arm_lazy_detach(eng)
+        """comfy is dropping this model. A clone swap / dropped patcher (unpatch_all=False) is LAZY: keep the
+        engine resident and arm a short one-shot unload window (see _QF_LAZY_DETACH_SECONDS — the measured
+        common caller is comfy's clone swap between two samplers, where an eager full unload costs a pointless
+        whole-weight-set round-trip); a successor clone's load/step reclaims it with zero reload, window expiry
+        runs the REAL unload. comfy's memory-pressure unload (unpatch_all=True) frees the VRAM now
+        (_qf_detach_engine). unload_vram keeps the CPU backup, so a later run reloads lazily; no destroy = no
+        use-after-free against a model comfy may still hold."""
+        how = _qf_detach_engine(self._engine(), unpatch_all, self._is_shadow())
+        if how == "lazy":
             print(f"[qf_prof] detach -> LAZY (engine resident; {_QF_LAZY_DETACH_SECONDS:.0f}s "
                   f"reclaim window)", flush=True)
+        elif how == "unload":
+            print("[qf_prof] detach -> engine VRAM freed (comfy memory-pressure unload)", flush=True)
         return super().detach(unpatch_all=unpatch_all)
 
     # ── HOST-RAM reporting ────────────────────────────────────────────────────────────────
