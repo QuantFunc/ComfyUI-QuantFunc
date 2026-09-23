@@ -159,7 +159,7 @@ def _mro(src, cls):
     leaf-only scan missed an INTERMEDIATE parent's extra_conds (QwenImage21 -> QwenImage reads reference_latents /
     reference_latents_method / attention_mask) — the reclassified edit keys were invisible to this audit."""
     chain = [cls]
-    while chain[-1] != "BaseModel" and len(chain) < 12:
+    while chain[-1] != "BaseModel":
         parent = _parent_class(src, chain[-1])
         if not parent or parent in chain:
             break

@@ -125,11 +125,9 @@ class QFQwenImage21Model(QFSessionModelMixin, comfy.model_base.QwenImage21):
         if ab != "auto":
             _o["attention_backend"] = ab
         # token-prune keep-fraction (the quality_enhance switch, Krea2's emission): absent = the engine
-        # resets to 1.0 (no prune). The engine prunes t2i with ONE cond group only (edit, CFG > 1, batch > 1 run full).
-        try:
-            _tp = float(getattr(self, "_token_prune", 1.0) or 1.0)
-        except Exception:
-            _tp = 1.0
+        # resets to 1.0 (no prune). The engine prunes a ONE-cond-group session without references only — text-to-image,
+        # img2img and mask inpainting (the mask blend is the sampler's); edit, CFG > 1 and batch > 1 run full.
+        _tp = getattr(self, "_token_prune", 1.0)          # set_token_prune stores a float (1.0 = no prune)
         if 0.0 < _tp < 1.0:
             _o["token_prune_keep_ratio"] = _tp
         bpx._opts = json.dumps(_o).encode()

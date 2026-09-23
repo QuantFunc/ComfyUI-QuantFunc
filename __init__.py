@@ -616,16 +616,19 @@ if _IMPORT_OK:
                                 "session knob — takes effect next run, never rebuilds."})
 
     # Qwen-Image-2.1: the same switch and mapping (_quality_enhance_to_token_prune), an image tooltip — the
-    # engine prunes text-to-image with one cond group only (CFG 1, batch 1 — the official recipe); edit, CFG > 1 and
-    # batch > 1 run full.
+    # engine prunes every one-cond-group run without references (text-to-image, img2img, mask inpainting; CFG 1, batch 1 — the
+    # official recipe); edit, CFG > 1 and batch > 1 run full.
     _QWEN21_QUALITY_ENHANCE_INPUT = ("BOOLEAN", {"default": False,
                      "tooltip": "Quality-enhance. OFF (default) = faster, LOSSY: token-prune at keep-fraction "
-                                "0.8 for text-to-image at CFG 1, batch 1 (recompute 80% of the image tokens "
-                                "per step; the last step is always full). Measured on Qwen-Image-2.1 int4 at "
-                                "1024x1024: ~16% faster sampling; the image differs from full compute by PSNR "
-                                "25.6-31.3 dB / SSIM 0.92-0.97 (same composition, no artifacts). ON = full "
-                                "compute (prune OFF). Image edit (reference images), CFG > 1 and batch > 1 "
-                                "always run full. Runtime session knob — takes effect next run, never rebuilds."})
+                                "0.8 for every CFG-1, batch-1 run without reference images — text-to-image, "
+                                "img2img and SetLatentNoiseMask inpainting (recompute 80% of the image tokens "
+                                "per step; the last step is always full). Measured on Qwen-Image-2.1 int4 "
+                                "against full compute, same seed: text-to-image at 1024x1024 ~16% faster sampling, "
+                                "PSNR 25.6-31.3 dB / SSIM 0.92-0.97 (same composition, no artifacts); img2img "
+                                "(denoise 0.6) PSNR 39.5 dB / SSIM 0.97; mask inpainting PSNR 28.9 dB inside the "
+                                "mask (33.5 dB / SSIM 0.98 over the whole image). ON = full compute (prune OFF). "
+                                "Image edit (reference images), CFG > 1 and batch > 1 always run full. Runtime "
+                                "session knob — takes effect next run, never rebuilds."})
 
     # [audio_enhance switch, user 2026-09-13] H3-only. OFF (default) = byte-identical to no knob.
     # ON = after the normal (video) denoise, run EXTRA AUDIO-ONLY sub-steps so video_steps +
