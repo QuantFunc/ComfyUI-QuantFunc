@@ -1300,6 +1300,7 @@ class CanonicalIntegration(unittest.TestCase):
     def test_post_create_domain_query_failure_restores_prior_grants_and_fences_hot_handle(self):
         patcher = self.wrapper("post-create-query-failure")
         owner, shared = patcher.model_patches_models()
+        self.short_busy_deadline()
         self.lib.device_limit = 0
         self.lib.resources[1]["limit"] = 0
         key = owner._resource._pointer.value
@@ -1312,7 +1313,7 @@ class CanonicalIntegration(unittest.TestCase):
                                       resource=prepared_resource, capacity_bytes=capacity_bytes)
 
         with mock.patch.object(qfe.QFEngineHandle, "create", side_effect=create):
-            with self.assertRaisesRegex(RuntimeError, "domain residency unavailable"):
+            with self.assertRaisesRegex(RuntimeError, r"domain residency (unavailable|stayed BUSY)"):
                 owner.partially_load(owner.load_device, 4096)
 
         self.assertEqual((self.lib.resources[key]["limit"],
@@ -1411,7 +1412,8 @@ class CanonicalIntegration(unittest.TestCase):
             self.addCleanup(host_patch.stop)
 
         self.lib.domain_state = qfe.QUANTFUNC_RESOURCE_BUSY
-        with self.assertRaisesRegex(RuntimeError, "domain residency unavailable"):
+        self.short_busy_deadline()
+        with self.assertRaisesRegex(RuntimeError, r"domain residency (unavailable|stayed BUSY)"):
             mm.load_models_gpu([owner], force_full_load=True)
         self.assertEqual(mm.current_loaded_models, [loaded])
         self.assertIs(loaded.model_finalizer, old_finalizer)
@@ -1428,11 +1430,12 @@ class CanonicalIntegration(unittest.TestCase):
         patcher, _owner, _shared = self.warm_native_model("logical-preflight")
         sentinel = object()
         mm.current_loaded_models.append(sentinel)
+        self.short_busy_deadline()
         for state in (qfe.QUANTFUNC_RESOURCE_BUSY, qfe.QUANTFUNC_RESOURCE_UNKNOWN,
                       qfe.QUANTFUNC_RESOURCE_CLOSED):
             with self.subTest(state=state):
                 self.lib.domain_state = state
-                with self.assertRaises(RuntimeError):
+                with self.assertRaisesRegex(RuntimeError, r"domain residency (unavailable|stayed BUSY)"):
                     patcher.model_patches_models()
                 self.assertEqual(mm.current_loaded_models, [sentinel])
 
@@ -1489,7 +1492,7 @@ class CanonicalIntegration(unittest.TestCase):
         refused = "unavailable|stayed BUSY"
         for state in (1, 2):
             self.lib.resources[2]["state"] = state
-            with self.assertRaisesRegex(RuntimeError, "unavailable"):  # bytes: never retried
+            with self.assertRaisesRegex(RuntimeError, refused):  # bytes too: refused, never zero
                 owner.loaded_size()
             with self.assertRaisesRegex(RuntimeError, refused):
                 owner.partially_unload(torch.device("cpu"), 64)
@@ -1668,11 +1671,42 @@ class CanonicalIntegration(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "resource query failed"):
             lazy.ensure()
 
-    def test_704_byte_readers_still_refuse_busy(self):
+    def test_704_byte_reads_busy_then_ready_proceed_with_real_bytes(self):
         _patcher, owner, _shared = self.warm_native_model("704-bytes")
-        self.answer("query_residency", state=qfe.QUANTFUNC_RESOURCE_BUSY)
-        with self.assertRaisesRegex(RuntimeError, "residency unavailable"):
-            owner.loaded_size()
+        held = self.lib.resources[owner._resource._pointer.value]["held"]
+        domain = sum(resource["held"] for resource in self.lib.resources.values())
+        for name, read, expected in (
+            ("query_residency", owner.loaded_size, held),
+            ("query_domain_residency", lambda: qfm._domain_loaded_size(owner), domain),
+            ("query_capacity", lambda: self.wrapper("704-capacity").model_patches_models()[0].model_size(),
+             self.lib.capacity_bytes),
+        ):
+            with self.subTest(read=name):
+                calls = self.answer(name, times=3, state=qfe.QUANTFUNC_RESOURCE_BUSY)
+                self.assertEqual(read(), expected)
+                self.assertGreaterEqual(calls[0], 4)
+
+    def test_704_byte_reads_busy_past_the_deadline_are_refused_never_zero(self):
+        _patcher, owner, _shared = self.warm_native_model("704-bytes-deadline")
+        self.short_busy_deadline()
+        # Different native functions AND consumers: one override never reaches the other read.
+        for name, what, read in (("query_residency", "resource residency", owner.loaded_size),
+                                 ("query_domain_residency", "domain residency",
+                                  lambda: qfm._domain_loaded_size(owner))):
+            with self.subTest(read=name):
+                self.answer(name, state=qfe.QUANTFUNC_RESOURCE_BUSY)
+                with self.assertRaisesRegex(RuntimeError, what + r" stayed BUSY for \d+ ms"):
+                    read()
+
+    def test_704_capacity_busy_past_the_deadline_refuses_the_prepare(self):
+        """A target still Creating answers BUSY for its whole create: a legitimate refusal, never a zero capacity."""
+        self.short_busy_deadline()
+        self.answer("query_capacity", state=qfe.QUANTFUNC_RESOURCE_BUSY)
+        with self.assertRaisesRegex(RuntimeError, r"resource capacity stayed BUSY for \d+ ms"):
+            self.wrapper("704-capacity-deadline").model_patches_models()
+        key = next(event[1] for event in self.lib.events if event[0] == "prepare")
+        self.assertIn(("close", key), self.lib.events)
+        self.assertNotIn(("enroll", key), self.lib.events)
 
     def test_704_admission_refuses_a_non_ready_prepared_lifecycle(self):
         """A non-READY lifecycle carries no phase; admission read None as "not Prepared" and skipped materialize()."""

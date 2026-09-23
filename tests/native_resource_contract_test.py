@@ -501,7 +501,7 @@ class FrozenCapacityDomainContract(unittest.TestCase):
         self.assertEqual(lib.quantfunc_resource_query_capacity.argtypes,
                          [ctypes.c_void_p, ctypes.POINTER(qfe._ResourceCapacity)])
 
-    def test_capacity_missing_unsupported_nonready_closed_and_zero_fail_closed(self):
+    def test_capacity_missing_unsupported_and_zero_fail_closed_nonready_is_nonnumeric(self):
         lib = self.authority_library()
         resource = qfe.NativeResource.prepare(lib, 2)
         params = qfe.make_create_params(model_dir="fixture", device_idx=2)
@@ -515,15 +515,21 @@ class FrozenCapacityDomainContract(unittest.TestCase):
         resource.configure(params)
         for status, state, byte_count in (
             (qfe.QUANTFUNC_ERROR_UNSUPPORTED, qfe.QUANTFUNC_RESOURCE_CAPACITY_UNSUPPORTED, 123),
-            (qfe.QUANTFUNC_OK, qfe.QUANTFUNC_RESOURCE_BUSY, 123),
-            (qfe.QUANTFUNC_OK, qfe.QUANTFUNC_RESOURCE_UNKNOWN, 123),
-            (qfe.QUANTFUNC_OK, qfe.QUANTFUNC_RESOURCE_CLOSED, 123),
             (qfe.QUANTFUNC_OK, qfe.QUANTFUNC_RESOURCE_READY, 0),
         ):
             with self.subTest(status=status, state=state, bytes=byte_count):
                 lib.capacity_status, lib.capacity_state, lib.capacity_bytes = status, state, byte_count
-                with self.assertRaises((qfe.NativeContractUnavailable, RuntimeError)):
+                with self.assertRaises(qfe.NativeContractUnavailable):
                     resource.query_capacity()
+        # Issue #704: a non-Ready answer is a soft, nonnumeric result (like residency()) so the caller can re-read a
+        # transient BUSY; its numbers are never the stale struct contents.
+        for state in (qfe.QUANTFUNC_RESOURCE_BUSY, qfe.QUANTFUNC_RESOURCE_UNKNOWN, qfe.QUANTFUNC_RESOURCE_CLOSED):
+            with self.subTest(state=state):
+                lib.capacity_status, lib.capacity_state, lib.capacity_bytes = qfe.QUANTFUNC_OK, state, 123
+                self.assertEqual(resource.query_capacity(), qfe.ResourceCapacity(state, None, None))
+        lib.capacity_status, lib.capacity_state = 1, qfe.QUANTFUNC_RESOURCE_READY
+        with self.assertRaisesRegex(RuntimeError, "capacity query failed"):
+            resource.query_capacity()
         resource.close()
         with self.assertRaisesRegex(RuntimeError, "closed"):
             resource.query_capacity()
@@ -536,9 +542,8 @@ class FrozenCapacityDomainContract(unittest.TestCase):
             self.assertEqual(shared.query_domain_residency().resident_bytes, 0)
             for state in (qfe.QUANTFUNC_RESOURCE_BUSY, qfe.QUANTFUNC_RESOURCE_UNKNOWN,
                           qfe.QUANTFUNC_RESOURCE_CLOSED):
-                lib.domain_state = state
-                with self.assertRaises(RuntimeError):
-                    shared.query_domain_residency()
+                lib.domain_state = state  # issue #704: soft and nonnumeric, never zero
+                self.assertEqual(shared.query_domain_residency(), qfe.ResourceDomainResidency(state, None))
             lib.domain_state, lib.domain_status = qfe.QUANTFUNC_RESOURCE_READY, 1
             with self.assertRaisesRegex(RuntimeError, "native resource failure"):
                 shared.query_domain_residency()
