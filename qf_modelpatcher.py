@@ -44,6 +44,7 @@ Design (measured from comfy 0.27.0 + include/quantfunc.h + the proven native_ses
 import ctypes
 from contextlib import contextmanager
 from contextvars import ContextVar
+import functools
 import hashlib
 import json
 import logging
@@ -1185,6 +1186,85 @@ def _ready_read(read, what):
     return result
 
 
+# ── #704: ONE rule for every method ComfyUI's memory manager calls on a loaded model ───────────────────────────────
+# Enumerated from the installed ComfyUI 0.37.0 comfy/model_management.py (md5 f626009567972a4872f36f18a1671485);
+# test_704_every_comfy_facing_override_declares_a_busy_policy re-derives the called set from the installed source:
+#   model_size            LoadedModel.model_memory :798, LoadedModel.model_offloaded_memory :804
+#   loaded_size           LoadedModel.model_loaded_memory :801, .model_offloaded_memory :804, .model_unload :837
+#   partially_unload      LoadedModel.model_unload :838
+#   detach                LoadedModel.model_unload :841, load_models_gpu :988 (unpatch_all=False)
+#   partially_load        LoadedModel.model_use_more_vram :848 <- model_load :820 <- load_models_gpu :1033
+#   model_patches_models  load_models_gpu :954
+# free_memory (:893) sizes EVERY loaded model (:902-907) before it decides anything. It runs on every load_models_gpu
+# (:1001, :1010), including prompts that never touch a QuantFunc model, and from unload_all_models (:2121), which
+# main.py:390 (POST /free), execution.py:644 (the OOM handler) and execution.py:837 call with no failure channel. So a
+# sizing or unload method never lets a persistent BUSY escape: it answers by its policy. A load method runs only for
+# the model a prompt asked for, and that prompt reports the failure, so it refuses honestly.
+_COMFY_BUSY_POLICY = {}
+
+
+def _comfy_facing(policy):
+    """Declare a ComfyUI-facing method and its persistent-BUSY policy: a function that answers in its place (called
+    with the adapter, the _NativeStillBusy, then the method's arguments), or "refuses" / "no native call"."""
+    def declare(method):
+        _COMFY_BUSY_POLICY[method.__qualname__] = getattr(policy, "__name__", policy)
+        if not callable(policy):
+            return method
+
+        @functools.wraps(method)
+        def guarded(self, *args, **kwargs):
+            try:
+                return method(self, *args, **kwargs)
+            except _NativeStillBusy as busy:
+                return policy(self, busy, *args, **kwargs)
+        return guarded
+    return declare
+
+
+def _busy_loaded_size(adapter, busy, *_args, **_kwargs):
+    """The last READY residency, stale by whatever the engine paged since; ComfyUI still reads the device's real free
+    memory (get_free_memory) for every decision that matters. None ever observed means the view was never admitted
+    (every host-managed admission reads it READY in _publish_domain_grants), so nothing is materialized and 0 is the
+    fact. Under-counting is also ComfyUI 0.37.0's evict-MORE side, never its OOM side: model_unload (:837) then skips
+    the partial path and fully detaches, free_memory (:905) orders this model first, and model_memory_required (:808)
+    frees its full size when it is requested; over-counting would make ComfyUI free nothing for it. Do not flip this."""
+    seen = adapter._last_ready_resident
+    if seen is None:
+        _log.warning("[qf_native] %s; loaded_size answers 0: no READY residency was ever observed, so this view was "
+                     "never admitted and nothing is materialized", busy)
+        return 0
+    _log.warning("[qf_native] %s; loaded_size answers the last READY residency, %d B (stale)", busy, seen)
+    return seen
+
+
+def _busy_model_size(adapter, busy, *_args, **_kwargs):
+    """An Owned view's size is its Prepared capacity, fixed at prepare time; a Shared view's is its residency."""
+    if adapter._capacity_bytes is None:
+        return _busy_loaded_size(adapter, busy)
+    _log.warning("[qf_native] %s; model_size answers the Prepared capacity, %d B (exact)", busy,
+                 adapter._capacity_bytes)
+    return int(adapter._capacity_bytes)
+
+
+def _busy_zero_freed(adapter, busy, *_args, **_kwargs):
+    """A release vouches only for what a READY answer reports: 0, and ComfyUI falls back to its own full detach."""
+    _log.warning("[qf_native] %s; reporting 0 freed, Comfy falls back to a full detach", busy)
+    return 0
+
+
+def _busy_stop_eviction(adapter, busy, unpatch_all=True):
+    """The eviction stops where it is (nothing more is released), like release_all's non-READY branch: growth stays
+    fenced, an Owned view is re-admitted formally, and ComfyUI's record is dropped as usual."""
+    domain = getattr(adapter, "_domain", None)
+    if domain is not None:
+        with domain.transaction_lock:
+            domain.shared_growth_fenced = True
+    if adapter._owner_epoch:
+        adapter._needs_readmission = True
+    _log.warning("[qf_native] %s; full eviction stopped, growth stays fenced until the next formal admission", busy)
+    return comfy.model_patcher.ModelPatcher.detach(adapter, unpatch_all=unpatch_all)
+
+
 def _set_domain_grants(shared, owned, mask, **limits):
     """One atomic domain-grant command, re-issued while it answers BUSY (bounded, like a read).
 
@@ -1319,7 +1399,7 @@ def _publish_domain_grants(adapter, *, publish_owner=False, growth_allowance=0):
             device_limit = min(total, domain_actual + allowance)
 
         def resource_limit(resource_adapter):
-            actual = min(int(resource_adapter.loaded_size()), total)
+            actual = min(int(resource_adapter._resident_bytes()), total)
             limit = total if allowance is None else min(total, actual + allowance)
             return min(device_limit, limit)
 
@@ -1580,6 +1660,7 @@ class QFNativeResourcePatcher(comfy.model_patcher.ModelPatcher):
         self._shared_adapter = None
         self._prepared_entry = None
         self._capacity_bytes = None
+        self._last_ready_resident = None  # ComfyUI-facing sizing answers it on a persistent BUSY
         self._admission_failed = False
         self._admitting_thread = None
 
@@ -1614,6 +1695,7 @@ class QFNativeResourcePatcher(comfy.model_patcher.ModelPatcher):
             _ready_read(shared._resource.query_domain_residency, "domain residency")
             return grant
 
+    @_comfy_facing("refuses")
     def model_patches_models(self):
         # Direct load_models_gpu([resource_adapter]) must preflight too.  Do not
         # return self as an additional model or alter the dependency graph.
@@ -1629,9 +1711,15 @@ class QFNativeResourcePatcher(comfy.model_patcher.ModelPatcher):
                 raise RuntimeError("QuantFunc owner capacity changed for one native identity")
             self._prepared_entry, self._capacity_bytes = entry, capacity
 
-    def loaded_size(self):
+    def _resident_bytes(self):
+        """This view's READY residency (strict: past the BUSY deadline it raises), remembered for ComfyUI's sizing."""
         with _domain_transaction(self):
-            return _ready_read(self._resource.residency, "resource residency").resident_bytes
+            self._last_ready_resident = _ready_read(self._resource.residency, "resource residency").resident_bytes
+            return self._last_ready_resident
+
+    @_comfy_facing(_busy_loaded_size)
+    def loaded_size(self):
+        return self._resident_bytes()
 
     def require_load_contract(self):
         with _domain_transaction(self):
@@ -1647,6 +1735,7 @@ class QFNativeResourcePatcher(comfy.model_patcher.ModelPatcher):
                 raise qfe.NativeContractUnavailable(
                     "QuantFunc evicted resource has no retained cold-capacity contract")
 
+    @_comfy_facing(_busy_model_size)
     def model_size(self):
         with _domain_transaction(self):
             self.require_load_contract()
@@ -1654,8 +1743,9 @@ class QFNativeResourcePatcher(comfy.model_patcher.ModelPatcher):
                 return int(self._capacity_bytes)
             # Shared has no Prepared model capacity. Its already-resident bytes
             # remain a zero-deficit dependency in Comfy's ledger.
-            return self.loaded_size()
+            return self._resident_bytes()
 
+    @_comfy_facing("refuses")
     def partially_load(self, device_to, extra_memory=0, force_patch_weights=False):
         if device_to != self.load_device:
             raise ValueError("a native resource cannot migrate to another device")
@@ -1717,29 +1807,24 @@ class QFNativeResourcePatcher(comfy.model_patcher.ModelPatcher):
             finally:
                 self._admitting_thread = None
 
+    @_comfy_facing(_busy_zero_freed)
     def partially_unload(self, device_to, memory_to_free=0, force_patch_weights=False):
         want = max(0, min(int(memory_to_free), (1 << 64) - 1))
         if not want:
             return 0
         with _domain_transaction(self):
-            try:
-                if self._host_managed:
-                    if self is not self._domain.shared:
-                        self._needs_readmission = True
-                    # Native inference does not take the Python transaction lock.
-                    # Revoke growth before release so freed capacity cannot be
-                    # reclaimed concurrently; release failure never restores it.
-                    _revoke_domain_growth(self)
-                # A BUSY release may already have freed eligible backing it does not report (engine releaseEligible,
-                # vram_manager/HostMemory.cpp:145-181), so the retry can free more than `want`: a reload-time cost only.
-                # `freed` is only what a READY answer reports, never an estimate; it errs low and Comfy then falls back
-                # to its own full detach.
-                result = _ready_read(lambda: self._resource.release_eligible(want), "resource release")
-            except _NativeStillBusy as busy:
-                # Comfy's unload path has no failure channel: vouch for no freed bytes instead of raising.
-                _log.warning("[qf_native] %s; reporting 0 freed, Comfy falls back to a full detach", busy)
-                return 0
-            return result.freed_bytes
+            if self._host_managed:
+                if self is not self._domain.shared:
+                    self._needs_readmission = True
+                # Native inference does not take the Python transaction lock.
+                # Revoke growth before release so freed capacity cannot be
+                # reclaimed concurrently; release failure never restores it.
+                _revoke_domain_growth(self)
+            # A BUSY release may already have freed eligible backing it does not report (engine releaseEligible,
+            # vram_manager/HostMemory.cpp:145-181), so the retry can free more than `want`: a reload-time cost only.
+            # `freed` is only what a READY answer reports, never an estimate; it errs low and Comfy then falls back
+            # to its own full detach.
+            return _ready_read(lambda: self._resource.release_eligible(want), "resource release").freed_bytes
 
     def clone(self, disable_dynamic=False, model_override=None, force_deepcopy=False):
         if model_override is not None or force_deepcopy:
@@ -1752,6 +1837,7 @@ class QFNativeResourcePatcher(comfy.model_patcher.ModelPatcher):
     def add_object_patch(self, name, obj):
         raise ValueError("a native resource identity cannot be patched")
 
+    @_comfy_facing(_busy_stop_eviction)
     def detach(self, unpatch_all=True):
         if unpatch_all:
             with _domain_transaction(self):
@@ -1759,43 +1845,32 @@ class QFNativeResourcePatcher(comfy.model_patcher.ModelPatcher):
                 if not identity.capabilities & qfe.QUANTFUNC_RESOURCE_CAP_RELEASE_ALL:
                     raise qfe.NativeContractUnavailable("QuantFunc native resource full eviction is unsupported "
                                                         "without CAP_RELEASE_ALL; keep the host record")
-                try:
-                    lifecycle = _ready_read(self._resource.lifecycle, "full eviction lifecycle")
-                    closed = lifecycle.phase == qfe.QUANTFUNC_RESOURCE_PHASE_CLOSED
-                    self._closed_identity = closed
-                    if not closed:
-                        _ready_grant(self._resource)
-                        # Even a failing foreign call may already have changed the
-                        # grant. Do not allow a cache hit to undo this admission fence.
-                        if identity.owner_epoch:
-                            self._needs_readmission = True
-                        _revoke_domain_growth(self)
-                        self._host_managed = True
-                    # Closed targets cannot grow; native permits final exact-old-owner
-                    # cleanup but this never makes their identity reusable.
-                    result = self._resource.release_all()
-                    if result.state != qfe.QUANTFUNC_RESOURCE_READY:
-                        # Comfy's unload hook has no failure channel: unload_all_models() runs unguarded on the
-                        # prompt worker (its OOM handler and POST /free), so an error escaping here ends the
-                        # server's only worker and every later prompt hangs. Native Busy is also the ORDINARY
-                        # answer for a live pipeline: release_all certifies ZERO backing, and the non-paged
-                        # floor never reaches zero. Everything eligible is already released; growth was revoked
-                        # above and is revoked again below, so nothing regrows before the next formal admission,
-                        # which re-reads native residency. What remains is physically visible to Comfy.
-                        print(f"[qf_native] full eviction left native backing (state={result.state}); "
-                              "growth stays fenced until the next formal admission", flush=True)
-                    if self._host_managed and not closed:
-                        _revoke_domain_growth(self)
-                except _NativeStillBusy as busy:
-                    # The unload hook has no failure channel (see the release_all comment above): a lock held past the
-                    # deadline stops the eviction where it is - nothing more is released - instead of raising, the same
-                    # outcome as release_all's non-READY branch. Growth stays fenced and an Owned adapter is
-                    # re-admitted formally. Every other refusal (API error, UNKNOWN, not enrolled) still raises.
-                    self._domain.shared_growth_fenced = True
+                lifecycle = _ready_read(self._resource.lifecycle, "full eviction lifecycle")
+                closed = lifecycle.phase == qfe.QUANTFUNC_RESOURCE_PHASE_CLOSED
+                self._closed_identity = closed
+                if not closed:
+                    _ready_grant(self._resource)
+                    # Even a failing foreign call may already have changed the
+                    # grant. Do not allow a cache hit to undo this admission fence.
                     if identity.owner_epoch:
                         self._needs_readmission = True
-                    _log.warning("[qf_native] %s; full eviction stopped, growth stays fenced until the next formal "
-                                 "admission", busy)
+                    _revoke_domain_growth(self)
+                    self._host_managed = True
+                # Closed targets cannot grow; native permits final exact-old-owner
+                # cleanup but this never makes their identity reusable.
+                result = self._resource.release_all()
+                if result.state != qfe.QUANTFUNC_RESOURCE_READY:
+                    # Comfy's unload hook has no failure channel: unload_all_models() runs unguarded on the
+                    # prompt worker (its OOM handler and POST /free), so an error escaping here ends the
+                    # server's only worker and every later prompt hangs. Native Busy is also the ORDINARY
+                    # answer for a live pipeline: release_all certifies ZERO backing, and the non-paged
+                    # floor never reaches zero. Everything eligible is already released; growth was revoked
+                    # above and is revoked again below, so nothing regrows before the next formal admission,
+                    # which re-reads native residency. What remains is physically visible to Comfy.
+                    print(f"[qf_native] full eviction left native backing (state={result.state}); "
+                          "growth stays fenced until the next formal admission", flush=True)
+                if self._host_managed and not closed:
+                    _revoke_domain_growth(self)
         # Keep the view and canonical object alive across host deregistration.
         return super().detach(unpatch_all=unpatch_all)
 
@@ -1830,10 +1905,12 @@ class QFModelPatcher(comfy.model_patcher.ModelPatcher):
         self.set_additional_models("quantfunc.native_resources", dependencies)
         return dependencies
 
+    @_comfy_facing("refuses")
     def model_patches_models(self):
         # Direct load_models_gpu uses this path, not nested additional_models.
         return list(dict.fromkeys(super().model_patches_models() + self._native_dependencies()))
 
+    @_comfy_facing("refuses")
     def get_additional_models(self):
         # Also refresh before official nested traversal and after clone/LoRA.
         self._native_dependencies()
@@ -1845,12 +1922,15 @@ class QFModelPatcher(comfy.model_patcher.ModelPatcher):
     def _is_shadow(self):
         return bool(getattr(getattr(self, "model", None), "_qf_shadow", False))
 
+    @_comfy_facing("no native call")
     def model_size(self):
         return super().model_size()
 
+    @_comfy_facing("no native call")
     def loaded_size(self):
         return super().loaded_size()
 
+    @_comfy_facing("refuses")
     def partially_load(self, device_to, extra_memory=0, force_patch_weights=False):
         if device_to != self.load_device:
             raise ValueError("a QuantFunc MODEL cannot migrate its native resources")
@@ -1862,6 +1942,7 @@ class QFModelPatcher(comfy.model_patcher.ModelPatcher):
         return super().partially_load(device_to, extra_memory,
                                       force_patch_weights=force_patch_weights)
 
+    @_comfy_facing("no native call")
     def partially_unload(self, device_to, memory_to_free=0, force_patch_weights=False):
         return super().partially_unload(device_to, memory_to_free,
                                         force_patch_weights=force_patch_weights)
@@ -1884,6 +1965,7 @@ class QFModelPatcher(comfy.model_patcher.ModelPatcher):
                                  self.object_patches_backup, self.pinned))
         return src.clone(model_override=override)
 
+    @_comfy_facing("no native call")
     def detach(self, unpatch_all=True):
         """Detach logical patches only; canonical dependencies own native eviction."""
         # Only logical patches belong here. Native adapters retain their own
