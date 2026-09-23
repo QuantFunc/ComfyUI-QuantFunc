@@ -473,14 +473,15 @@ class QFSessionModelMixin:
             step_index = min(range(len(_sched) - 1), key=lambda k: abs(float(_sched[k]) - _cur))
         return step_index
 
-    def _call_denoise_step(self, p, fail_prefix):
-        """Run one quantfunc_denoise_step, clearing the (GPU-resident) session on ANY failure so a
+    def _call_denoise_step(self, p, fail_prefix, fn_name="quantfunc_denoise_step"):
+        """Run one quantfunc_denoise_step (or the same-contract `fn_name` export, e.g.
+        quantfunc_denoise_step_refs), clearing the (GPU-resident) session on ANY failure so a
         mid-sample error never strands a stale session. `fail_prefix` is the model-specific
         message head (e.g. 'denoise_step[step=..,group=..,key=..]' for WAN, 'LTX denoise_step[..]'
-        for LTX). Verbatim-shared by QFWanModel + QFLTXModel."""
+        for LTX). Verbatim-shared by QFWanModel + QFLTXModel + QFQwenImage21Model."""
         _qf_cancel_pending_detach(self._qf)   # an active step supersedes any lazy-detach window
         try:
-            st = self._qf.lib.quantfunc_denoise_step(self._qf.current_session, ctypes.byref(p))
+            st = getattr(self._qf.lib, fn_name)(self._qf.current_session, ctypes.byref(p))
         except Exception:
             self._qf.end_session_if_open()
             raise

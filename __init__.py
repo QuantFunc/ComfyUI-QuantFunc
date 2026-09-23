@@ -615,6 +615,18 @@ if _IMPORT_OK:
                                 "ON = full quality (keep every token, prune OFF). Runtime "
                                 "session knob — takes effect next run, never rebuilds."})
 
+    # Qwen-Image-2.1: the same switch and mapping (_quality_enhance_to_token_prune), an image tooltip — the
+    # engine prunes text-to-image with one cond group only (CFG 1, batch 1 — the official recipe); edit, CFG > 1 and
+    # batch > 1 run full.
+    _QWEN21_QUALITY_ENHANCE_INPUT = ("BOOLEAN", {"default": False,
+                     "tooltip": "Quality-enhance. OFF (default) = faster, LOSSY: token-prune at keep-fraction "
+                                "0.8 for text-to-image at CFG 1, batch 1 (recompute 80% of the image tokens "
+                                "per step; the last step is always full). Measured on Qwen-Image-2.1 int4 at "
+                                "1024x1024: ~16% faster sampling; the image differs from full compute by PSNR "
+                                "25.6-31.3 dB / SSIM 0.92-0.97 (same composition, no artifacts). ON = full "
+                                "compute (prune OFF). Image edit (reference images), CFG > 1 and batch > 1 "
+                                "always run full. Runtime session knob — takes effect next run, never rebuilds."})
+
     # [audio_enhance switch, user 2026-09-13] H3-only. OFF (default) = byte-identical to no knob.
     # ON = after the normal (video) denoise, run EXTRA AUDIO-ONLY sub-steps so video_steps +
     # extra-audio steps total 16 — refining audio against the finished video at fixed per-sub-step
@@ -875,9 +887,10 @@ if _IMPORT_OK:
             return (_p,)
 
     class QuantFuncQwenImage21Loader:
-        """Qwen-Image-2.1 loader (svdq, denoise_only, t2i): one MODEL a stock KSampler drives with
-        latents; CLIP (type qwen_image, TextEncodeQwenImage21) + VAE + sampler stay comfy-owned
-        (drop-in for the official UNETLoader slot). Reference-image edit is not on this seam."""
+        """Qwen-Image-2.1 loader (svdq, denoise_only, text-to-image + image edit): one MODEL a stock
+        KSampler drives with latents; CLIP (type qwen_image, TextEncodeQwenImage21) + VAE + sampler stay
+        comfy-owned (drop-in for the official UNETLoader slot). Edit = TextEncodeQwenImage21 with a VAE and
+        reference images: the references ride every step into the engine (quantfunc_denoise_step_refs)."""
 
         @classmethod
         def INPUT_TYPES(cls):
@@ -890,22 +903,28 @@ if _IMPORT_OK:
                                              + _preset_file_expectations()}),
             }, "optional": {
                 "attention_backend": _attn_backend_input(),
+                "quality_enhance": _QWEN21_QUALITY_ENHANCE_INPUT,
             }}
 
         RETURN_TYPES = ("MODEL",)
         FUNCTION = "load"
         CATEGORY = "loaders"
-        DESCRIPTION = ("QuantFunc Qwen-Image-2.1 loader (svdq, denoise_only): one native t2i MODEL a "
-                       "stock sampler drives with latents (text-to-image only — reference images on "
-                       "TextEncodeQwenImage21 are refused). " + _COMMON_LIMITS)
+        DESCRIPTION = ("QuantFunc Qwen-Image-2.1 loader (svdq, denoise_only): one native MODEL a stock "
+                       "sampler drives with latents — text-to-image, and image edit with "
+                       "TextEncodeQwenImage21 reference images (+ its VAE). RGBA: VAEDecode + SaveImage "
+                       "keep the alpha channel (transparent PNG). " + _COMMON_LIMITS)
 
-        def load(self, transformer, model_config, attention_backend="auto"):
+        def load(self, transformer, model_config, attention_backend="auto", quality_enhance=False):
+            # [runtime dials] backend + token-prune (quality_enhance) are SESSION knobs (NOT create keys —
+            # a widget change never re-keys the engine = no rebuild), exactly like the Krea2 node.
             _p = _run_family_load("qwenimage21", transformer, model_config,
                                   None,
                                   sparse_opts=None)
             _mm = getattr(_p, "model", None)
             if _mm is not None and hasattr(_mm, "set_attn_backend"):
                 _mm.set_attn_backend(_attn_backend_to_engine(attention_backend))
+            if _mm is not None and hasattr(_mm, "set_token_prune"):
+                _mm.set_token_prune(_quality_enhance_to_token_prune(quality_enhance))
             return (_p,)
 
 

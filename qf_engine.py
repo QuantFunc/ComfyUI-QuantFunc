@@ -166,6 +166,22 @@ class DenoiseStepMultiParams(ctypes.Structure):
     ]
 
 
+class DenoiseStepRefsParams(ctypes.Structure):
+    # ONE denoise step WITH sequence-spliced reference latents (QwenImage-2.1 edit through the native
+    # loader). base = the plain step (validated identically to quantfunc_denoise_step); the references are
+    # the WORKFLOW's own VAE latents (TextEncodeQwenImage21 -> the model's process_latent_in), each spliced
+    # in front of context row image_slots[r]. Field order/types mirror include/quantfunc.h
+    # quantfunc_denoise_step_refs_params_t VERBATIM. Present only in refs-capable engine builds (hasattr).
+    _fields_ = [
+        ("struct_size", ctypes.c_size_t),
+        ("base", DenoiseStepParams),
+        ("num_refs", ctypes.c_int),
+        ("ref_latents", ctypes.POINTER(ctypes.c_void_p)),
+        ("ref_dims", ctypes.POINTER(ctypes.c_int32)),     # num_refs x 4: [1, C, h, w]
+        ("image_slots", ctypes.POINTER(ctypes.c_int32)),  # num_refs entries
+    ]
+
+
 class TECloudParams(ctypes.Structure):
     # Field order/types mirror include/quantfunc.h TECloudParams VERBATIM (natural
     # alignment matches the C compiler, so ctypes reproduces the C layout).
@@ -207,6 +223,11 @@ def _bind(lib):
     if hasattr(lib, "quantfunc_denoise_step_multi"):
         lib.quantfunc_denoise_step_multi.restype = ctypes.c_int
         lib.quantfunc_denoise_step_multi.argtypes = [v, ctypes.POINTER(DenoiseStepMultiParams)]
+    # Reference-latent step (QwenImage-2.1 edit through the native loader). hasattr-gated like step_multi:
+    # an older .so lacks the symbol and the qwenimage21 seam then refuses reference images with guidance.
+    if hasattr(lib, "quantfunc_denoise_step_refs"):
+        lib.quantfunc_denoise_step_refs.restype = ctypes.c_int
+        lib.quantfunc_denoise_step_refs.argtypes = [v, ctypes.POINTER(DenoiseStepRefsParams)]
     # i2v cond-latent begin (cond-ABI builds only; hasattr-gated like step_multi — an old .so
     # simply lacks the symbol and the wan i2v sampling path then refuses with guidance).
     if hasattr(lib, "quantfunc_denoise_cond_tail_supported"):

@@ -102,12 +102,19 @@ _AUDITED_MODELS = (
     # per-model report for every other row). Its reject-list = reference_latents/reference_latents_method
     # (the krea2 ref2img channel) + the BaseModel controlnet/noise_concat channels; nothing covered elsewhere.
     _Model("Krea2", "qf_krea2_modelpatcher.py", set(), ("concat_cond", "encode_adm")),
-    # Qwen-Image-2.1 t2i (QFQwenImage21Model) — the image seam registered WITH its audit row from day one.
-    # Its reject-list is the defensive superset: image_slots (comfy.model_base.QwenImage21's own key) +
-    # reference_latents/reference_latents_method/attention_mask (the QwenImage parent's edit + mask channels
-    # the generic step ABI has no field for) + the BaseModel controlnet/noise_concat channels. No
-    # covered-elsewhere keys: every consumable it cannot honour is refused loud in extra_conds.
-    _Model("QwenImage21", "qf_qwenimage21_modelpatcher.py", set(), ("concat_cond", "encode_adm")),
+    # Qwen-Image-2.1 t2i + edit (QFQwenImage21Model). The rule: a key is accepted only if the engine CONSUMES it
+    # or the SAMPLER honours it. Its reject-list = attention_mask (the engine forward is mask-blind),
+    # reference_latents_method (QI2.1 has one splice rule — a method would do nothing) + the BaseModel
+    # controlnet/noise_concat/concat channels. Documented-ACCEPTED keys:
+    #  • image_slots + reference_latents — CONSUMED: the edit channel. extra_conds keeps comfy's own processing
+    #    (process_latent_in on the references, CONDConstant slots) and _apply_model forwards both per step
+    #    through quantfunc_denoise_step_refs (the engine's forwardEdit = comfy build_sequence).
+    #  • denoise_mask — SAMPLER-honoured: KSamplerX0Inpaint blends outside the model; comfy's QwenImage21 has no
+    #    concat keys, so its concat_cond never reads it — SetLatentNoiseMask inpainting behaves as in comfy, with
+    #    the engine's own (switchable) token-prune applied to the model output exactly as on plain t2i.
+    _Model("QwenImage21", "qf_qwenimage21_modelpatcher.py",
+           {"image_slots", "reference_latents", "denoise_mask"},
+           ("concat_cond", "encode_adm")),
 )
 
 
@@ -141,10 +148,34 @@ def _method_body(src, cls, meth):
     return b[k: k + 5 + nd.start()] if nd else b[k: k + 3000]
 
 
+def _parent_class(src, cls):
+    """The single base class of `cls` in model_base (e.g. QwenImage21 -> QwenImage), module prefix stripped."""
+    m = re.search(r"^class\s+" + re.escape(cls) + r"\s*\(\s*([A-Za-z_][\w.]*)", src, re.M)
+    return m.group(1).split(".")[-1] if m else None
+
+
+def _mro(src, cls):
+    """`cls`, then its model_base parents in order, ending at BaseModel (model_base uses single inheritance). A
+    leaf-only scan missed an INTERMEDIATE parent's extra_conds (QwenImage21 -> QwenImage reads reference_latents /
+    reference_latents_method / attention_mask) — the reclassified edit keys were invisible to this audit."""
+    chain = [cls]
+    while chain[-1] != "BaseModel" and len(chain) < 12:
+        parent = _parent_class(src, chain[-1])
+        if not parent or parent in chain:
+            break
+        chain.append(parent)
+    if chain[-1] != "BaseModel":
+        chain.append("BaseModel")
+    return chain
+
+
 def _effective_body(src, cls, meth):
-    """Body of cls.meth if `cls` OVERRIDES it, else BaseModel's (the effective MRO method)."""
-    b = _method_body(src, cls, meth)
-    return b if b else _method_body(src, "BaseModel", meth)
+    """Body of the FIRST class in cls's parent chain that defines `meth` (the effective MRO method)."""
+    for c in _mro(src, cls):
+        b = _method_body(src, c, meth)
+        if b:
+            return b
+    return ""
 
 
 def _compute(comfy_root, model):
@@ -156,10 +187,11 @@ def _compute(comfy_root, model):
     base = _method_body(src, "BaseModel", "extra_conds")
     if not own or not base:
         return None  # the model's own OR BaseModel.extra_conds not found — comfy layout changed
-    # Scan <class>.extra_conds + BaseModel.extra_conds (the super() it opens with) + each BaseModel.extra_conds
-    # callee resolved to the model's override if present. Scanning ONLY the extra_conds bodies missed callee
-    # kwargs (the CR6 blind spot: a future <class>.encode_adm override would have slipped through).
-    chain = own + base
+    # Scan extra_conds along the WHOLE parent chain (<class> -> ... -> BaseModel: each super() hop) + each
+    # BaseModel.extra_conds callee resolved to the nearest override. Scanning ONLY the extra_conds bodies missed
+    # callee kwargs (the CR6 blind spot: a future <class>.encode_adm override would have slipped through), and
+    # scanning only the leaf + BaseModel missed an intermediate parent (QwenImage21 -> QwenImage).
+    chain = "".join(_method_body(src, c, "extra_conds") for c in _mro(src, model.comfy_class))
     for callee in model.callees:
         chain += _effective_body(src, model.comfy_class, callee)
     consumed = set(re.findall(r'kwargs\.get\(\s*["\']([a-z_]+)["\']', chain))

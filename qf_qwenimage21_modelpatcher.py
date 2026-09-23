@@ -1,4 +1,4 @@
-"""qf_qwenimage21_modelpatcher — the Qwen-Image-2.1 (image t2i) family seam (model + builder), self-contained.
+"""qf_qwenimage21_modelpatcher — the Qwen-Image-2.1 (t2i + image edit) family seam (model + builder), self-contained.
 
 The Krea2 shape (the first image family on the native seam): comfy owns CLIP (TextEncodeQwenImage21 →
 Qwen3-VL-8B last-hidden [B, S, 4096]) / VAE (qwen_image_2.1_vae) / sampler / CFG; the engine owns ONLY
@@ -6,8 +6,10 @@ the 32-block denoise via the generic external session (QwenImage21Pipeline::prep
 quantfunc_denoise_begin + quantfunc_denoise_step). comfy's own QwenImage21Transformer2DModel receives
 (x [B,64,H/16,W/16] normalized latent, timestep = sigma, context) per cond group — exactly what this
 seam forwards, so cond and latent pass through unchanged (cast to bf16, the engine's activation dtype).
-Reference-image EDIT conditioning (reference_latents / image_slots) is NOT on the seam (no field in the
-generic step ABI) and is refused loud, never silently dropped.
+Reference-image EDIT: TextEncodeQwenImage21 (with a VAE + images) appends reference_latents to both conds and
+reports image_slots per cond; model_base.QwenImage.extra_conds normalizes the references (process_latent_in).
+Both ride every step through quantfunc_denoise_step_refs — the engine splices them exactly like comfy's own
+build_sequence (generate_edit's forwardEdit). Anything else the seam cannot consume is refused loud.
 """
 import ctypes
 import json
@@ -64,14 +66,16 @@ class QFQwenImage21Model(QFSessionModelMixin, comfy.model_base.QwenImage21):
     def get_dynamic_vram__units(self):
         return [], []   # no torch blocks to page — the engine holds the weights
 
-    # comfy model_base.QwenImage(21).extra_conds consumables this seam cannot honor — refuse LOUD,
-    # never silently drop (the wan reject-list discipline). reference_latents/image_slots = the QI2.1
-    # edit channel (engine generate_edit only); attention_mask = the engine forward is mask-blind;
-    # concat_latent_image/concat_mask/denoise_mask = the BaseModel inpaint/concat channels (no i2i or
-    # inpaint on the t2i seam). Audited by tests/reject_list_completeness.py (QwenImage21 row).
-    _ENGINE_IGNORED_COND_KEYS = ("reference_latents", "reference_latents_method", "image_slots",
-                                 "attention_mask", "cross_attn_controlnet", "noise_concat",
-                                 "concat_latent_image", "concat_mask", "denoise_mask")
+    # comfy model_base.QwenImage(21).extra_conds consumables — the RULE: a key is accepted only if the engine
+    # consumes it or the SAMPLER honours it; every other wired key is refused LOUD, never silently dropped (the
+    # wan reject-list discipline). CONSUMED: reference_latents + image_slots (quantfunc_denoise_step_refs).
+    # SAMPLER-HONOURED: denoise_mask (SetLatentNoiseMask inpainting is KSamplerX0Inpaint's blend, never a QI2.1
+    # model input). REFUSED: attention_mask (the engine forward is mask-blind), reference_latents_method (QI2.1
+    # has one splice rule — a method from e.g. FluxKontextMultiReferenceLatentMethod would do nothing), and
+    # cross_attn_controlnet / noise_concat / concat_latent_image / concat_mask (channels QI2.1 has no input for).
+    # Audited by tests/reject_list_completeness.py (QwenImage21 row, the parent chain walked).
+    _ENGINE_IGNORED_COND_KEYS = ("attention_mask", "reference_latents_method", "cross_attn_controlnet",
+                                 "noise_concat", "concat_latent_image", "concat_mask")
 
     def extra_conds(self, **kwargs):
         self._assert_wire_lora()
@@ -85,8 +89,14 @@ class QFQwenImage21Model(QFSessionModelMixin, comfy.model_base.QwenImage21):
                 raise RuntimeError(
                     f"qf_native qwenimage21: '{_k}' conditioning is wired, but the native session "
                     f"cannot consume it — it would be silently ignored, so it is refused. "
-                    f"Reference-image edit (images on TextEncodeQwenImage21) is not part of the "
-                    f"qwenimage21 t2i seam — remove the reference images.")
+                    f"Remove the node feeding '{_k}'.")
+        # probe the loaded library, NOT self._qf.lib (that materializes the lazy engine = creates the pipeline early)
+        if kwargs.get("reference_latents") is not None and \
+                not hasattr(qfe.load_lib(), "quantfunc_denoise_step_refs"):
+            raise RuntimeError(
+                "qf_native qwenimage21: reference images are wired (TextEncodeQwenImage21 images + vae), but "
+                "the loaded QuantFunc engine has no quantfunc_denoise_step_refs — update the engine library "
+                "(bin/linux/libquantfunc.so) to a build with Qwen-Image-2.1 edit support.")
         out = super().extra_conds(**kwargs)
         cross_attn = kwargs.get("cross_attn", None)
         if cross_attn is not None:
@@ -114,13 +124,21 @@ class QFQwenImage21Model(QFSessionModelMixin, comfy.model_base.QwenImage21):
         ab = str(getattr(self, "_attn_backend", "auto") or "auto")
         if ab != "auto":
             _o["attention_backend"] = ab
+        # token-prune keep-fraction (the quality_enhance switch, Krea2's emission): absent = the engine
+        # resets to 1.0 (no prune). The engine prunes t2i with ONE cond group only (edit, CFG > 1, batch > 1 run full).
+        try:
+            _tp = float(getattr(self, "_token_prune", 1.0) or 1.0)
+        except Exception:
+            _tp = 1.0
+        if 0.0 < _tp < 1.0:
+            _o["token_prune_keep_ratio"] = _tp
         bpx._opts = json.dumps(_o).encode()
         bpx.options_json = bpx._opts
         session = ctypes.c_void_p()
         st = lib.quantfunc_denoise_begin(self._qf.pipeline, ctypes.byref(bpx), ctypes.byref(session))
         self._begin_keep = bpx
         if st != qfe.QUANTFUNC_OK:
-            raise RuntimeError(f"denoise_begin (qwenimage21 t2i) failed: {qfe.last_err(lib)}")
+            raise RuntimeError(f"denoise_begin (qwenimage21) failed: {qfe.last_err(lib)}")
         self._qf.current_session = session
         self._qf.unloaded = False
         self._step_i = 0
@@ -142,7 +160,7 @@ class QFQwenImage21Model(QFSessionModelMixin, comfy.model_base.QwenImage21):
                 "control input — it would be silently ignored, so it is refused.")
         if c_concat is not None:
             raise RuntimeError(
-                "qf_native qwenimage21: c_concat conditioning is not part of the t2i seam — remove "
+                "qf_native qwenimage21: c_concat conditioning is not part of the qwenimage21 seam — remove "
                 "the node feeding it.")
         # BF16-latent/BF16-cond family (the engine's activation dtype); comfy may hand FP32 and may
         # keep the cond host-side — cast to the LATENT's device + bf16 in one .to() (a no-op when
@@ -171,6 +189,18 @@ class QFQwenImage21Model(QFSessionModelMixin, comfy.model_base.QwenImage21):
         # the engine logged "cfg_context_key=0 — prefix K/V cache OFF" on the first QI2.1 native run).
         cuuids = transformer_options.get("uuids") if isinstance(transformer_options, dict) else None
         step_index = self._sigma_step_index(sigma, sig_all, transformer_options)
+        # QwenImage21Cache (the official edit template wires it) configures comfy's OWN torch prefix cache; the
+        # QuantFunc engine's prefix cache is a create-time engine option (off by default), so say it once.
+        if isinstance(transformer_options, dict) and transformer_options.get("qwen_image21_cache") \
+                and not getattr(self, "_qi21_cache_noted", False):
+            self._qi21_cache_noted = True
+            print("[qf_native] qwenimage21: QwenImage21Cache settings do not apply to the QuantFunc engine "
+                  "(its prefix K/V cache is an engine option, off by default) — sampling is unaffected",
+                  flush=True)
+        # Reference-image EDIT: the references (already normalized by extra_conds' process_latent_in) and this
+        # cond's slots; comfy build_sequence fills missing slots with the text length (reference after the text).
+        refs = kwargs.get("ref_latents", None) or []
+        slots_in = list(kwargs.get("image_slots", None) or [])
         for i in range(B):
             _interrupt_poll_end_session_on_raise(self._qf)
             xi = xin[i:i + 1].contiguous()          # QI2.1 latent is IMAGE 4D [1,64,h,w] (no T axis)
@@ -196,7 +226,31 @@ class QFQwenImage21Model(QFSessionModelMixin, comfy.model_base.QwenImage21):
             p.context_dims = (ctypes.c_int * 3)(*ci.shape)
             p.context_dtype = _qf_dtype(ci.dtype)
             p.cfg_context_key = ctx_key
-            self._call_denoise_step(p, f"qwenimage21 denoise_step[step={step_index},group={i},key={ctx_key}]")
+            if refs:
+                n = len(refs)
+                slots = (slots_in + [int(ci.shape[1])] * n)[:n]
+                ref_i = [(r[i:i + 1] if int(r.shape[0]) > 1 else r).to(device=_dev, dtype=xi.dtype)
+                         .contiguous() for r in refs]            # CONDList repeats/concats per batch item; ABI: dtype = the latent's
+                if any(t.dim() != 4 for t in ref_i):             # the ABI packs exactly [1, C, h, w] per reference
+                    self._qf.end_session_if_open()               # never strand the session begun above
+                    raise RuntimeError("qf_native qwenimage21: reference latents must be 4-D image latents [1, C, h, w]; got "
+                                       f"{[tuple(t.shape) for t in ref_i]} — feed Qwen-Image-2.1 references (TextEncodeQwenImage21 + its VAE)")
+                rp = qfe.DenoiseStepRefsParams()
+                ctypes.memset(ctypes.byref(rp), 0, ctypes.sizeof(rp))
+                rp.struct_size = ctypes.sizeof(rp)
+                rp.base = p
+                ptrs = (ctypes.c_void_p * n)(*[t.data_ptr() for t in ref_i])
+                dims = (ctypes.c_int32 * (4 * n))(*[int(v) for t in ref_i for v in t.shape])
+                sl = (ctypes.c_int32 * n)(*[int(v) for v in slots])
+                rp.num_refs = n
+                rp.ref_latents = ctypes.cast(ptrs, ctypes.POINTER(ctypes.c_void_p))
+                rp.ref_dims = ctypes.cast(dims, ctypes.POINTER(ctypes.c_int32))
+                rp.image_slots = ctypes.cast(sl, ctypes.POINTER(ctypes.c_int32))
+                self._call_denoise_step(
+                    rp, f"qwenimage21 denoise_step_refs[step={step_index},group={i},key={ctx_key},refs={n}]",
+                    fn_name="quantfunc_denoise_step_refs")
+            else:
+                self._call_denoise_step(p, f"qwenimage21 denoise_step[step={step_index},group={i},key={ctx_key}]")
             self._qf.step_count += 1
             self._sess_denoise += 1
         self._step_i += 1
@@ -221,7 +275,7 @@ def register(deps):
 
     def build(transformer1_path, transformer2_path, bundle_dir=None,
               lora_entries=(), sparse_opts=None):
-        """File-based Qwen-Image-2.1 t2i — the Krea2 single-expert staging pattern: stage the shipped
+        """File-based Qwen-Image-2.1 (t2i + edit) — the Krea2 single-expert staging pattern: stage the shipped
         config bundle (configs/qwen-image-2.1-*/, model_index.json only — the engine synthesizes the
         per-component configs from the reference arch) + symlink the transformer file; engine create
         runs denoise_only=True (TE + VAE weights skipped — comfy's TextEncodeQwenImage21 owns
@@ -251,7 +305,7 @@ def register(deps):
             model = QFQwenImage21Model(model_config, engine, device=device)
             _register_model(model)
             patcher = QFModelPatcher(model, load_device=device, offload_device=offload)
-            print(f"[qf_native] loaded QuantFuncNativeLoader (Qwen-Image-2.1 t2i svdq) package={model_name} "
+            print(f"[qf_native] loaded QuantFuncNativeLoader (Qwen-Image-2.1 svdq) package={model_name} "
                   f"footprint~{engine.footprint_bytes // (1024*1024)}MB (create deferred)", flush=True)
             return qfmp.tag_lora_rebuild(patcher, lora_entries, _build)
 

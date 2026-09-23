@@ -254,6 +254,22 @@ Import from [`workflow_sample/`](workflow_sample/):
 | `QuantFunc-QwenImage-Layered.json` | Layered (transparent RGBA) generation + layer viewer |
 | `QuantFunc-ControlNet.json` | ControlNet structure-guided generation |
 
+Qwen-Image-2.1 native-loader workflows are in [`example_workflows/`](example_workflows/) — ComfyUI lists them under
+**Templates → ComfyUI-QuantFunc**. They use the stock `CLIPLoader` (type `qwen_image`), `TextEncodeQwenImage21`, VAE and
+`KSampler`; only the transformer loader is QuantFunc's. The VAE is RGBA, so `VAE Decode` + `Save Image` keep transparency.
+The loader's `quality_enhance` switch (default OFF, like the Krea2 node): OFF = token-prune 0.8 on plain
+text-to-image (CFG 1, batch 1) — about 16% faster sampling, and the image differs from full compute by
+PSNR 25.6–31.3 dB / SSIM 0.92–0.97 (same composition, no artifacts); ON = full compute. Image edit, CFG > 1
+and batch > 1 always run full.
+
+| File | Use Case |
+|------|----------|
+| `QuantFunc-QwenImage21-t2i.json` | text-to-image |
+| `QuantFunc-QwenImage21-t2i-transparent.json` | text-to-image with a transparent background (RGBA PNG) |
+| `QuantFunc-QwenImage21-edit.json` | image edit, one reference (`<image1>`) |
+| `QuantFunc-QwenImage21-edit-multi-reference.json` | image edit, two references (the official example) |
+| `QuantFunc-QwenImage21-edit-remove-background.json` | remove the background → transparent PNG |
+
 ## 4. Troubleshooting
 
 | Issue | Solution |
