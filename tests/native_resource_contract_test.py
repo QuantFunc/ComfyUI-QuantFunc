@@ -576,10 +576,10 @@ class FrozenCapacityDomainContract(unittest.TestCase):
         with qfe.NativeResource.shared(lib, 2) as shared, qfe.NativeResource.prepare(lib, 2) as owner:
             for state in (qfe.QUANTFUNC_RESOURCE_BUSY, qfe.QUANTFUNC_RESOURCE_UNKNOWN,
                           qfe.QUANTFUNC_RESOURCE_CLOSED):
-                lib.domain_grant_state = state
-                with self.assertRaises(RuntimeError):
-                    shared.set_domain_grants(owner, 7, owner_limit_bytes=1,
-                                             shared_limit_bytes=2, device_limit_bytes=3)
+                lib.domain_grant_state = state  # issue #704: soft (nothing applied), so a BUSY can be re-issued
+                self.assertEqual(shared.set_domain_grants(owner, 7, owner_limit_bytes=1,
+                                                          shared_limit_bytes=2, device_limit_bytes=3),
+                                 qfe.ResourceDomainGrantsResult(state, None))
             lib.domain_grant_state, lib.domain_grant_status = qfe.QUANTFUNC_RESOURCE_READY, 1
             with self.assertRaisesRegex(RuntimeError, "native resource failure"):
                 shared.set_domain_grants(owner, 7, owner_limit_bytes=1,

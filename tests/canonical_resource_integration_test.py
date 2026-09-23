@@ -1229,6 +1229,7 @@ class CanonicalIntegration(unittest.TestCase):
                   self.lib.resources[1]["limit"], self.lib.device_limit)
         event_start = len(self.lib.events)
         self.lib.domain_grant_state = qfe.QUANTFUNC_RESOURCE_BUSY
+        self.short_busy_deadline()
         with self.assertRaisesRegex(RuntimeError, "domain grant"):
             newcomer_owner.partially_load(newcomer_owner.load_device, 4096)
         after = (self.lib.resources[newcomer_owner._resource._pointer.value]["limit"],
@@ -1325,6 +1326,7 @@ class CanonicalIntegration(unittest.TestCase):
             patcher.model._qf.ensure()
 
     def test_busy_rollback_keeps_python_fence_until_next_formal_admission(self):
+        self.short_busy_deadline()
         last = None
         for rollback_state in (qfe.QUANTFUNC_RESOURCE_BUSY, qfe.QUANTFUNC_RESOURCE_UNKNOWN):
             with self.subTest(rollback_state=rollback_state):
@@ -1494,8 +1496,11 @@ class CanonicalIntegration(unittest.TestCase):
             self.lib.resources[2]["state"] = state
             with self.assertRaisesRegex(RuntimeError, refused):  # bytes too: refused, never zero
                 owner.loaded_size()
-            with self.assertRaisesRegex(RuntimeError, refused):
-                owner.partially_unload(torch.device("cpu"), 64)
+            if state == qfe.QUANTFUNC_RESOURCE_BUSY:  # a release that stays BUSY vouches for no freed bytes
+                self.assertEqual(owner.partially_unload(torch.device("cpu"), 64), 0)
+            else:
+                with self.assertRaisesRegex(RuntimeError, refused):
+                    owner.partially_unload(torch.device("cpu"), 64)
             self.assertEqual((self.lib.resources[2]["limit"],
                               self.lib.resources[1]["limit"], self.lib.device_limit), (0, 0, 0))
             self.assertTrue(owner._domain.shared_growth_fenced)
@@ -1603,6 +1608,23 @@ class CanonicalIntegration(unittest.TestCase):
         patch.start()
         self.addCleanup(patch.stop)
 
+    def busy_first(self, name, times=None):
+        """lib.quantfunc_resource_<name> answers BUSY having done NOTHING (a lock miss) for its first `times` calls
+        (None = all), then behaves normally. Returns a call counter."""
+        attr = "quantfunc_resource_" + name
+        original, calls = getattr(self.lib, attr), [0]
+
+        def busy(*args):
+            calls[0] += 1
+            if times is not None and calls[0] > times:
+                return original(*args)
+            args[-1]._obj.state = qfe.QUANTFUNC_RESOURCE_BUSY
+            return 0
+
+        setattr(self.lib, attr, busy)
+        self.addCleanup(setattr, self.lib, attr, original)
+        return calls
+
     def test_704_per_step_ensure_proceeds_on_busy_identity(self):
         patcher, _owner, _shared = self.warm_native_model("704-ensure")
         lazy = patcher.model._qf
@@ -1697,6 +1719,107 @@ class CanonicalIntegration(unittest.TestCase):
                 self.answer(name, state=qfe.QUANTFUNC_RESOURCE_BUSY)
                 with self.assertRaisesRegex(RuntimeError, what + r" stayed BUSY for \d+ ms"):
                     read()
+
+    def test_704_a_concurrent_detach_waits_at_most_the_deadline(self):
+        """The re-reads sleep inside _domain_transaction: a concurrent detach on the same device domain (Comfy's
+        /free) waits for them, bounded by the deadline, then proceeds (native code never takes this lock: no deadlock)."""
+        _patcher, owner, _shared = self.warm_native_model("704-lock")
+        self.lib.capabilities = 7  # CAP_RELEASE_ALL
+        deadline = 0.2
+        patch = mock.patch.object(qfm, "_NATIVE_BUSY_DEADLINE_S", deadline, create=True)
+        patch.start()
+        self.addCleanup(patch.stop)
+        entered, original = threading.Event(), self.lib.quantfunc_resource_query_residency
+
+        def busy(pointer, out):
+            status = original(pointer, out)
+            out._obj.state = qfe.QUANTFUNC_RESOURCE_BUSY
+            entered.set()
+            return status
+
+        self.lib.quantfunc_resource_query_residency = busy
+        self.addCleanup(setattr, self.lib, "quantfunc_resource_query_residency", original)
+        errors = []
+
+        def holder():
+            try:
+                owner.loaded_size()
+            except RuntimeError as error:
+                errors.append(error)
+
+        thread = threading.Thread(target=holder, daemon=True)
+        thread.start()
+        self.assertTrue(entered.wait(3))
+        started = time.monotonic()
+        owner.detach(True)
+        waited = time.monotonic() - started
+        self.assertIn(("full", owner._resource._pointer.value), self.lib.events)
+        thread.join(3)
+        self.assertFalse(thread.is_alive(), "the retrying holder never finished")
+        self.assertRegex(str(errors[0]), r"resource residency stayed BUSY for \d+ ms")
+        self.assertGreater(waited, deadline / 4)   # it really waited behind the held transaction lock ...
+        self.assertLess(waited, deadline + 1.0)    # ... and only for about one deadline
+
+    def test_704_domain_grants_busy_then_ready_are_applied(self):
+        _patcher, owner, _shared = self.warm_native_model("704-grants")
+        key = owner._resource._pointer.value
+        self.assertGreater(self.lib.resources[key]["limit"], 0)  # admitted: the revoke below has work to do
+        calls = self.busy_first("set_domain_grants", times=3)
+        owner.partially_unload(torch.device("cpu"), 1024)
+        self.assertEqual((self.lib.resources[key]["limit"], self.lib.resources[1]["limit"], self.lib.device_limit),
+                         (0, 0, 0))
+        self.assertGreaterEqual(calls[0], 4)
+
+    def test_704_domain_grants_busy_past_the_deadline_refuse_honestly(self):
+        patcher = self.wrapper("704-grants-deadline")
+        owner, _shared = patcher.model_patches_models()
+        self.short_busy_deadline()
+        self.busy_first("set_domain_grants")
+        with mock.patch.object(qfe.QFEngineHandle, "create") as create:
+            with self.assertRaisesRegex(RuntimeError, r"atomic domain grant stayed BUSY for \d+ ms"):
+                owner.partially_load(owner.load_device, 4096)
+        create.assert_not_called()
+
+    def test_704_release_busy_then_ready_frees_and_reports_exactly_the_request(self):
+        _patcher, owner, _shared = self.warm_native_model("704-release")
+        key = owner._resource._pointer.value
+        held = self.lib.resources[key]["held"]
+        calls = self.busy_first("release_eligible", times=2)
+        self.assertEqual(owner.partially_unload(torch.device("cpu"), 1024), 1024)
+        self.assertEqual(self.lib.resources[key]["held"], held - 1024)
+        self.assertEqual(calls[0], 3)
+
+    def test_704_release_partial_free_then_busy_reports_only_ready_bytes_and_comfy_falls_back(self):
+        """A BUSY release may already have freed bytes it does not report; the retry frees only eligible backing,
+        `freed` is only what the READY answer reports, and Comfy's own full-detach fallback then runs cleanly."""
+        _patcher, owner, _shared = self.warm_native_model("704-release-partial")
+        self.lib.capabilities = 7  # CAP_RELEASE_ALL for Comfy's fallback detach
+        key = owner._resource._pointer.value
+        held, want = self.lib.resources[key]["held"], 2048
+        self.assertGreater(held, want)
+        self.answer("release_eligible", times=1, state=qfe.QUANTFUNC_RESOURCE_BUSY)  # frees `want`, reports BUSY
+        loaded, reported, real = self.official_loaded_model(owner), [], owner.partially_unload
+
+        def partially_unload(*args, **kwargs):
+            reported.append(real(*args, **kwargs))
+            return reported[-1]
+
+        with mock.patch.object(owner, "partially_unload", side_effect=partially_unload):
+            self.assertTrue(loaded.model_unload(memory_to_free=want))  # fell short -> Comfy's full detach
+        self.assertEqual(reported, [held - want])  # the READY retry's bytes only, never the BUSY attempt's
+        self.assertEqual(self.lib.resources[key]["held"], 0)
+        self.assertIn(("full", key), self.lib.events)
+
+    def test_704_release_busy_past_the_deadline_returns_zero_with_a_logged_busy(self):
+        """partially_unload runs inside Comfy's unload path (no failure channel): a persistent BUSY vouches for no
+        freed bytes, so it returns 0 and Comfy falls back to its own full detach."""
+        _patcher, owner, _shared = self.warm_native_model("704-release-deadline")
+        self.short_busy_deadline()
+        calls = self.busy_first("release_eligible")
+        with self.assertLogs(qfm._log.name, "WARNING") as logs:
+            self.assertEqual(owner.partially_unload(torch.device("cpu"), 1024), 0)
+        self.assertRegex("\n".join(logs.output), r"resource release stayed BUSY for \d+ ms")
+        self.assertGreater(calls[0], 1)
 
     def test_704_capacity_busy_past_the_deadline_refuses_the_prepare(self):
         """A target still Creating answers BUSY for its whole create: a legitimate refusal, never a zero capacity."""
