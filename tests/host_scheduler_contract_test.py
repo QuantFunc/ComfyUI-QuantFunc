@@ -540,6 +540,9 @@ class NativeResourceSchedulerContract(unittest.TestCase):
         self.assertEqual(patcher.loaded_size(), 1472)
 
     def test_nonready_and_native_error_never_become_zero_or_drop_record(self):
+        short = mock.patch.object(qfm, "_NATIVE_BUSY_DEADLINE_S", 0.05, create=True)
+        short.start()
+        self.addCleanup(short.stop)
         for state, status in ((1, 0), (2, 0), (3, 0), (0, 1)):
             with self.subTest(state=state, status=status):
                 lib, patcher = self.make_resource()
@@ -551,8 +554,15 @@ class NativeResourceSchedulerContract(unittest.TestCase):
                         with self.assertRaises(RuntimeError):
                             mm.free_memory(4096, patcher.load_device)
                     self.assertEqual(mm.current_loaded_models, [original])
-                    with self.assertRaises(RuntimeError):
-                        patcher.partially_unload(torch.device("cpu"), 128)
+                    if (state, status) == (1, 0):
+                        # #704: a release that stays BUSY vouches for no freed bytes. partially_unload runs inside
+                        # Comfy's unload path (no failure channel), so it reports 0 (logged) and Comfy falls back to
+                        # its own full detach; Unknown, Closed and a native error still refuse.
+                        self.assertEqual(patcher.partially_unload(torch.device("cpu"), 128), 0)
+                    else:
+                        with self.assertRaises(RuntimeError):
+                            patcher.partially_unload(torch.device("cpu"), 128)
+                    self.assertEqual(mm.current_loaded_models, [original])
 
     def test_clone_handoff_does_not_request_physical_release(self):
         lib, patcher = self.make_resource()
