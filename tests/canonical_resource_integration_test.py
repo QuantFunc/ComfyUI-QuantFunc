@@ -1484,16 +1484,19 @@ class CanonicalIntegration(unittest.TestCase):
     def test_busy_and_unknown_are_not_zero(self):
         p = self.wrapper()
         owner, _ = p.model_patches_models()
+        # #704: a value read that STAYS busy is refused after the bounded retry, with its own honest message.
+        self.short_busy_deadline()
+        refused = "unavailable|stayed BUSY"
         for state in (1, 2):
             self.lib.resources[2]["state"] = state
-            with self.assertRaisesRegex(RuntimeError, "unavailable"):
+            with self.assertRaisesRegex(RuntimeError, "unavailable"):  # bytes: never retried
                 owner.loaded_size()
-            with self.assertRaisesRegex(RuntimeError, "unavailable"):
+            with self.assertRaisesRegex(RuntimeError, refused):
                 owner.partially_unload(torch.device("cpu"), 64)
             self.assertEqual((self.lib.resources[2]["limit"],
                               self.lib.resources[1]["limit"], self.lib.device_limit), (0, 0, 0))
             self.assertTrue(owner._domain.shared_growth_fenced)
-            with self.assertRaisesRegex(RuntimeError, "unavailable"):
+            with self.assertRaisesRegex(RuntimeError, refused):
                 p.model_patches_models()
 
     def test_full_detach_fences_growth_and_an_incomplete_native_release_stays_inside_the_hook(self):
