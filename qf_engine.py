@@ -199,13 +199,13 @@ class ResourceResidency(NamedTuple):
 
 class ResourceDomainResidency(NamedTuple):
     state: int
-    resident_bytes: int
+    resident_bytes: Optional[int]
 
 
 class ResourceCapacity(NamedTuple):
     state: int
-    component_count: int
-    required_persistent_bytes: int
+    component_count: Optional[int]
+    required_persistent_bytes: Optional[int]
 
 
 class ResourceSnapshot(NamedTuple):
@@ -367,7 +367,7 @@ class NativeResource:
             if status != QUANTFUNC_OK:
                 raise RuntimeError(f"QuantFunc resource capacity query failed: {last_err(self._lib)}")
             if out.state != QUANTFUNC_RESOURCE_READY:
-                raise RuntimeError(f"QuantFunc resource capacity unavailable (state={out.state})")
+                return ResourceCapacity(out.state, None, None)  # BUSY is transient: the caller may re-read
             if out.component_count == 0 or out.required_persistent_bytes == 0:
                 raise NativeContractUnavailable(
                     "QuantFunc prepared capacity returned no complete persistent components")
@@ -413,7 +413,7 @@ class NativeResource:
                 raise RuntimeError(
                     f"QuantFunc domain residency query failed: {last_err(self._lib)}")
             if out.state != QUANTFUNC_RESOURCE_READY:
-                raise RuntimeError(f"QuantFunc domain residency unavailable (state={out.state})")
+                return ResourceDomainResidency(out.state, None)  # BUSY is transient: the caller may re-read
             return ResourceDomainResidency(out.state, int(out.resident_bytes))
 
     def lifecycle(self):

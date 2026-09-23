@@ -1170,6 +1170,14 @@ def _read_past_busy(read, what):
         backoff = min(backoff * 2, _NATIVE_BUSY_MAX_BACKOFF_S)
 
 
+def _ready_read(read, what):
+    """A native read whose value is used: BUSY is re-read (bounded); any other non-READY answer is refused."""
+    result = _read_past_busy(read, what)
+    if result.state != qfe.QUANTFUNC_RESOURCE_READY:
+        raise RuntimeError(f"QuantFunc {what} unavailable (state={result.state})")
+    return result
+
+
 def _ready_grant(resource, *, enroll=False):
     result = resource.enroll_host() if enroll else _read_past_busy(resource.query_grant, "host grant")
     if result.state == qfe.QUANTFUNC_RESOURCE_BUSY:
@@ -1254,7 +1262,7 @@ def _domain_loaded_size(adapter):
     """One coherent native snapshot of all Shared + Owned backing in the domain."""
     with _domain_transaction(adapter):
         shared, _ = _domain_members(adapter)
-        return shared._resource.query_domain_residency().resident_bytes
+        return _ready_read(shared._resource.query_domain_residency, "domain residency").resident_bytes
 
 
 def _publish_domain_grants(adapter, *, publish_owner=False, growth_allowance=0):
@@ -1272,7 +1280,8 @@ def _publish_domain_grants(adapter, *, publish_owner=False, growth_allowance=0):
         if total <= 0:
             raise RuntimeError("ComfyUI returned no physical capacity for the QuantFunc device")
         total = min(total, _QF_UINT64_MAX)
-        domain_actual = min(int(shared._resource.query_domain_residency().resident_bytes), total)
+        domain_actual = min(_ready_read(shared._resource.query_domain_residency, "domain residency").resident_bytes,
+                            total)
         if growth_allowance is None:
             allowance = None
             device_limit = total
@@ -1441,7 +1450,8 @@ class QFPreparedEntry:
                 raise qfe.NativeContractUnavailable(
                     "QuantFunc Prepared capacity requires the complete create descriptor")
             self.resource.configure(create_params)
-            capacity = self.resource.query_capacity()
+            # A target still Creating answers BUSY for its whole create; past the deadline that is a refusal.
+            capacity = _ready_read(self.resource.query_capacity, "resource capacity")
             self.capacity_bytes = int(capacity.required_persistent_bytes)
             self.component_count = int(capacity.component_count)
             _ready_grant(self.resource, enroll=True)
@@ -1574,10 +1584,7 @@ class QFNativeResourcePatcher(comfy.model_patcher.ModelPatcher):
         """
         with _domain_transaction(self):
             identity = self._identity()
-            lifecycle = _read_past_busy(self._resource.lifecycle, "resource lifecycle")
-            if lifecycle.state != qfe.QUANTFUNC_RESOURCE_READY:
-                raise RuntimeError(
-                    f"QuantFunc host preflight lifecycle unavailable (state={lifecycle.state})")
+            lifecycle = _ready_read(self._resource.lifecycle, "host preflight lifecycle")
             if lifecycle.phase == qfe.QUANTFUNC_RESOURCE_PHASE_CLOSED:
                 raise RuntimeError("QuantFunc host preflight rejected a Closed resource identity")
             grant = _ready_grant(self._resource)
@@ -1592,7 +1599,7 @@ class QFNativeResourcePatcher(comfy.model_patcher.ModelPatcher):
             shared = self._domain.shared
             _ready_grant(shared._resource)
             _ready_device_grant(shared._resource)
-            shared._resource.query_domain_residency()
+            _ready_read(shared._resource.query_domain_residency, "domain residency")
             return grant
 
     def model_patches_models(self):
@@ -1612,16 +1619,11 @@ class QFNativeResourcePatcher(comfy.model_patcher.ModelPatcher):
 
     def loaded_size(self):
         with _domain_transaction(self):
-            result = self._resource.residency()
-            if result.state != qfe.QUANTFUNC_RESOURCE_READY:
-                raise RuntimeError(f"QuantFunc resource residency unavailable (state={result.state})")
-            return result.resident_bytes
+            return _ready_read(self._resource.residency, "resource residency").resident_bytes
 
     def require_load_contract(self):
         with _domain_transaction(self):
-            lifecycle = _read_past_busy(self._resource.lifecycle, "resource lifecycle")
-            if lifecycle.state != qfe.QUANTFUNC_RESOURCE_READY:
-                raise RuntimeError(f"QuantFunc resource lifecycle unavailable (state={lifecycle.state})")
+            lifecycle = _ready_read(self._resource.lifecycle, "resource lifecycle")
             self._closed_identity = lifecycle.phase == qfe.QUANTFUNC_RESOURCE_PHASE_CLOSED
             if self._closed_identity:
                 raise RuntimeError("QuantFunc Closed resource identity is not reloadable")
@@ -1677,10 +1679,8 @@ class QFNativeResourcePatcher(comfy.model_patcher.ModelPatcher):
                         growth_allowance=allowance)
                     published = True
                 if self._prepared_entry is not None:
-                    lifecycle = _read_past_busy(self._resource.lifecycle, "resource lifecycle")
-                    if lifecycle.state != qfe.QUANTFUNC_RESOURCE_READY:
-                        # A non-READY answer carries no phase; reading None as "not Prepared" skipped materialize().
-                        raise RuntimeError(f"QuantFunc admission lifecycle unavailable (state={lifecycle.state})")
+                    # A non-READY answer carries no phase; reading None as "not Prepared" skipped materialize().
+                    lifecycle = _ready_read(self._resource.lifecycle, "admission lifecycle")
                     if lifecycle.phase == qfe.QUANTFUNC_RESOURCE_PHASE_PREPARED:
                         self._prepared_entry.materialize()
                 self._prepared = False
@@ -1740,9 +1740,7 @@ class QFNativeResourcePatcher(comfy.model_patcher.ModelPatcher):
                 if not identity.capabilities & qfe.QUANTFUNC_RESOURCE_CAP_RELEASE_ALL:
                     raise qfe.NativeContractUnavailable("QuantFunc native resource full eviction is unsupported "
                                                         "without CAP_RELEASE_ALL; keep the host record")
-                lifecycle = _read_past_busy(self._resource.lifecycle, "resource lifecycle")
-                if lifecycle.state != qfe.QUANTFUNC_RESOURCE_READY:
-                    raise RuntimeError(f"QuantFunc full eviction lifecycle unavailable (state={lifecycle.state})")
+                lifecycle = _ready_read(self._resource.lifecycle, "full eviction lifecycle")
                 closed = lifecycle.phase == qfe.QUANTFUNC_RESOURCE_PHASE_CLOSED
                 self._closed_identity = closed
                 if not closed:
