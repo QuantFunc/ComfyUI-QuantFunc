@@ -1118,7 +1118,9 @@ _log = logging.getLogger(__name__)
 # (grants, lifecycle phase, bytes) do not.
 _IDENTITY_STATES = (qfe.QUANTFUNC_RESOURCE_READY, qfe.QUANTFUNC_RESOURCE_BUSY, qfe.QUANTFUNC_RESOURCE_UNKNOWN)
 # A value read that answers BUSY is re-read until this deadline, then refused. BUSY lasts one native critical
-# section; the bound is far above that and only stops a lock that never frees.
+# section; the bound is far above that and only stops a lock that never frees. The re-reads run inside the caller's
+# _domain_transaction, so another thread on the same device domain (e.g. Comfy's /free -> detach) waits for them: at
+# most this deadline per read, never a deadlock (native code never takes that Python lock).
 _NATIVE_BUSY_DEADLINE_S = 2.0
 _NATIVE_BUSY_FIRST_BACKOFF_S = 0.001
 _NATIVE_BUSY_MAX_BACKOFF_S = 0.05
@@ -1144,8 +1146,13 @@ def _query_identity(resource, *, owner_epoch=None, device=None, allow_closed=Fal
     return snapshot
 
 
+class _NativeStillBusy(RuntimeError):
+    """A native call answered BUSY until _NATIVE_BUSY_DEADLINE_S."""
+
+
 def _read_past_busy(read, what):
-    """One native VALUE read, re-read while it answers BUSY, until _NATIVE_BUSY_DEADLINE_S.
+    """One native call, re-issued while it answers BUSY, until _NATIVE_BUSY_DEADLINE_S: a read, or a command whose
+    re-issue is safe (see _set_domain_grants and partially_unload).
 
     Only BUSY is retried. Any other state (READY, UNKNOWN, CLOSED) returns at once for the caller to judge, and an
     API error raises from `read` unchanged.
@@ -1163,19 +1170,30 @@ def _read_past_busy(read, what):
             return result
         busy_reads += 1
         if waited >= _NATIVE_BUSY_DEADLINE_S:
-            raise RuntimeError(f"QuantFunc {what} stayed BUSY for {waited * 1e3:.0f} ms ({busy_reads} reads, "
-                               f"deadline {_NATIVE_BUSY_DEADLINE_S * 1e3:.0f} ms): another native thread held "
-                               "the lock the whole time")
+            raise _NativeStillBusy(f"QuantFunc {what} stayed BUSY for {waited * 1e3:.0f} ms ({busy_reads} reads, "
+                                   f"deadline {_NATIVE_BUSY_DEADLINE_S * 1e3:.0f} ms): another native thread held "
+                                   "the lock the whole time")
         time.sleep(min(backoff, _NATIVE_BUSY_DEADLINE_S - waited))
         backoff = min(backoff * 2, _NATIVE_BUSY_MAX_BACKOFF_S)
 
 
 def _ready_read(read, what):
-    """A native read whose value is used: BUSY is re-read (bounded); any other non-READY answer is refused."""
+    """A native call whose READY answer is used: BUSY is re-issued (bounded); any other non-READY is refused."""
     result = _read_past_busy(read, what)
     if result.state != qfe.QUANTFUNC_RESOURCE_READY:
         raise RuntimeError(f"QuantFunc {what} unavailable (state={result.state})")
     return result
+
+
+def _set_domain_grants(shared, owned, mask, **limits):
+    """One atomic domain-grant command, re-issued while it answers BUSY (bounded, like a read).
+
+    Re-issuing is exact: a BUSY answer applied NOTHING and the command carries absolute limits. The C API answers BUSY
+    on an owned-target lock or phase miss before it reaches the allocator (quantfunc_api.cpp:2071-2076), and the
+    allocator's setHostDomainGrants returns every non-Ready before its first assignment (Tensor.h:3098-3134). An
+    engine change that breaks either premise must revisit this retry.
+    """
+    return _ready_read(lambda: shared._resource.set_domain_grants(owned, mask, **limits), "atomic domain grant")
 
 
 def _ready_grant(resource, *, enroll=False):
@@ -1313,16 +1331,14 @@ def _publish_domain_grants(adapter, *, publish_owner=False, growth_allowance=0):
         shared_target = resource_limit(shared)
         if target_owner is None:
             mask = qfe.QUANTFUNC_RESOURCE_GRANT_SHARED | qfe.QUANTFUNC_RESOURCE_GRANT_DEVICE
-            shared._resource.set_domain_grants(
-                None, mask, shared_limit_bytes=shared_target, device_limit_bytes=device_limit)
+            _set_domain_grants(shared, None, mask, shared_limit_bytes=shared_target, device_limit_bytes=device_limit)
         else:
             owner_target = resource_limit(target_owner)
             mask = (qfe.QUANTFUNC_RESOURCE_GRANT_OWNER |
                     qfe.QUANTFUNC_RESOURCE_GRANT_SHARED |
                     qfe.QUANTFUNC_RESOURCE_GRANT_DEVICE)
-            shared._resource.set_domain_grants(
-                target_owner._resource, mask, owner_limit_bytes=owner_target,
-                shared_limit_bytes=shared_target, device_limit_bytes=device_limit)
+            _set_domain_grants(shared, target_owner._resource, mask, owner_limit_bytes=owner_target,
+                               shared_limit_bytes=shared_target, device_limit_bytes=device_limit)
         domain.shared_growth_fenced = False
         return device_limit
 
@@ -1338,15 +1354,13 @@ def _revoke_domain_growth(adapter):
             raise RuntimeError("QuantFunc Owner is not retained by its canonical domain")
         if target_owner is None:
             mask = qfe.QUANTFUNC_RESOURCE_GRANT_SHARED | qfe.QUANTFUNC_RESOURCE_GRANT_DEVICE
-            shared._resource.set_domain_grants(
-                None, mask, shared_limit_bytes=0, device_limit_bytes=0)
+            _set_domain_grants(shared, None, mask, shared_limit_bytes=0, device_limit_bytes=0)
         else:
             mask = (qfe.QUANTFUNC_RESOURCE_GRANT_OWNER |
                     qfe.QUANTFUNC_RESOURCE_GRANT_SHARED |
                     qfe.QUANTFUNC_RESOURCE_GRANT_DEVICE)
-            shared._resource.set_domain_grants(
-                target_owner._resource, mask, owner_limit_bytes=0,
-                shared_limit_bytes=0, device_limit_bytes=0)
+            _set_domain_grants(shared, target_owner._resource, mask, owner_limit_bytes=0,
+                               shared_limit_bytes=0, device_limit_bytes=0)
 
 
 def _capture_domain_grants(adapter, identity):
@@ -1365,16 +1379,14 @@ def _restore_domain_grants(adapter, snapshot):
     owner_limit, shared_limit, device_limit, shared_fenced = snapshot
     shared = adapter._domain.shared
     if owner_limit is None:
-        shared._resource.set_domain_grants(
-            None, qfe.QUANTFUNC_RESOURCE_GRANT_SHARED | qfe.QUANTFUNC_RESOURCE_GRANT_DEVICE,
-            shared_limit_bytes=shared_limit, device_limit_bytes=device_limit)
+        _set_domain_grants(shared, None, qfe.QUANTFUNC_RESOURCE_GRANT_SHARED | qfe.QUANTFUNC_RESOURCE_GRANT_DEVICE,
+                           shared_limit_bytes=shared_limit, device_limit_bytes=device_limit)
     else:
-        shared._resource.set_domain_grants(
-            adapter._resource,
-            qfe.QUANTFUNC_RESOURCE_GRANT_OWNER | qfe.QUANTFUNC_RESOURCE_GRANT_SHARED |
-            qfe.QUANTFUNC_RESOURCE_GRANT_DEVICE,
-            owner_limit_bytes=owner_limit, shared_limit_bytes=shared_limit,
-            device_limit_bytes=device_limit)
+        _set_domain_grants(shared, adapter._resource,
+                           qfe.QUANTFUNC_RESOURCE_GRANT_OWNER | qfe.QUANTFUNC_RESOURCE_GRANT_SHARED |
+                           qfe.QUANTFUNC_RESOURCE_GRANT_DEVICE,
+                           owner_limit_bytes=owner_limit, shared_limit_bytes=shared_limit,
+                           device_limit_bytes=device_limit)
     adapter._domain.shared_growth_fenced = shared_fenced
 
 
@@ -1710,14 +1722,23 @@ class QFNativeResourcePatcher(comfy.model_patcher.ModelPatcher):
         if not want:
             return 0
         with _domain_transaction(self):
-            if self._host_managed:
-                if self is not self._domain.shared:
-                    self._needs_readmission = True
-                # Native inference does not take the Python transaction lock.
-                # Revoke growth before release so freed capacity cannot be
-                # reclaimed concurrently; release failure never restores it.
-                _revoke_domain_growth(self)
-            result = self._resource.release_eligible(want)
+            try:
+                if self._host_managed:
+                    if self is not self._domain.shared:
+                        self._needs_readmission = True
+                    # Native inference does not take the Python transaction lock.
+                    # Revoke growth before release so freed capacity cannot be
+                    # reclaimed concurrently; release failure never restores it.
+                    _revoke_domain_growth(self)
+                # A BUSY release may already have freed eligible backing it does not report (engine releaseEligible,
+                # vram_manager/HostMemory.cpp:145-181), so the retry can free more than `want`: a reload-time cost only.
+                # `freed` is only what a READY answer reports, never an estimate; it errs low and Comfy then falls back
+                # to its own full detach.
+                result = _read_past_busy(lambda: self._resource.release_eligible(want), "resource release")
+            except _NativeStillBusy as busy:
+                # Comfy's unload path has no failure channel: vouch for no freed bytes instead of raising.
+                _log.warning("[qf_native] %s; reporting 0 freed, Comfy falls back to a full detach", busy)
+                return 0
             if result.state != qfe.QUANTFUNC_RESOURCE_READY:
                 raise RuntimeError(f"QuantFunc resource release unavailable (state={result.state})")
             return result.freed_bytes

@@ -176,7 +176,7 @@ class ResourceGrant(NamedTuple):
 
 class ResourceDomainGrantsResult(NamedTuple):
     state: int
-    applied_mask: int
+    applied_mask: Optional[int]
 
 
 class _ResourceLifecycle(ctypes.Structure):
@@ -524,7 +524,9 @@ class NativeResource:
             if function(self._pointer, owned_pointer, ctypes.byref(command),
                         ctypes.byref(out)) != QUANTFUNC_OK:
                 raise RuntimeError(f"QuantFunc atomic domain grant failed: {last_err(self._lib)}")
-            if out.state != QUANTFUNC_RESOURCE_READY or out.applied_mask != mask:
+            if out.state != QUANTFUNC_RESOURCE_READY:
+                return ResourceDomainGrantsResult(out.state, None)  # all-or-none: nothing applied; BUSY may be re-issued
+            if out.applied_mask != mask:
                 raise RuntimeError(
                     f"QuantFunc atomic domain grant unavailable (state={out.state}, "
                     f"applied_mask={out.applied_mask}, requested_mask={mask})")
