@@ -292,6 +292,17 @@ def _bind(lib):
 
 
 _LIB = None
+_LOG_LEVEL = None   # the level a loader asked for (qf_log_level); applied when/after the library loads
+
+
+def set_log_level(level):
+    """Engine console detail, process-wide. Applied now if the library is already loaded; otherwise
+    load_lib() applies it right after loading, so asking for a level never loads the library by itself
+    (a loader run without an engine library behaves exactly as before)."""
+    global _LOG_LEVEL
+    _LOG_LEVEL = int(level)
+    if _LIB is not None:
+        _LIB.quantfunc_set_log_level(_LOG_LEVEL)
 
 
 def resolve_so_path():
@@ -525,6 +536,8 @@ def load_lib():
                 break
             pending = still
         _LIB = _bind(ctypes.CDLL(so_path, mode=ctypes.RTLD_GLOBAL))
+        if _LOG_LEVEL is not None:   # a loader asked for a level before the library was loaded
+            _LIB.quantfunc_set_log_level(_LOG_LEVEL)
     return _LIB
 
 

@@ -1133,3 +1133,18 @@ except Exception as _qf_ltx_afix_exc:  # noqa: BLE001
     _qf_lg2.warning("[qf_native] LTX-2.5 AV audio fix not installed: %r", _qf_ltx_afix_exc)
 
 
+# ── Engine log detail ─────────────────────────────────────────────────────────
+# One optional "log level" input on EVERY QuantFunc loader (family loaders and the cloud-TE loader alike;
+# default warning: warnings and errors only), handed to qf_engine before the loader runs and applied to the
+# engine library as soon as it is (or once it gets) loaded; asking never loads it. Process-wide. This runs LAST,
+# after every NODE_CLASS_MAPPINGS registration above, so no loader is missed (tests/log_level_input_test.py
+# checks that no registration comes after it). Fully guarded: it must never break plugin import.
+try:
+    from . import qf_engine as _qf_ll_engine
+    from .qf_log_level import add_log_level_input as _qf_add_log_level
+    for _qf_name, _qf_cls in list(NODE_CLASS_MAPPINGS.items()):
+        if _qf_name.startswith("QuantFunc") and _qf_name.endswith("Loader"):
+            _qf_add_log_level(_qf_cls, _qf_ll_engine.set_log_level)
+except Exception as _qf_ll_exc:  # noqa: BLE001
+    import logging as _qf_ll_lg
+    _qf_ll_lg.warning("[qf_native] log-level input not attached: %r", _qf_ll_exc)
