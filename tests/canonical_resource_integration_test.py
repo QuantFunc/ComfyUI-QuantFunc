@@ -1821,6 +1821,21 @@ class CanonicalIntegration(unittest.TestCase):
         self.assertRegex("\n".join(logs.output), r"resource release stayed BUSY for \d+ ms")
         self.assertGreater(calls[0], 1)
 
+    def test_704_revoke_busy_past_the_deadline_returns_zero_via_unload(self):
+        """The growth revoke precedes the release. When IT stays BUSY, partially_unload vouches for no freed bytes
+        (0, logged) and never reaches the release; the Python fence stays up (set before the native call)."""
+        _patcher, owner, _shared = self.warm_native_model("704-revoke-deadline")
+        self.assertTrue(owner._host_managed)
+        key = owner._resource._pointer.value
+        self.short_busy_deadline()
+        grants = self.busy_first("set_domain_grants")
+        with self.assertLogs(qfm._log.name, "WARNING") as logs:
+            self.assertEqual(owner.partially_unload(torch.device("cpu"), 1024), 0)
+        self.assertRegex("\n".join(logs.output), r"atomic domain grant stayed BUSY for \d+ ms")
+        self.assertGreater(grants[0], 1)
+        self.assertFalse(any(event[:2] == ("release", key) for event in self.lib.events))
+        self.assertTrue(owner._domain.shared_growth_fenced)
+
     def test_704_capacity_busy_past_the_deadline_refuses_the_prepare(self):
         """A target still Creating answers BUSY for its whole create: a legitimate refusal, never a zero capacity."""
         self.short_busy_deadline()
