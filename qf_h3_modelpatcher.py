@@ -81,6 +81,9 @@ from comfy.ldm.minimax.model import pack_audio, unpack_audio, patchify_video, un
 class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
     """MiniMax-H3 svdq joint-AV pipeline exposed as a native comfy MODEL (native-KSampler seam), t2va."""
 
+    # H3's own loader dials, carried across a LoRA rebuild like the mixin's (see QFSessionModelMixin._SESSION_DIALS).
+    _SESSION_DIALS = QFSessionModelMixin._SESSION_DIALS + ("_audio_enhance", "_allow_partial_denoise")
+
     def __init__(self, model_config, engine, device=None):
         super().__init__(model_config, device=device)     # disable_unet honored in BaseModel.__init__
         self.diffusion_model = _QFStub()

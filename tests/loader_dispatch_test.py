@@ -1380,6 +1380,62 @@ def main():
         qfn._resolve_lora = _saved_resolve
         del _ContractEngine.quantfunc_pipeline_update, _ContractEngine.quantfunc_last_error
 
+    # ── 5c) a LoRA rebuild keeps the loader's session dials ──
+    # The loader sets its widgets (attention backend, quality, caches, H3's audio / partial-denoise opt-ins) on the MODEL;
+    # a QuantFuncNativeLoRA rebuild hands back a NEW model. Without the carry, a LoRA'd H3 silently ran "auto" attention
+    # instead of its flash default, dropped allow_partial_denoise (a double-sample workflow then refuses) and the quality.
+    import ast as _dast
+    _saved_resolve = qfn._resolve_lora
+    try:
+        dl_dir = os.path.join(tmp, "loras_dials"); os.makedirs(dl_dir, exist_ok=True)
+        _hdr = json.dumps({"blocks.0.attn.to_q.lora_A.weight":
+                           {"dtype": "F16", "shape": [1, 1], "data_offsets": [0, 2]}}).encode()
+        with open(os.path.join(dl_dir, "dial.safetensors"), "wb") as fh:
+            fh.write(_rst.pack("<Q", len(_hdr)) + _hdr + b"\0\0")
+        qfn._resolve_lora = lambda n: os.path.join(dl_dir, n)
+        _h3 = H3L.load("fx-minimax-h3-quantfunc-int4.safetensors", "minimax-h3-fl2va",
+                       attention_backend="flash", sol_tau=0.5, quality="balance", audio_enhance=True,
+                       step_cache=0.1, block_cache=0.2, allow_partial_denoise=True)[0]
+        _h3l = qfn.NODE_CLASS_MAPPINGS["QuantFuncNativeLoRA"]().apply(_h3, "dial.safetensors", 0.5)[0]
+        _src, _dst = _h3.model, _h3l.model
+        _want = (_src.residency_opts(), _src._audio_enhance, _src._allow_partial_denoise)
+        _got = (_dst.residency_opts(), _dst._audio_enhance, _dst._allow_partial_denoise)
+        check("a LoRA rebuild keeps the loader's session dials (H3: backend, sol_tau, quality, caches, audio, partial)",
+              _dst is not _src and _got == _want and _want[0].get("attention_backend") == "flash"
+              and _want[1] is True and _want[2] is True,
+              f"-> rebuilt={_dst is not _src} want={_want} got={_got}")
+        # DEATH RULE: every set_* on the session mixin or a family model writes only attributes its class carries in
+        # _SESSION_DIALS, so a new dial cannot be forgotten by the carry.
+        from qfn_test_pkg import qf_modelpatcher as _dqmp
+        import qfn_test_pkg as _dpkg
+        _dmods = {"qf_modelpatcher": _dqmp}
+        for _mn in _dpkg._FAMILY_MODULES:
+            _dmods[_mn] = sys.modules[f"qfn_test_pkg.{_mn}"]
+        _dviol, _dseen = [], 0
+        for _mn, _mod in _dmods.items():
+            for _cn in _dast.parse(open(_mod.__file__).read()).body:
+                if not isinstance(_cn, _dast.ClassDef):
+                    continue
+                _cls = getattr(_mod, _cn.name, None)
+                if not (isinstance(_cls, type) and issubclass(_cls, _dqmp.QFSessionModelMixin)):
+                    continue
+                for _fn in _cn.body:
+                    if not (isinstance(_fn, _dast.FunctionDef) and _fn.name.startswith("set_")):
+                        continue
+                    _dseen += 1
+                    for _n in _dast.walk(_fn):
+                        if isinstance(_n, _dast.Assign):
+                            for _t in _n.targets:
+                                if (isinstance(_t, _dast.Attribute) and isinstance(_t.value, _dast.Name)
+                                        and _t.value.id == "self" and _t.attr not in _cls._SESSION_DIALS):
+                                    _dviol.append(f"{_mn}.{_cn.name}.{_fn.name} writes {_t.attr}")
+        check("every session-dial setter's attribute is carried across a LoRA rebuild (AST, family modules derived)",
+              _dseen >= 9 and not _dviol, f"-> setters={_dseen} uncarried={_dviol}")
+    except Exception as e:  # noqa: BLE001
+        check("session-dial carry arm", False, f"-> raised {type(e).__name__}: {e}")
+    finally:
+        qfn._resolve_lora = _saved_resolve
+
     # ── 6) HOST-RAM honesty on a DEDICATED file pair (isolated ckey) ──
     try:
         for f in ("ram-t2v-high-quantfunc-int4.safetensors", "ram-t2v-low-quantfunc-int4.safetensors"):

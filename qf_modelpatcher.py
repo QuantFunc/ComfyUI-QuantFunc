@@ -390,6 +390,19 @@ class QFSessionModelMixin:
         # refuses both). Same rides-residency_opts class as set_video_enhance, which stays for an engine that predates `quality`.
         self._quality = str(q) if q else None
 
+    # Every loader-set session dial: each set_* on this mixin or a family model writes exactly one of these (a death
+    # rule in loader_dispatch_test checks the setters, subclasses included). A QuantFuncNativeLoRA rebuild hands back a
+    # NEW model, so QFModelPatcher.adopt_comfy_state_from carries these; a dial missing here would make the LoRA'd model
+    # run that dial's default without a word.
+    _SESSION_DIALS = ("_step_cache", "_block_cache", "_sparse", "_attn_backend", "_sol_tau",
+                      "_video_enhance", "_quality")
+
+    def adopt_session_dials_from(self, src):
+        """Copy the dials the loader set on SRC (the model a LoRA rebuild replaces) onto this model."""
+        for name in type(self)._SESSION_DIALS:
+            if name in vars(src):
+                setattr(self, name, vars(src)[name])
+
     def residency_opts(self):
         """The begin-options fragment EVERY family merges into its options_json — the ONE
         injection point for ALL runtime session knobs (residency + the two cache
@@ -2002,6 +2015,9 @@ class QFModelPatcher(comfy.model_patcher.ModelPatcher):
         """
         override = (self.model, (self.backup, self.backup_buffers,
                                  self.object_patches_backup, self.pinned))
+        # The loader's session dials (attention backend, quality, caches, H3's audio / partial-denoise opt-ins) live on
+        # the MODEL the rebuild replaced, not in comfy's state: carry them, or the LoRA'd model silently runs defaults.
+        self.model.adopt_session_dials_from(src.model)
         return src.clone(model_override=override)
 
     @_comfy_facing("no resource read")
