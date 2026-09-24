@@ -764,16 +764,23 @@ if _IMPORT_OK:
     # dot), so the node's widget layout is the same on every GPU: widget values are stored by POSITION, and a workflow saved on
     # one kind of GPU opens on the other with every value in its place (including any widget added after quality later).
     # Whatever value a saved workflow carries there is ignored on such a GPU.
-    _QI21_QUALITY_TOOLTIP = ("Speed or quality. super_fast: the fastest; fine details can differ from best_quality. fast: faster, "
-                             "and closer to best_quality. balance (default): faster than best_quality, with nearly the same "
-                             "result. best_quality: the highest quality, and the slowest.")
+    # Measured (SM89, 25 / 40 steps, same seed): super_fast about 15 % faster than best_quality, balance about 5-8 %, fast in
+    # between; all three keep the picture but change details such as the subject's pose about equally (PSNR ~27 dB vs
+    # best_quality) — so no "closer" / "nearly the same" claims for this family.
+    _QI21_QUALITY_TOOLTIP = ("Speed or quality. super_fast: the fastest. fast and balance (default): a little faster than "
+                             "best_quality. With these three the picture stays the same, but details such as a pose or an "
+                             "expression can differ from best_quality. best_quality: the highest quality, and the slowest.")
     _QI21_QUALITY_TOOLTIP_FIXED = "On this GPU Qwen-Image-2.1 always uses the highest quality; this setting has no effect here."
 
     def _qi21_resolve_quality(quality=None, quality_enhance=None, transformer=None, model_config=None, device_idx=None):
         """QI-2.1's quality for this run on the load's device: _resolve_quality where the fast mode exists; elsewhere
-        best_quality, whatever a saved workflow carries (the input is hidden there)."""
-        return (_resolve_quality(quality, quality_enhance, transformer, model_config, device_idx)
-                if _quality_fast_tier(device_idx) else "best_quality")
+        best_quality, whatever a saved workflow carries (the input is hidden there) — with one console line when that value
+        was a fast option (a workflow saved on another GPU, or a multi-GPU box whose form device differs from the load's)."""
+        if _quality_fast_tier(device_idx):
+            return _resolve_quality(quality, quality_enhance, transformer, model_config, device_idx)
+        if quality in ("super_fast", "fast"):
+            print(f"[QuantFunc] '{quality}' is not available here; using best_quality.", flush=True)
+        return "best_quality"
 
     def _qi21_quality_input():
         if _quality_fast_tier():

@@ -404,9 +404,18 @@ def main():
                 return 1 if idx == 1 else 0
         qfn._quality_engine_cache.clear()
         qfn.qfe.load_lib = lambda: _FakeQLibDev(None)
-        _dv = [qfn._qi21_resolve_quality(q, device_idx=d) for q, d in (("fast", 1), ("fast", 0), ("balance", 1), (None, 0))]
-        check("QI-2.1 run quality follows the load's device: fast on the device that has the fast mode, best_quality on one without",
-              _dv == ["fast", "best_quality", "balance", "best_quality"], f"-> {_dv}")
+        import contextlib as _qctl
+        import io as _qio
+        _dv = []
+        for q, d in (("fast", 1), ("fast", 0), ("balance", 1), (None, 0), ("balance", 0), ("super_fast", 0)):
+            _qb = _qio.StringIO()
+            with _qctl.redirect_stdout(_qb):
+                _r = qfn._qi21_resolve_quality(q, device_idx=d)
+            _dv.append((_r, _qb.getvalue().count(f"'{q}' is not available here; using best_quality.")))
+        check("QI-2.1 run quality follows the load's device: fast on the device that has the fast mode, best_quality on one "
+              "without — one console line only when a fast option was dropped",
+              _dv == [("fast", 0), ("best_quality", 1), ("balance", 0), ("best_quality", 0), ("best_quality", 0),
+                      ("best_quality", 1)], f"-> {_dv}")
         qfn._quality_engine_cache.clear()
         qfn.qfe.load_lib = lambda: _FakeQLib(1)
         R = qfn._resolve_quality
