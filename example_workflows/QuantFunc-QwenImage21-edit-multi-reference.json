@@ -20,7 +20,7 @@
    "outputs": [],
    "properties": {},
    "widgets_values": [
-    "## QuantFunc Qwen-Image-2.1\n\n- **QuantFunc Qwen-Image-2.1 Loader** replaces the official `Load Diffusion Model` (UNETLoader): the QuantFunc engine runs the 32-block transformer; the text encoder (`CLIPLoader`, type `qwen_image`), `TextEncodeQwenImage21`, the VAE, the sampler and CFG stay stock ComfyUI.\n- `transformer`: the QuantFunc int4 export under `models/diffusion_models`; `model_config`: `qwen-image-2.1-int4`.\n- `quality_enhance` OFF (default) = faster, lossy (token-prune 0.8 on CFG-1, batch-1 runs without reference images: text-to-image, img2img, mask inpainting): text-to-image ~16% faster sampling, the image differs from full compute by PSNR 25.6-31.3 dB / SSIM 0.92-0.97. ON = full compute. Image edit (reference images), CFG > 1 and batch > 1 always run full.\n- Output is **RGBA**: `VAE Decode` + `Save Image` keep the alpha channel, so a transparent result saves as a transparent PNG.\n- Official settings: 25 steps, CFG 1, euler / simple (40 steps = the diffusers default, a little sharper).\n\n**Image edit (two references)** — the official example: `<image1>` = the person (sets the output size), `<image2>` = the shirt. Up to 16 references (`image_1` .. `image_16`)."
+    "## QuantFunc Qwen-Image-2.1\n\n- **QuantFunc Qwen-Image-2.1 Loader** replaces the official `Load Diffusion Model` (UNETLoader): the QuantFunc engine runs the 32-block transformer; the text encoder (`CLIPLoader`, type `qwen_image`), `TextEncodeQwenImage21`, the VAE, the sampler and CFG stay stock ComfyUI.\n- `transformer`: the QuantFunc int4 export under `models/diffusion_models`; `model_config`: `qwen-image-2.1-int4`.\n- `quality`: `balance` (default) can be a little faster than `best_quality` with almost the same result; `best_quality` gives the highest quality. On GPUs that offer them, `fast` and `super_fast` are faster still, and their details can differ more.\n- Output is **RGBA**: `VAE Decode` + `Save Image` keep the alpha channel, so a transparent result saves as a transparent PNG.\n- Official settings: 25 steps, CFG 1, euler / simple (40 steps = the diffusers default, a little sharper).\n\n**Image edit (two references)** — the official example: `<image1>` = the person (sets the output size), `<image2>` = the shirt. Up to 16 references (`image_1` .. `image_16`)."
    ]
   },
   {
@@ -55,7 +55,7 @@
     "qwen-image-2.1-quantfunc-int4-r128-i8sidecar.qfc.safetensors",
     "qwen-image-2.1-int4",
     "auto",
-    false
+    "balance"
    ]
   },
   {

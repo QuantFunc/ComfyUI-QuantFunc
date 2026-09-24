@@ -479,7 +479,7 @@ class _LoaderModel:
     def set_audio_enhance(self, _value):
         pass
 
-    def set_video_enhance(self, _value):   # the ONE video switch every loader must reach (mandatory, unguarded)
+    def set_quality(self, _value):   # the ONE quality switch every loader must reach (mandatory, unguarded)
         pass
 
     def set_allow_partial_denoise(self, value):
@@ -492,10 +492,13 @@ _loader_namespace = {
     "object": object,
     "_transformer_choices": lambda: ["transformer"],
     "_model_config_choices": lambda **_kwargs: ["config"],
-    "_preset_file_expectations": lambda: "",
     "_attn_backend_input": lambda default: ([default], {"default": default}),
     "_SOL_TAU_INPUT": ("FLOAT", {"default": 1.0}),
-    "_QUALITY_ENHANCE_INPUT": ("BOOLEAN", {"default": False}),
+    "_quality_input": lambda: (["balance", "best_quality"], {"default": "balance"}),
+    "_QUALITY_LEGACY_HIDDEN": {"quality_enhance": ("BOOLEAN", {})},
+    "_loaded_device_index": lambda _patcher: 0,
+    "_resolve_quality": lambda *_args: "balance",
+    "_apply_quality": lambda model, q, _dev=None: model.set_quality(q),
     "_AUDIO_ENHANCE_INPUT": ("BOOLEAN", {"default": False}),
     "_STEP_CACHE_INPUT": ("FLOAT", {"default": 0.0}),
     "_BLOCK_CACHE_INPUT": ("FLOAT", {"default": 0.0}),
