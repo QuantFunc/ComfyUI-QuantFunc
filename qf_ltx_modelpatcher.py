@@ -398,6 +398,7 @@ def _load_ltx_audio_connector(connector_ckpt, device, dtype=torch.bfloat16, _bud
     return conn
 
 
+@qfe.console_safe_methods   # an exception leaving it is console-safe (#738)
 class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
     """LTX-2 svdq pipeline exposed as a native comfy MODEL (native-KSampler seam), t2v + i2v.
 
@@ -898,6 +899,7 @@ _LTXAV_AUDIO_MEL = 16
 _LTXAV_AUDIO_PACK = _LTXAV_AUDIO_CH * _LTXAV_AUDIO_MEL   # 128
 
 
+@qfe.console_safe_methods   # an exception leaving it is console-safe (#738)
 class QFLTXAVModel(QFLTXModel):
     """LTX-2.5 JOINT AUDIO+VIDEO through the native session (t2av).
 

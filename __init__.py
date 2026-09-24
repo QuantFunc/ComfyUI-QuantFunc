@@ -1243,3 +1243,13 @@ try:
             _qf_add_log_level(_qf_cls, _qf_ll_engine.set_log_level)
 except Exception as _qf_ll_exc:  # noqa: BLE001
     _log.warning("[qf_native] log-level input not attached: %s", ascii(_qf_ll_exc))
+
+
+# -- The console-safe boundary (#738) ---------------------------------------------------------------------------------
+# ComfyUI logs an uncaught node exception and its traceback to its strict console; a character the code page lacks (a
+# Chinese username in a path, on an English Windows) made that logging raise a second exception inside ComfyUI's error
+# handling. Every node's FUNCTION rewrites an exception leaving it console-safe (qf_engine.console_safe_nodes), and the
+# classes ComfyUI calls into carry @qfe.console_safe_methods. This runs LAST, after every registration and the log-level
+# wrap, so it is the outermost layer and no node skips it (tests/text_encoding_test.py, the boundary arm).
+if qfe is not None:
+    qfe.console_safe_nodes(NODE_CLASS_MAPPINGS)

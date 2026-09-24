@@ -14,6 +14,7 @@ import os
 import comfy.model_base
 import comfy.supported_models
 
+from . import qf_engine as qfe
 from . import qf_modelpatcher as qfmp
 
 
@@ -26,6 +27,7 @@ def matches(pipeline_class, transformer_class=""):
             or str(transformer_class) == "Krea2Transformer2DModel")
 
 
+@qfe.console_safe_methods   # an exception leaving it is console-safe (#738)
 class QFKrea2Model(qfmp.QFImageSessionModel, comfy.model_base.Krea2):
     _TAG = "krea2"
     _VAE_S = 8   # AutoencoderKLQwenImage spatial scale; session W/H = latent * 8

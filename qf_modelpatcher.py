@@ -271,6 +271,7 @@ def make_engine_factory(get_engine_fn, bind_pipeline_model):
     return factory, register_model
 
 
+@qfe.console_safe_methods   # an exception leaving it is console-safe (#738)
 class QFSessionModelMixin:
     """Shared base for every QuantFunc native-session model wrapper (LTX-2.5 / MiniMax-H3 / Krea-2 / Qwen-Image-2.1).
 
@@ -576,6 +577,7 @@ class QFSessionModelMixin:
             raise RuntimeError(f"{fail_prefix} failed: {err}")
 
 
+@qfe.console_safe_methods   # an exception leaving it is console-safe (#738)
 class QFImageSessionModel(QFSessionModelMixin):
     """The image families' seam (Krea-2, Qwen-Image-2.1), written once: comfy owns the text encoder, the VAE, the sampler
     and CFG; the engine owns only the denoise, through the generic external session (quantfunc_denoise_begin, then one
@@ -1665,6 +1667,7 @@ class QFPreparedEntry:
             "QuantFunc prepared resource has no live common lazy-engine materializer")
 
 
+@qfe.console_safe_methods   # an exception leaving it is console-safe (#738)
 class QFNativeResourcePatcher(comfy.model_patcher.ModelPatcher):
     """Host adapter for an existing native resource, not a model-load estimate.
 
@@ -1909,6 +1912,7 @@ class QFNativeResourcePatcher(comfy.model_patcher.ModelPatcher):
         return super().detach(unpatch_all=unpatch_all)
 
 
+@qfe.console_safe_methods   # an exception leaving it is console-safe (#738)
 class QFModelPatcher(comfy.model_patcher.ModelPatcher):
     """Logical MODEL; canonical dependencies own native bytes, this patcher owns Torch bytes."""
     def __init__(self, *args, **kwargs):

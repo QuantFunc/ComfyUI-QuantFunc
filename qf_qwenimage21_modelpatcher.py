@@ -32,6 +32,7 @@ def matches(pipeline_class, transformer_class=""):
             or str(transformer_class) == "QwenImage21Transformer2DModel")
 
 
+@qfe.console_safe_methods   # an exception leaving it is console-safe (#738)
 class QFQwenImage21Model(qfmp.QFImageSessionModel, comfy.model_base.QwenImage21):
     _TAG = "qwenimage21"
     _VAE_S = 16   # latent_formats.QwenImage21 spacial_downscale_ratio; session W/H = latent * 16

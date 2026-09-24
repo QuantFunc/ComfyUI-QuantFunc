@@ -76,6 +76,7 @@ _H3_AUDIO_STEREO = 2      # K (stereo)
 from comfy.ldm.minimax.model import pack_audio, unpack_audio, patchify_video, unpatchify_video
 
 
+@qfe.console_safe_methods   # an exception leaving it is console-safe (#738)
 class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
     """MiniMax-H3 svdq joint-AV pipeline exposed as a native comfy MODEL (native-KSampler seam), t2va."""
 

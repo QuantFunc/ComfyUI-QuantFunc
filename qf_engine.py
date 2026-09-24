@@ -5,7 +5,9 @@ verbatim from the PROVEN tests/scripts/native_session_t1.py). No tests/lib depen
 import contextlib
 import ctypes
 from contextvars import ContextVar
+import functools
 import glob
+import inspect
 import json
 import logging
 import mmap
@@ -19,6 +21,7 @@ import sys
 import operator
 import threading
 import traceback
+import types
 import weakref
 from typing import NamedTuple, Optional
 
@@ -864,6 +867,104 @@ def logger(name):
     if not any(isinstance(f, _ConsoleSafe) for f in log.filters):
         log.addFilter(_ConsoleSafe())
     return log
+
+
+def _console_safe_one(exc):
+    """console_safe on one exception's printed text (its args, OSError/SyntaxError fields, notes); the original message
+    stays readable as exc.qf_console_original. Returns whether it now prints safely."""
+    notes = getattr(exc, "__notes__", None)
+    if isinstance(notes, list):
+        exc.__notes__ = [console_safe(n) if isinstance(n, str) else n for n in notes]
+    try:
+        text = str(exc)
+    except Exception:  # noqa: BLE001 - a broken __str__: a traceback prints a fixed ASCII placeholder for it
+        return True
+    if console_safe(text) == text:
+        return True
+    try:
+        exc.qf_console_original = text
+    except (AttributeError, TypeError):
+        pass
+    exc.args = tuple(console_safe(a) if isinstance(a, str) else a for a in exc.args)
+    fields = (("strerror", "filename", "filename2") if isinstance(exc, OSError) else
+              ("msg", "filename", "text") if isinstance(exc, SyntaxError) else ())
+    for attr in fields:
+        value = getattr(exc, attr, None)
+        if isinstance(value, str):
+            setattr(exc, attr, console_safe(value))
+    try:
+        text = str(exc)
+    except Exception:  # noqa: BLE001
+        return True
+    return console_safe(text) == text
+
+
+def console_safe_exception(exc):
+    """Rewrite `exc` IN PLACE so that everything a traceback prints for it holds on the console's code page: its message,
+    its notes and every exception chained to it (cause, context, group members). ComfyUI logs an uncaught node
+    exception and its traceback to its strict console, and one character the code page lacks makes that logging raise a
+    second exception inside ComfyUI's error handling (#738). The object and its type stay the same; each rewritten
+    exception keeps its original text as `qf_console_original`. Returns False when some text could not be rewritten
+    (a __str__ built from other state)."""
+    seen, pending, ok = set(), [exc], True
+    while pending:
+        e = pending.pop()
+        if e is None or id(e) in seen:
+            continue
+        seen.add(id(e))
+        ok = _console_safe_one(e) and ok
+        pending += [e.__cause__, e.__context__, *getattr(e, "exceptions", ())]
+    return ok
+
+
+def console_safe_errors(fn):
+    """Wrap `fn` (a node FUNCTION, a method ComfyUI calls) so that an exception leaving it is console-safe
+    (console_safe_exception) and re-raised as the same object. One whose text cannot be rewritten is replaced by a
+    RuntimeError carrying its safe text and its traceback, with the original object as `qf_console_original`."""
+    if getattr(fn, "__qf_console_safe__", False):
+        return fn
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as exc:
+            if console_safe_exception(exc):
+                raise
+            safe = RuntimeError(console_safe(f"{type(exc).__name__}: {exc!r}"))
+            safe.qf_console_original = exc
+            raise safe.with_traceback(exc.__traceback__) from None
+    wrapper.__qf_console_safe__ = True
+    return wrapper
+
+
+def _console_safe_attr(cls, name):
+    """Wrap one attribute of `cls` with console_safe_errors, keeping a classmethod / staticmethod what it is."""
+    raw = inspect.getattr_static(cls, name)
+    if isinstance(raw, (classmethod, staticmethod)):
+        setattr(cls, name, type(raw)(console_safe_errors(raw.__func__)))
+    elif isinstance(raw, types.FunctionType):
+        setattr(cls, name, console_safe_errors(raw))
+
+
+def console_safe_methods(cls):
+    """Class decorator: every method the class defines (dunders aside) runs under console_safe_errors. It goes on every
+    class ComfyUI calls into (a comfy base, a plugin subclass of one, the mixins combined with one), so the sampler and
+    model-management paths, present and future, pass the same boundary as the nodes (tests/text_encoding_test.py)."""
+    for name in list(vars(cls)):
+        if not (name.startswith("__") and name.endswith("__")):
+            _console_safe_attr(cls, name)
+    return cls
+
+
+def console_safe_nodes(mapping):
+    """Wrap every registered node's FUNCTION with console_safe_errors. __init__ calls it once, after the last
+    NODE_CLASS_MAPPINGS registration, so no node skips it (tests/text_encoding_test.py, the boundary arm)."""
+    for cls in mapping.values():
+        name = getattr(cls, "FUNCTION", None)
+        if isinstance(name, str) and hasattr(cls, name):
+            _console_safe_attr(cls, name)
+    return mapping
 
 # ── Engine library install (option C, user 2026-09-24 「在原生加载器里实现」「根据自己的显卡型号下载对应so」) ──────────
 # The plugin installs the engine it needs into bin/<platform>/, SHA-256-verified against the release's published

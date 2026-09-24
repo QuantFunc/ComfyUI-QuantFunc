@@ -36,7 +36,12 @@ cannot hold raises UnicodeEncodeError out of the print() / log call, and out of 
               ("--- Logging error ---"); every plugin logger carries the console-safe filter; the bytes on stdout/stderr
               are valid in the code page, with what it cannot hold backslash-escaped; qf_lora_convert --help runs;
               an ENGINE error (last_err) raised through the plugin's real create_pipeline and logged the way
-              ComfyUI's execution.py logs it (the message, then the traceback) never raises a second exception.
+              ComfyUI's execution.py logs it (the message, then the traceback) never raises a second exception;
+              an error naming a user path (a Chinese username, chained from the OSError) raised through a node
+              FUNCTION and through a denoise method never raises a second exception either, keeps its type and
+              its original text (qf_console_original), and is unchanged where the console holds it (cp936, UTF-8).
+  boundary    static: every class ComfyUI calls into carries @qfe.console_safe_methods, and every registered node's
+              FUNCTION is wrapped by qfe.console_safe_nodes after the last registration.
 
 Run:  python3 tests/text_encoding_test.py       stdlib only: no ComfyUI, no torch, no GPU
       QF_TEXTIO_TEST_ROOT=<plugin tree> points it at another tree (e.g. the unfixed base, to show the arms go RED).
@@ -207,9 +212,56 @@ def _non_ascii_code_lines(tree, path):
             if any(ord(c) > 127 for c in lines[ln - 1])]
 
 
+def _boundary_sites(root):
+    """Where an exception leaves the plugin for ComfyUI, it must pass the console-safe boundary (#738): every class
+    ComfyUI calls into (a comfy.* base, a plugin subclass of one, or a mixin combined with one) carries
+    @qfe.console_safe_methods, and __init__ wraps every registered node's FUNCTION with
+    qfe.console_safe_nodes(NODE_CLASS_MAPPINGS) after the last registration, so a new node cannot skip it."""
+    classes, sites = {}, []
+    trees = {}
+    for fn in sorted(os.listdir(root)):
+        if fn.endswith(".py"):
+            with open(os.path.join(root, fn), encoding="utf-8") as f:
+                trees[fn] = ast.parse(f.read())
+            for n in ast.walk(trees[fn]):
+                if isinstance(n, ast.ClassDef):
+                    classes[n.name] = (fn, n, [ast.unparse(b) for b in n.bases])
+    facing = {c for c, (_, _, bases) in classes.items() if any(b.startswith("comfy.") for b in bases)}
+    grown = True
+    while grown:   # plugin subclasses of a comfy-facing class, and the mixins combined with one
+        grown = False
+        for c, (_, _, bases) in classes.items():
+            names = {b.rsplit(".", 1)[-1] for b in bases}
+            add = ({c} if names & facing else set()) | ({b for b in names if b in classes} if c in facing else set())
+            if add - facing:
+                facing |= add
+                grown = True
+    for c in sorted(facing):
+        fn, node, _ = classes[c]
+        if not any(ast.unparse(d).endswith("console_safe_methods") for d in node.decorator_list):
+            sites.append(f"{fn}:{node.lineno} class {c}: ComfyUI calls into it, but it lacks @qfe.console_safe_methods")
+    init = trees.get("__init__.py")
+    wraps = [n.lineno for n in ast.walk(init) if isinstance(n, ast.Call)
+             and ast.unparse(n.func).endswith("console_safe_nodes") and "NODE_CLASS_MAPPINGS" in ast.unparse(n)]
+    if not wraps:
+        sites.append("__init__.py: no qfe.console_safe_nodes(NODE_CLASS_MAPPINGS): the node FUNCTIONs are unwrapped")
+    else:
+        for n in ast.walk(init):
+            registers = ((isinstance(n, (ast.Assign, ast.AugAssign)) and "NODE_CLASS_MAPPINGS" in ast.unparse(
+                n.targets[0] if isinstance(n, ast.Assign) else n.target)) or (
+                isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr in ("update", "setdefault")
+                and "NODE_CLASS_MAPPINGS" in ast.unparse(n.func.value)))
+            if registers and n.lineno > max(wraps):
+                sites.append(f"__init__.py:{n.lineno} registers a node after console_safe_nodes: it would skip it")
+    return sites
+
+
 # The plugin's own non-ASCII punctuation (— – →), CJK, Hangul, Latin-1 and an emoji: no single code page holds them all.
 _CONSOLE_TEXT = "— – → 中文 한국어 日本語 éü \U0001f600"
-_CONSOLE_PAGES = ("cp932", "cp949", "cp1252", "cp936")   # redirected Windows consoles: Japanese, Korean, Western, Chinese
+_CONSOLE_PAGES = ("cp932", "cp949", "cp1252", "cp936", "utf-8")   # redirected Windows consoles, and a UTF-8 one
+# A Chinese username + directory in a path: GBK holds it, cp932/cp949/cp1252 do not (English Windows, Chinese user).
+_CONSOLE_PATH = "C:\\Users\\\u5f20\u4e09\\\u4e2d\u6587\u76ee\u5f55\\model.safetensors"
+_BOUNDARY_MSG = "qf_native: cannot stage the weights: " + _CONSOLE_PATH
 _LOG_ERROR = b"--- Logging error ---"
 
 
@@ -272,6 +324,27 @@ def _console_child(job):
                 logging.getLogger().error(f"!!! Exception during processing !!! {ex}")
                 logging.getLogger().error(traceback.format_exc())
         out["console engine error"] = _outcome(comfy_logs_an_engine_error)
+    def fail():   # a plugin error naming a user path, chained from the OSError that named it first
+        try:
+            raise OSError(2, "No such file or directory", _CONSOLE_PATH)
+        except OSError as e:
+            raise RuntimeError(_BOUNDARY_MSG) from e
+    if qfe is not None and hasattr(qfe, "console_safe_nodes") and hasattr(qfe, "console_safe_methods"):
+        class Node:   # stands in for a QuantFunc node class, wrapped the way __init__ wraps every registered node
+            FUNCTION = "load"
+
+            def load(self):
+                fail()
+        qfe.console_safe_nodes({"QuantFuncTextioNode": Node})
+
+        @qfe.console_safe_methods
+        class Model:   # stands in for a class ComfyUI calls into while it samples
+            def _apply_model(self):
+                fail()
+        out["console node error"] = _boundary_outcome(qfe, lambda: Node().load())
+        out["console denoise error"] = _boundary_outcome(qfe, lambda: Model()._apply_model())
+    else:   # no boundary: the same error reaches ComfyUI's logging as it is
+        out["console node error"] = out["console denoise error"] = _boundary_outcome(qfe, fail)
     afix = sys.modules.get("qfn_textio_pkg.qf_ltx_ancestral_audio_fix")
     out["console audio-fix"] = (_outcome(afix._log_once, "sampler " + _CONSOLE_TEXT, "euler") if afix
                                 else ["error", "Missing", "the audio-fix module was not imported"])
@@ -300,6 +373,30 @@ def _broken_engine_copy(root, tmp):
     return dst
 
 
+def _boundary_outcome(qfe, call):
+    """ComfyUI's execution.py:637-638 around one plugin call. The logging must not raise a second exception; the
+    exception keeps its type, its original message is recoverable, and it is unchanged where the console holds it."""
+    import logging
+    import traceback
+    try:
+        try:
+            call()
+        except Exception as ex:  # noqa: BLE001
+            logging.getLogger().error(f"!!! Exception during processing !!! {ex}")
+            logging.getLogger().error(traceback.format_exc())
+            caught = ex
+        else:
+            return ["error", "NoRaise", "the call did not raise"]
+    except Exception as second:  # noqa: BLE001 - the secondary exception this guards against
+        return ["error", type(second).__name__, str(second)]
+    fits = qfe.console_safe(_BOUNDARY_MSG) == _BOUNDARY_MSG if hasattr(qfe, "console_safe") else True
+    original = getattr(caught, "qf_console_original", str(caught))
+    kept = type(caught) is RuntimeError and original == _BOUNDARY_MSG and isinstance(caught.__cause__, OSError)
+    if kept and (str(caught) == _BOUNDARY_MSG or not fits):
+        return ["ok", "unchanged" if fits else "escaped; type and original recoverable"]
+    return ["error", "Lost", f"type={type(caught).__name__} original={original[:50]!r} now={str(caught)[:50]!r}"]
+
+
 def _console_arms(root, tmp):
     """rows for every code page: each output path, and the bytes the child wrote to stdout/stderr."""
     rows = []
@@ -320,7 +417,8 @@ def _console_arms(root, tmp):
                 "console logger": ("stderr", "[log] "), "console exception": ("stderr", "[exc] "),
                 "console engine error": ("stderr", "[engine] ")}
         for arm in ("console import", "console say", "console info", "console logger", "console exception",
-                    "console engine error", "console audio-fix", "console loggers"):
+                    "console engine error", "console node error", "console denoise error", "console audio-fix",
+                    "console loggers"):
             g = got.get(arm, ["error", "Missing", "the child did not run this arm"])
             ok, act = g[0] == "ok", _show(g)
             if ok and arm in want:   # the line reached the console, with what the code page cannot hold escaped
@@ -567,6 +665,10 @@ def main():
     rows.append(("static", "console", "0 unsafe console-output sites", f"{len(csites)} site(s)", not csites))
     for s in csites:
         print(f"  console-unsafe: {s}")
+    bsites = _boundary_sites(_ROOT)
+    rows.append(("static", "boundary", "every node and comfy-facing class wrapped", f"{len(bsites)} site(s)", not bsites))
+    for s in bsites:
+        print(f"  boundary: {s}")
     tmp = tempfile.mkdtemp(prefix="qf-textio-")
     try:
         mal_job, mal_expect = _malformed(tmp)
