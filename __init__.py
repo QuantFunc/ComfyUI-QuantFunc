@@ -622,6 +622,15 @@ if _IMPORT_OK:
                              "can produce a different variation of the same seed.")
     _QUALITY_TOOLTIP_BASE = ("Speed or quality. balance (default): can be faster, with almost the same result as best_quality. "
                              "best_quality: the highest quality, and slower.")
+    # [user 2026-09-24 「LTX-2.5 不提供 super_fast」] On LTX-2.5 super_fast visibly smears fast-moving faces and hands; H3 /
+    # Krea-2 / QI-2.1 stay sharp. The ONE place a family drops options: its loader never offers them, and a saved workflow's
+    # value runs the substitute with one console line (never an error, so old workflows still open and run).
+    _QUALITY_DROPPED = {"ltx2": {"super_fast": "fast"}}
+    _QUALITY_TOOLTIP_FAST_BY_FAMILY = {
+        "ltx2": ("Speed or quality. fast: faster; details can differ from best_quality. balance (default): can be a little "
+                 "faster than best_quality, with almost the same result. best_quality: the highest quality, and the slowest. On "
+                 "turbo models, fast can produce a different variation of the same seed."),
+    }
     # Saved workflows (migration): they carry the retired quality_enhance switch — API-format prompts under its NAME (declared
     # hidden, in ComfyUI's (type, options) input form, so ComfyUI hands it to load() and can validate it when it is linked; an
     # undeclared key would be dropped silently), UI workflows as a boolean in this widget's POSITION (widget values are stored by
@@ -650,10 +659,13 @@ if _IMPORT_OK:
         dev = getattr(patcher, "load_device", None)
         return int(dev.index) if getattr(dev, "type", "") == "cuda" and dev.index is not None else 0
 
-    def _quality_input():
+    def _quality_input(family=None):
+        """The loader's quality input on this GPU: the engine's options minus what the family drops (_QUALITY_DROPPED)."""
         fast = _quality_fast_tier()
-        return (list(_QUALITY_FAST_OPTIONS if fast else _QUALITY_BASE_OPTIONS),
-                {"default": _QUALITY_DEFAULT, "tooltip": _QUALITY_TOOLTIP_FAST if fast else _QUALITY_TOOLTIP_BASE})
+        dropped = _QUALITY_DROPPED.get(family, {})
+        return ([o for o in (_QUALITY_FAST_OPTIONS if fast else _QUALITY_BASE_OPTIONS) if o not in dropped],
+                {"default": _QUALITY_DEFAULT,
+                 "tooltip": _QUALITY_TOOLTIP_FAST_BY_FAMILY.get(family, _QUALITY_TOOLTIP_FAST) if fast else _QUALITY_TOOLTIP_BASE})
 
     # [quality — Qwen-Image-2.1, user 2026-09-24 「balance改为只快慢路径 fast 以及supper改为剪枝 0.9」「sm120不要展示这个选项就好」]
     # QI-2.1 keeps the four names (what each does for this family is the engine's table), but where the engine offers only the
@@ -698,12 +710,13 @@ if _IMPORT_OK:
             return True
         return f"quality must be one of {', '.join(_QUALITY_FAST_OPTIONS)} (got {quality!r})"
 
-    def _resolve_quality(quality=None, quality_enhance=None, device_idx=None):
+    def _resolve_quality(quality=None, quality_enhance=None, device_idx=None, family=None):
         """The node's quality → the mode this run uses. An explicit quality wins; the retired switch (a boolean in quality's
-        position, or by name when quality is absent) maps old ON → best_quality, OFF → balance; nothing given → the default. A
-        fast option this GPU cannot run (or an older engine) runs balance, with one console line. The model FILE is the engine's
-        call: a loaded model without the fast form runs such a call as balance and the engine warns once — the plugin reads no
-        file before the load (that read took 66 s for LTX-2.5 on a cold spinning disk)."""
+        position, or by name when quality is absent) maps old ON → best_quality, OFF → balance; nothing given → the default. An
+        option the family does not offer (_QUALITY_DROPPED: a saved workflow) runs its substitute; a fast option this GPU cannot
+        run (or an older engine) runs balance — one console line either way. The model FILE is the engine's call: a loaded model
+        without the fast form runs such a call as balance and the engine warns once — the plugin reads no file before the load
+        (that read took 66 s for LTX-2.5 on a cold spinning disk)."""
         if isinstance(quality, bool):
             q = "best_quality" if quality else "balance"
         elif quality is not None:
@@ -714,9 +727,13 @@ if _IMPORT_OK:
             q = _QUALITY_DEFAULT
         if q not in _QUALITY_FAST_OPTIONS:
             raise ValueError(_validate_quality(q))
+        note = None
+        if q in _QUALITY_DROPPED.get(family, {}):
+            note, q = f"'{q}' is not offered for this model", _QUALITY_DROPPED[family][q]
         if q in ("super_fast", "fast") and not _quality_fast_tier(device_idx):
-            print(f"[QuantFunc] '{q}' is not available here; using balance.", flush=True)   # this GPU, or an older engine
-            q = "balance"
+            note, q = note or f"'{q}' is not available here", "balance"   # this GPU, or an older engine
+        if note:
+            print(f"[QuantFunc] {note}; using {q}.", flush=True)
         return q
 
 
@@ -807,7 +824,7 @@ if _IMPORT_OK:
             }, "optional": {
                 "attention_backend": _attn_backend_input(),
                 "sol_tau": _SOL_TAU_INPUT,
-                "quality": _quality_input(),
+                "quality": _quality_input("ltx2"),
                 "step_cache": _STEP_CACHE_INPUT,
                 "block_cache": _BLOCK_CACHE_INPUT,
             }, "hidden": dict(_QUALITY_LEGACY_HIDDEN)}
@@ -830,7 +847,7 @@ if _IMPORT_OK:
             # conditioning (LTXVImgToVideoInplace).
             _p = _run_family_load("ltx2", transformer, model_config)
             _dev = _loaded_device_index(_p)
-            q = _resolve_quality(quality, quality_enhance, _dev)
+            q = _resolve_quality(quality, quality_enhance, _dev, "ltx2")
             _mm = getattr(_p, "model", None)
             if _mm is not None and hasattr(_mm, "set_attn_backend"):
                 _mm.set_attn_backend(_attn_backend_to_engine(attention_backend))

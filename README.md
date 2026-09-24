@@ -243,9 +243,9 @@ Qwen-Image-2.1 native-loader workflows are in [`example_workflows/`](example_wor
 The loader's `quality` choice (default `balance`, the same on the MiniMax-H3, LTX-2, Krea-2 and Qwen-Image-2.1 loaders): `balance` can be a little faster than
 `best_quality`, with almost the same result; `best_quality` gives the highest quality. On GPUs that offer them, `fast` and
 `super_fast` are faster still, and their details can differ more (on turbo models they can give a different variation of
-the same seed). Qwen-Image-2.1 differs: on GPUs that offer `fast` and `super_fast`, its `balance` can change details such
-as poses, faces or small objects, like `fast`; on other GPUs its loader shows no `quality` choice and always gives the
-highest quality.
+the same seed). The LTX-2 loader offers `fast` but not `super_fast` (a workflow saved with `super_fast` runs `fast`).
+Qwen-Image-2.1 differs: on GPUs that offer `fast` and `super_fast`, its `balance` can change details such as poses, faces
+or small objects, like `fast`; on other GPUs its loader shows no `quality` choice and always gives the highest quality.
 
 | File | Use Case |
 |------|----------|

@@ -388,8 +388,11 @@ def main():
             qfn._quality_fast_cache.clear()
             qfn.qfe.load_lib = loader_fn
             _opts = {n: qfn.NODE_CLASS_MAPPINGS[n].INPUT_TYPES()["optional"]["quality"] for n in _FOUR if n != _QI21}
-            check(f"quality options follow the engine ({label}) on the H3 / LTX / Krea2 loaders, default balance",
-                  all(o[0] == want and o[1]["default"] == "balance" for o in _opts.values()),
+            _want = {n: [o for o in want if not (n == "QuantFuncLTXLoader" and o == "super_fast")] for n in _opts}
+            check(f"quality options follow the engine ({label}) on the H3 / LTX / Krea2 loaders, default balance; the LTX "
+                  f"loader never offers super_fast (user 「LTX-2.5 不提供 super_fast」)",
+                  all(o[0] == _want[n] and o[1]["default"] == "balance" for n, o in _opts.items())
+                  and "super_fast" not in _opts["QuantFuncLTXLoader"][1]["tooltip"],
                   f"-> {[(n, o[0], o[1]['default']) for n, o in _opts.items()]}")
             # QI-2.1 (user 「sm120不要展示这个选项就好」): four options where the engine offers them; elsewhere the input stays in
             # its slot (widget values are positional) but hidden, socketless, defaulting to best_quality.
@@ -443,6 +446,22 @@ def main():
         qfn.qfe.load_lib = lambda: _FakeQLib(0)
         check("a two-way GPU runs a saved fast option as balance",
               [R(x) for x in _Q4] == ["balance", "balance", "balance", "best_quality"], f"-> {[R(x) for x in _Q4]}")
+        _ltx_saved = []
+        for _ans in (1, 0):
+            qfn._quality_fast_cache.clear()
+            qfn.qfe.load_lib = (lambda a=_ans: _FakeQLib(a))
+            for _x in _Q4:
+                _qb = _qio.StringIO()
+                with _qctl.redirect_stdout(_qb):
+                    _r = R(_x, family="ltx2")
+                _ltx_saved.append((_x, _r, _qb.getvalue().count("[QuantFunc]"),
+                                   _qb.getvalue().count("'super_fast' is not offered for this model")))
+        check("LTX: a saved super_fast runs fast on a fast GPU and balance on a two-way GPU — one console line, never an error; "
+              "the other options resolve as on every loader",
+              _ltx_saved == [("super_fast", "fast", 1, 1), ("fast", "fast", 0, 0), ("balance", "balance", 0, 0),
+                             ("best_quality", "best_quality", 0, 0),
+                             ("super_fast", "balance", 1, 1), ("fast", "balance", 1, 0), ("balance", "balance", 0, 0),
+                             ("best_quality", "best_quality", 0, 0)], f"-> {_ltx_saved}")
     finally:
         qfn.qfe.load_lib = _orig_load_lib
         qfn._quality_fast_cache.clear()
@@ -667,6 +686,16 @@ def main():
 
     # ── positive path: the all-in file alone loads (AV via the packed audio connector) ──
     out_ltx = LtxL.load(_allin_name, "ltx2-2.5-22b")[0]
+    _orig_load_lib5 = qfn.qfe.load_lib
+    try:   # a fast GPU: a saved super_fast reaches the LTX model as fast (the real load(), not the resolver alone)
+        qfn._quality_fast_cache.clear()
+        qfn.qfe.load_lib = lambda: _FakeQLib(1)
+        _ltx_q = [getattr(LtxL.load(_allin_name, "ltx2-2.5-22b", quality=_x)[0].model, "_quality", "MISSING")
+                  for _x in ("super_fast", "fast")]
+    finally:
+        qfn.qfe.load_lib = _orig_load_lib5
+        qfn._quality_fast_cache.clear()
+    check("ltx2 load(): a saved super_fast runs fast; fast stays fast", _ltx_q == ["fast", "fast"], f"-> {_ltx_q}")
     check("ltx2 AV file-mode returns a QFModelPatcher",
           type(out_ltx).__name__ == "QFModelPatcher")
     check("ltx2 AV model is QFLTXAVModel (packed audio connector -> AV path)",
