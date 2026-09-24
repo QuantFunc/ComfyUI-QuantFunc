@@ -209,7 +209,6 @@ class QFKrea2Model(QFSessionModelMixin, comfy.model_base.Krea2):
 def register(deps):
     get_engine = deps["get_engine"]
     bind_pipeline_model = deps["bind_pipeline_model"]
-    retire_handle = deps["retire_handle"]
 
     def build(transformer1_path, bundle_dir=None, lora_entries=()):
         """File-based Krea-2 Turbo t2i — the H3 single-expert staging pattern: stage the
@@ -230,7 +229,7 @@ def register(deps):
                 lambda: get_engine(model_dir, create_cfg=(_lora_cfg or None),
                                    device_idx=device_idx),
                 bind_pipeline_model)
-            engine = qfmp.QFLazyEngine(_factory, retire=retire_handle)
+            engine = qfmp.QFLazyEngine(_factory)
             offload = comfy.model_management.unet_offload_device()
             unet_config = {"image_model": "krea2", "disable_unet_model_creation": True}
             model_config = comfy.supported_models.Krea2(unet_config)

@@ -514,8 +514,7 @@ if _IMPORT_OK:
         import is SKIPPED WITH A LOUD WARNING (its models then say 'no registered native seam')
         — one broken family must not take the whole plugin's registration down."""
         import importlib
-        deps = {"get_engine": _get_engine, "bind_pipeline_model": _bind_pipeline_model,
-                "retire_handle": _retire_handle}
+        deps = {"get_engine": _get_engine, "bind_pipeline_model": _bind_pipeline_model}
         for mod_name in _FAMILY_MODULES:
             try:
                 mod = importlib.import_module("." + mod_name, __name__)

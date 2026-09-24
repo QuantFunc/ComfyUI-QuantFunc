@@ -1289,27 +1289,27 @@ def main():
     finally:
         qfn._resolve_lora = _saved_resolve
 
-    # ── 6) HOST-RAM honesty on a DEDICATED file pair (isolated ckey) ──
+    # ── 6) HOST-RAM: the LOGICAL patcher owns none. Native backing (VRAM pages and their host backup) belongs to the
+    #    canonical resource adapters; ComfyUI 0.37 calls loaded_ram_size/partially_unload_ram only on a DYNAMIC patcher,
+    #    and its base answers 0. So: 0 and nothing freed before create, after create and after the logical detach, which
+    #    never evicts the engine. (The pre-canonical arms asserted a logical-detach eviction that no longer exists.)
     try:
         open(os.path.join(dm, "ram-krea2-turbo-quantfunc-int4.safetensors"), "wb").write(b"\0" * 16)
         fresh = KreaL.load("ram-krea2-turbo-quantfunc-int4.safetensors", "krea2-turbo-int4")[0]
         eng = fresh.model._qf
-        check("never-created engine reports 0 host RAM", fresh.loaded_ram_size() == 0)
-        check("never-created engine frees 0 host RAM", fresh.partially_unload_ram(10 ** 12) == 0)
+        _ram = [(fresh.loaded_ram_size(), fresh.partially_unload_ram(10 ** 12))]
         _ = eng.lib
+        _ram.append((fresh.loaded_ram_size(), fresh.partially_unload_ram(10 ** 12)))
         fresh.detach(unpatch_all=False)
-        held = fresh.loaded_ram_size()
-        check("evicted engine DOES report its CPU backup", held > 0, f"-> {held}")
-        freed = fresh.partially_unload_ram(10 ** 12)
-        check("partially_unload_ram frees the backup", freed == held, f"-> {freed}")
-        check("released handle re-creates on next use",
-              getattr(eng, "materialized", True) is False)
-        fresh.partially_unload_ram(10 ** 12, subsets=["patches"])
-        check("partially_unload_ram accepts comfy's subsets kwarg", True)
+        _ram.append((fresh.loaded_ram_size(), fresh.partially_unload_ram(10 ** 12)))
+        check("the logical patcher reports and frees 0 host RAM (before create, after create, after its detach)",
+              _ram == [(0, 0)] * 3 and not fresh.is_dynamic(), f"-> {_ram}")
+        check("the logical detach never evicts the engine (native eviction is the resource adapters')",
+              eng.materialized and eng.ensure().pipeline is not None)
     except Exception as e:  # noqa: BLE001
-        check("host-RAM accounting", False, f"-> raised {type(e).__name__}: {e}")
+        check("host-RAM ownership arm", False, f"-> raised {type(e).__name__}: {e}")
 
-    # ── 7) SHARED-handle sibling safety on a DEDICATED pair ──
+    # ── 7) SHARED-handle sibling safety on a DEDICATED pair: one real handle, never torn down by a logical detach ──
     try:
         import gc
         open(os.path.join(dm, "sh-krea2-turbo-quantfunc-int4.safetensors"), "wb").write(b"\0" * 16)
@@ -1319,17 +1319,11 @@ def main():
         rb = pb.model._qf.ensure()
         check("two loads of one file share the real handle", ra is rb)
         pa.detach(unpatch_all=False)
-        check("sibling-shared release REFUSES (freed 0, sibling alive)",
-              pa.partially_unload_ram(10 ** 12) == 0)
-        check("sibling's pipeline SURVIVES the refused release",
-              pb.model._qf.pipeline is not None)
-        check("sibling still honestly reports its backup", pb.loaded_ram_size() > 0)
+        check("a logical detach on one sibling leaves the shared pipeline alive for the other",
+              pb.model._qf.pipeline is not None and ra.pipeline is not None)
         del pb, rb
         gc.collect()
-        freed = pa.partially_unload_ram(10 ** 12)
-        check("sole-consumer release DOES free once the sibling is gone", freed > 0, f"-> {freed}")
-        check("released wrapper reports 0 afterwards", pa.loaded_ram_size() == 0)
-        check("released wrapper self-heals on next use",
+        check("the surviving wrapper keeps its pipeline once the sibling is gone",
               pa.model._qf.ensure().pipeline is not None)
         del pa, ra
         gc.collect()

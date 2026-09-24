@@ -602,19 +602,14 @@ class QFLazyEngine:
     __getattr__ magic: a typo must fail loud, not silently forward.
     """
 
-    def __init__(self, factory, retire=None):
+    def __init__(self, factory):
         self._factory = factory          # () -> (QFEngineHandle, ckey)
         self._real = None
         self._prepared_entry = None
-        self._ckey = None                # the materialized handle's cache key (for retire)
+        self._ckey = None                # the materialized handle's cache key
         # This consumer's declarative LoRA set, set by tag_lora_rebuild: each chained LoRA node builds a fresh lazy
         # engine with its whole cumulative stack, so a raw loader output holds [] and deleting a LoRA node needs no cleanup.
         self._lora = []
-        # retire(ckey, eng, requester, *, keep_binding=False, reason="") -> bool: the cache
-        # layer's SINGLE liveness-gated retire chokepoint (the only .destroy() site in the
-        # plugin). None => this wrapper can NEVER destroy (fail-safe: a wrapper that cannot
-        # prove exclusivity must not free a handle a sibling may hold).
-        self._retire = retire
         # Persistent VRAM capacity comes only from the configured Prepared
         # resource. CPU-backup bytes are a separate, currently unknown ledger.
         self.capacity_bytes = None
@@ -808,45 +803,9 @@ class QFLazyEngine:
             return 0
         return entry.vram_need_bytes(latent_shape)
 
-    # NOTE: deliberately NO destroy() on the wrapper. The raw ungated destroy was dead code with
-    # zero callers, and any future caller reaching for it would reproduce the shared-handle UAF the
-    # liveness gate exists to prevent — release(requester=...) is the one sanctioned teardown (the
-    # cache's _sweep_dead_pipelines destroys REAL handles, never wrappers). Fail-loud by absence.
-    def release(self, requester=None):
-        """Free the created pipeline (VRAM + the CPU backup) and go back to UNMATERIALIZED — the
-        factory re-creates it from disk on the next use. Used by comfy's RAM manager
-        (partially_unload_ram); refuses while a session is open.
-
-        SHARED-HANDLE SAFETY (measured defect this closes): the real handle may be SHARED by
-        other live models (two loader nodes on the same package hit one cache entry), so destroy
-        is gated on the cache layer's retire chokepoint (liveness registry) — destroying under a live
-        sibling left it a NULL pipeline for its next denoise while its ledger kept reporting the
-        destroyed backup. No callback wired => refuse (fail-safe; better an unreclaimed backup
-        than a use-after-destroy). Returns True iff the handle was actually destroyed."""
-        if self._real is None:
-            return False
-        if self._real.pipeline is None:
-            # already destroyed elsewhere — nothing to free; just fall back to lazy re-create
-            self._real = None
-            self._unloaded = True
-            return False
-        if getattr(self._real, "current_session", None) is not None:
-            # Retention (2026-08-24): try to close a stale/abandoned session first — only a
-            # session that still refuses to end (genuinely running) blocks the release.
-            self._real.end_session_if_open()
-        if getattr(self._real, "current_session", None) is not None:
-            return False
-        # keep_binding=True: the SAME ckey's next handle re-binds this entry's surviving
-        # consumers (release does not change the create recipe). requester rides through so
-        # the retire chokepoint applies the pair-mate discriminator (a bound MODEL is
-        # accepted — its _qf wrapper is used).
-        if self._retire is None or not self._retire(self._ckey, self._real,
-                                                    requester if requester is not None else self,
-                                                    keep_binding=True, reason="comfy RAM release"):
-            return False
-        self._real = None
-        self._unloaded = True
-        return True
+    # NOTE: deliberately NO destroy() and NO release() on the wrapper: native backing is evicted by the canonical
+    # resource adapters, and the cache's _sweep_dead_pipelines destroys REAL handles, never wrappers. A caller
+    # reaching for a wrapper teardown would reproduce the shared-handle UAF the liveness gate prevents.
 
 
 # ── shared sidecar-LoRA rebuild contract (CR simplicity: ONE definition, not one per family) ──
@@ -1077,7 +1036,8 @@ def _ready_read(read, what):
 #                         :2130 and sampler_helpers._prepare_sampling :193, both for a prompt's own model
 #   loaded_ram_size       load_models_gpu :1036, only when model.is_dynamic()
 #   partially_unload_ram  free_model_pins :682 (models_for_pin_eviction :667) and reset_cast_buffers :1483, only when
-#                         model.is_dynamic(); no QuantFunc patcher is dynamic, so these two are declared, not reached
+#                         model.is_dynamic(); no QuantFunc patcher is dynamic or overrides them (ComfyUI's base answers 0:
+#                         native backing is the canonical resource adapters', never the logical patcher's host RAM)
 # free_memory (:893) sizes EVERY loaded model (:902-907) before it decides anything. It runs on every load_models_gpu
 # (:1001, :1010), including prompts that never touch a QuantFunc model, and from unload_all_models (:2121), which
 # main.py:390 (POST /free), execution.py:644 (the OOM handler) and execution.py:837 call with no failure channel. So a
@@ -1856,76 +1816,3 @@ class QFModelPatcher(comfy.model_patcher.ModelPatcher):
         # Only logical patches belong here. Native adapters retain their own
         # full-detach refusal; detaching a clone never releases their views.
         return super().detach(unpatch_all=unpatch_all)
-
-    # ── HOST-RAM reporting ────────────────────────────────────────────────────────────────
-    # REACHABILITY, stated honestly (measured in this ComfyUI): comfy calls loaded_ram_size() and
-    # partially_unload_ram() ONLY behind `model.is_dynamic()` (0.37.0 model_management.py:667/1036/1471;
-    # base ModelPatcher.is_dynamic() returns False and comfy's own comment says "Loaded RAM
-    # pressure tracking is only implemented for DynamicVram loading"). This patcher is NOT dynamic
-    # — opting in would mean implementing comfy's whole DynamicVram surface (weight pinning, VBAR,
-    # backup restore) for an engine that owns its memory outside torch. So these two are correct
-    # but currently INERT: the live integration for this plugin is detach() + model_size() /
-    # loaded_size(), which comfy calls unconditionally. They are kept (not deleted) because they
-    # are the right answers if this patcher ever goes dynamic, and they carry comfy's dynamic-path
-    # signature so that switch cannot crash on an unexpected kwarg.
-
-    def _engine_holds_cpu_backup(self):
-        """True only for a pipeline that WAS created and then co-evicted (weights now in host RAM).
-        A never-materialized lazy handle holds NOTHING — `unloaded` alone cannot tell those apart
-        (it is True in both states), and reporting the footprint for a handle that never allocated
-        would be claiming memory we do not hold."""
-        eng = self._engine()
-        if eng is None or not getattr(eng, "unloaded", False):
-            return False, None
-        # A lazy handle exposes `materialized`; a plain handle always has a real pipeline.
-        if not getattr(eng, "materialized", True):
-            return False, eng
-        # A DESTROYED handle (pipeline gone — e.g. a sibling wrapper legitimately released the
-        # last reference) holds no backup either; unload_vram keeps the pipeline valid, destroy
-        # nulls it, so this is exactly the "backup actually exists" discriminator.
-        if getattr(eng, "pipeline", None) is None:
-            return False, eng
-        return True, eng
-
-    @_comfy_facing("no resource read")
-    def loaded_ram_size(self):
-        """HOST-RAM this model is actually responsible for: the engine's CPU backup after a
-        co-eviction, else 0 (including for a handle that was never created)."""
-        holds, eng = self._engine_holds_cpu_backup()
-        return max(0, int(getattr(eng, "footprint_bytes", 0))) if holds else 0
-
-    @_comfy_facing(_busy_zero_freed)
-    def partially_unload_ram(self, ram_to_unload, subsets=None):
-        """comfy's RAM manager asking for host memory back. Releasing the engine handle frees the
-        CPU backup; the lazy handle re-creates from disk on the next use, so this is a real
-        reclaim, not a leak — but only when we genuinely hold one and nothing is in flight (an
-        open session must not have its pipeline pulled out from under it). `subsets` is comfy's
-        dynamic-path kwarg (it names weight subsets to drop); this engine's backup is all-or-
-        nothing, so it is accepted and ignored rather than crashing on an unexpected argument."""
-        holds, eng = self._engine_holds_cpu_backup()
-        if not holds:
-            return 0
-        if getattr(eng, "current_session", None) is not None:
-            # Retention (2026-08-24, delta-CR R8): this pre-check is the 4th truthiness
-            # consumer — short-circuiting here defeated release()'s own self-heal for a
-            # retained-but-dead pointer. Attempt the end first; only a session that STILL
-            # refuses to end (genuinely running) declines the RAM reclaim.
-            end = getattr(eng, "end_session_if_open", None)
-            if end is not None:
-                end()
-        if getattr(eng, "current_session", None) is not None:
-            return 0
-        release = getattr(eng, "release", None)
-        if release is None:            # a plain (non-lazy) handle cannot be re-created: keep it
-            return 0
-        freed = max(0, int(getattr(eng, "footprint_bytes", 0)))
-        try:
-            # requester=self.model: the cache layer refuses the destroy while any OTHER live
-            # model shares the handle (a sibling loader node on the same package) — report freed
-            # bytes ONLY when the destroy actually happened, else the ledger gets credited for
-            # memory a sibling still holds.
-            if not release(requester=self.model):
-                return 0
-        except Exception:  # noqa: BLE001
-            return 0
-        return freed

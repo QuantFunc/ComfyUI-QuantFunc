@@ -1161,7 +1161,6 @@ def register(deps):
     liveness registry, lazy-engine class) without importing __init__."""
     get_engine = deps["get_engine"]
     bind_pipeline_model = deps["bind_pipeline_model"]
-    retire_handle = deps["retire_handle"]
 
 
     def build(transformer1_path, bundle_dir=None, lora_entries=()):
@@ -1322,7 +1321,7 @@ def register(deps):
                 # DEFERRED create (QFLazyEngine): a chained QuantFuncNativeLoRA rebuilds the PATCHER for its
                 # accumulated set; the pipeline is created only for the model the sampler touches, and every LoRA
                 # set of this model shares it (the set goes on in place at run start).
-                engine = qfmp.QFLazyEngine(_factory, retire=retire_handle)
+                engine = qfmp.QFLazyEngine(_factory)
                 offload = comfy.model_management.unet_offload_device()
                 unet_config = {"image_model": "ltxav", "disable_unet_model_creation": True}
                 model_config = comfy.supported_models.LTXAV(unet_config)
@@ -1362,7 +1361,7 @@ def register(deps):
             # DEFERRED create (QFLazyEngine): a chained QuantFuncNativeLoRA rebuilds the PATCHER for its
             # accumulated set; the pipeline is created only for the model the sampler touches, and every LoRA
             # set of this model shares it (the set goes on in place at run start).
-            engine = qfmp.QFLazyEngine(_factory, retire=retire_handle)
+            engine = qfmp.QFLazyEngine(_factory)
             # [19B non-gated connector] authoritative head count from the ORIGINAL model dir\'s diffusers
             # LTX2TextConnectors config (the 19B family ships NON-gated connector weights; the head split
             # lives ONLY here). Absent/malformed -> None (gated checkpoints need nothing; a non-gated one
