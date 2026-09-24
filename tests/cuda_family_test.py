@@ -214,7 +214,7 @@ def arm_closure(tmp):
                   f"got={sorted(got)}")
 
 
-def arm_real_linker(_tmp):
+def arm_real_linker(tmp):
     """(L) the one piece the dict-driven arms stand in for: this process's real dynamic linker."""
     if not sys.platform.startswith("linux"):
         print("  [SKIP] (L) real linker: not Linux")
@@ -238,6 +238,22 @@ def arm_real_linker(_tmp):
         loaded_now = idle in f.read()
     bad += _check(f"(L) probing {idle} (present, not loaded) neither reports nor loads it",
                   got is None and not loaded_now, f"got={got!r} loaded_now={loaded_now}")
+    # two real copies of one soname: the one loaded FIRST (in z/, so a path sort would pick the other) is the one the
+    # linker hands out, as it is for a NEEDED entry; the copy loaded after it (a vendored twin) never is
+    first, twin = (os.path.join(tmp, d, idle) for d in ("z", "a"))
+    for dst in (first, twin):
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        with open(os.path.join(libdir, idle), "rb") as src, open(dst, "wb") as out:
+            out.write(src.read())
+    qfe.ctypes.CDLL(first, mode=qfe.ctypes.RTLD_LOCAL)
+    qfe.ctypes.CDLL(twin, mode=qfe.ctypes.RTLD_LOCAL)
+    with open("/proc/self/maps") as f:
+        maps_now = f.read()
+    both_mapped = first in maps_now and twin in maps_now
+    got = qfe._linker_path(idle)
+    bad += _check(f"(L) two loaded copies of {idle}: the linker hands out the first-loaded one, not the later twin",
+                  both_mapped and got is not None and os.path.realpath(got) == first,
+                  f"both_mapped={both_mapped} got={got!r} first={first}")
     return bad
 
 
