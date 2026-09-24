@@ -16,6 +16,20 @@ from unittest import mock
 import torch
 
 
+# ComfyUI's own --cpu mode (the contract tests' idiom) for the production-path arm: it needs comfy importable, not a
+# GPU, and the CPU suite hides CUDA. comfy parses its args ONCE, when comfy.cli_args is first imported, so force that
+# parse here, before any test can import comfy, and give unittest back its own argv.
+_COMFY_ROOT = os.environ.get("COMFY_ROOT")
+if _COMFY_ROOT and (Path(_COMFY_ROOT) / "comfy/cli_args.py").is_file():
+    sys.path.insert(0, _COMFY_ROOT)
+    _argv, sys.argv = sys.argv, [sys.argv[0], "--cpu"]
+    try:
+        import comfy.options
+        comfy.options.enable_args_parsing()
+        import comfy.cli_args  # noqa: F401 — the one parse, with --cpu
+    finally:
+        sys.argv = _argv
+
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 H3_SOURCE = (PLUGIN_ROOT / "qf_h3_modelpatcher.py").read_text(encoding="utf-8")
 MIXIN_SOURCE = (PLUGIN_ROOT / "qf_modelpatcher.py").read_text(encoding="utf-8")
@@ -102,7 +116,7 @@ def _load_real_plugin(test_case):
     comfy_root = Path(comfy_root)
     if not (comfy_root / "comfy/model_management.py").is_file():
         test_case.fail(f"COMFY_ROOT does not contain comfy/model_management.py: {comfy_root}")
-    sys.path.insert(0, str(comfy_root))
+    sys.path.insert(0, str(comfy_root))   # comfy runs in --cpu mode: forced at module import (top of file)
     package_name = "qf_h3_partial_production_contract"
     spec = importlib.util.spec_from_file_location(
         package_name,

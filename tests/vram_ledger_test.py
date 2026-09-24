@@ -144,11 +144,10 @@ proxy = SimpleNamespace(vram_need_bytes=lambda s: 0, footprint_bytes=1, ensure_i
                         ensure=lambda: created.append(1), current_session=None)
 m = _Model(); m._qf = proxy
 r, log = _quiet(m.memory_required, SHAPE, cond_shapes=COND)
-check(r == side and created == [] and "nothing measured yet" in log,
+check(r == side and created == [] and "cold: no pipeline yet" in log,
       "arm4b: cache MISS → comfy-side only, ensure() NOT called (no create ahead of comfy's eviction)")
-# the real QFLazyEngine demand surface: cold native demand is zero while the
-# model-level ordinary Comfy estimate remains the request floor; a hot retained
-# handle supplies native need without a create.
+# the real QFLazyEngine demand surface: cold native demand is zero and memory_required reserves the comfy side
+# only (D3: no ComfyUI torch-estimate floor); a hot retained handle supplies native need without a create.
 Lazy = qfmp.QFLazyEngine
 calls = []
 def _fac():
