@@ -54,6 +54,11 @@ for root, _dirs, files in os.walk(_PLUGIN):
 check(not hits, "arm1: no raw enhance knob reachable from the plugin path (%s)" % (hits or "clean"))
 
 try:
+    # Fake-engine test: run ComfyUI in its own --cpu mode (the contract tests' idiom), so a box with no visible GPU
+    # (the CPU suite hides CUDA) imports comfy instead of skipping every arm. Must precede the first comfy import.
+    sys.argv = [sys.argv[0], "--cpu"]
+    import comfy.options
+    comfy.options.enable_args_parsing()
     import comfy.model_management  # noqa: F401
     _pkg = os.path.basename(_PLUGIN)
     sys.path.insert(0, os.path.dirname(_PLUGIN))

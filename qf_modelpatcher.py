@@ -459,8 +459,9 @@ class QFSessionModelMixin:
     # forward of `shape` needs (sampler_helpers.estimate_memory → load_models_gpu(memory_required=…) → free_memory
     # unloads comfy's IDLE models, largest first, keeping the sampler's declared set; samplers.calc_cond_batch →
     # `need × 1.5 < free` decides cond batching) — and `loaded_size()`/`model_size()` — what it holds (the patcher,
-    # below). Cold demand keeps Comfy's ordinary request estimate as its floor; a hot pipeline refines it with
-    # quantfunc_vram_need_bytes, while actual residency comes from quantfunc_resident_vram_bytes. Comfy's own
+    # below). A cold request (no pipeline yet) reserves the comfy-side bytes only — no native pre-create working-set
+    # estimate exists (D3: no torch-estimate floor); a hot pipeline adds quantfunc_vram_need_bytes, while actual
+    # residency comes from quantfunc_resident_vram_bytes. Comfy's own
     # allocator makes the room before the denoise starts; nothing here reaches into comfy's state (user: 「不要 hack」).
     # What this REPLACES (git: 52ec260 / 9b6f7d3 / a6ec609): this function returned the comfy-side bytes ONLY — a
     # deliberate under-report so comfy would never evict the engine for a stage-2 shadow load (2026-08-22: the
@@ -761,6 +762,9 @@ class QFLazyEngine:
                 "qf_native: the LoRA set changed while this model's generation is still running. The engine applies "
                 "a LoRA change only between generations; re-queue the prompt.")
         union = self.lora_union()
+        # UNKNOWN until the engine confirms: a refused update may have left the previous set OR rolled the weights
+        # back to the base mid-apply, so after any failure the next run must re-send its set, never trust a mark.
+        real.applied_lora_sig = None
         real.pipeline_update({"lora": union})
         real.applied_lora_sig = want
         print(f"[qf_native] LoRA set applied in place (no reload): {len(union)} LoRA(s)", flush=True)
@@ -850,9 +854,8 @@ class QFLazyEngine:
     def vram_need_bytes(self, latent_shape):
         entry = self._real or self.ensure_if_cached()
         if entry is None:
-            # The native ABI defines a cold/unestimable result as zero and
-            # requires the host to retain its own request estimate as a floor.
-            # QFSessionModelMixin.memory_required does so via BaseModel.
+            # A cold/unestimable result is zero: QFSessionModelMixin.memory_required then reserves the
+            # comfy-side bytes only (D3 — never ComfyUI's torch estimate as a floor).
             return 0
         return entry.vram_need_bytes(latent_shape)
 

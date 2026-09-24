@@ -609,10 +609,9 @@ def register(deps):
                                    device_idx=device_idx),
                 bind_pipeline_model)
 
-            # DEFERRED create (QFLazyEngine): a chained QuantFuncNativeLoRA rebuilds for its
-            # accumulated LoRA set, so an eager create here would build ONE PIPELINE PER
-            # CHAIN LINK (and comfy's node-output cache would pin every intermediate's
-            # multi-GB CPU backup). Only the model the sampler touches is ever created.
+            # DEFERRED create (QFLazyEngine): a chained QuantFuncNativeLoRA rebuilds the PATCHER for its
+            # accumulated set; the pipeline is created only for the model the sampler touches, and every LoRA
+            # set of this model shares it (the set goes on in place at run start).
             engine = qfmp.QFLazyEngine(_factory, retire=retire_handle)
             engine.set_lora_side("all", lora_entries)
             offload = comfy.model_management.unet_offload_device()

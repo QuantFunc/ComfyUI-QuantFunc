@@ -103,7 +103,6 @@ class QFQwenImage21Model(QFSessionModelMixin, comfy.model_base.QwenImage21):
         return out
 
     def _begin(self, x_group, ctx_group):
-        qfmp._qf_cancel_pending_detach(self._qf)
         lib = self._qf.lib                       # MATERIALIZE FIRST (deferred-wrapper no-op close)
         self._qf.end_session_if_open()
         bpx = qfe.DenoiseBeginParams()

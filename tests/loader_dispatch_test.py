@@ -41,6 +41,11 @@ def _load_plugin():
         return None, "ComfyUI root not found (set COMFY_ROOT)"
     sys.path.insert(0, comfy_root)
     try:
+        # Fake-engine test: run ComfyUI in its own --cpu mode (the contract tests' idiom), so a box with no visible GPU
+        # (the CPU suite hides CUDA) imports comfy instead of skipping every arm. Must precede the first comfy import.
+        sys.argv = [sys.argv[0], "--cpu"]
+        import comfy.options
+        comfy.options.enable_args_parsing()
         import importlib.util
         import folder_paths  # noqa: F401 — proves the env is real
         spec = importlib.util.spec_from_file_location("qfn_test_pkg",
@@ -1088,8 +1093,9 @@ def main():
               _rt_updates == [{"lora": [_pa]}, {"lora": []}, {"lora": [_pb1]}, {"lora": [_pa, _pb5]},
                               {"lora": []}],
               f"-> updates={_rt_updates}")
-        # A refused update raises the engine's message and leaves the applied set alone, so the next run
-        # retries it (both ways).
+        # A refused update raises the engine's message and leaves the applied set UNKNOWN: the engine may have kept
+        # the previous set or rolled back to the base mid-apply, so the next run re-sends its set — including the
+        # set that was applied before the failure (A applied -> a refused B -> A again must send A).
         _rt_status[0] = 7
         _refused = ""
         try:
@@ -1097,14 +1103,25 @@ def main():
         except RuntimeError as _e:
             _refused = str(_e)
         _rt_real = rt_a.model._qf._real
-        _kept_sig = _rt_real.applied_lora_sig
+        _unknown = _rt_real.applied_lora_sig
         _rt_status[0] = 0
-        _ = rt_a.model._qf.lib
-        check("runtime LoRA: a refused update raises the engine's message, keeps the applied set, and retries",
+        _ = rt_a.model._qf.lib                      # the retry puts A on
+        _retried = _rt_updates[-1] == {"lora": [_pa]} and _rt_real.applied_lora_sig == rt_a.model._qf._lora_sig()
+        _rt_status[0] = 7
+        try:
+            _ = rt_b.model._qf.lib                  # B refused while A was on
+        except RuntimeError:
+            pass
+        _rt_status[0] = 0
+        _n_before = len(_rt_updates)
+        _ = rt_a.model._qf.lib                      # A again: must be RE-SENT, not trusted
+        check("runtime LoRA: a refused update raises the engine's message, leaves the set unknown, and the next "
+              "run re-sends (A -> refused B -> A re-sends A)",
               "pipeline_update failed (status 7)" in _refused and "pipeline busy" in _refused
-              and _kept_sig == "[]" and _rt_updates[-1] == {"lora": [_pa]}
-              and _rt_real.applied_lora_sig == rt_a.model._qf._lora_sig(),
-              f"-> refused={_refused!r} kept={_kept_sig} last={_rt_updates[-1]}")
+              and _unknown is None and _retried and len(_rt_updates) == _n_before + 1
+              and _rt_updates[-1] == {"lora": [_pa]},
+              f"-> refused={_refused!r} unknown={_unknown!r} retried={_retried} "
+              f"resent={_rt_updates[_n_before:]}")
         # Mid-generation: a set change while a session is still open refuses LOUD; the SAME set passes
         # without touching the engine (both ways).
         _rt_real.current_session = object()           # the fixture's end_session_if_open never closes it
