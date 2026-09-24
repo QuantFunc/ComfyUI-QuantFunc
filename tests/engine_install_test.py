@@ -521,9 +521,13 @@ def main():
             pass
         finally:
             qfe.os.replace = real_replace
-        so = qfe.resolve_so_path()
+        try:
+            so = qfe.resolve_so_path()
+        except RuntimeError as e:   # a marker naming the torn new pair would be refused here
+            so = f"REFUSED: {e}"
         check("an update killed between the renames: the old pair (both files) is what loads",
-              env.marker()["version"] == "0.0.13" and so == os.path.realpath(env.path("0.0.13-consumer-cu13", HOSTS[13]))
+              (env.marker() or {}).get("version") == "0.0.13"
+              and so == os.path.realpath(env.path("0.0.13-consumer-cu13", HOSTS[13]))
               and env.read("0.0.13-consumer-cu13", KERNELS[13]) == old.files[f"0.0.13/linux/consumer/{KERNELS[13]}"], so)
     # 15) V3: a KNOWN mismatch never loads.
     #   (a) the release publishes other bytes for the installed version and the re-download fails: the marker goes
