@@ -935,22 +935,26 @@ def main():
                 self.quantfunc_quality_fast_available_file = _FakeFn(file_ans)
     import contextlib as _ctl
     import io as _io
+    _kq = lambda **kw: getattr(KreaL.load("fx-krea2-turbo-quantfunc-int4.safetensors", "krea2-turbo-int4", **kw)[0].model,
+                               "_quality", "MISSING")
     _orig_load_lib4 = qfn.qfe.load_lib
     try:
         _fq, _asked = [], []
-        for _q in ("super_fast", "fast"):
+        for _ld, _q in ((_hq, "super_fast"), (_hq, "fast"), (_kq, "super_fast")):
             qfn._quality_fast_cache.clear()
             _lib = _FakeFileQLib(1, 0)                  # a GPU with the fast mode; the file query would say "no"
             _lib.quantfunc_quality_fast_available_file.calls = _asked
             qfn.qfe.load_lib = (lambda lib=_lib: lib)
             _buf = _io.StringIO()
             with _ctl.redirect_stdout(_buf):
-                _fq.append((_hq(quality=_q), _buf.getvalue().count("is not available here")))
+                _fq.append((_ld(quality=_q), _buf.getvalue().count("is not available here")))
     finally:
         qfn.qfe.load_lib = _orig_load_lib4
         qfn._quality_fast_cache.clear()
-    check("h3 load(): a fast option never asks the engine about the model FILE before the create (no read, kept as chosen)",
-          _fq == [("super_fast", 0), ("fast", 0)] and _asked == [] and not hasattr(qfn.qfe, "quality_fast_available_file")
+    check("a fast option never asks the engine about the model FILE before the create (no read, no downgrade): H3 fast and "
+          "Krea-2 super_fast are kept as chosen; H3's saved super_fast runs its family substitute fast (#736)",
+          _fq == [("fast", 0), ("fast", 0), ("super_fast", 0)] and _asked == []
+          and not hasattr(qfn.qfe, "quality_fast_available_file")
           and not hasattr(qfn, "_quality_fast_for_file"), f"-> {_fq} file queries={len(_asked)}")
     _hmd = out_h3.model._qf._ckey[0]
     check("h3 staged: config-complete + xfm linked + transformer_2 pruned",
