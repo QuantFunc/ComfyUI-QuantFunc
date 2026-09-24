@@ -1194,15 +1194,15 @@ def _install_lock(path):
         if _BIN_SUBDIR == "windows":
             import errno
             import msvcrt
-            held = {errno.EACCES, getattr(errno, "EDEADLOCK", errno.EDEADLK)}   # "locked by someone else" (MS CRT)
             f.seek(0)
             while True:
-                try:
-                    msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)   # LK_LOCK itself retries for ~10 s, then raises
+                try:   # LK_NBLCK: one attempt whose errno says WHY (LK_LOCK reports any failure as EDEADLOCK)
+                    msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
                     break
                 except OSError as e:
-                    if e.errno not in held:                         # anything but "held" fails the install loudly
-                        raise
+                    if e.errno != errno.EACCES:    # EACCES = held by the other installer; anything else (a filesystem
+                        raise                      # without byte-range locks, a bad handle) fails the install loudly
+                    time.sleep(1)
             try:
                 yield
             finally:

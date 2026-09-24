@@ -26,6 +26,7 @@ import datetime
 import functools
 import hashlib
 import http.server
+import importlib.util
 import json
 import os
 import shutil
@@ -82,6 +83,23 @@ def build_stage(staged, stage, version, plugin_req, fixer_verify):
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             shutil.copyfile(os.path.join(root, n), dst)
             body[rel] = sha256(dst)
+    # Every staged DLL's CUDA major, read from its PE imports by the plugin's own reader, must be the one its name
+    # promises (quantfunc.dll = CUDA 13, quantfunc-12.dll = CUDA 12): a mislabeled build is caught here, for every set,
+    # not only by FORK-2 on the one GPU class this box has.
+    spec = importlib.util.spec_from_file_location("qf_engine_stage", os.path.join(PLUGIN, "qf_engine.py"))
+    qfe = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(qfe)
+    promised = {dll: major for major, dll in qfe._ENGINE_PLATFORMS["windows"]["hosts"].items()}
+    wrong = []
+    for rel in sorted(body):
+        name = rel.rsplit("/", 1)[-1]
+        if name in promised:
+            got = qfe._so_cuda_major(os.path.join(stage, version, "windows", *rel.split("/")))
+            print(f"   {rel}: CUDA {got} from its imports (its name says {promised[name]})")
+            if got != promised[name]:
+                wrong.append(rel)
+    if wrong:
+        sys.exit(f"staged DLLs whose imports do not carry their CUDA major: {wrong}")
     if fixer_verify:
         theirs = json.load(open(fixer_verify, encoding="utf-8")).get("win32", {})
         bad = sorted(k for k in body if theirs.get(k) != body[k])
@@ -191,7 +209,7 @@ if dry:   # no GPU / not Windows: stub what only the box can answer; the install
     qfe.platform.machine = lambda: "AMD64"
     qfe._torch_cuda_major, qfe._driver_cuda_major, qfe._gpu_sm = (lambda: 12), (lambda: 12), (lambda idx=0: 89)
     if "msvcrt" not in sys.modules:
-        ms = types.ModuleType("msvcrt"); ms.LK_UNLCK, ms.LK_LOCK = 0, 1
+        ms = types.ModuleType("msvcrt"); ms.LK_UNLCK, ms.LK_LOCK, ms.LK_NBLCK = 0, 1, 2
         ms.locking = lambda fd, mode, n: print(f"   lock call: {'lock' if mode else 'unlock'} {n} byte")
         sys.modules["msvcrt"] = ms
 print("platform row:", qfe._BIN_SUBDIR, qfe._engine_platform()["key"], "| driver CUDA", qfe._driver_cuda_major())
@@ -282,8 +300,7 @@ def main():
         sys.exit("--comfy is required (or --dry-run)")
     out = os.path.abspath(a.out or tempfile.mkdtemp(prefix="qf-e2e-"))
     stage, tls = os.path.join(out, "stage"), tempfile.mkdtemp(prefix="qf-e2e-tls-")
-    env = {k: v for k, v in os.environ.items() if k not in ("QF_NATIVE_SO_PATH", "QF_NATIVE_KEYFILE", "SSL_CERT_FILE",
-                                                             "REQUESTS_CA_BUNDLE")}
+    env = {k: v for k, v in os.environ.items() if k not in ("QF_NATIVE_SO_PATH", "QF_NATIVE_KEYFILE", "SSL_CERT_FILE")}
     for k in ("NO_PROXY", "no_proxy"):     # the local stage and ComfyUI are loopback: never through a box proxy
         env[k] = ",".join(x for x in (env.get(k, ""), "127.0.0.1,localhost") if x)
     print(f"plugin {PLUGIN} | out {out} | bin\\windows holds {sorted(os.listdir(os.path.join(PLUGIN, 'bin', 'windows')))}")
@@ -293,7 +310,7 @@ def main():
         ca, crt, key, how = make_tls(tls)
         srv, base = serve(stage, crt, key)
         print(f"   serving {base} (throwaway CA via {how}); the CA is trusted only by the install process below")
-        trusted = dict(env, SSL_CERT_FILE=ca, REQUESTS_CA_BUNDLE=ca)
+        trusted = dict(env, SSL_CERT_FILE=ca)       # urllib's default context honours it (measured just below)
         for label, e in (("with SSL_CERT_FILE", trusted), ("without (control)", env)):
             r = subprocess.run([sys.executable, "-c", FETCH, base + "/version.json"], env=e, capture_output=True, text=True)
             print(f"   urllib default context {label}: {r.stdout.strip()}")

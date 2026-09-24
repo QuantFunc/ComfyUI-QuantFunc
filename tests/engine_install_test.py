@@ -149,16 +149,18 @@ class WinRelease(Release):
 
 class _FakeMsvcrt(types.ModuleType):
     """msvcrt on Linux: records the installer's byte-range lock calls."""
-    LK_UNLCK, LK_LOCK = 0, 1
+    LK_UNLCK, LK_LOCK, LK_NBLCK = 0, 1, 2      # the MS CRT's values
 
     def __init__(self):
         super().__init__("msvcrt")
-        self.calls, self.fail = [], []          # fail: errnos the next LK_LOCK calls raise, in order
+        self.calls, self.fail = [], []          # fail: errnos the next lock attempts raise, in order
 
     def locking(self, fd, mode, nbytes):
-        self.calls.append(("lock" if mode == self.LK_LOCK else "unlock", nbytes))
-        if mode == self.LK_LOCK and self.fail:
-            code = self.fail.pop(0)
+        """Like the MS CRT: LK_NBLCK fails with the real errno; LK_LOCK retries, then reports ANY failure as EDEADLOCK."""
+        self.calls.append(({self.LK_UNLCK: "unlock", self.LK_NBLCK: "nblck"}.get(mode, "lock"), nbytes))
+        if mode != self.LK_UNLCK and self.fail:
+            import errno as _e
+            code = self.fail.pop(0) if mode == self.LK_NBLCK else (self.fail.pop(0), getattr(_e, "EDEADLOCK", _e.EDEADLK))[1]
             raise OSError(code, os.strerror(code))
 
 
@@ -1132,7 +1134,7 @@ def main():
                                     env.marker(gset, major) == m, env.leftovers())
                 want[(sm, major)] = (gset, dll, None, [dll], True, f"{folder}/{dll}",
                                      ["version.json", "0.0.13/verify.json", "0.0.13/windows/sets.json",
-                                      f"0.0.13/windows/{gset}/{dll}"], [("lock", 1), ("unlock", 1)], True, [])
+                                      f"0.0.13/windows/{gset}/{dll}"], [("nblck", 1), ("unlock", 1)], True, [])
     check("Windows: each consumer GPU x CUDA major installs exactly its own DLL (SM 89 + cu12 -> sm89/quantfunc-12.dll), "
           "fetches nothing else, locks, and loads it", got == want,
           {k: v for k, v in got.items() if v != want[k]} or "all 8")
@@ -1245,22 +1247,30 @@ def main():
     check("Windows: a marker naming a kernel, or recording a second file, is not a Windows marker and is never followed",
           good and followed == {"kernel named": False, "second sha256": False} and loaded is True,
           f"good={good} followed={followed} loaded={loaded}")
-    # 44) the Windows install lock waits ONLY while another installer holds it (the CRT's EDEADLOCK / EACCES after its
-    #     own ~10 s of retries); any other error fails the install loudly instead of spinning forever.
+    # 44) the Windows install lock (LK_NBLCK, one attempt per second) waits ONLY while another installer holds it
+    #     (EACCES); anything else — a filesystem without byte-range locks (EINVAL), a bad handle (EBADF), even the
+    #     CRT's EDEADLOCK that LK_LOCK would report for every failure — fails the install loudly instead of waiting.
     import errno as _errno
-    held = getattr(_errno, "EDEADLOCK", _errno.EDEADLK)
-    with windows() as ms, Env(WinRelease(), torch_major=12, sm=89, machine="AMD64") as env:
-        ms.fail = [held, _errno.EACCES]
-        waited = (qfe.install_engine() or {}).get("set"), [c[0] for c in ms.calls]
-    with windows() as ms, Env(WinRelease(), torch_major=12, sm=89, machine="AMD64") as env:
-        ms.fail = [_errno.EBADF]
-        try:
-            qfe.install_engine()
-            broken = "installed!"
-        except OSError as e:
-            broken = e.errno == _errno.EBADF and not env.pairs()
-    check("Windows: the install lock waits while held (EDEADLOCK/EACCES) and fails loudly on anything else",
-          waited == ("sm89", ["lock", "lock", "lock", "unlock"]) and broken is True, f"waited={waited} broken={broken}")
+    real_sleep, slept = qfe.time.sleep, []
+    qfe.time.sleep = slept.append
+    try:
+        with windows() as ms, Env(WinRelease(), torch_major=12, sm=89, machine="AMD64") as env:
+            ms.fail = [_errno.EACCES, _errno.EACCES]
+            waited = (qfe.install_engine() or {}).get("set"), [c[0] for c in ms.calls], slept[:]
+        broken = {}
+        for code in (_errno.EINVAL, _errno.EBADF, getattr(_errno, "EDEADLOCK", _errno.EDEADLK)):
+            with windows() as ms, Env(WinRelease(), torch_major=12, sm=89, machine="AMD64") as env:
+                ms.fail = [code]
+                try:
+                    qfe.install_engine()
+                    broken[code] = "installed!"
+                except OSError as e:
+                    broken[code] = e.errno == code and not env.pairs()
+    finally:
+        qfe.time.sleep = real_sleep
+    check("Windows: the install lock waits (1 s per try) only while held (EACCES) and fails loudly on anything else",
+          waited == ("sm89", ["nblck", "nblck", "nblck", "unlock"], [1, 1]) and all(v is True for v in broken.values()),
+          f"waited={waited} broken={broken}")
     print("ENGINE_INSTALL:", "PASS" if bad == 0 else f"FAIL ({bad} wrong)")
     return 1 if bad else 0
 
