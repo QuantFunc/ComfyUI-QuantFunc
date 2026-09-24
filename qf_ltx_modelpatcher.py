@@ -680,7 +680,6 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
         """Open the t2v external denoise session. x_group = [1,128,F,H,W] latent; vemb_group =
         [1,S,4096] POST-connector video_embeds. Geometry: engine derives F_lat/H_lat/W_lat from
         num_frames + width/height (spatial 32, temporal 8)."""
-        qfmp._qf_cancel_pending_detach(self._qf)   # session begin supersedes a lazy-detach window
         lib = self._qf.lib   # MATERIALIZE FIRST (see qf_h3_modelpatcher._begin: a deferred wrapper
         # no-ops the close while the cached engine still holds an interrupted run's open session)
         self._qf.end_session_if_open()
@@ -1159,11 +1158,10 @@ def matches(pipeline_class, transformer_class=""):
 
 def register(deps):
     """Return the ltx2 family BUILDER. `deps` gives the package-level helpers (engine cache,
-    liveness registry, footprint estimator, lazy-engine class) without importing __init__."""
+    liveness registry, lazy-engine class) without importing __init__."""
     get_engine = deps["get_engine"]
     bind_pipeline_model = deps["bind_pipeline_model"]
     retire_handle = deps["retire_handle"]
-    estimate_footprint = deps["estimate_footprint"]
 
 
     def build(transformer1_path, transformer2_path, bundle_dir=None,
@@ -1296,6 +1294,7 @@ def register(deps):
             _lora_cfg = dict(create_extra or {})   # file-mode: {"denoise_only": True}
             if lora_entries:
                 _lora_cfg["lora"] = list(lora_entries)   # engine svdq factory: sidecar apply post-load
+            device, device_idx = qfmp.current_torch_device()
             # ── LTX-2.5 JOINT-AV auto-detect (c5.8b): the SAME discriminant the engine's own
             # has_audio_ uses — the engine model_dir ships audio_vae/ weights (the video-only
             # 19B staging deliberately omits it) — so plugin and engine agree by construction.
@@ -1327,16 +1326,15 @@ def register(deps):
                 or _file_has_prefix(_conn_staged, "audio_embeddings_connector."))
             if _is_av:
                 _factory, _register_model = qfmp.make_engine_factory(
-                    lambda: get_engine(model_dir, create_cfg=(_lora_cfg or None)),
+                    lambda: get_engine(model_dir, create_cfg=(_lora_cfg or None),
+                                       device_idx=device_idx),
                     bind_pipeline_model)
 
                 # DEFERRED create (QFLazyEngine): a chained QuantFuncNativeLoRA rebuilds for its
                 # accumulated LoRA set, so an eager create here would build ONE PIPELINE PER
                 # CHAIN LINK (and comfy's node-output cache would pin every intermediate's
                 # multi-GB CPU backup). Only the model the sampler touches is ever created.
-                engine = qfmp.QFLazyEngine(_factory, estimate_footprint(model_dir),
-                                      retire=retire_handle)
-                device = comfy.model_management.get_torch_device()
+                engine = qfmp.QFLazyEngine(_factory, retire=retire_handle)
                 offload = comfy.model_management.unet_offload_device()
                 unet_config = {"image_model": "ltxav", "disable_unet_model_creation": True}
                 model_config = comfy.supported_models.LTXAV(unet_config)
@@ -1346,7 +1344,7 @@ def register(deps):
                 patcher = QFModelPatcher(model, load_device=device, offload_device=offload)
                 print(f"[qf_native] loaded QuantFuncNativeLoader (LTX-2.5 JOINT-AV svdq) "
                       f"package={model_name} "
-                      f"footprint~{engine.footprint_bytes // (1024*1024)}MB (create deferred)", flush=True)
+                      f"capacity=native Prepared query (create deferred)", flush=True)
                 return qfmp.tag_lora_rebuild(patcher, lora_entries, _build)
             if not connector_ckpt:
                 raise RuntimeError("QuantFuncNativeLoader: connector_ckpt (comfy LTX-2.3 ckpt with the "
@@ -1369,15 +1367,15 @@ def register(deps):
             # without a wired 4-bit tier ever routes through this minimal create, it hits the same class.
             # No fix now (adding keys back defeats minimal=True's purpose); this note is the tripwire.
             _factory, _register_model = qfmp.make_engine_factory(
-                lambda: get_engine(model_dir, create_cfg=(_lora_cfg or None)),
+                lambda: get_engine(model_dir, create_cfg=(_lora_cfg or None),
+                                   device_idx=device_idx),
                 bind_pipeline_model)
 
             # DEFERRED create (QFLazyEngine): a chained QuantFuncNativeLoRA rebuilds for its
             # accumulated LoRA set, so an eager create here would build ONE PIPELINE PER
             # CHAIN LINK (and comfy's node-output cache would pin every intermediate's
             # multi-GB CPU backup). Only the model the sampler touches is ever created.
-            engine = qfmp.QFLazyEngine(_factory, estimate_footprint(model_dir),
-                                      retire=retire_handle)
+            engine = qfmp.QFLazyEngine(_factory, retire=retire_handle)
             # [19B non-gated connector] authoritative head count from the ORIGINAL model dir\'s diffusers
             # LTX2TextConnectors config (the 19B family ships NON-gated connector weights; the head split
             # lives ONLY here). Absent/malformed -> None (gated checkpoints need nothing; a non-gated one
@@ -1396,7 +1394,6 @@ def register(deps):
                         break
                 except (OSError, ValueError):
                     continue
-            device = comfy.model_management.get_torch_device()
             offload = comfy.model_management.unet_offload_device()
             # ★ PER-LOAD combined-footprint running total: THIS load() holds the video connector AND (when
             # join_audio_prompt=True) the audio connector CONCURRENTLY, so their host allocs ADD. `conn_budget` is
@@ -1424,7 +1421,7 @@ def register(deps):
             _register_model(model)
             patcher = QFModelPatcher(model, load_device=device, offload_device=offload)
             print(f"[qf_native] loaded QuantFuncNativeLoader (LTX-2 svdq) package={model_name} "
-                  f"footprint~{engine.footprint_bytes // (1024*1024)}MB (create deferred)", flush=True)
+                  f"capacity=native Prepared query (create deferred)", flush=True)
             return qfmp.tag_lora_rebuild(patcher, lora_entries, _build)
 
         return _build(list(lora_entries))

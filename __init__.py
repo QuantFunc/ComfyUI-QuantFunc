@@ -8,6 +8,7 @@ import os
 import json
 import logging
 import weakref
+import threading
 
 # GUARDED imports (mirror the real plugin __init__.py) — a broken comfy-internals import must NOT
 # take down node registration on a ComfyUI upgrade; degrade to zero nodes + a loud warning.
@@ -33,35 +34,6 @@ except Exception as _fp_exc:  # noqa: BLE001 — never break registration
     logging.warning("[qf_native] folder_paths unavailable: %r", _fp_exc)
 
 _NO_LORA_HINT = "(no LoRA in models/loras)"
-
-
-def _package_weight_paths(pkg):
-    """The svdq transformer weight files inside a package (footprint estimate)."""
-    outs = []
-    for sub in ("transformer", "transformer_2"):
-        d = os.path.join(pkg, sub)
-        if os.path.isdir(d):
-            for f in os.listdir(d):
-                if f.endswith(".safetensors"):
-                    outs.append(os.path.join(d, f))
-    return outs
-
-
-def _estimate_package_footprint(pkg, device_idx=0, server_url=None, api_key=None):
-    """Engine-resident transformer weight bytes for a package, so the memory ledger has a real number
-    before the pipeline is created (QFLazyEngine). EXACT when the engine offers it (the loader-law
-    estimate, SM-aware + page-rounded — the disk size under-reports a packed svdq transformer by ~41 %
-    on SM89), else the on-disk proxy."""
-    try:
-        exact = qfe.estimate_resident_bytes(qfe.load_lib(), pkg, device_idx=device_idx, server_url=server_url, api_key=api_key)
-        if exact > 0:
-            return exact
-    except Exception:  # noqa: BLE001 — fall through to the disk proxy
-        pass
-    try:
-        return qfe.estimate_footprint_bytes(*_package_weight_paths(pkg))
-    except Exception:  # noqa: BLE001 — a bad estimate must not break loading
-        return 1
 
 
 _CONFIGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs")
@@ -285,53 +257,92 @@ def _apply_checkpoint_flow_shift(model, model_dir):
 
 
 # Pipeline CACHE: reuse the created engine handle for a repeated config → a re-executed workflow does
-# NOT leak a fresh pipeline. Keyed by the create-determining inputs. TWO bounds:
-#  • VRAM (at most ONE pipeline resident): `_evict_other_pipelines` frees every OTHER cached handle's
-#    VRAM via quantfunc_unload_sync — the handles STAY VALID (reload lazily on their next generate).
-#    NO destroy of a LIVE handle → no use-after-destroy against a QFModelPatcher comfy still holds.
+# NOT leak a fresh pipeline. Keyed by the create-determining inputs.
+#  • VRAM residency is scheduled by ComfyUI. Cache selection must not independently
+#    evict other live handles; their resource adapters execute host reclaim requests.
 #  • HOST RAM (bounded by the set of LIVE patchers): `_sweep_dead_pipelines` DESTROYS a handle only
 #    once its QFWanModel has been garbage-collected (comfy dropped the patcher) — a dead model cannot
 #    be use-after-freed, so destroy is safe there. Without this the unload_vram-only design leaks a
 #    multi-GB CPU backup per distinct config forever (a resolution/model sweep). `_PIPELINE_MODELS`
-#    holds weakrefs to ALL of a config's live models as the liveness signal (bound in each build).
+#    holds weakrefs to ALL live consumers: QFLazyEngine acquisition pins plus family models.
 _PIPELINE_CACHE = {}     # ckey -> QFEngineHandle
-_PIPELINE_MODELS = {}    # ckey -> [weakref.ref(model), ...] — ALL live consumers of that config's
+_PREPARED_CACHE = weakref.WeakValueDictionary()  # cold identities retained by lazy consumers
+_ENGINE_IDENTITY_LOCK = threading.RLock()
+_PIPELINE_MODELS = {}    # ckey -> [weakref.ref(consumer), ...] — ALL live consumers of that config's
 #                          handle. A LIST, not one ref: two loader nodes on the same package share
 #                          ONE handle, and a single last-load-wins ref made the FIRST model invisible
 #                          to liveness (measured: a sibling's release/sweep could destroy the shared
 #                          handle under a still-live patcher → NULL pipeline at its next denoise +
 #                          a ledger that kept reporting the destroyed backup).
-# KNOWN RESIDUALS — both UNREACHABLE in the production consumer (comfy's PromptExecutor runs every node on
-# a SINGLE execution thread, so load() is never concurrent with another load()); recorded, not silent:
-#  • These two dicts are mutated WITHOUT a lock. A hypothetical MULTI-THREADED caller could race the
-#    check-then-create in _get_engine. NOT locked deliberately: a lock would have to span the multi-second
-#    create_pipeline (a heavy critical section) to guard a path the single-threaded executor cannot reach —
-#    defensive wiring for an unreachable race. Revisit IF comfy ever executes nodes concurrently.
-#  • If load() raises AFTER _get_engine caches the handle but BEFORE it binds the weakref
-#    (_PIPELINE_MODELS[ckey]=), that handle reads as "unbound" to _sweep_dead_pipelines forever (never
-#    destroyed). Its VRAM is still freed by _evict_other_pipelines; only a DISTINCT config that fails
-#    mid-load AND is never retried leaks ONE CPU-backup handle. A retry of the SAME config REUSES the
-#    cached handle (faster) and, on success, binds the weakref → it becomes sweepable — so the pin is a
-#    reuse-on-retry feature except in the never-retried case; evicting on failure would forfeit it.
+# CONCURRENCY CONTRACT: the three cache dictionaries above are protected by short
+# `_ENGINE_IDENTITY_LOCK` lookup/publication/removal sections.  The lock is NEVER
+# held while constructing QFPreparedEntry, checking native grants, creating or
+# destroying a pipeline, or closing a losing prepared candidate.  Cold creation
+# is single-flight under domain.transaction_lock -> entry._materialize_lock; that
+# path may briefly take this cache lock, and no inverse cache-lock -> domain-lock
+# edge is permitted.
+
+
+def _unpin_pipeline_consumer(ckey, consumer):
+    """Rollback one acquisition-created pin without touching model bindings."""
+    with _ENGINE_IDENTITY_LOCK:
+        refs = []
+        for ref in _PIPELINE_MODELS.get(ckey, []):
+            current = ref()
+            if current is not None and current is not consumer:
+                refs.append(ref)
+        if refs:
+            _PIPELINE_MODELS[ckey] = refs
+        else:
+            _PIPELINE_MODELS.pop(ckey, None)
+
+
+def _pin_pipeline_consumer_locked(ckey):
+    """Pin the current QFLazyEngine in the same transaction as cache selection.
+
+    Caller holds `_ENGINE_IDENTITY_LOCK`.  Returning a live handle without this
+    context is forbidden: otherwise retire can remove/destroy it before the
+    family factory reaches its later model-binding loop.
+    """
+    acquisition = qfmp._current_engine_cache_acquisition()
+    if acquisition is None:
+        raise qfe.NativeContractUnavailable(
+            "QuantFunc engine cache lookup requires a QFLazyEngine consumer acquisition")
+    consumer = acquisition.consumer
+    refs = [ref for ref in _PIPELINE_MODELS.get(ckey, []) if ref() is not None]
+    if not any(ref() is consumer for ref in refs):
+        refs.append(weakref.ref(consumer))
+        _PIPELINE_MODELS[ckey] = refs
+        acquisition.register_pin(lambda: _unpin_pipeline_consumer(ckey, consumer))
+    elif refs:
+        _PIPELINE_MODELS[ckey] = refs
+    return consumer
 
 
 def _bind_pipeline_model(ckey, model):
     """Register `model` as a live consumer of ckey's cached handle (called by every family builder
     after constructing its model). Prunes dead refs so the list tracks the true live set."""
-    refs = [r for r in _PIPELINE_MODELS.get(ckey, []) if r() is not None]
-    if not any(r() is model for r in refs):   # re-materialize of a live model must not accumulate
-        refs.append(weakref.ref(model))
-    _PIPELINE_MODELS[ckey] = refs
+    with _ENGINE_IDENTITY_LOCK:
+        # Cold preparation also binds consumers but owns no pipeline. Keep that
+        # metadata bounded by live consumers, not every historical cold recipe.
+        for old_key in list(_PIPELINE_MODELS):
+            if old_key not in _PIPELINE_CACHE:
+                _live_pipeline_models(old_key)
+        refs = [r for r in _PIPELINE_MODELS.get(ckey, []) if r() is not None]
+        if not any(r() is model for r in refs):   # re-materialize of a live model must not accumulate
+            refs.append(weakref.ref(model))
+        _PIPELINE_MODELS[ckey] = refs
 
 
 def _live_pipeline_models(ckey):
     """The models still alive on ckey's handle (prunes dead refs in place)."""
-    refs = [r for r in _PIPELINE_MODELS.get(ckey, []) if r() is not None]
-    if refs:
-        _PIPELINE_MODELS[ckey] = refs
-    else:
-        _PIPELINE_MODELS.pop(ckey, None)
-    return [r() for r in refs]
+    with _ENGINE_IDENTITY_LOCK:
+        refs = [r for r in _PIPELINE_MODELS.get(ckey, []) if r() is not None]
+        if refs:
+            _PIPELINE_MODELS[ckey] = refs
+        else:
+            _PIPELINE_MODELS.pop(ckey, None)
+        return [r() for r in refs]
 
 
 def _retire_handle(ckey, eng, requester=None, *, keep_binding=False, reason=""):
@@ -352,19 +363,35 @@ def _retire_handle(ckey, eng, requester=None, *, keep_binding=False, reason=""):
     ON GRANT: pop the cache entry, pop the binding list unless keep_binding (release() keeps it
     — the SAME ckey's next handle re-binds its surviving consumers; the LoRA reconcile re-creates
     under a NEW ckey and the sweep retires dead entries, so both drop it), then destroy."""
-    req_qf = getattr(requester, "_qf", requester)   # model -> wrapper; wrapper -> itself; None -> None
-    foreign = []
-    for m in _live_pipeline_models(ckey):
-        if requester is not None and (m is requester or getattr(m, "_qf", None) is req_qf):
-            continue
-        foreign.append(m)
-    if foreign:
-        print(f"[qf_native] retire refused ({reason or 'unspecified'}): {len(foreign)} live "
-              "foreign consumer(s) still bound to this cache entry", flush=True)
-        return False
-    _PIPELINE_CACHE.pop(ckey, None)
-    if not keep_binding:
-        _PIPELINE_MODELS.pop(ckey, None)
+    retired_entry = None
+    with _ENGINE_IDENTITY_LOCK:
+        if _PIPELINE_CACHE.get(ckey) is not eng:
+            return False
+        req_qf = getattr(requester, "_qf", requester)   # model -> wrapper; wrapper -> itself; None -> None
+        foreign = []
+        for consumer in _live_pipeline_models(ckey):
+            consumer_qf = getattr(consumer, "_qf", consumer)
+            if requester is not None and consumer_qf is req_qf:
+                continue
+            foreign.append(consumer)
+        if foreign:
+            print(f"[qf_native] retire refused ({reason or 'unspecified'}): {len(foreign)} live "
+                  "foreign consumer(s) still bound to this cache entry", flush=True)
+            return False
+        _PIPELINE_CACHE.pop(ckey, None)
+        prepared_key = (qfe.library_identity(eng.lib), ckey)
+        candidate = _PREPARED_CACHE.get(prepared_key)
+        if candidate is not None and candidate.resource is eng.resource:
+            _PREPARED_CACHE.pop(prepared_key, None)
+            # Publish non-creatable in the same identity transaction as cache
+            # removal. retire_materialized performs the domain-locked cleanup.
+            candidate._cache_usable = False
+            retired_entry = candidate
+        if not keep_binding:
+            _PIPELINE_MODELS.pop(ckey, None)
+    if retired_entry is not None:
+        retired_entry.retire_materialized()
+    # Native teardown may be slow and must never run under the cache lock.
     try:
         eng.destroy()   # idempotent (pipeline→None); closes any session first
     except Exception:  # noqa: BLE001 — retire must never mask the caller's continuation
@@ -372,30 +399,137 @@ def _retire_handle(ckey, eng, requester=None, *, keep_binding=False, reason=""):
     return True
 
 
-def _evict_other_pipelines(keep_key):
-    """Free the VRAM of every OTHER cached pipeline (unload_sync → CPU backup; handle stays valid)."""
-    for k, e in list(_PIPELINE_CACHE.items()):
-        if k != keep_key and e is not None and e.pipeline is not None and not e.unloaded:
-            try:
-                e.unload_vram()
-            except Exception:  # noqa: BLE001
-                pass
-
-
 def _sweep_dead_pipelines(keep_key):
     """Reclaim HOST RAM: destroy any cached handle whose model comfy has GC'd (no live reference → no
-    UAF). A still-live model is kept (its VRAM is freed separately by _evict_other_pipelines). Never
+    UAF). A still-live model is kept; ComfyUI decides its VRAM residency. Never
     touches keep_key or a handle not yet bound to a model (its load() may still be in flight)."""
-    for k in list(_PIPELINE_CACHE.keys()):
+    with _ENGINE_IDENTITY_LOCK:
+        keys = list(_PIPELINE_CACHE.keys())
+    for k in keys:
         if k == keep_key:
             continue
-        if not _PIPELINE_MODELS.get(k):
-            continue   # UNBOUND (load may be in flight) → never touch; only ever-bound entries sweep
-        eng = _PIPELINE_CACHE.get(k)
+        with _ENGINE_IDENTITY_LOCK:
+            if not _PIPELINE_MODELS.get(k):
+                continue   # UNBOUND (load may be in flight) → never touch; only ever-bound entries sweep
+            eng = _PIPELINE_CACHE.get(k)
         # requester=None ⇒ _retire_handle refuses while ANY consumer is live (only-all-dead sweeps)
         if eng is not None and _retire_handle(k, eng, None, reason="host-RAM sweep"):
             print("[qf_native] host-RAM sweep: destroyed a cached pipeline whose QFWanModel was GC'd "
                   "(comfy dropped its patcher) — freed its CPU backup", flush=True)
+
+
+def _engine_recipe(model_dir, create_cfg=None, device_idx=0):
+    """Resolve immutable create inputs without entering a cache critical section."""
+    # [EXPERIMENT-ONLY 2026-08-23, internal A/B — remove after measurement; shipped
+    # form will be loader-node widgets, per the no-env-production-switch rule]:
+    # QF_NATIVE_CREATE_EXTRA merges extra create keys (internal dials /
+    # attention_backend...) BEFORE the cache key is computed, so每个 extra 配置有独立
+    # pipeline cache 身份 (never collides with the default config's handle).
+    extra = os.environ.get("QF_NATIVE_CREATE_EXTRA")
+    if extra:
+        create_cfg = {**(create_cfg or {}), **json.loads(extra)}
+        print(f"[qf_native] EXPERIMENT create-extra merged: {extra}", flush=True)
+    lib = qfe.load_lib()
+    ckey = (qfe.resolve_so_path(), model_dir, "svdq", int(device_idx),
+            json.dumps(create_cfg or {}, sort_keys=True))
+    return lib, ckey, (qfe.library_identity(lib), ckey), create_cfg
+
+
+def _prepare_params(model_dir, create_cfg, device_idx):
+    """Build retained create params only after both engine caches miss."""
+    key, surl = _read_auth()
+    cfg = dict(create_cfg or {})
+    if key:
+        cfg["api_key"] = key
+        cfg["server_url"] = surl
+    return qfe.make_create_params(model_dir=model_dir, model_backend="svdq",
+                                  device_idx=int(device_idx), config_json=cfg or None)
+
+
+def _get_or_prepare_entry(lib, ckey, prepared_key, model_dir, create_cfg, device_idx):
+    """Return the cached handle/entry, constructing a publish candidate outside the cache lock."""
+    with _ENGINE_IDENTITY_LOCK:
+        eng = _PIPELINE_CACHE.get(ckey)
+        if eng is not None and eng.pipeline is not None:
+            if qfe.library_identity(eng.lib) != qfe.library_identity(lib):
+                raise RuntimeError("QuantFunc cache entry belongs to a different loaded native image")
+            _pin_pipeline_consumer_locked(ckey)
+            return eng
+        entry = _PREPARED_CACHE.get(prepared_key)
+        if entry is not None and not entry._cache_usable:
+            _PREPARED_CACHE.pop(prepared_key, None)
+            entry = None
+    if entry is not None:
+        return entry
+
+    params = _prepare_params(model_dir, create_cfg, device_idx)
+    candidate = qfmp.QFPreparedEntry(lib, int(params.device_idx), create_params=params)
+    winner = None
+    mismatch = False
+    with _ENGINE_IDENTITY_LOCK:
+        eng = _PIPELINE_CACHE.get(ckey)
+        if eng is not None and eng.pipeline is not None:
+            if qfe.library_identity(eng.lib) != qfe.library_identity(lib):
+                mismatch = True
+            else:
+                _pin_pipeline_consumer_locked(ckey)
+                winner = eng
+        else:
+            winner = _PREPARED_CACHE.get(prepared_key)
+            if winner is not None and not winner._cache_usable:
+                _PREPARED_CACHE.pop(prepared_key, None)
+                winner = None
+            if winner is None:
+                _PREPARED_CACHE[prepared_key] = candidate
+                winner, candidate = candidate, None
+    if candidate is not None:
+        candidate.retire_unpublished()
+    if mismatch:
+        raise RuntimeError("QuantFunc cache entry belongs to a different loaded native image")
+    return winner
+
+
+def _materialize_engine(entry, lib, ckey):
+    """Single-flight cold create under domain -> prepared-entry lock order."""
+    acquisition = qfmp._current_engine_cache_acquisition()
+    if acquisition is None:
+        raise qfe.NativeContractUnavailable(
+            "QuantFunc engine materialization requires a QFLazyEngine consumer acquisition")
+    # Validate weak-reference support before native creation; publication itself
+    # must not discover an unpinnable consumer after allocating a live handle.
+    weakref.ref(acquisition.consumer)
+    with qfmp._domain_transaction(entry._owner_adapter):
+        with entry._materialize_lock:
+            if not entry._cache_usable:
+                raise qfe.NativeContractUnavailable(
+                    "QuantFunc prepared identity was retired before materialization")
+            with _ENGINE_IDENTITY_LOCK:
+                eng = _PIPELINE_CACHE.get(ckey)
+                if eng is not None and eng.pipeline is not None:
+                    if qfe.library_identity(eng.lib) != qfe.library_identity(lib):
+                        raise RuntimeError("QuantFunc cache entry belongs to a different loaded native image")
+                    _pin_pipeline_consumer_locked(ckey)
+                    return eng, ckey
+            # Creation is reachable only after the canonical Comfy dependency has
+            # installed finite Owned/Shared/device grants. A direct factory caller has
+            # no host-admitted capacity and therefore cannot bypass the common seam.
+            if acquisition.consumer not in entry._materializers:
+                raise qfe.NativeContractUnavailable(
+                    "QuantFunc cold creation requires a live ComfyUI materializer binding")
+            qfmp._require_engine_host_grants(entry)
+            _sweep_dead_pipelines(ckey)
+            # The exact configured-Prepared native capacity Comfy admitted is
+            # retained on this identity. It is VRAM authority, not CPU-backup
+            # footprint, and is never re-estimated from paths at create time.
+            eng = qfe.QFEngineHandle.create(lib, create_params=entry.create_params,
+                                           capacity_bytes=int(entry.capacity_bytes),
+                                           prepared_resource=entry.resource)
+            eng._qf_resource_adapters = entry._qf_resource_adapters
+            eng._qf_resource_adapters[0]._prepared = False
+            with _ENGINE_IDENTITY_LOCK:
+                _PIPELINE_CACHE[ckey] = eng
+                _pin_pipeline_consumer_locked(ckey)
+            return eng, ckey
 
 
 def _get_engine(model_dir, create_cfg=None, device_idx=0):
@@ -409,47 +543,15 @@ def _get_engine(model_dir, create_cfg=None, device_idx=0):
     # [session-knobs] the session-knob-≠-create-key guard is sealed INSIDE
     # qf_engine.create_pipeline (the real quantfunc_create boundary — construction-enforced,
     # unbypassable by a future direct caller), not duplicated here (one truth source).
-    # [EXPERIMENT-ONLY 2026-08-23, internal A/B — remove after measurement; shipped
-    # form will be loader-node widgets, per the no-env-production-switch rule]:
-    # QF_NATIVE_CREATE_EXTRA merges extra create keys (internal dials /
-    # attention_backend...) BEFORE the cache key is computed, so每个 extra 配置有独立
-    # pipeline cache 身份 (never collides with the default config's handle).
-    _extra = os.environ.get("QF_NATIVE_CREATE_EXTRA")
-    if _extra:
-        create_cfg = {**(create_cfg or {}), **json.loads(_extra)}
-        print(f"[qf_native] EXPERIMENT create-extra merged: {_extra}", flush=True)
-    lib = qfe.load_lib()
-    # device_idx follows COMFY's torch device (the builders pass get_torch_device().index), so
-    # a ComfyUI started on a different GPU — or an in-process device choice — drives the engine
-    # on the SAME card comfy computes on. Part of the cache key: two devices = two handles.
-    ckey = (qfe.resolve_so_path(), model_dir, "svdq", int(device_idx),
-            json.dumps(create_cfg or {}, sort_keys=True))
-    _sweep_dead_pipelines(ckey)        # reclaim host RAM from configs whose patchers comfy dropped
-    _evict_other_pipelines(ckey)       # keep only THIS config's VRAM resident (others reload lazily)
-    eng = _PIPELINE_CACHE.get(ckey)
-    if eng is not None and eng.pipeline is not None:
-        return eng, ckey
-    key, surl = _read_auth()
-    cfg = dict(create_cfg or {})       # minimal: svdq metadata drives layout/precision
-    if key:
-        cfg["api_key"] = key
-        cfg["server_url"] = surl
-    # Footprint = the ENGINE-RESIDENT transformer weight bytes only (dual-expert). VAE + text_encoder
-    # stay NATIVE comfy nodes (comfy already accounts for them), so they must NOT be added here — an
-    # over-report would make comfy's ledger evict siblings that actually fit.
-    # ORDER IS LOAD-BEARING: the exact estimate is a PIPELINE-LESS engine entry that installs its own
-    # metadata-KV resolver and CLEARS the process slot on exit (quantfunc_api.cpp ClearResolverOnExit).
-    # Called AFTER create it wiped the live pipeline's resolver, so a LAZY-weight family (MiniMax-H3
-    # materializes its transformer at the first denoise_begin) failed its first sealed-metadata touch
-    # with "KV-protected … API key is required" (measured 2026-09-07, h3 venue on 远程-linux-d).
-    # Estimating BEFORE create leaves create's resolver as the last writer.
-    footprint = _estimate_package_footprint(model_dir, device_idx=int(device_idx), server_url=cfg.get("server_url"), api_key=cfg.get("api_key"))
-    pipeline = qfe.create_pipeline(lib, model_dir=model_dir, transformer_path=None,
-                                   model_backend="svdq", device_idx=int(device_idx),
-                                   config_json=(cfg if cfg else None))
-    eng = qfe.QFEngineHandle(lib, pipeline, footprint_bytes=footprint)
-    _PIPELINE_CACHE[ckey] = eng
-    return eng, ckey
+    # Cache lookup/publication is atomic; prepare/grant/create use the independent
+    # domain -> prepared-entry order and never run under the global cache lock.
+    lib, ckey, prepared_key, create_cfg = _engine_recipe(model_dir, create_cfg, device_idx)
+    entry = _get_or_prepare_entry(lib, ckey, prepared_key, model_dir, create_cfg, device_idx)
+    if isinstance(entry, qfe.QFEngineHandle):
+        return entry, ckey
+    if qfe.FACTORY_PREPARE_ONLY.get():
+        return entry, ckey
+    return _materialize_engine(entry, lib, ckey)
 
 
 if _IMPORT_OK:
@@ -481,7 +583,6 @@ if _IMPORT_OK:
         import importlib
         deps = {"get_engine": _get_engine, "bind_pipeline_model": _bind_pipeline_model,
                 "retire_handle": _retire_handle,
-                "estimate_footprint": _estimate_package_footprint,
                 "apply_checkpoint_flow_shift": _apply_checkpoint_flow_shift}
         for mod_name in _FAMILY_MODULES:
             try:
@@ -604,16 +705,12 @@ if _IMPORT_OK:
                                      "Runtime session knob — takes effect next run, never "
                                      "rebuilds. COMPOSABLE with step_cache (EC skips whole "
                                      "steps; FBC skips blocks inside computed steps)."})
-    # [quality_enhance switch, user 2026-09-12] abstracts the raw token_prune float behind a
-    # BOOLEAN: OFF (default) = token-prune ON @0.8 keep (~1.2x faster; last step always full,
-    # audio never pruned), ON = keep every token (full quality, prune OFF). The engine is
-    # unchanged — it still receives token_prune_keep_ratio via set_token_prune/residency_opts.
+    # [quality_enhance widget -> the mixin's ONE video_enhance switch, user 2026-09-19] OFF (default) = the
+    # engine's speed policy, ON = full quality; what that means is ENGINE law, this plugin carries no number.
     _QUALITY_ENHANCE_INPUT = ("BOOLEAN", {"default": False,
-                     "tooltip": "Quality-enhance. OFF (default) = faster: token-prune ON at "
-                                "keep-fraction 0.8 (recompute 80% of VIDEO tokens per step, "
-                                "~1.2x; last step always full, audio never pruned). "
-                                "ON = full quality (keep every token, prune OFF). Runtime "
-                                "session knob — takes effect next run, never rebuilds."})
+                     "tooltip": "Quality-enhance. OFF (default) = the engine's faster speed policy. "
+                                "ON = full quality. Runtime session knob — takes effect next run, "
+                                "never rebuilds."})
 
     # Qwen-Image-2.1: the same switch and mapping (_quality_enhance_to_token_prune), an image tooltip — the
     # engine prunes every one-cond-group run without references (text-to-image, img2img, mask inpainting; CFG 1, batch 1 — the
@@ -644,13 +741,6 @@ if _IMPORT_OK:
                                 "sub-steps) — sharper/cleaner AUDIO at fixed per-sub-step cost, the "
                                 "VIDEO is untouched (byte-identical). No effect when the video "
                                 "already runs >= 16 steps. Runtime session knob — next run, no rebuild."})
-
-    def _quality_enhance_to_token_prune(enhance):
-        """quality_enhance switch -> engine token-prune keep-fraction (user 2026-09-12):
-        ON = 1.0 (keep all tokens = prune OFF, full quality); OFF (default) = 0.8 (prune,
-        ~1.2x faster). The engine still receives the float via set_token_prune ->
-        residency_opts token_prune_keep_ratio; only the plugin-exposed widget changed."""
-        return 1.0 if enhance else 0.8
 
     # [sol-tau dial 2026-08-31] the ONE user-facing Sol-Attn knob (user "就一个就好"). Applies to
     # the flash/sage backends — the engine's applySolTauDial engages the Sol-Attn keep-ratio per
@@ -844,8 +934,7 @@ if _IMPORT_OK:
                 _mm.set_attn_backend(_attn_backend_to_engine(attention_backend))
             if _mm is not None and hasattr(_mm, "set_sol_tau"):
                 _mm.set_sol_tau(sol_tau)
-            if _mm is not None and hasattr(_mm, "set_token_prune"):
-                _mm.set_token_prune(_quality_enhance_to_token_prune(quality_enhance))
+            _mm.set_video_enhance(quality_enhance)
             _arm_session_caches(_mm, step_cache, block_cache)
             return (_p,)
 
@@ -877,7 +966,7 @@ if _IMPORT_OK:
 
         def load(self, transformer, model_config, attention_backend="auto",
                  quality_enhance=False):
-            # [runtime dials] backend + token-prune (quality_enhance) are SESSION knobs
+            # [runtime dials] backend + video_enhance (quality_enhance) are SESSION knobs
             # (NOT create keys — a widget change never re-keys the engine = no rebuild).
             _p = _run_family_load("krea2", transformer, model_config,
                                   None,
@@ -885,8 +974,7 @@ if _IMPORT_OK:
             _mm = getattr(_p, "model", None)
             if _mm is not None and hasattr(_mm, "set_attn_backend"):
                 _mm.set_attn_backend(_attn_backend_to_engine(attention_backend))
-            if _mm is not None and hasattr(_mm, "set_token_prune"):
-                _mm.set_token_prune(_quality_enhance_to_token_prune(quality_enhance))
+            _mm.set_video_enhance(quality_enhance)
             return (_p,)
 
     class QuantFuncQwenImage21Loader:
@@ -956,6 +1044,10 @@ if _IMPORT_OK:
                 "audio_enhance": _AUDIO_ENHANCE_INPUT,
                 "step_cache": _STEP_CACHE_INPUT,
                 "block_cache": _BLOCK_CACHE_INPUT,
+                "allow_partial_denoise": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Opt in to split/trimmed sigma schedules for intentional H3 double-sampling workflows.",
+                }),
             }}
 
         RETURN_TYPES = ("MODEL",)
@@ -965,7 +1057,8 @@ if _IMPORT_OK:
                        "stock sampler drives with latents. " + _COMMON_LIMITS)
 
         def load(self, transformer, model_config,
-                 attention_backend="flash", sol_tau=1.0, quality_enhance=False, audio_enhance=False, step_cache=0.0, block_cache=0.0):  # H3: flash default (auto→sage is broken)
+                 attention_backend="flash", sol_tau=1.0, quality_enhance=False, audio_enhance=False,
+                 step_cache=0.0, block_cache=0.0, allow_partial_denoise=False):  # H3: flash default (auto→sage is broken)
             _p = _run_family_load("minimax-h3", transformer, model_config,
                                    None,
                                    sparse_opts=None)
@@ -974,10 +1067,10 @@ if _IMPORT_OK:
                 _mm.set_attn_backend(_attn_backend_to_engine(attention_backend))
             if _mm is not None and hasattr(_mm, "set_sol_tau"):
                 _mm.set_sol_tau(sol_tau)
-            if _mm is not None and hasattr(_mm, "set_token_prune"):
-                _mm.set_token_prune(_quality_enhance_to_token_prune(quality_enhance))
+            _mm.set_video_enhance(quality_enhance)
             if _mm is not None and hasattr(_mm, "set_audio_enhance"):
                 _mm.set_audio_enhance(audio_enhance)
+            _mm.set_allow_partial_denoise(bool(allow_partial_denoise))
             _arm_session_caches(_mm, step_cache, block_cache)
             return (_p,)
 
@@ -1117,8 +1210,6 @@ try:
 except Exception as _qf_cloud_te_exc:  # noqa: BLE001
     import logging as _qf_lg
     _qf_lg.warning("[qf_native] cloud-TE node not registered: %r", _qf_cloud_te_exc)
-
-
 # ── QuantFunc LTX-2.5 AV ancestral-sampler audio fix ─────────────────────────────
 # The engine's STATELESS flow-match forward requires a non-re-noised trajectory; comfy's
 # ancestral samplers (euler_ancestral auto-routes to *_RF for CONST/flow models) re-noise x

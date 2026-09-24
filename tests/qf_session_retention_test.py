@@ -11,7 +11,7 @@ imports standalone — no comfy, no GPU) with a stub lib, asserting BOTH directi
   T2  ok end       -> pointer CLEARED  + (True, True)
   T3  raising end  -> pointer RETAINED (best-effort branch)
   T4  partial_unload self-heals a stale-but-endable pointer (proceeds) and still refuses a
-      genuinely-open one (returns 0 without touching the C reclaim)
+      genuinely-open one (raises without touching the C reclaim)
   T5  static: every family file arms `_qf_needs_begin` in extra_conds AND consumes it in the
       lazy-begin gate (the silent-session-REUSE hole fix; textual death-rule — deleting
       either half of the f5b75e2 edit goes red)
@@ -105,9 +105,14 @@ check("T4a partial_unload heals an endable pointer and reclaims", freed == 42 an
 # T4b: partial_unload still refuses a genuinely-open session (end keeps refusing)
 lib = _StubLib(end_rc=1)
 h = _handle(lib)
-freed = h.partial_unload_vram(10 * 1024 * 1024)
-check("T4b partial_unload refuses a still-open session", freed == 0 and lib.partial_calls == 0,
-      f"freed={freed} partial_calls={lib.partial_calls}")
+refused = False
+try:
+    h.partial_unload_vram(10 * 1024 * 1024)
+except RuntimeError as exc:
+    refused = "session" in str(exc)
+check("T4b partial_unload raises for a still-open session", refused and lib.partial_calls == 0,
+      f"refused={refused} partial_calls={lib.partial_calls}")
+check("T4b refused partial reclaim retains the session pointer", h.current_session is not None)
 
 # T5: static death-rule for the needs-begin flag (silent session-REUSE hole)
 for fam in ("qf_h3_modelpatcher.py", "qf_ltx_modelpatcher.py", "qf_wan_modelpatcher.py"):

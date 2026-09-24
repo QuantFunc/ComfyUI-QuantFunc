@@ -79,7 +79,6 @@ class QFKrea2Model(QFSessionModelMixin, comfy.model_base.Krea2):
         return out
 
     def _begin(self, x_group, ctx_group):
-        qfmp._qf_cancel_pending_detach(self._qf)
         lib = self._qf.lib                       # MATERIALIZE FIRST (deferred-wrapper no-op close)
         self._qf.end_session_if_open()
         bpx = qfe.DenoiseBeginParams()
@@ -96,22 +95,16 @@ class QFKrea2Model(QFSessionModelMixin, comfy.model_base.Krea2):
         # IMAGE session: the video-flavored residency_opts CACHE/SPARSE keys are
         # engine-REFUSED here (E3, correctly) — send only the knobs the image seam
         # consumes: the runtime attn-backend dial (applyAttnBackendDial) and the
-        # token-prune keep-fraction (quality_enhance switch).
+        # video_enhance switch (quality_enhance widget).
         _o = {}
         ab = str(getattr(self, "_attn_backend", "auto") or "auto")
         if ab != "auto":
             _o["attention_backend"] = ab
-        # token-prune (CAT): the krea2 _begin builds its own _o (video residency_opts
-        # keys are engine-REFUSED here), so the mixin's generic emission never runs —
-        # emit the key HERE or the widget is silently dropped (field 2026-09-01:
-        # user set 0.3, engine stayed 1.0, no ARMED line). Engine session parse is
-        # generic (denoise begin :4511); absent = engine resets to 1.0 (anti-ghost).
-        try:
-            _tp = float(getattr(self, "_token_prune", 1.0) or 1.0)
-        except Exception:
-            _tp = 1.0
-        if 0.0 < _tp < 1.0:
-            _o["token_prune_keep_ratio"] = _tp
+        # [enhance switch] the krea2 _begin builds its own _o (video residency_opts keys are
+        # engine-REFUSED here), so the mixin's generic emission never runs — emit the switch HERE
+        # or the widget is silently dropped (the field 2026-09-01 lesson). Always sent, boolean;
+        # the number behind it is engine law (never the raw token_prune_keep_ratio key).
+        _o["video_enhance"] = bool(getattr(self, "_video_enhance", False))
         bpx._opts = json.dumps(_o).encode()
         bpx.options_json = bpx._opts
         session = ctypes.c_void_p()
@@ -230,7 +223,6 @@ def register(deps):
     get_engine = deps["get_engine"]
     bind_pipeline_model = deps["bind_pipeline_model"]
     retire_handle = deps["retire_handle"]
-    estimate_footprint = deps["estimate_footprint"]
 
     def build(transformer1_path, transformer2_path, bundle_dir=None,
               lora_entries=(), sparse_opts=None):
@@ -251,12 +243,12 @@ def register(deps):
             _lora_cfg = dict(create_extra or {})
             if lora_entries:
                 _lora_cfg["lora"] = list(lora_entries)   # engine svdq load: sidecar apply post-load
+            device, device_idx = qfmp.current_torch_device()
             _factory, _register_model = qfmp.make_engine_factory(
-                lambda: get_engine(model_dir, create_cfg=(_lora_cfg or None)),
+                lambda: get_engine(model_dir, create_cfg=(_lora_cfg or None),
+                                   device_idx=device_idx),
                 bind_pipeline_model)
-            engine = qfmp.QFLazyEngine(_factory, estimate_footprint(model_dir),
-                                       retire=retire_handle)
-            device = comfy.model_management.get_torch_device()
+            engine = qfmp.QFLazyEngine(_factory, retire=retire_handle)
             offload = comfy.model_management.unet_offload_device()
             unet_config = {"image_model": "krea2", "disable_unet_model_creation": True}
             model_config = comfy.supported_models.Krea2(unet_config)
@@ -265,7 +257,7 @@ def register(deps):
             _register_model(model)
             patcher = QFModelPatcher(model, load_device=device, offload_device=offload)
             print(f"[qf_native] loaded QuantFuncNativeLoader (Krea-2 t2i svdq) package={model_name} "
-                  f"footprint~{engine.footprint_bytes // (1024*1024)}MB (create deferred)", flush=True)
+                  f"capacity=native Prepared query (create deferred)", flush=True)
             return qfmp.tag_lora_rebuild(patcher, lora_entries, _build)
 
         return _build(list(lora_entries))

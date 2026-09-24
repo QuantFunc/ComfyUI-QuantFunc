@@ -269,7 +269,6 @@ def register(deps):
     get_engine = deps["get_engine"]
     bind_pipeline_model = deps["bind_pipeline_model"]
     retire_handle = deps["retire_handle"]
-    estimate_footprint = deps["estimate_footprint"]
 
     def build(transformer1_path, transformer2_path, bundle_dir=None,
               lora_entries=(), sparse_opts=None):
@@ -290,12 +289,12 @@ def register(deps):
             _lora_cfg = dict(create_extra or {})
             if lora_entries:
                 _lora_cfg["lora"] = list(lora_entries)   # engine svdq load: sidecar apply post-load
+            device, device_idx = qfmp.current_torch_device()
             _factory, _register_model = qfmp.make_engine_factory(
-                lambda: get_engine(model_dir, create_cfg=(_lora_cfg or None)),
+                lambda: get_engine(model_dir, create_cfg=(_lora_cfg or None),
+                                   device_idx=device_idx),
                 bind_pipeline_model)
-            engine = qfmp.QFLazyEngine(_factory, estimate_footprint(model_dir),
-                                       retire=retire_handle)
-            device = comfy.model_management.get_torch_device()
+            engine = qfmp.QFLazyEngine(_factory, retire=retire_handle)
             offload = comfy.model_management.unet_offload_device()
             unet_config = {"image_model": "qwen_image21", "disable_unet_model_creation": True}
             model_config = comfy.supported_models.QwenImage21(unet_config)
@@ -304,7 +303,7 @@ def register(deps):
             _register_model(model)
             patcher = QFModelPatcher(model, load_device=device, offload_device=offload)
             print(f"[qf_native] loaded QuantFuncNativeLoader (Qwen-Image-2.1 svdq) package={model_name} "
-                  f"footprint~{engine.footprint_bytes // (1024*1024)}MB (create deferred)", flush=True)
+                  f"capacity=native Prepared query (create deferred)", flush=True)
             return qfmp.tag_lora_rebuild(patcher, lora_entries, _build)
 
         return _build(list(lora_entries))
