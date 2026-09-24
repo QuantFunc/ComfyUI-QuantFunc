@@ -28,9 +28,22 @@ ComfyUI plugin for **QuantFunc** — the fastest diffusion model inference engin
 
 | Plugin (`comfy`) | Engine (`lib`) | Summary |
 |:---:|:---:|---|
-| **0.0.06** *(current)* | **0.0.12** | New modes — Ideogram4 · Layered (RGBA) · ControlNet · img2img · VRAM-budget · FBCache · Klein auto-download · SHA-256 integrity check — details below |
+| **0.0.07** *(current)* | **0.0.13** | `quality` option · settings and LoRA changes without a rebuild · one LoRA format · per-GPU-architecture engine · warning-only logging — details below |
+| 0.0.06 | 0.0.12 | New modes — Ideogram4 · Layered (RGBA) · ControlNet · img2img · VRAM-budget · FBCache · Klein auto-download · SHA-256 integrity check — details below |
 | 0.0.02 | 0.0.07 | v2 loader architecture · inpainting · full GPU coverage · faster editing |
 | 0.0.01 | 0.0.01 – 0.0.06 | Base release: runtime/offline quantization · model & LoRA loaders · reference-image editing · export · auto-update |
+
+### What's New in 0.0.07 (engine 0.0.13)
+
+- **One `quality` option** on the loaders: `super_fast` / `fast` / `balance` / `best_quality` (default `balance`). `fast` and `super_fast` are faster and can give a different variation of the same seed. Some GPUs (for example the RTX 50 series, SM 12.0) offer only `balance` and `best_quality`. Details in section 3.
+- **No rebuild when you change settings or LoRAs**: the loaded pipeline is reused; only different model weights load a new one.
+- **One LoRA format**: diffusers / PEFT. Convert other formats with `scripts/qf_lora_convert.py`; LyCORIS LoHa / LoKr files are not supported.
+- **An engine per GPU architecture (Linux)**: the plugin downloads only the engine for your GPU's architecture (about 150-175 MB) and installs it automatically. One ComfyUI serves one GPU architecture; for GPUs of different architectures, run one ComfyUI per architecture (section 2.5).
+- **Quieter console**: the engine prints only warnings and errors by default.
+- **MiniMax-H3 at 1920x1120 on 32 GB cards**: the two-stage video generation now completes at that size.
+- **Supported models**: MiniMax-H3, LTX-2.5, Krea-2 and Qwen-Image-2.1.
+
+> The plugin installs the matching engine at startup: plugin (`comfy`) **0.0.07** pairs with engine **0.0.13**.
 
 ### What's New in 0.0.06 (engine 0.0.12)
 
@@ -134,13 +147,14 @@ ComfyUI/
 
 | Requirement | Minimum |
 |-------------|---------|
-| **GPU** | NVIDIA RTX 20 series or newer (CC 7.5+) |
+| **GPU** | NVIDIA, compute capability 7.5 / 8.0 / 8.6 / 8.9 / 9.0 / 10.0 / 10.3 / 12.0 (RTX 20/30/40/50, T4, A100, A10/A40, L4/L40, H100/H200, B200/GB200, B300/GB300, RTX PRO 6000 Blackwell). Not published: 8.7, 11.0, 12.1 (aarch64 parts) |
 | **VRAM** | 8 GB |
 | **Driver** | NVIDIA ≥ 575 (CUDA 12 engine) or ≥ 580 (CUDA 13 engine) |
-| **CUDA Runtime** | 12.9+ or 13.0+ (the engine matches PyTorch's CUDA version) |
+| **CUDA Runtime** | PyTorch built for CUDA 12.6 or newer (CUDA 12 engine) or CUDA 13.0 or newer (CUDA 13 engine); the engine matches PyTorch's CUDA major |
 | **cuDNN** | 9.x |
 | **OS** | Linux (glibc 2.31+) or Windows 10/11 |
 | **Python** | 3.9+ (ComfyUI's embedded Python) |
+| **Engine build** (0.0.13) | CUDA 13.0 + cuDNN 9.13 (CUDA 13 engine), CUDA 12.9.2 + cuDNN 9.3 (CUDA 12 engine); gcc 11.4; OpenCV / OpenSSL / curl linked statically |
 
 ### 2.4 Runtime Dependencies
 
