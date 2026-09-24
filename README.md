@@ -240,12 +240,12 @@ python3 scripts/qf_lora_convert.py --in my_kohya_lora.safetensors --out my_lora-
 Qwen-Image-2.1 native-loader workflows are in [`example_workflows/`](example_workflows/) — ComfyUI lists them under
 **Templates → ComfyUI-QuantFunc**. They use the stock `CLIPLoader` (type `qwen_image`), `TextEncodeQwenImage21`, VAE and
 `KSampler`; only the transformer loader is QuantFunc's. The VAE is RGBA, so `VAE Decode` + `Save Image` keep transparency.
-The loader's `quality` choice (default `balance`, the same on the MiniMax-H3, LTX-2, Krea-2 and Qwen-Image-2.1 loaders): `balance` can be a little faster than
-`best_quality`, with almost the same result; `best_quality` gives the highest quality. On GPUs that offer them, `fast` and
-`super_fast` are faster still, and their details can differ more (on turbo models they can give a different variation of
-the same seed). The LTX-2 loader offers `fast` but not `super_fast` (a workflow saved with `super_fast` runs `fast`).
-Qwen-Image-2.1 differs: on GPUs that offer `fast` and `super_fast`, its `balance` can change details such as poses, faces
-or small objects, like `fast`; on other GPUs its loader shows no `quality` choice and always gives the highest quality.
+The loader's `quality` choice (default `balance` on the MiniMax-H3, LTX-2, Krea-2 and Qwen-Image-2.1 loaders): `balance`
+can be a little faster than `best_quality`, and on GPUs that offer them `fast` and `super_fast` are usually faster still.
+With these the picture stays the same, but details such as poses, faces or small objects can differ from `best_quality`;
+`best_quality` gives the highest quality. The LTX-2 loader offers `fast` but not `super_fast` (a workflow saved with
+`super_fast` runs `fast`). On GPUs without `fast` and `super_fast`, the Qwen-Image-2.1 loader shows no `quality` choice
+and always gives the highest quality.
 
 | File | Use Case |
 |------|----------|

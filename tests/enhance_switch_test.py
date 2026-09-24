@@ -55,10 +55,28 @@ for root, _dirs, files in os.walk(_PLUGIN):
 # (a docstring/comment that merely MENTIONS a key is not an exact-match Constant, so prose never trips this)
 check(not hits, "arm1: no raw enhance knob reachable from the plugin path (%s)" % (hits or "clean"))
 
-# ---- arm 1b: the Qwen-Image-2.1 example workflows state the family's MEASURED quality behaviour -------------------------
-# (tests-07 re-CR round 4, A): on QI-2.1, balance / fast / super_fast change details (PSNR 23-27 dB vs best_quality,
-# __init__.py's QI-2.1 note: no "closer" / "nearly the same" claims), and a GPU without the fast mode shows no choice and
-# always runs best_quality. A note claiming "almost the same result" or only "balance (default)" misstates both.
+# ---- arm 1b: every user-visible text states the MEASURED quality behaviour ----------------------------------------------
+# (tests-07 re-CR rounds 4-5): vs best_quality the faster options change details on every family (QI-2.1 PSNR 23-27 dB,
+# Krea-2 balance 20.7-22 dB, LTX-2.5 balance 15.8 dB), so no text may claim "almost the same" / "nearly the same" /
+# "closer": not a tooltip or description (every string constant in the plugin's code, f-strings included), not the README,
+# not a workflow note. And the QI-2.1 notes carry the measured wording plus the no-choice rule (a GPU without the fast mode
+# shows no choice and always runs best_quality).
+_CLAIM = ("almost the same", "nearly the same", "closer to best")
+_claims = []
+for _root, _dirs, _files in os.walk(_PLUGIN):
+    if "/tests" in _root or "/.git" in _root:
+        continue
+    for _fn in _files:
+        _path = os.path.join(_root, _fn)
+        if _fn.endswith(".py"):
+            for _node in ast.walk(ast.parse(open(_path, encoding="utf-8").read(), filename=_path)):
+                if isinstance(_node, ast.Constant) and isinstance(_node.value, str) \
+                        and any(c in _node.value.lower() for c in _CLAIM):
+                    _claims.append(f"{os.path.relpath(_path, _PLUGIN)}:{_node.lineno}")
+        elif _fn.endswith((".md", ".json")):
+            _t = open(_path, encoding="utf-8", errors="replace").read().lower()
+            _claims += [f"{os.path.relpath(_path, _PLUGIN)}: {c!r}" for c in _CLAIM if c in _t]
+check(not _claims, "arm1b: no text claims a faster option gives almost / nearly the same result (%s)" % (_claims or "clean"))
 import glob as _glob
 import json as _json
 _qi_notes = []
@@ -66,7 +84,7 @@ for _wf in sorted(_glob.glob(os.path.join(_PLUGIN, "example_workflows", "QuantFu
     _txt = " ".join(str(v) for n in _json.load(open(_wf, encoding="utf-8")).get("nodes", [])
                     for v in (n.get("widgets_values") or []) if isinstance(v, str) and "`quality`" in v)
     _qi_notes.append((os.path.basename(_wf), _txt))
-_bad = [(w, t[:80]) for w, t in _qi_notes if not t or "almost the same" in t or "nearly the same" in t
+_bad = [(w, t[:80]) for w, t in _qi_notes if not t
         or "details such as poses, faces or small objects can differ" not in t or "always uses the highest quality" not in t]
 check(len(_qi_notes) == 5 and not _bad, "arm1b: the 5 QI-2.1 workflow notes carry the measured quality wording (%s)"
       % (_bad or "clean"))

@@ -616,20 +616,25 @@ if _IMPORT_OK:
     _QUALITY_FAST_OPTIONS = ["super_fast", "fast", "balance", "best_quality"]
     _QUALITY_BASE_OPTIONS = ["balance", "best_quality"]
     _QUALITY_DEFAULT = "balance"   # every GPU; the fast options are opt-in (user 「默认balance」)
-    _QUALITY_TOOLTIP_FAST = ("Speed or quality. super_fast: the fastest; details can differ from best_quality. fast: faster, and "
-                             "closer to best_quality. balance (default): can be a little faster than best_quality, with almost "
-                             "the same result. best_quality: the highest quality, and the slowest. On turbo models, super_fast and fast "
-                             "can produce a different variation of the same seed.")
-    _QUALITY_TOOLTIP_BASE = ("Speed or quality. balance (default): can be faster, with almost the same result as best_quality. "
-                             "best_quality: the highest quality, and slower.")
+    # ONE wording for what the faster options do, on every family and every text (tooltips, README, workflow notes), from
+    # the measurements vs best_quality: Qwen-Image-2.1 PSNR 23-27 dB (the note below), Krea-2 balance 20.7-22 dB / SSIM ~0.78
+    # (a pose / composition shift), LTX-2.5 balance 15.8 dB (a different pose / motion); H3's 3-step turbo balance is
+    # byte-identical, where "can differ" still holds. So no "almost the same" / "nearly the same" / "closer" claim anywhere
+    # (enhance_switch_test arm 1b scans every text surface for them).
+    _QUALITY_DIFFERS = ("the picture stays the same, but details such as poses, faces or small objects can differ from "
+                        "best_quality")
+    _QUALITY_TOOLTIP_FAST = ("Speed or quality. super_fast: usually the fastest. fast: usually faster than best_quality. balance "
+                             f"(default): can be a little faster than best_quality. With these three {_QUALITY_DIFFERS}. "
+                             "best_quality: the highest quality.")
+    _QUALITY_TOOLTIP_BASE = ("Speed or quality. balance (default): can be a little faster than best_quality; "
+                             f"{_QUALITY_DIFFERS}. best_quality: the highest quality.")
     # [user 2026-09-24 「LTX-2.5 不提供 super_fast」] On LTX-2.5 super_fast visibly smears fast-moving faces and hands; H3 /
     # Krea-2 / QI-2.1 stay sharp. The ONE place a family drops options: its loader never offers them, and a saved workflow's
     # value runs the substitute with one console line (never an error, so old workflows still open and run).
     _QUALITY_DROPPED = {"ltx2": {"super_fast": "fast"}}
     _QUALITY_TOOLTIP_FAST_BY_FAMILY = {
-        "ltx2": ("Speed or quality. fast: faster; details can differ from best_quality. balance (default): can be a little "
-                 "faster than best_quality, with almost the same result. best_quality: the highest quality, and the slowest. On "
-                 "turbo models, fast can produce a different variation of the same seed."),
+        "ltx2": ("Speed or quality. fast: usually faster than best_quality. balance (default): can be a little faster than "
+                 f"best_quality. With these two {_QUALITY_DIFFERS}. best_quality: the highest quality."),
     }
     # Saved workflows (migration): they carry the retired quality_enhance switch — API-format prompts under its NAME (declared
     # hidden, in ComfyUI's (type, options) input form, so ComfyUI hands it to load() and can validate it when it is linked; an
@@ -679,11 +684,7 @@ if _IMPORT_OK:
     # +7..+9 % in the quiet run; in the noisy run (best_quality itself varying up to 58 %) fast was once 11 % slower and super_fast
     # once behind fast and balance — hence "usually". balance -3..+3 % there, +11..+20 % with the whole card (its gain depends on memory
     # headroom). All three keep the scene but change details — a subject's pose or expression, which people stand where, small
-    # objects — about equally (PSNR 23-27 dB vs best_quality); no "closer" / "nearly the same" claims for this family.
-    _QI21_QUALITY_TOOLTIP = ("Speed or quality. super_fast: usually the fastest. fast: usually faster than best_quality. balance "
-                             "(default): can be a little faster than best_quality. With these three the picture stays the same, "
-                             "but details such as poses, faces or small objects can differ from best_quality. best_quality: the "
-                             "highest quality.")
+    # objects — about equally (PSNR 23-27 dB vs best_quality); it shows the fast-tier tooltip every family shows.
     _QI21_QUALITY_TOOLTIP_FIXED = "On this GPU Qwen-Image-2.1 always uses the highest quality; this setting has no effect here."
 
     def _qi21_resolve_quality(quality=None, quality_enhance=None, device_idx=None):
@@ -698,7 +699,7 @@ if _IMPORT_OK:
 
     def _qi21_quality_input():
         if _quality_fast_tier():
-            return (list(_QUALITY_FAST_OPTIONS), {"default": _QUALITY_DEFAULT, "tooltip": _QI21_QUALITY_TOOLTIP})
+            return (list(_QUALITY_FAST_OPTIONS), {"default": _QUALITY_DEFAULT, "tooltip": _QUALITY_TOOLTIP_FAST})
         return (list(_QUALITY_FAST_OPTIONS), {"default": "best_quality", "hidden": True, "socketless": True,
                                               "tooltip": _QI21_QUALITY_TOOLTIP_FIXED})
 
