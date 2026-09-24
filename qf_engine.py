@@ -34,6 +34,7 @@ QUANTFUNC_RESOURCE_CAPACITY_ABI_VERSION = 1
 QUANTFUNC_RESOURCE_GRANT_ABI_VERSION = 1
 QUANTFUNC_RESOURCE_DOMAIN_GRANTS_ABI_VERSION = 1
 QUANTFUNC_RESOURCE_LIFECYCLE_ABI_VERSION = 1
+QUANTFUNC_ERROR_INVALID_ARG = 1
 QUANTFUNC_ERROR_UNSUPPORTED = 8
 QUANTFUNC_RESOURCE_READY = 0
 QUANTFUNC_RESOURCE_BUSY = 1
@@ -374,6 +375,26 @@ class NativeResource:
                     "QuantFunc prepared capacity returned no complete persistent components")
             return ResourceCapacity(out.state, int(out.component_count),
                                     int(out.required_persistent_bytes))
+
+    def cold_vram_need_bytes(self):
+        """#738 The engine's COLD create-time device need for this configured Prepared resource
+        (quantfunc_resource_vram_need_bytes: its CCA-resident persistent bytes + its largest paged block + the ambient
+        reserve — the plan side's number, header facts only). None = this engine cannot say (an older library, a layout
+        the plan does not model, a busy resource): the caller keeps its own floor, it never reads None as 0."""
+        with self._lock:
+            self._check_open()
+            function = getattr(self._lib, "quantfunc_resource_vram_need_bytes", None)
+            if function is None:
+                return None
+            function.restype = ctypes.c_int
+            function.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint64)]
+            out = ctypes.c_uint64(0)
+            status = function(self._pointer, ctypes.byref(out))
+            if status == QUANTFUNC_OK and out.value:
+                return int(out.value)
+            if status == QUANTFUNC_ERROR_INVALID_ARG:
+                raise RuntimeError(f"QuantFunc cold VRAM need refused: {last_err(self._lib)}")
+            return None
 
     def query(self):
         with self._lock:

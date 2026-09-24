@@ -209,6 +209,10 @@ class CanonicalIntegration(unittest.TestCase):
             # every number pinned before the inference-reserve term existed stays as it was.
             mock.patch.object(mm, "get_free_memory", return_value=0),
             mock.patch.object(mm, "current_loaded_models", []),
+            # #738 host inference reserve: no recorded comfy side and no --reserve-vram unless a test says otherwise,
+            # so every ceiling pinned before the reserve term existed stays as it was.
+            mock.patch.dict(qfm._QF_HOST_INFERENCE_BYTES, {}, clear=True),
+            mock.patch.object(mm, "extra_reserved_memory", return_value=0),
         ):
             patch.start()
             self.addCleanup(patch.stop)
@@ -510,6 +514,49 @@ class CanonicalIntegration(unittest.TestCase):
         self.assertEqual(observed["actual_delta"], self.lib.capacity_bytes)
         self.assertTrue(lazy.materialized)
 
+    def test_cold_request_asks_comfy_for_the_engines_create_time_need_not_its_floor(self):
+        """#738 (G3 landed): with an engine that reports its cold create-time need (quantfunc_resource_vram_need_bytes),
+        the cold reserve is comfy side + that need — comfy's torch estimate is no longer the floor — so ComfyUI evicts its
+        idle models before our create. MEASURED without it: "engine need 0 MB cold" kept a 4.4 GB idle TE resident and
+        Krea-2's create failed physically on a 6 GB card. Never a create during the estimate; an engine without the
+        entry keeps the floor (test_official_prepare_sampling_cold_request_takes_comfys_estimate_as_floor...)."""
+        import comfy.sampler_helpers as sampler_helpers
+        import comfy.supported_models as supported_models
+        from qf_loader_contract import qf_krea2_modelpatcher as krea2
+
+        cold_need = 3 << 30
+        asked = []
+
+        def vram_need_bytes(pointer, out):
+            asked.append(pointer)
+            out._obj.value = cold_need
+            return 0
+        self.lib.quantfunc_resource_vram_need_bytes = vram_need_bytes
+        self.lib.capacity_bytes = 32 << 30
+        noise_shape = (1, 16, 32, 32)
+        cfg = supported_models.Krea2({"image_model": "krea2", "disable_unet_model_creation": True})
+        qfm.ensure_model_config_attrs(cfg)
+        lazy = qfm.QFLazyEngine(lambda: plugin._get_engine("cold-need-chain"))
+        model = krea2.QFKrea2Model(cfg, lazy, device=torch.device("cuda:0"))
+        patcher = qfm.QFModelPatcher(model, torch.device("cuda:0"), torch.device("cpu"))
+        full_shape = [noise_shape[0] * 2, *noise_shape[1:]]
+        comfy_side = model._qf_comfy_side_bytes(full_shape, {})
+        torch_estimate = int(super(qfm.QFSessionModelMixin, model).memory_required(full_shape, cond_shapes={}))
+        self.assertNotEqual(comfy_side + cold_need, torch_estimate)   # discriminating: need vs floor
+        observed = {}
+
+        def admit(models, *, memory_required, minimum_memory_required, force_full_load=False, **_kwargs):
+            observed.update(memory_required=memory_required)
+            self.assertEqual(plugin._PIPELINE_CACHE, {}, "cold estimate must not materialize the native pipeline")
+
+        with mock.patch.object(mm, "load_models_gpu", side_effect=admit):
+            sampler_helpers.prepare_sampling(patcher, noise_shape, {}, model_options=patcher.model_options)
+        self.assertTrue(asked, "the cold need was never asked")
+        self.assertEqual(observed["memory_required"], comfy_side + cold_need)
+        # recorded for the grant: the larger (full cond+uncond shape) of prepare_sampling's two answers
+        self.assertEqual(qfm._host_inference_bytes(torch.device("cuda:0")), comfy_side)
+        self.assertFalse(lazy.materialized)
+
     def test_domain_actual_and_load_delta_never_sum_per_resource_residency(self):
         patcher = self.wrapper("coherent-domain")
         owner, _ = patcher.model_patches_models()
@@ -726,6 +773,36 @@ class CanonicalIntegration(unittest.TestCase):
                 self.assertEqual((self.lib.resources[key]["limit"], self.lib.resources[1]["limit"],
                                   self.lib.device_limit), (10 + growth, growth, 10 + growth))
                 self.lib.resources[key].update(held=0)  # keep the next subTest's domain residency its own
+
+    def test_ceiling_leaves_the_hosts_own_inference_tensors_and_reserve_free(self):
+        """#738 C4b/C4d: ComfyUI's OWN tensors for the sampling (the ledger's comfy side) and its --reserve-vram are torch
+        allocations OUTSIDE our grant. MEASURED (--novram / --disable-dynamic-vram at a 6 GB card): granting all of
+        `free` left none, and ComfyUI's samplers.inner_sample died on a torch OOM after our warm-up. The growth is now
+        free - (comfy side + reserve), never below Comfy's own budget; with neither recorded it is exactly `free`."""
+        for comfy_side, reserve, free, budget, growth in ((6, 4, 30, 5, 20), (0, 0, 30, 5, 30), (20, 9, 30, 5, 5)):
+            with self.subTest(comfy_side=comfy_side, reserve=reserve):
+                patcher = self.wrapper(f"host-reserve-{comfy_side}-{reserve}")
+                owner, _ = patcher.model_patches_models()
+                key = owner._resource._pointer.value
+                self.lib.resources[key].update(held=10, limit=0, phase=qfe.QUANTFUNC_RESOURCE_PHASE_ATTACHED)
+                self.lib.resources[1].update(held=0, limit=0)
+                self.lib.device_limit = 0
+                qfm._QF_HOST_INFERENCE_BYTES.clear()
+                if comfy_side:
+                    qfm._note_host_inference_bytes(torch.device("cuda:0"), comfy_side)
+                with mock.patch.object(mm, "get_free_memory", return_value=free), \
+                        mock.patch.object(mm, "extra_reserved_memory", return_value=reserve):
+                    self.assertEqual(owner.partially_load(owner.load_device, budget), 0)
+                self.assertEqual((self.lib.resources[key]["limit"], self.lib.resources[1]["limit"],
+                                  self.lib.device_limit), (10 + growth, growth, 10 + growth))
+                self.lib.resources[key].update(held=0)
+
+    def test_host_inference_bytes_key_one_card_however_comfy_names_it(self):
+        """torch.device("cuda") and torch.device("cuda:0") are the same card to ComfyUI: one reserve entry."""
+        qfm._QF_HOST_INFERENCE_BYTES.clear()
+        qfm._note_host_inference_bytes(torch.device("cuda"), 7)
+        self.assertEqual(qfm._host_inference_bytes(torch.device("cuda:0")), 7)
+        self.assertEqual(qfm._host_inference_bytes(torch.device("cuda:1")), 0)
 
     def test_negative_allowance_shrinks_then_admits_the_run_without_a_weights_budget(self):
         """Comfy's negative budget = "shrink by this much, THEN RUN" (a stock patcher samples in low-VRAM mode).

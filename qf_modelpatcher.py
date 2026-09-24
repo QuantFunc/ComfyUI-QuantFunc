@@ -488,8 +488,9 @@ class QFSessionModelMixin:
         Accepted by the user (2026-09-19 「comfyui 路径不合并 CFG 就好」): with a real need comfy runs cond/uncond
         un-batched on a card that cannot hold 1.5x the B=2 working set; our own full-pipeline path keeps CFG batched."""
         comfy_side = self._qf_comfy_side_bytes(input_shape, cond_shapes)
-        eng = getattr(self, "_qf", None)
+        lazy = eng = getattr(self, "_qf", None)
         need = 0
+        cold_need = None
         if eng is not None:
             # Lookup may bind an existing cached handle, but must never create ahead of host admission. Query errors
             # must reach the host instead of authorizing execution with a fabricated zero demand.
@@ -498,8 +499,19 @@ class QFSessionModelMixin:
                 eng = peek()
             if eng is not None:
                 need = int(eng.vram_need_bytes(self._qf_engine_latent_dims(input_shape)))
-        floor = int(super().memory_required(input_shape, cond_shapes=cond_shapes or {})) if eng is None else 0
+            else:
+                # #738 COLD: the engine's own create-time need (the plan side's number, header facts only) — so comfy
+                # evicts its idle models before our create (MEASURED: "need 0 MB cold" left a 4.4 GB idle TE resident
+                # and Krea-2's create failed physically on a 6 GB card). Unknown -> comfy's estimate stays the floor.
+                reader = getattr(lazy, "cold_vram_need_bytes", None)
+                cold_need = reader() if callable(reader) else None
+        if cold_need is not None:
+            need = int(cold_need)
+        floor = (int(super().memory_required(input_shape, cond_shapes=cond_shapes or {}))
+                 if eng is None and cold_need is None else 0)
         total = int(max(floor, comfy_side + need))
+        # #738: the host's OWN inference tensors for this sampling (comfy side) stay outside our grant
+        _note_host_inference_bytes(getattr(self, "device", None), comfy_side)
         # One line per CHANGE of the answer (comfy asks per estimate + per cond-batch decision): the numbers comfy
         # will act on, so a ledger question is answerable from the log, not a guess.
         sig = (tuple(int(d) for d in input_shape), comfy_side, need, floor, eng is None)
@@ -512,7 +524,8 @@ class QFSessionModelMixin:
             qfe.info("[qf_native] VRAM ledger: memory_required%s = %d MB (comfy-side %d MB, engine need %d MB%s); "
                   "engine hold %s"
                   % (list(sig[0]), total >> 20, comfy_side >> 20, need >> 20,
-                     " (cold: no pipeline yet; comfy's own estimate %d MB is the floor)" % (floor >> 20)
+                     (" (cold: no pipeline yet; the engine's create-time need)" if cold_need is not None else
+                      " (cold: no pipeline yet; comfy's own estimate %d MB is the floor)" % (floor >> 20))
                      if eng is None else
                      "" if need else " (0: covered by what it holds, or nothing measured yet)",
                      hold), flush=True)
@@ -961,10 +974,18 @@ class QFLazyEngine:
     def vram_need_bytes(self, latent_shape):
         entry = self._real or self.ensure_if_cached()
         if entry is None:
-            # A cold/unestimable result is zero: QFSessionModelMixin.memory_required then takes comfy's own
-            # estimate as the floor (#716) until a pipeline exists; hot requests never do (D3).
+            # A cold/unestimable result is zero: QFSessionModelMixin.memory_required then asks cold_vram_need_bytes
+            # (#738), and only an engine that cannot say falls back to comfy's own estimate as the floor (#716).
             return 0
         return entry.vram_need_bytes(latent_shape)
+
+    def cold_vram_need_bytes(self):
+        """#738 No pipeline yet: the engine's create-time need for these weights, from the Prepared resource the cold
+        path already configured (never a create). None = unknown (an older engine / an unmodeled layout / busy)."""
+        entry = self._prepared_entry
+        resource = getattr(entry, "resource", None) if entry is not None else None
+        reader = getattr(resource, "cold_vram_need_bytes", None)
+        return reader() if callable(reader) else None
 
     # NOTE: deliberately NO destroy() and NO release() on the wrapper: native backing is evicted by the canonical
     # resource adapters, and the cache's _sweep_dead_pipelines destroys REAL handles, never wrappers. A caller
@@ -1399,6 +1420,30 @@ def _domain_loaded_size(adapter):
         return _ready_read(shared._resource.query_domain_residency, "domain residency").resident_bytes
 
 
+# #738 The host's own inference bytes for the sampling being admitted, per device: the ledger's comfy side. ComfyUI asks
+# memory_required for the full (cond+uncond) shape and then the minimum shape back to back, so the reserve is the larger
+# of one burst of answers (answers seconds apart start a new sampling's value). Read by _publish_domain_grants so the
+# grant leaves them free — they are torch allocations ComfyUI makes outside any QuantFunc ceiling.
+_QF_HOST_INFERENCE_BYTES = {}
+_QF_HOST_INFERENCE_BURST_S = 2.0
+
+
+def _device_key(device):
+    # torch.device("cuda") and torch.device("cuda:0") are one card to comfy: key by (type, index or 0)
+    return (getattr(device, "type", str(device)), getattr(device, "index", None) or 0)
+
+
+def _note_host_inference_bytes(device, nbytes):
+    key, now = _device_key(device), time.monotonic()
+    previous, when = _QF_HOST_INFERENCE_BYTES.get(key, (0, float("-inf")))
+    value = max(0, int(nbytes))
+    _QF_HOST_INFERENCE_BYTES[key] = (max(previous, value) if now - when < _QF_HOST_INFERENCE_BURST_S else value, now)
+
+
+def _host_inference_bytes(device):
+    return _QF_HOST_INFERENCE_BYTES.get(_device_key(device), (0, 0.0))[0]
+
+
 def _publish_domain_grants(adapter, *, publish_owner=False, growth_allowance=0):
     """Publish one formal Comfy admission from exact native residency.
 
@@ -1431,7 +1476,11 @@ def _publish_domain_grants(adapter, *, publish_owner=False, growth_allowance=0):
             # 20951 MB budget, 14270 MB of weights -> step 0 refused with ~10 GB physically free.
             # The ceiling is what Comfy left free at this admission, never less than its own budget.
             free = max(0, int(comfy.model_management.get_free_memory(shared.load_device)))
-            allowance = min(max(allowance, free), total)
+            # #738 C4b/C4d: ComfyUI's OWN tensors for this sampling (latent, noise, conversions — the ledger's comfy
+            # side) plus its --reserve-vram are torch allocations OUTSIDE our grant; granting all of `free` left none
+            # (MEASURED: --novram / --disable-dynamic-vram at a 6 GB card -> torch OOM in samplers.inner_sample).
+            host_reserve = _host_inference_bytes(shared.load_device) + int(comfy.model_management.extra_reserved_memory())
+            allowance = min(max(allowance, free - host_reserve), total)
             device_limit = min(total, domain_actual + allowance)
 
         def resource_limit(resource_adapter):
