@@ -616,15 +616,14 @@ if _IMPORT_OK:
         # statically — so the dropdown CANNOT dynamically filter by the sibling model_config
         # widget without frontend JS. The correspondence contract is therefore enforced HERE,
         # fail-loud at load, with the expected patterns named.
-        import fnmatch
+        from .qf_file_hints import name_matches_hints  # one predicate, pinned by tests/published_names_test.py
         hints = manifest.get("file_hints") or {}
         for arm, val in (("transformer1", transformer1),
                          ("transformer2", None if xfm2 is None else transformer2)):
             pats = hints.get(arm) or []
             if val is None or not pats:
                 continue
-            base = os.path.basename(val).lower()
-            if not any(fnmatch.fnmatch(base, p.lower()) for p in pats):
+            if not name_matches_hints(val, pats):
                 raise RuntimeError(
                     f"qf_native: {arm}={val!r} does not look like a '{model_config}' "
                     f"{arm} weight (expected a name matching {pats}). Pick the file the "

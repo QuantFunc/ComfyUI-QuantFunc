@@ -7,7 +7,8 @@
   "transformer1": [
    "*qwen-image-2.1*quantfunc*int4*",
    "*qwen_image_2.1*quantfunc*int4*",
-   "*qwen-image-2.1*quantfunc*"
+   "*qwen-image-2.1*quantfunc*",
+   "*qwen_image_21*quantfunc*int4*"
   ]
  }
 }
