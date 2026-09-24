@@ -262,8 +262,8 @@ The loader's `quality` choice (default `balance`, the same on the MiniMax-H3, LT
 `super_fast` are faster still, and their details can differ more (on turbo models they can give a different variation of
 the same seed). For image edit, CFG above 1 and batches, `balance` runs like `best_quality`. Qwen-Image-2.1 differs: on
 GPUs that offer `fast` and `super_fast`, its `balance` can be a little faster for image edit, CFG above 1 and batches too, and
-like `fast` it can change details such as a pose; on other GPUs its loader shows no `quality` choice and always gives the
-highest quality.
+like `fast` it can change details such as poses, faces or small objects; on other GPUs its loader shows no `quality` choice
+and always gives the highest quality.
 
 | File | Use Case |
 |------|----------|
