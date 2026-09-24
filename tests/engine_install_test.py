@@ -712,6 +712,28 @@ def main():
                 sys.settrace(None)
             check("the loaded path is published before the library: no line of load_lib shows _LIB without _LIB_PATH",
                   torn == [] and qfe._LIB is not None and qfe._LIB_PATH is not None, f"torn at lines {torn}")
+            # 21) one first load per process (tests-07 re-CR round 4, B): threads racing the first load_lib() while the
+            #     resolver is slow (and could answer differently after a marker switch) resolve ONCE and share one library.
+            import threading
+            calls, got = [], []
+            slow_real = qfe.resolve_so_path
+
+            def slow_resolve():
+                calls.append(threading.get_ident())
+                time.sleep(0.2)
+                return slow_real()
+            qfe.resolve_so_path = slow_resolve
+            qfe._LIB = qfe._LIB_PATH = None
+            try:
+                ts = [threading.Thread(target=lambda: got.append(qfe.load_lib())) for _ in range(4)]
+                for t in ts:
+                    t.start()
+                for t in ts:
+                    t.join()
+            finally:
+                qfe.resolve_so_path = slow_real
+            check("concurrent first loads: one resolve, one library for every caller",
+                  len(calls) == 1 and len(got) == 4 and all(g is got[0] for g in got), f"resolves={len(calls)} libs={len(set(map(id, got)))}")
     finally:
         (qfe.assert_toolchain_compatible, qfe.ctypes.CDLL, qfe._bind, qfe._LIB, qfe._LIB_PATH,
          qfe._FINGERPRINT_PENDING) = saved

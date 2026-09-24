@@ -765,6 +765,7 @@ def _bind(lib):
 _LIB = None
 _LIB_PATH = None             # the engine library load_lib loaded — constant for the process (loaded_so_path)
 _FINGERPRINT_PENDING = None  # (lib, path) whose fingerprint line waits for the first info-level loader
+_LIB_LOCK = threading.Lock()  # one first load per process: two could resolve two different pairs (a marker switched between)
 _LOG_LEVEL = None   # the level a loader asked for (qf_log_level); applied when/after the library loads
 
 
@@ -1499,7 +1500,11 @@ def load_lib():
     FORK-2: the fail-closed CUDA-toolchain guard runs BEFORE ctypes.CDLL, so a mismatched combination is
     refused rather than dlopen'd into torch's live CUDA context."""
     global _LIB, _LIB_PATH, _FINGERPRINT_PENDING
-    if _LIB is None:
+    if _LIB is not None:
+        return _LIB
+    with _LIB_LOCK:
+        if _LIB is not None:   # another thread loaded it while this one waited
+            return _LIB
         so_path = resolve_so_path()
         assert_toolchain_compatible(so_path)   # FORK-2 fail-closed torch-CUDA / .so-CUDA match check
         # Sidecar preloads: a library the engine NEEDS that sits next to it may differ from this machine's copy
