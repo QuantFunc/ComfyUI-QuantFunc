@@ -73,8 +73,21 @@ def _model_config_choices(family=None):
         return [_NO_CFG_HINT]
 
 
+def _family_preset(family):
+    """The ONE preset a family loader uses (user 2026-09-24 「model_config也不是设置啊 就一个选项没意义啊」): every family
+    ships exactly one configs/ preset, so the loaders show no model_config choice. A family with more than one would need
+    that choice again: the loader refuses instead of guessing — bring the dropdown back when a family ships a second one."""
+    presets = [c for c in _model_config_choices(family=family) if c != _NO_CFG_HINT]
+    if len(presets) == 1:
+        return presets[0]
+    if not presets:
+        raise RuntimeError(f"qf_native: this plugin ships no model config for {family} (configs/ has no preset for it).")
+    raise RuntimeError(f"qf_native: this plugin ships {len(presets)} model configs for {family} ({', '.join(presets)}) "
+                       f"and the loader cannot choose between them.")
+
+
 def _load_model_config(name):
-    """Resolve + read a preset's manifest. The name is a widget value (workflow-serializable =
+    """Resolve + read a preset's manifest. The name comes from a saved workflow (workflow-serializable =
     untrusted): it must be exactly one of the listed preset dirs — no separators, no traversal."""
     if name == _NO_CFG_HINT or os.sep in name or "/" in name or "\\" in name or name in ("", ".", ".."):
         raise RuntimeError(f"qf_native: invalid model_config {name!r} — pick one of the shipped "
@@ -529,20 +542,28 @@ if _IMPORT_OK:
 
 
 
-    def _run_family_load(expect_family, transformer1, model_config):
-        """The SHARED loader core behind the per-family nodes (user 2026-08-21 pivot). All
-        validation is preserved verbatim from the original single-node load(); the per-family
-        nodes add only (a) a family-filtered preset dropdown and (b) this family guard —
-        defense-in-depth against a preset dir whose manifest family drifted after the dropdown
-        rendered. Returns the family builder's result AS-IS (one patcher)."""
+    def _run_family_load(expect_family, transformer1, model_config=None):
+        """The SHARED loader core behind the per-family nodes (user 2026-08-21 pivot). The loaders show no
+        model_config choice (each family ships ONE preset: _family_preset); `model_config` is only a saved workflow's
+        value of the retired widget (a hidden input). It is honoured when it names this family's preset and refused
+        otherwise, naming what the plugin ships. The family guard below is defense-in-depth against a preset dir whose
+        manifest family changed between the listing and the read. Returns the family builder's result AS-IS."""
+        if model_config is None:
+            model_config = _family_preset(expect_family)
+        else:
+            shipped = [c for c in _model_config_choices(family=expect_family) if c != _NO_CFG_HINT]
+            if model_config not in shipped:
+                raise RuntimeError(
+                    f"qf_native: this workflow was saved with model_config {model_config!r}, which is not a "
+                    f"{expect_family} model config of this plugin (it ships: {', '.join(shipped) or 'none'}). "
+                    f"The loader has no model_config choice any more; re-save the workflow.")
         bundle_dir, manifest = _load_model_config(model_config)
         family = str(manifest["family"])
         if family != expect_family:
             raise RuntimeError(
                 f"qf_native: model_config '{model_config}' declares family '{family}' but this "
-                f"loader node is the '{expect_family}' loader — pick a '{expect_family}' preset "
-                f"(the dropdown lists only those; this mismatch means the preset dir changed "
-                f"after the UI rendered).")
+                f"loader node is the '{expect_family}' loader (the preset dir changed while it was "
+                f"being read).")
         builder = _FAMILY_BUILDERS.get(family)
         if builder is None:
             raise RuntimeError(
@@ -554,16 +575,16 @@ if _IMPORT_OK:
         # file_hints validation (DATA-driven; the manifest names what its transformers look
         # like). DESIGN BOUNDARY, recorded deliberately: comfy combo values must be the REAL
         # relative filenames (they resolve through folder_paths) and INPUT_TYPES is rendered
-        # statically — so the dropdown CANNOT dynamically filter by the sibling model_config
-        # widget without frontend JS. The correspondence contract is therefore enforced HERE,
-        # fail-loud at load, with the expected patterns named.
+        # statically — so the transformer dropdown lists every file, not only this family's.
+        # The correspondence contract is therefore enforced HERE, fail-loud at load, with the
+        # expected patterns named.
         from .qf_file_hints import name_matches_hints  # one predicate, pinned by tests/published_names_test.py
         pats = (manifest.get("file_hints") or {}).get("transformer1") or []
         if pats and not name_matches_hints(transformer1, pats):
             raise RuntimeError(
                 f"qf_native: transformer1={transformer1!r} does not look like a '{model_config}' "
                 f"transformer1 weight (expected a name matching {pats}). Pick a file with such a "
-                f"name, or choose the preset matching this file.")
+                f"name, or use the loader for this file's model.")
         # NO aux resolution (user 2026-08-22 "引擎层不应该依赖这个"): the loader depends on
         # nothing but the transformer file(s) themselves. The retired [aux-auto] manifest
         # fallback layer (te/audio_vae/connectors conventional-filename resolution) served
@@ -646,6 +667,20 @@ if _IMPORT_OK:
     # undeclared key would be dropped silently), UI workflows as a boolean in this widget's POSITION (widget values are stored by
     # position). Old ON (full quality) → best_quality, old OFF (the speed default) → balance.
     _QUALITY_LEGACY_HIDDEN = {"quality_enhance": ("BOOLEAN", {})}
+
+    def _model_config_input(family):
+        """The loaders' model_config input: the FIRST optional input, right after the transformer (widget index 1, where the
+        dropdown always was). Each family ships one preset, and a setting with one choice is not a setting (user 2026-09-24
+        「model_config也不是设置啊 就一个选项没意义啊」), so the widget is HIDDEN, the same way _qi21_quality_input hides QI-2.1's
+        quality: ComfyUI's input option `hidden` keeps the widget, invisible, in its slot, and `socketless` = no input dot.
+        Widget values are stored by POSITION, so every saved workflow keeps each value in its place, and a saved preset
+        value is honoured by _run_family_load. Should a family ever ship a second preset, the dropdown shows again, so the
+        user chooses and the loader never guesses."""
+        presets = [c for c in _model_config_choices(family=family) if c != _NO_CFG_HINT] or [_NO_CFG_HINT]
+        opts = {"default": presets[0], "tooltip": "The model config that matches the chosen model file."}
+        if len(presets) == 1:
+            opts.update(hidden=True, socketless=True)
+        return presets, opts
     _quality_fast_cache = {}
 
     def _quality_fast_tier(idx=None):
@@ -824,9 +859,8 @@ if _IMPORT_OK:
             return {"required": {
                 "transformer": (_transformer_choices(),
                                 {"tooltip": "The QuantFunc LTX-2 model file in models/diffusion_models."}),
-                "model_config": (_model_config_choices(family="ltx2"),
-                                 {"tooltip": "The LTX-2 preset that matches the chosen model file."}),
             }, "optional": {
+                "model_config": _model_config_input("ltx2"),   # hidden; widget index 1 (see _model_config_input)
                 "attention_backend": _attn_backend_input(),
                 "sol_tau": _SOL_TAU_INPUT,
                 "quality": _quality_input("ltx2"),
@@ -845,7 +879,7 @@ if _IMPORT_OK:
                        "of the usual diffusion-model loader. For image-to-video, add the official LTXVImgToVideoInplace node on "
                        "the latent input. " + _COMMON_LIMITS)
 
-        def load(self, transformer, model_config,
+        def load(self, transformer, model_config=None,
                  attention_backend="auto", sol_tau=1.0, quality=None, step_cache=0.0, block_cache=0.0, quality_enhance=None):
             # NO aux file widgets and NO image socket (user 2026-08-22 "只保留
             # transformer/block/model_config … 只关注latent"): i2v is the workflow's own latent
@@ -872,9 +906,8 @@ if _IMPORT_OK:
             return {"required": {
                 "transformer": (_transformer_choices(),
                                 {"tooltip": "The QuantFunc Krea-2 Turbo model file in models/diffusion_models."}),
-                "model_config": (_model_config_choices(family="krea2"),
-                                 {"tooltip": "The Krea-2 Turbo preset that matches the chosen model file."}),
             }, "optional": {
+                "model_config": _model_config_input("krea2"),   # hidden; widget index 1 (see _model_config_input)
                 "attention_backend": _attn_backend_input(),
                 "quality": _quality_input(),
             }, "hidden": dict(_QUALITY_LEGACY_HIDDEN)}
@@ -889,7 +922,7 @@ if _IMPORT_OK:
         DESCRIPTION = ("Loads a QuantFunc Krea-2 Turbo model (text-to-image) for ComfyUI's standard samplers — use it in "
                        "place of the usual diffusion-model loader. " + _COMMON_LIMITS)
 
-        def load(self, transformer, model_config, attention_backend="auto",
+        def load(self, transformer, model_config=None, attention_backend="auto",
                  quality=None, quality_enhance=None):
             # [runtime dials] backend + quality are SESSION knobs (NOT create keys — a widget change never re-keys the
             # engine = no rebuild).
@@ -913,9 +946,8 @@ if _IMPORT_OK:
             return {"required": {
                 "transformer": (_transformer_choices(),
                                 {"tooltip": "The QuantFunc Qwen-Image-2.1 model file in models/diffusion_models."}),
-                "model_config": (_model_config_choices(family="qwenimage21"),
-                                 {"tooltip": "The Qwen-Image-2.1 preset that matches the chosen model file."}),
             }, "optional": {
+                "model_config": _model_config_input("qwenimage21"),   # hidden; widget index 1 (see _model_config_input)
                 "attention_backend": _attn_backend_input(),
                 "quality": _qi21_quality_input(),
             }, "hidden": dict(_QUALITY_LEGACY_HIDDEN)}
@@ -931,7 +963,7 @@ if _IMPORT_OK:
                        "editing with TextEncodeQwenImage21 reference images (plus its VAE). Transparent images: VAE Decode + "
                        "Save Image keep the transparency. " + _COMMON_LIMITS)
 
-        def load(self, transformer, model_config, attention_backend="auto", quality=None, quality_enhance=None):
+        def load(self, transformer, model_config=None, attention_backend="auto", quality=None, quality_enhance=None):
             # [runtime dials] backend + quality are SESSION knobs (NOT create keys — a widget change never re-keys the engine =
             # no rebuild), exactly like the Krea2 node.
             _p = _run_family_load("qwenimage21", transformer, model_config)
@@ -952,9 +984,8 @@ if _IMPORT_OK:
             return {"required": {
                 "transformer": (_transformer_choices(),
                                 {"tooltip": "The QuantFunc MiniMax-H3 model file in models/diffusion_models."}),
-                "model_config": (_model_config_choices(family="minimax-h3"),
-                                 {"tooltip": "The MiniMax-H3 preset that matches the chosen model file."}),
             }, "optional": {
+                "model_config": _model_config_input("minimax-h3"),   # hidden; widget index 1 (see _model_config_input)
                 # [sparse, user 2026-08-25 ONE-number dial; #659 session knob — no rebuild]
                 # H3 default = flash: this model's auto resolves to sage2 int8-QK, which is
                 # BROKEN on H3's post-qk-RMSNorm γ-outliers at high-res (blank/NaN — measured
@@ -983,7 +1014,7 @@ if _IMPORT_OK:
         DESCRIPTION = ("Loads a QuantFunc MiniMax-H3 model (video with sound) for ComfyUI's standard samplers — use it in "
                        "place of the usual diffusion-model loader. " + _COMMON_LIMITS)
 
-        def load(self, transformer, model_config,
+        def load(self, transformer, model_config=None,
                  attention_backend="flash", sol_tau=1.0, quality=None, audio_enhance=False,
                  step_cache=0.0, block_cache=0.0, allow_partial_denoise=False, quality_enhance=None):  # H3: flash default (auto→sage is broken)
             _p = _run_family_load("minimax-h3", transformer, model_config)

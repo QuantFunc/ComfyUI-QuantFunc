@@ -220,8 +220,8 @@ A loader run during the first download stops with "still downloading": queue the
 
 Put a QuantFunc model file in ComfyUI's `models/diffusion_models/`, add the QuantFunc loader for it (**QuantFunc
 MiniMax-H3**, **LTX-2**, **Krea-2** or **Qwen-Image-2.1 Loader**) where ComfyUI's diffusion-model loader would go, pick
-the file and its `model_config` preset, and keep ComfyUI's own text encoder, VAE and sampler nodes. The Qwen-Image-2.1
-workflows in [`example_workflows/`](example_workflows/) show the wiring.
+the file, and keep ComfyUI's own text encoder, VAE and sampler nodes. The Qwen-Image-2.1 workflows in
+[`example_workflows/`](example_workflows/) show the wiring.
 
 ### 3.1 QuantFunc Models
 

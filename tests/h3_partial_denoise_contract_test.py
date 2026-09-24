@@ -505,7 +505,7 @@ _loader_patcher = SimpleNamespace(model=_loader_model)
 _loader_namespace = {
     "object": object,
     "_transformer_choices": lambda: ["transformer"],
-    "_model_config_choices": lambda **_kwargs: ["config"],
+    "_model_config_input": lambda _family: (["config"], {"default": "config", "hidden": True, "socketless": True}),
     "_attn_backend_input": lambda default: ([default], {"default": default}),
     "_SOL_TAU_INPUT": ("FLOAT", {"default": 1.0}),
     "_quality_input": lambda: (["balance", "best_quality"], {"default": "balance"}),

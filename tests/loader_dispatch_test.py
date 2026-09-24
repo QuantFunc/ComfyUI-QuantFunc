@@ -289,12 +289,53 @@ def main():
           not any("Wan" in k or "CloudTE" in k for k in _nodes)
           and {"QuantFuncLTXLoader", "QuantFuncH3Loader", "QuantFuncKrea2Loader", "QuantFuncQwenImage21Loader",
                "QuantFuncNativeLoRA"} <= set(_nodes), f"-> {_nodes}")
-    ltx_cfgs = LtxL.INPUT_TYPES()["required"]["model_config"][0]
+    # model_config (user 2026-09-24 「model_config也不是设置啊 就一个选项没意义啊」): the FIRST optional input, right after the
+    # transformer (widget index 1, where the dropdown always was), HIDDEN + socketless while the family ships ONE preset
+    # (the QI-2.1 quality idiom: the widget keeps its slot, so saved workflows keep every value in place); a family with
+    # two presets shows it again (this fixture gives ltx2 and h3 a synthetic second one).
+    ltx_cfgs = LtxL.INPUT_TYPES()["optional"]["model_config"][0]
     check("ltx model_config lists ONLY ltx2 presets",
           "fx-ltx" in ltx_cfgs and "krea2-turbo-int4" not in ltx_cfgs, f"-> {ltx_cfgs}")
-    h3_cfgs = H3L.INPUT_TYPES()["required"]["model_config"][0]
+    h3_cfgs = H3L.INPUT_TYPES()["optional"]["model_config"][0]
     check("h3 model_config lists ONLY minimax-h3 presets",
           "fx-h3" in h3_cfgs and "krea2-turbo-int4" not in h3_cfgs, f"-> {h3_cfgs}")
+    _mc_bad = {}
+    for _n in ("QuantFuncLTXLoader", "QuantFuncH3Loader", "QuantFuncKrea2Loader", "QuantFuncQwenImage21Loader"):
+        _it = qfn.NODE_CLASS_MAPPINGS[_n].INPUT_TYPES()
+        _opt = _it.get("optional", {})
+        if list(_it["required"]) != ["transformer"] or list(_opt)[:1] != ["model_config"]:
+            _mc_bad[_n] = (list(_it["required"]), list(_opt)[:2])
+            continue
+        _choices, _o = _opt["model_config"]
+        if bool(_o.get("hidden")) != (len(_choices) == 1) or bool(_o.get("socketless")) != (len(_choices) == 1) \
+                or _o.get("default") != _choices[0]:
+            _mc_bad[_n] = (_choices, _o)
+    check("every loader: transformer alone is required; model_config is the first optional input, hidden + socketless "
+          "exactly when the family ships one preset, defaulting to it", not _mc_bad, f"-> {_mc_bad}")
+    _real_cfg, _saved_cfg = os.path.join(_PLUGIN, "configs"), qfn._CONFIGS_DIR
+    qfn._CONFIGS_DIR = _real_cfg
+    try:
+        _real = {_n: qfn.NODE_CLASS_MAPPINGS[_n].INPUT_TYPES() for _n in
+                 ("QuantFuncLTXLoader", "QuantFuncH3Loader", "QuantFuncKrea2Loader", "QuantFuncQwenImage21Loader")}
+    finally:
+        qfn._CONFIGS_DIR = _saved_cfg
+    _real_mc = {_n: (_v["optional"]["model_config"][0], _v["optional"]["model_config"][1].get("hidden"))
+                for _n, _v in _real.items()}
+    check("with the SHIPPED configs every loader's model_config is hidden with its family's one preset (no dropdown)",
+          all(len(c) == 1 and h is True for c, h in _real_mc.values()), f"-> {_real_mc}")
+    # the OLD example workflow (QI-2.1 t2i as saved before this change: [transformer, model_config, attention_backend,
+    # quality]) opens with every value in its slot: widget values are stored by position, and model_config keeps slot 1.
+    _qi_it = _real["QuantFuncQwenImage21Loader"]
+    _old = ["qwen-image-2.1-quantfunc-int4-r128-i8sidecar.qfc.safetensors", "qwen-image-2.1-int4", "auto", "balance"]
+    _widgets = list(_qi_it["required"]) + list(_qi_it.get("optional", {}))
+    _spec = {**_qi_it["required"], **_qi_it.get("optional", {})}
+    _fits = [w == "transformer" or v in _spec[w][0] for w, v in zip(_widgets, _old)]
+    check("the old QI-2.1 example workflow's values land on the right widgets (model_config keeps slot 1)",
+          _widgets[:4] == ["transformer", "model_config", "attention_backend", "quality"] and all(_fits),
+          f"-> {list(zip(_widgets, _old))} fits={_fits}")
+    _shifted = [w for w in _widgets if w != "model_config"]
+    check("... and without the model_config slot they would not (the preset name would land in attention_backend)",
+          _old[1] not in _spec[_shifted[1]][0], f"-> {_shifted[1]}")
     t1 = KreaL.INPUT_TYPES()["required"]["transformer"][0]
     check("transformer lists .safetensors FILES (and only those)",
           "fx-krea2-turbo-quantfunc-int4.safetensors" in t1 and "not-a-model.txt" not in t1)
@@ -338,24 +379,24 @@ def main():
               "transformer-only" in str(e) and "connectors completion" in str(e)
               and "allin" in str(e) and "audio_embeddings_connector" in str(e),
               f"-> {str(e)[:90]}")
-    # node surface: required = latent-only duo (transformer + model_config; the manual
-    # block-count widget was REMOVED 2026-09-12 — residency is arena-managed); optional =
+    # node surface: required = the transformer alone (model_config is the hidden first optional since 2026-09-24, see
+    # above; the manual block-count widget was REMOVED 2026-09-12 — residency is arena-managed); optional =
     # the runtime SESSION dials (attention_backend 2026-08-27; sol_tau; quality [the speed/quality choice that replaced
     # the quality_enhance switch 2026-09-24]; step_cache +
     # block_cache). Every optional is a session knob (no create key / no rebuild) — sparse is
     # deliberately NOT among them (removed 2026-08-29, only the caches came back).
     _lit = LtxL.INPUT_TYPES()
-    check("ltx node surface = latent-duo required + session-dial optionals (no sparse)",
-          list(_lit["required"].keys()) == ["transformer", "model_config"]
-          and list(_lit.get("optional", {}).keys()) == ["attention_backend", "sol_tau", "quality",
+    check("ltx node surface = transformer required + hidden model_config + session-dial optionals (no sparse)",
+          list(_lit["required"].keys()) == ["transformer"]
+          and list(_lit.get("optional", {}).keys()) == ["model_config", "attention_backend", "sol_tau", "quality",
                                                         "step_cache", "block_cache"]
           and "sparse" not in _lit.get("optional", {}),
           f"-> req={list(_lit['required'].keys())} opt={list(_lit.get('optional', {}).keys())}")
     # h3 node surface (same latent-duo + session dials shape as ltx; block-count removed 2026-09)
     _h3it = H3L.INPUT_TYPES()
-    check("h3 node surface = latent-duo required + session-dial optionals",
-          list(_h3it["required"].keys()) == ["transformer", "model_config"]
-          and list(_h3it.get("optional", {}).keys()) == ["attention_backend", "sol_tau",
+    check("h3 node surface = transformer required + hidden model_config + session-dial optionals",
+          list(_h3it["required"].keys()) == ["transformer"]
+          and list(_h3it.get("optional", {}).keys()) == ["model_config", "attention_backend", "sol_tau",
                                                           "quality", "audio_enhance", "step_cache", "block_cache",
                                                           "allow_partial_denoise"],
           f"-> req={list(_h3it['required'].keys())} opt={list(_h3it.get('optional', {}).keys())}")
@@ -869,23 +910,58 @@ def main():
               ("model_index.json", "transformer/config.json", "vae/config.json"))
           and os.path.realpath(os.path.join(_hmd, "transformer", "model.safetensors")).endswith("fx-minimax-h3-quantfunc-int4.safetensors")
           and not os.path.exists(os.path.join(_hmd, "transformer_2")))
-    # a preset whose manifest family does not match the NODE's family → the defense-in-depth guard
+    # a saved workflow's model_config of another family / of no family: not this family's preset -> refused, naming it
     try:
         KreaL.load("fx-krea2-turbo-quantfunc-int4.safetensors", "fx-ltx")
-        check("cross-family preset on the Krea-2 node refused", False, "-> no exception")
+        check("cross-family saved model_config on the Krea-2 node refused", False, "-> no exception")
     except RuntimeError as e:
-        check("cross-family preset on the Krea-2 node refused", "declares family" in str(e))
+        check("cross-family saved model_config on the Krea-2 node refused",
+              "not a krea2 model config" in str(e) and "krea2-turbo-int4" in str(e), f"-> {str(e)[:120]}")
     try:
         LtxL.load("fx-ltx-2.5-quantfunc-4bit.safetensors", "fx-alien")
-        check("unknown-family preset refused (family guard)", False, "-> no exception")
+        check("unknown-family saved model_config refused", False, "-> no exception")
     except RuntimeError as e:
-        check("unknown-family preset refused (family guard)", "declares family" in str(e))
+        check("unknown-family saved model_config refused", "not a ltx2 model config" in str(e), f"-> {str(e)[:120]}")
     for evil_cfg in ("../krea2-turbo-int4", "a/b", "..", ""):
         try:
             KreaL.load("fx-krea2-turbo-quantfunc-int4.safetensors", evil_cfg)
             check(f"model_config refuses {evil_cfg!r}", False, "-> loaded!")
         except RuntimeError:
             check(f"model_config refuses {evil_cfg!r}", True)
+    # model_config values (user 2026-09-24): an API prompt that omits it gets the family's one preset; a saved value is
+    # honoured when it is one of the family's presets and refused otherwise, naming what ships; with two presets and no
+    # value the loader refuses instead of guessing (the dropdown shows again then — see the surface arm).
+    with open(os.path.join(dm, "mc-krea2-turbo-quantfunc-int4.safetensors"), "wb") as fh:
+        fh.write(b"\0" * 16)
+    _mc_a = KreaL.load("mc-krea2-turbo-quantfunc-int4.safetensors")[0]            # the API prompt omits model_config
+    _mc_b = KreaL.load("mc-krea2-turbo-quantfunc-int4.safetensors", model_config="krea2-turbo-int4")[0]
+    _ = (_mc_a.model._qf.lib, _mc_b.model._qf.lib)                                 # materialize both staged packages
+    check("an API prompt without model_config loads the family's one preset (the same staged package as naming it)",
+          _mc_a.model._qf._ckey == _mc_b.model._qf._ckey, f"-> {_mc_a.model._qf._ckey} vs {_mc_b.model._qf._ckey}")
+    try:
+        LtxL.load("fx-ltx-2.5-quantfunc-4bit.safetensors")
+        check("no model_config with two presets for the family: refused, never a guess", False, "-> no exception")
+    except RuntimeError as e:
+        check("no model_config with two presets for the family: refused, never a guess",
+              "cannot choose" in str(e) and "fx-ltx" in str(e) and "ltx2-2.5-22b" in str(e), f"-> {str(e)[:120]}")
+    try:
+        KreaL.load("mc-krea2-turbo-quantfunc-int4.safetensors", model_config="no-such-preset")
+        check("an unknown saved model_config is refused, naming the shipped preset", False, "-> no exception")
+    except RuntimeError as e:
+        check("an unknown saved model_config is refused, naming the shipped preset",
+              "no-such-preset" in str(e) and "krea2-turbo-int4" in str(e), f"-> {str(e)[:120]}")
+    # the family guard (defense in depth): the listing says krea2, the manifest read says ltx2
+    _listing = qfn._model_config_choices
+    qfn._model_config_choices = lambda family=None: ["fx-ltx"]
+    try:
+        KreaL.load("mc-krea2-turbo-quantfunc-int4.safetensors", model_config="fx-ltx")
+        check("a preset whose manifest family changed after the listing is refused (family guard)", False,
+              "-> no exception")
+    except RuntimeError as e:
+        check("a preset whose manifest family changed after the listing is refused (family guard)",
+              "declares family" in str(e), f"-> {str(e)[:120]}")
+    finally:
+        qfn._model_config_choices = _listing
     # ── 3) single-expert staging + denoise_only create cfg + the shared ledger / D3 arms (Krea-2; the Wan dual
     #      loader these arms used to ride left the release — user scope 2026-09-24) ──
     try:
