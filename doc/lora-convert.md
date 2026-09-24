@@ -34,6 +34,9 @@ python3 qf_lora_convert.py \
 # 自检:对任意 diffusers 形 LoRA 做「合成 kohya 孪生 → 转回」的 round-trip,
 # 断言模块集合与张量字节完全一致
 python3 qf_lora_convert.py --self-test /path/to/some_diffusers_lora.safetensors
+
+# 自检:Krea-2 BFL → 引擎名的改名表(合成键,不需要文件)
+python3 qf_lora_convert.py --self-test-krea2
 ```
 
 转换后把 `-diff.safetensors` 放进 `models/loras/`,在 **QuantFunc Native LoRA** 节点里选它即可。
@@ -43,6 +46,7 @@ python3 qf_lora_convert.py --self-test /path/to/some_diffusers_lora.safetensors
 | 情况 | 行为 |
 |---|---|
 | 已是 diffusers/PEFT 形 | 归一(`lora_down/up` → `lora_A/B`)后原样输出 |
+| Krea-2 的 BFL / ai-toolkit 模块名(社区 Krea-2 LoRA 常见:`blocks.N.attn.wq`、`txtfusion.*`、`first`/`tmlp.0`/`tproj.1`/`txtmlp.1`/`last.linear`) | 改成引擎的 diffusers 模块名(对照 ComfyUI `comfy/utils.py` 的 krea2_to_diffusers:MAP_BASIC + 块映射);仅当文件含 Krea-2 专有名(`txtfusion.`/`tmlp.`/`txtmlp.`/`tproj.`)时启用。引擎原样加载这类文件会**响亮拒绝**并提示本工具 |
 | kohya / ai-toolkit(`lora_unet_*` 下划线键) | 键名重建为点分模块路径;`--model` 时用目标 checkpoint 的真实模块表做精确逆映射;**不带 `--model` 时退化为内置词表(按真实语料拟合、新家族可能漏词,工具会打警告)——强烈建议总是带 `--model`** |
 | 文本编码器 LoRA(`lora_te*`) | 丢弃(原生 loader 只驱动 transformer) |
 | LyCORIS(LoHa/LoKr) | **响亮拒绝**——它是因子分解不是 (A,B) 低秩对,改名转不动;请先合并/重导出为标准 LoRA |
