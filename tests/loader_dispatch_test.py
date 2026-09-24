@@ -362,8 +362,8 @@ def main():
     # (B) quality (user 2026-09-24): the four loaders' speed/quality choice. DEATH RULES: the options follow the ENGINE's
     #     answer (quantfunc_quality_fast_available — the plugin keeps no GPU list); saved workflows map (old ON → best_quality,
     #     OFF → balance, by name and by position); a fast option on a two-way GPU runs balance; NO option adds a create key (a
-    #     quality change never rebuilds — the engine arms its fast mode in place); the session sends the name, never video_enhance
-    #     with it; every loader declares the legacy names.
+    #     quality change never rebuilds — the engine arms its fast mode in place); the session always sends the name; every
+    #     loader declares the legacy names; only a real engine answer is cached (a library that cannot load yet is asked again).
     _FOUR = ("QuantFuncLTXLoader", "QuantFuncH3Loader", "QuantFuncKrea2Loader", "QuantFuncQwenImage21Loader")
     _QI21 = "QuantFuncQwenImage21Loader"
     _Q4, _Q2 = ["super_fast", "fast", "balance", "best_quality"], ["balance", "best_quality"]
@@ -385,7 +385,7 @@ def main():
         for label, loader_fn, want in (("engine says 1", lambda: _FakeQLib(1), _Q4), ("engine says 0", lambda: _FakeQLib(0), _Q2),
                                        ("engine says -1", lambda: _FakeQLib(-1), _Q2), ("engine without the query", object, _Q2),
                                        ("library fails to load", _boom, _Q2)):
-            qfn._quality_engine_cache.clear()
+            qfn._quality_fast_cache.clear()
             qfn.qfe.load_lib = loader_fn
             _opts = {n: qfn.NODE_CLASS_MAPPINGS[n].INPUT_TYPES()["optional"]["quality"] for n in _FOUR if n != _QI21}
             check(f"quality options follow the engine ({label}) on the H3 / LTX / Krea2 loaders, default balance",
@@ -413,7 +413,7 @@ def main():
         class _FakeQLibDev(_FakeQLib):
             def quantfunc_quality_fast_available(self, idx):
                 return 1 if idx == 1 else 0
-        qfn._quality_engine_cache.clear()
+        qfn._quality_fast_cache.clear()
         qfn.qfe.load_lib = lambda: _FakeQLibDev(None)
         import contextlib as _qctl
         import io as _qio
@@ -427,7 +427,7 @@ def main():
               "without — one console line only when a fast option was dropped",
               _dv == [("fast", 0), ("best_quality", 1), ("balance", 0), ("best_quality", 0), ("best_quality", 0),
                       ("best_quality", 1)], f"-> {_dv}")
-        qfn._quality_engine_cache.clear()
+        qfn._quality_fast_cache.clear()
         qfn.qfe.load_lib = lambda: _FakeQLib(1)
         R = qfn._resolve_quality
         check("migration: old ON → best_quality, old OFF → balance (by name: quality_enhance; by position)",
@@ -439,13 +439,13 @@ def main():
               and R("balance", quality_enhance=True) == "balance",
               f"-> {[R('fast', quality_enhance=False), R('super_fast', quality_enhance=True), R('balance', quality_enhance=True)]}")
         check("a four-option GPU keeps every option", [R(x) for x in _Q4] == _Q4, f"-> {[R(x) for x in _Q4]}")
-        qfn._quality_engine_cache.clear()
+        qfn._quality_fast_cache.clear()
         qfn.qfe.load_lib = lambda: _FakeQLib(0)
         check("a two-way GPU runs a saved fast option as balance",
               [R(x) for x in _Q4] == ["balance", "balance", "balance", "best_quality"], f"-> {[R(x) for x in _Q4]}")
     finally:
         qfn.qfe.load_lib = _orig_load_lib
-        qfn._quality_engine_cache.clear()
+        qfn._quality_fast_cache.clear()
     V = qfn._validate_quality
     check("VALIDATE_INPUTS: the four names, the retired booleans and None (ComfyUI's value for a LINKED input) pass; anything "
           "else is refused",
@@ -458,11 +458,13 @@ def main():
     class _QProbe(_qmp_q.QFSessionModelMixin):
         pass
     _qp = _QProbe()
-    _qp.set_video_enhance(True)
     _qp.set_quality("fast")
     _dq = _qp.residency_opts()
-    _du = _QProbe().residency_opts()
+    _qu = _QProbe()
+    _qu.set_quality("balance")
+    _du = _qu.residency_opts()
     _qa = _QProbe()
+    _qa.set_quality("balance")
     _qa.set_attn_backend("flash")
     _qa_flash = _qa.residency_opts().get("attention_backend")
     _qa.set_attn_backend("auto")
@@ -471,36 +473,39 @@ def main():
           _du.get("attention_backend") == "auto" and _qa_flash == "flash"
           and _qa.residency_opts().get("attention_backend") == "auto" and _qa.dial_opts().get("attention_backend") == "auto",
           f"-> unset={_du.get('attention_backend')!r} flash={_qa_flash!r} back={_qa.residency_opts().get('attention_backend')!r}")
-    check("session: set_quality → residency_opts sends quality and never video_enhance with it (the engine refuses both); unset → "
-          "no quality key, the retired switch instead",
+    try:
+        _QProbe().residency_opts()
+        _unset = "sent"
+    except RuntimeError:
+        _unset = "refused"
+    check("session: set_quality → residency_opts sends quality, never the retired video_enhance or a raw key; a model without "
+          "a quality refuses to begin (the loaders always set one)",
           _dq.get("quality") == "fast" and "video_enhance" not in _dq and "token_prune_keep_ratio" not in _dq
-          and "quality" not in _du and _du.get("video_enhance") is False,
-          f"-> {_dq} / unset {_du}")
+          and _unset == "refused", f"-> {_dq} / unset {_unset}")
     # the retired name is declared hidden (an old API prompt's value reaches load()) in ComfyUI's (type, options) input form:
     # ComfyUI reads a declared input as spec[0] / spec[1], so a bare "BOOLEAN" string breaks its check of a LINKED input
     # (spec[1] = "O" → AttributeError in validate_inputs).
     _hid = {n: qfn.NODE_CLASS_MAPPINGS[n].INPUT_TYPES().get("hidden", {}) for n in _FOUR}
     check("every quality loader declares the retired quality_enhance hidden, as a (type, options) input spec",
           all(h.get("quality_enhance") == ("BOOLEAN", {}) for h in _hid.values()), f"-> {_hid}")
-    # the session key follows the ENGINE: `quality` to an engine that has it; an engine that predates it (no query symbol)
-    # refuses the key, so it gets the retired switch instead — best_quality = video_enhance ON, else OFF (the speed policy).
+    # G1 (tests-07 CR): a quality answer is cached only when the ENGINE gave one. A library that cannot load yet (a fresh
+    # install still downloading) must not pin the two-way form for the whole session: once it loads, the fast options appear.
     _orig_load_lib2 = qfn.qfe.load_lib
     try:
-        def _emit(lib_fn, q):
-            qfn._quality_engine_cache.clear()
-            qfn.qfe.load_lib = lib_fn
-            _p = _QProbe()
-            qfn._apply_quality(_p, q)
-            _d = _p.residency_opts()
-            return {k: _d[k] for k in ("quality", "video_enhance", "token_prune_keep_ratio") if k in _d}
-        _new = [_emit(lambda: _FakeQLib(1), q) for q in _Q4]
-        _old = [_emit(object, q) for q in ("balance", "best_quality")]
-        check("session key follows the engine: quality to an engine that has it; an older engine gets the retired switch",
-              _new == [{"quality": q} for q in _Q4] and _old == [{"video_enhance": False}, {"video_enhance": True}],
-              f"-> new={_new} old={_old}")
+        qfn._quality_fast_cache.clear()
+        qfn.qfe.load_lib = _boom
+        _before = qfn._quality_input()[0]
+        qfn.qfe.load_lib = lambda: _FakeQLib(1)
+        _after = qfn._quality_input()[0]
+        _qi_after = qfn._qi21_quality_input()[1].get("hidden")
+        qfn.qfe.load_lib = _boom
+        _cached = qfn._quality_input()[0]
+        check("G1: while the engine cannot load, two options WITHOUT caching; once it loads, its answer (then cached)",
+              _before == _Q2 and _after == _Q4 and not _qi_after and _cached == _Q4,
+              f"-> before={_before} after={_after} qi21 hidden={_qi_after} cached={_cached}")
     finally:
         qfn.qfe.load_lib = _orig_load_lib2
-        qfn._quality_engine_cache.clear()
+        qfn._quality_fast_cache.clear()
     # (B) the four loaders' user-visible text states only the speed / quality trade (user 「介绍上不要透露技术细节」,
     #     「四个 loader 的所有说明都改」): no technique word in any DESCRIPTION or tooltip — both quality forms included. Widget and
     #     option NAMES are the user's and stay (a whole-word match, so the step_cache widget name is not a hit).
@@ -509,7 +514,7 @@ def main():
                           r"kernel|svdq|denoise_only|easycache|first.block|sol.attn|\bseam\b|lora rank", _re.I)
     _texts = []
     for _tier_ans in (1, 0):   # both quality forms
-        qfn._quality_engine_cache.clear()
+        qfn._quality_fast_cache.clear()
         qfn.qfe.load_lib = (lambda a=_tier_ans: _FakeQLib(a))
         for _n in _FOUR:
             _c = qfn.NODE_CLASS_MAPPINGS[_n]
@@ -519,7 +524,7 @@ def main():
                     if len(_v) > 1 and isinstance(_v[1], dict) and _v[1].get("tooltip"):
                         _texts.append((f"{_n}.{_k}", _v[1]["tooltip"]))
     qfn.qfe.load_lib = _orig_load_lib
-    qfn._quality_engine_cache.clear()
+    qfn._quality_fast_cache.clear()
     _hits = [(w, m.group(0)) for w, t in _texts for m in [_BANNED.search(t)] if m]
     check("the four loaders' user-visible text carries no technique word (DESCRIPTIONs + every tooltip, both quality forms)",
           not _hits and len(_texts) > 20, f"-> {len(_texts)} texts, hits {_hits[:4]}")
@@ -529,25 +534,12 @@ def main():
     except RuntimeError:
         _q_refused = True
     check("create boundary refuses `quality` (a session knob) in a create config", _q_refused, "-> not refused")
-    # (B) quality_enhance widget -> the ONE boolean begin option `video_enhance` (user 2026-09-19: the keep ratio
-    #     is engine law; the plugin carries no number). NOTE: the pixel-level A/B (quality_enhance ON vs OFF) is
-    #     the USER's ComfyUI acceptance — this arm only proves the widget->engine key wiring, not the visual effect.
+    # the retired video_enhance switch is gone from the plugin (the engine speaks `quality`), and so is any keep-ratio mapper
     from qfn_test_pkg import qf_modelpatcher as _qmp_tp
-    class _TPProbe(_qmp_tp.QFSessionModelMixin):
-        pass
-    _tp_on = _TPProbe(); _tp_on.set_video_enhance(True)
-    _d_tp_on = _tp_on.residency_opts()
-    _tp_off = _TPProbe(); _tp_off.set_video_enhance(False)
-    _d_tp_off = _tp_off.residency_opts()
-    _d_tp_def = _TPProbe().residency_opts()
-    check("video_enhance wiring: set_video_enhance(True/False) -> residency_opts video_enhance True/False; default False (still sent); never the raw key",
-          _d_tp_on.get("video_enhance") is True and _d_tp_off.get("video_enhance") is False
-          and _d_tp_def.get("video_enhance") is False
-          and not any("token_prune_keep_ratio" in d for d in (_d_tp_on, _d_tp_off, _d_tp_def)),
-          f"-> on={_d_tp_on.get('video_enhance')} off={_d_tp_off.get('video_enhance')} default={_d_tp_def.get('video_enhance')}")
-    check("no plugin-side keep-ratio mapper survives (the number is engine law)",
-          not hasattr(qfn, "_quality_enhance_to_token_prune") and not hasattr(_qmp_tp.QFSessionModelMixin, "set_token_prune"),
-          "-> mapper/set_token_prune still present" )
+    check("no retired switch or plugin-side keep-ratio mapper survives (the number is engine law)",
+          not hasattr(qfn, "_quality_enhance_to_token_prune") and not hasattr(_qmp_tp.QFSessionModelMixin, "set_token_prune")
+          and not hasattr(_qmp_tp.QFSessionModelMixin, "set_video_enhance") and not hasattr(qfn, "_apply_quality"),
+          "-> a retired setter / mapper is still present")
     # qfa REMOVED as a user-facing attention_backend choice (2026-09-13)
     check("attention_backend choices drop qfa (SM80+ and SM75)",
           "qfa" not in qfn._ATTN_BACKEND_SM80PLUS and "qfa" not in qfn._ATTN_BACKEND_SM75,
@@ -789,13 +781,13 @@ def main():
     _hq = lambda **kw: getattr(H3L.load("fx-minimax-h3-quantfunc-int4.safetensors", "minimax-h3-fl2va", **kw)[0].model,
                                "_quality", "MISSING")
     _orig_load_lib3 = qfn.qfe.load_lib
-    try:   # an engine that takes `quality` (the answer _apply_quality asks for); fast options unavailable is fine here
-        qfn._quality_engine_cache.clear()
+    try:   # an engine whose fast options are unavailable on this GPU
+        qfn._quality_fast_cache.clear()
         qfn.qfe.load_lib = lambda: _FakeQLib(0)
         _hqs = [_hq(quality_enhance=True), _hq(quality_enhance=False), _hq(), _hq(quality="best_quality", quality_enhance=False)]
     finally:
         qfn.qfe.load_lib = _orig_load_lib3
-        qfn._quality_engine_cache.clear()
+        qfn._quality_fast_cache.clear()
     check("h3 load(): retired key applies when quality is absent, default balance, explicit quality wins",
           _hqs == ["best_quality", "balance", "balance", "best_quality"], f"-> {_hqs}")
     # (DECISION 2) a fast option that cannot run for THIS model file behaves like one that cannot run on this GPU: the loader asks
@@ -822,14 +814,14 @@ def main():
     try:
         _fq = []
         for _file_ans in (1, 0, -1, None):
-            qfn._quality_engine_cache.clear()
+            qfn._quality_fast_cache.clear()
             qfn.qfe.load_lib = (lambda fa=_file_ans: _FakeFileQLib(1, fa))
             _buf = _io.StringIO()
             with _ctl.redirect_stdout(_buf):
                 _fq.append((_hq(quality="super_fast"), _buf.getvalue().count("'super_fast' is not available here; using balance.")))
     finally:
         qfn.qfe.load_lib = _orig_load_lib4
-        qfn._quality_engine_cache.clear()
+        qfn._quality_fast_cache.clear()
     check("h3 load(): a fast option the model FILE cannot run → balance + the one line (0 and -1 alike); yes / no file query → kept",
           _fq == [("super_fast", 0), ("balance", 1), ("balance", 1), ("super_fast", 0)], f"-> {_fq}")
     _hmd = out_h3.model._qf._ckey[0]
@@ -1315,12 +1307,12 @@ def main():
                         _nm = _n.args[1].value
                     elif isinstance(_n, _dast.Attribute) and isinstance(_n.ctx, _dast.Load):
                         _nm = _n.attr
-                    if _nm in ("_attn_backend", "_quality", "_video_enhance"):
+                    if _nm in ("_attn_backend", "_quality"):
                         _ereads += _fn.name == "dial_opts"
                         if _fn.name != "dial_opts":
                             _eviol.append(f"{_mn}.{_fn.name} reads {_nm}")
         check("the begin dials (attention backend, quality) are read ONLY by dial_opts (AST, family modules derived)",
-              _ereads >= 3 and not _eviol, f"-> dial_opts reads={_ereads} others={_eviol}")
+              _ereads >= 2 and not _eviol, f"-> dial_opts reads={_ereads} others={_eviol}")
     except Exception as e:  # noqa: BLE001
         check("session-dial carry arm", False, f"-> raised {type(e).__name__}: {e}")
     finally:

@@ -5,8 +5,9 @@
   1. the plugin's production code carries NO raw enhance knob — no source file (outside tests/) uses the begin-option
      strings `token_prune_keep_ratio` / `extra_audio_steps` as a CODE constant (comments/docstrings may name them),
      and no numeric keep-ratio / total-step constant survives (0.8 / 16 are engine law now);
-  2. QFSessionModelMixin.residency_opts ALWAYS emits `video_enhance` as a boolean — both states — and never the raw key;
-  3. the switch setters are booleans: set_video_enhance / set_audio_enhance store bool(...).
+  2. QFSessionModelMixin.residency_opts ALWAYS emits `quality` (the one speed/quality switch; the engine speaks it) and
+     never the retired `video_enhance` or a raw key; a model its loader never gave a quality refuses to begin;
+  3. the audio switch setter is a boolean: set_audio_enhance stores bool(...).
 
 Run:  python tests/enhance_switch_test.py   (arm 1 is pure-python; arms 2-3 need comfy importable → SKIP (77) without it)
 """
@@ -17,8 +18,9 @@ from types import SimpleNamespace
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _PLUGIN = os.path.dirname(_HERE)
-FORBIDDEN_KEYS = {"token_prune_keep_ratio", "extra_audio_steps"}
-FORBIDDEN_NAMES = {"_AUDIO_ENHANCE_TOTAL_STEPS", "_quality_enhance_to_token_prune", "set_token_prune"}
+FORBIDDEN_KEYS = {"token_prune_keep_ratio", "extra_audio_steps", "video_enhance"}   # video_enhance: retired, never sent
+FORBIDDEN_NAMES = {"_AUDIO_ENHANCE_TOTAL_STEPS", "_quality_enhance_to_token_prune", "set_token_prune",
+                   "set_video_enhance", "_video_enhance"}
 
 fails = 0
 def check(cond, msg):
@@ -75,21 +77,23 @@ class _Model(Mixin):
     pass
 
 
-# ---- arm 2: residency_opts emits the switch, both states, never the raw key ----------------------------------------
+# ---- arm 2: residency_opts sends quality, every option, never the retired switch or a raw key -----------------------
 m = _Model(); m._qf = SimpleNamespace(current_session=None)
-m.set_video_enhance(False)
-o = m.residency_opts()
-check(o.get("video_enhance") is False and "token_prune_keep_ratio" not in o, "arm2: OFF → video_enhance=False, no raw key")
-m.set_video_enhance(True)
-o = m.residency_opts()
-check(o.get("video_enhance") is True and "token_prune_keep_ratio" not in o, "arm2: ON → video_enhance=True, no raw key")
+sent = []
+for q in ("super_fast", "fast", "balance", "best_quality"):
+    m.set_quality(q)
+    sent.append(m.residency_opts())
+check([o.get("quality") for o in sent] == ["super_fast", "fast", "balance", "best_quality"]
+      and not any(k in o for o in sent for k in FORBIDDEN_KEYS), "arm2: every quality is SENT, never video_enhance / a raw key")
 m2 = _Model(); m2._qf = SimpleNamespace(current_session=None)
-o = m2.residency_opts()
-check(o.get("video_enhance") is False, "arm2: never set → False (the engine's speed default), still SENT")
+try:
+    m2.residency_opts()
+    refused = False
+except RuntimeError:
+    refused = True
+check(refused, "arm2: a model its loader never gave a quality refuses to begin (a wiring error, never a silent default)")
 
-# ---- arm 3: setters are booleans ----------------------------------------------------------------------------------
-m.set_video_enhance(1)
-check(m._video_enhance is True, "arm3: set_video_enhance(1) stores True")
+# ---- arm 3: the audio switch setter is a boolean --------------------------------------------------------------------
 try:
     h3 = __import__(f"{_pkg}.qf_h3_modelpatcher", fromlist=["QFH3Model"])
     h = h3.QFH3Model.__new__(h3.QFH3Model)

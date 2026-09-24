@@ -626,23 +626,22 @@ if _IMPORT_OK:
     # undeclared key would be dropped silently), UI workflows as a boolean in this widget's POSITION (widget values are stored by
     # position). Old ON (full quality) → best_quality, old OFF (the speed default) → balance.
     _QUALITY_LEGACY_HIDDEN = {"quality_enhance": ("BOOLEAN", {})}
-    _quality_engine_cache = {}
+    _quality_fast_cache = {}
 
-    def _quality_engine(idx=None):
-        """(speaks, fast) for a GPU (default: the one ComfyUI computes on — a load passes the device IT captured), asked of the
-        ENGINE once per device: speaks = the engine takes the
-        `quality` session key (it exports quantfunc_quality_fast_available — the key and the query ship together); fast =
-        super_fast / fast can take effect on that GPU (the engine's own arming rule; the plugin keeps no GPU list). An older
-        engine, no CUDA device, or any failure → (False, False): the two-way form, never a silently inert option."""
+    def _quality_fast_tier(idx=None):
+        """super_fast / fast can take effect on this GPU (default: the one ComfyUI computes on — a load passes the device IT
+        captured): the ENGINE's answer (quantfunc_quality_fast_available, its own arming rule; the plugin keeps no GPU list),
+        asked once per device. Only an answer is cached: while the engine cannot load yet (a fresh install still downloading,
+        say) this says no WITHOUT caching it, so the next ask — the next page load, the next run — asks the engine again."""
         idx = _comfy_device_index() if idx is None else int(idx)
-        if idx not in _quality_engine_cache:
+        if idx not in _quality_fast_cache:
             try:
                 lib = qfe.load_lib()
-                speaks = hasattr(lib, "quantfunc_quality_fast_available")
-                _quality_engine_cache[idx] = (speaks, bool(speaks and lib.quantfunc_quality_fast_available(idx) == 1))
             except Exception:
-                _quality_engine_cache[idx] = (False, False)
-        return _quality_engine_cache[idx]
+                return False
+            ask = getattr(lib, "quantfunc_quality_fast_available", None)
+            _quality_fast_cache[idx] = bool(ask is not None and ask(idx) == 1)
+        return _quality_fast_cache[idx]
 
     def _quality_fast_for_file(transformer, model_config, idx=None):
         """super_fast / fast also depend on the model FILE (a checkpoint with no layer the fast mode speeds up, or one stored in
@@ -656,9 +655,6 @@ if _IMPORT_OK:
         except Exception:
             return False
         return ans is None or ans == 1
-
-    def _quality_fast_tier(idx=None):
-        return _quality_engine(idx)[1]
 
     def _loaded_device_index(patcher):
         """The CUDA index the family load captured (its load_device) — the ONE device capture of a load drives the quality
@@ -734,15 +730,6 @@ if _IMPORT_OK:
             print(f"[QuantFunc] '{q}' is not available here; using balance.", flush=True)   # this GPU / file, or an older engine
             q = "balance"
         return q
-
-    def _apply_quality(_mm, q, device_idx=None):
-        """Hand the resolved quality to the model's sessions. An engine that predates `quality` refuses that key, so it gets the
-        retired switch instead (best_quality = video_enhance ON, else OFF — the engine's speed policy); the fast options never
-        reach it — with no query symbol _resolve_quality already ran them as balance."""
-        if _quality_engine(device_idx)[0]:
-            _mm.set_quality(q)   # mandatory + unguarded, like the retired switch: a patcher without it is a wiring error
-        else:
-            _mm.set_video_enhance(q == "best_quality")
 
 
     # [audio_enhance switch, user 2026-09-13] H3-only. OFF (default) = byte-identical to no knob.
@@ -862,7 +849,7 @@ if _IMPORT_OK:
                 _mm.set_attn_backend(_attn_backend_to_engine(attention_backend))
             if _mm is not None and hasattr(_mm, "set_sol_tau"):
                 _mm.set_sol_tau(sol_tau)
-            _apply_quality(_mm, q, _dev)
+            _mm.set_quality(q)   # mandatory + unguarded: a patcher without it is a wiring error
             _arm_session_caches(_mm, step_cache, block_cache)
             return (_p,)
 
@@ -903,7 +890,7 @@ if _IMPORT_OK:
             _mm = getattr(_p, "model", None)
             if _mm is not None and hasattr(_mm, "set_attn_backend"):
                 _mm.set_attn_backend(_attn_backend_to_engine(attention_backend))
-            _apply_quality(_mm, q, _dev)
+            _mm.set_quality(q)   # mandatory + unguarded: a patcher without it is a wiring error
             return (_p,)
 
     class QuantFuncQwenImage21Loader:
@@ -944,7 +931,7 @@ if _IMPORT_OK:
             _mm = getattr(_p, "model", None)
             if _mm is not None and hasattr(_mm, "set_attn_backend"):
                 _mm.set_attn_backend(_attn_backend_to_engine(attention_backend))
-            _apply_quality(_mm, q, _dev)
+            _mm.set_quality(q)   # mandatory + unguarded: a patcher without it is a wiring error
             return (_p,)
 
 
@@ -998,7 +985,7 @@ if _IMPORT_OK:
                 _mm.set_attn_backend(_attn_backend_to_engine(attention_backend))
             if _mm is not None and hasattr(_mm, "set_sol_tau"):
                 _mm.set_sol_tau(sol_tau)
-            _apply_quality(_mm, q, _dev)
+            _mm.set_quality(q)   # mandatory + unguarded: a patcher without it is a wiring error
             if _mm is not None and hasattr(_mm, "set_audio_enhance"):
                 _mm.set_audio_enhance(audio_enhance)
             _mm.set_allow_partial_denoise(bool(allow_partial_denoise))

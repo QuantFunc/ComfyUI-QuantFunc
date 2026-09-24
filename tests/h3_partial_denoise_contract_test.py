@@ -140,7 +140,7 @@ def _load_real_plugin(test_case):
 
 class _HarnessBase:
     def residency_opts(self):
-        return {"sparse_cdf": 1.0, "video_enhance": False}
+        return {"sparse_cdf": 1.0, "attention_backend": "auto", "quality": "balance"}
 
     def process_latent_out(self, latent):
         self._base_process_calls += 1
@@ -512,7 +512,6 @@ _loader_namespace = {
     "_QUALITY_LEGACY_HIDDEN": {"quality_enhance": ("BOOLEAN", {})},
     "_loaded_device_index": lambda _patcher: 0,
     "_resolve_quality": lambda *_args: "balance",
-    "_apply_quality": lambda model, q, _dev=None: model.set_quality(q),
     "_AUDIO_ENHANCE_INPUT": ("BOOLEAN", {"default": False}),
     "_STEP_CACHE_INPUT": ("FLOAT", {"default": 0.0}),
     "_BLOCK_CACHE_INPUT": ("FLOAT", {"default": 0.0}),

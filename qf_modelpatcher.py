@@ -323,26 +323,17 @@ class QFSessionModelMixin:
         except (TypeError, ValueError):
             self._sol_tau = 1.0
 
-    def set_video_enhance(self, on):
-        # [enhance switch, user 2026-09-19] the ONE video-quality switch: OFF (default) = the engine's speed
-        # policy, ON = full quality. What that means (which tokens are recomputed, how much, which step stays
-        # full, what yields to a step-cache) is ENGINE law behind the begin option `video_enhance` — this
-        # plugin carries no number for it. Same rides-residency_opts class as set_sol_tau.
-        self._video_enhance = bool(on)
-
     def set_quality(self, q):
         # [quality 2026-09-24] the loaders' speed/quality choice (super_fast / fast / balance / best_quality), already resolved
         # for this GPU and file by the node. The ENGINE owns what it means per run (its per-family law: prune + fast steps from
-        # that run's own step count), so a session sends the name, never the numbers — and never with video_enhance (the engine
-        # refuses both). Same rides-residency_opts class as set_video_enhance, which stays for an engine that predates `quality`.
+        # that run's own step count), so a session sends the name, never the numbers. Rides residency_opts like the other dials.
         self._quality = str(q) if q else None
 
     # Every loader-set session dial: each set_* on this mixin or a family model writes exactly one of these (a death
     # rule in loader_dispatch_test checks the setters, subclasses included). A QuantFuncNativeLoRA rebuild hands back a
     # NEW model, so QFModelPatcher.adopt_comfy_state_from carries these; a dial missing here would make the LoRA'd model
     # run that dial's default without a word.
-    _SESSION_DIALS = ("_step_cache", "_block_cache", "_sparse", "_attn_backend", "_sol_tau",
-                      "_video_enhance", "_quality")
+    _SESSION_DIALS = ("_step_cache", "_block_cache", "_sparse", "_attn_backend", "_sol_tau", "_quality")
 
     def adopt_session_dials_from(self, src):
         """Copy the dials the loader set on SRC (the model a LoRA rebuild replaces) onto this model."""
@@ -395,16 +386,14 @@ class QFSessionModelMixin:
         - attention_backend: ALWAYS sent, "auto" included. The engine KEEPS the current backend when the key is
           absent, so omitting "auto" left the previous run's explicit choice in force (MEASURED: a run set back to
           auto rendered byte-for-byte as the flash run before it). "auto" is every family's create-time default.
-        - quality (the engine resolves it and decides the prune), else the retired video_enhance switch for an
-          engine without it. Always one of the two: an absent key leaves the engine on its raw-key default, which
-          is neither; the engine refuses a begin that carries both, or the raw token_prune_keep_ratio key."""
-        o = {"attention_backend": str(getattr(self, "_attn_backend", "auto") or "auto")}
+        - quality: ALWAYS sent (the engine resolves it per run and decides the prune; an absent key would leave the
+          engine on a raw-key default that is none of the four). Every loader sets it on the model it builds, so a
+          model without one is a wiring error: refused here, never a silent default."""
         q = getattr(self, "_quality", None)
-        if q:
-            o["quality"] = q
-        else:
-            o["video_enhance"] = bool(getattr(self, "_video_enhance", False))
-        return o
+        if not q:
+            raise RuntimeError("QuantFunc: this model has no quality setting (the loader sets one on every model it builds; "
+                               "set_quality was never called)")
+        return {"attention_backend": str(getattr(self, "_attn_backend", "auto") or "auto"), "quality": q}
 
     # ── comfy's per-model VRAM interface (2026-09-19, user: 「与 comfyui 打通,让它知道我们需要多少显存、当前占了多少」) ──
     # comfy asks a model TWO numbers and does the rest itself: `memory_required(shape)` — how much MORE VRAM one
