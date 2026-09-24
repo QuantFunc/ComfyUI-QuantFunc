@@ -345,7 +345,8 @@ def main():
     check("h3 node surface = latent-duo required + session-dial optionals",
           list(_h3it["required"].keys()) == ["transformer", "model_config"]
           and list(_h3it.get("optional", {}).keys()) == ["attention_backend", "sol_tau",
-                                                          "quality_enhance", "audio_enhance", "step_cache", "block_cache"],
+                                                          "quality_enhance", "audio_enhance", "step_cache", "block_cache",
+                                                          "allow_partial_denoise"],
           f"-> req={list(_h3it['required'].keys())} opt={list(_h3it.get('optional', {}).keys())}")
     # (B) quality_enhance widget -> the ONE boolean begin option `video_enhance` (user 2026-09-19: the keep ratio
     #     is engine law; the plugin carries no number). NOTE: the pixel-level A/B (quality_enhance ON vs OFF) is
@@ -967,15 +968,12 @@ def main():
         # begin hook exists to forget).
         _drops = []
 
-        class _FakeReal:
-            pipeline = object()
-            current_session = None
-            step_count = 0
-            sampler_step_count = 0
-            footprint_bytes = 0
-
-            def end_session_if_open(self):
-                return (False, True)
+        class _FakeReal(_ContractEngine):
+            """A materialized handle that honours the prepared-resource contract: the host-vram QFLazyEngine.ensure()
+            resolves EVERY factory through prepare_resource(), which refuses a bare object without a retained
+            native resource ("lacks the common prepared-resource contract")."""
+            def __init__(self):
+                super().__init__(_DummyPrepared().resource)
         _le = _qmp2.QFLazyEngine(lambda: (_FakeReal(), "new-ck"),
                                  retire=lambda _ck, _e, _req=None, **_kw: _drops.append(_ck) or True)
         _le.set_lora_side("high", [{"path": "x", "scale": 1.0, "target": "high"}])
