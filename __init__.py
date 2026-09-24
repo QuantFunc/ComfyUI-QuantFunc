@@ -73,22 +73,6 @@ def _model_config_choices(family=None):
         return [_NO_CFG_HINT]
 
 
-def _preset_file_expectations():
-    """One line per shipped preset naming its expected transformer files (tooltip text)."""
-    out = []
-    try:
-        for d in _model_config_choices():
-            mf = os.path.join(_CONFIGS_DIR, d, "qf_native.json")
-            if os.path.isfile(mf):
-                notes = (json.load(open(mf)).get("notes") or "")
-                exp = notes.split("expected files:")[-1].strip() if "expected files:" in notes else ""
-                if exp:
-                    out.append(f"{d}: {exp}")
-    except Exception:  # noqa: BLE001
-        pass
-    return (" Expected files — " + "; ".join(out)) if out else ""
-
-
 def _load_model_config(name):
     """Resolve + read a preset's manifest. The name is a widget value (workflow-serializable =
     untrusted): it must be exactly one of the listed preset dirs — no separators, no traversal."""
@@ -216,6 +200,15 @@ def _read_auth():
 # on comfy's shift-8.0 sigmas [1.0,0.96,0.889,0.727] instead of the checkpoint's shift-5.0 sigmas
 # [1.0,0.938,0.833,0.625], the mid-range denoising is under-resolved → mangled fine structure
 # (hands/hair) vs the engine's OWN pipeline (which uses flow_shift=5.0 UniPC). Read it and apply it.
+def _comfy_device_index():
+    """The CUDA index of the GPU ComfyUI computes on (0 when it is not a CUDA device or comfy is unavailable)."""
+    try:
+        dev = comfy.model_management.get_torch_device()
+        return int(dev.index) if getattr(dev, "type", "") == "cuda" and dev.index is not None else 0
+    except Exception:
+        return 0
+
+
 def _read_flow_shift(model_dir):
     """The checkpoint's flow-matching shift from its diffusers scheduler config
     (`flow_shift`, falling back to `shift`). Returns None (→ keep comfy's default) if the
@@ -681,42 +674,119 @@ if _IMPORT_OK:
     # no create key, no pipeline rebuild on a widget change). Engine EasyCache/FBCache
     # (lighting_step_cache.h) is untouched on main.
     _STEP_CACHE_INPUT = ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.005,
-                         "tooltip": "Step cache threshold (EasyCache; 0 = OFF, byte-identical). "
-                                    ">0 lets the engine SKIP whole denoise steps whose "
-                                    "predicted change is below this relative budget and "
-                                    "reuse the cached trajectory (typical 0.02-0.05; larger "
-                                    "= faster but drifts more). Runtime session knob — "
-                                    "takes effect next run, never rebuilds the pipeline."})
+                         "tooltip": "Speed-up that reuses earlier work while the result is barely changing. 0 (default) = off. "
+                                    "Higher values are faster but can move the result away from the full render; "
+                                    "0.02–0.05 is typical. Takes effect on the next run."})
     _BLOCK_CACHE_INPUT = ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.005,
-                          "tooltip": "Block cache threshold (First-Block Cache; 0 = OFF, byte-identical). "
-                                     ">0 runs block 0 every step and SKIPS blocks 1..N-1 when "
-                                     "block 0's output change is below this relative budget, "
-                                     "reconstructing from the cached residual — effective even "
-                                     "on few-step distilled workflows (typical 0.05-0.12). "
-                                     "Runtime session knob — takes effect next run, never "
-                                     "rebuilds. COMPOSABLE with step_cache (EC skips whole "
-                                     "steps; FBC skips blocks inside computed steps)."})
-    # [quality_enhance widget -> the mixin's ONE video_enhance switch, user 2026-09-19] OFF (default) = the
-    # engine's speed policy, ON = full quality; what that means is ENGINE law, this plugin carries no number.
-    _QUALITY_ENHANCE_INPUT = ("BOOLEAN", {"default": False,
-                     "tooltip": "Quality-enhance. OFF (default) = the engine's faster speed policy. "
-                                "ON = full quality. Runtime session knob — takes effect next run, "
-                                "never rebuilds."})
+                          "tooltip": "A second speed-up that reuses work inside each pass when little changes. 0 (default) = "
+                                     "off. 0.05–0.12 is typical; higher is faster but can lose detail. Can be combined "
+                                     "with step_cache. Takes effect on the next run."})
+    # [quality — user 2026-09-24] ONE speed/quality choice on the four QuantFunc loaders (H3, LTX-2.5, Krea2, Qwen-Image-2.1). It
+    # replaces the quality_enhance switch (the engine's video_enhance). The option names are the user's; what each one does is
+    # ENGINE law, one table per model family (the engine's QualityLaw) — the loader sends only the name as the session's
+    # `quality` and the engine resolves it per run from that run's own step count. A quality change never rebuilds or reloads
+    # (user 「更换quality的时候不应该重建pipeline」): the create config never depends on it, so all four options share one cached
+    # pipeline; the engine prepares its fast mode in place at the first fast step of a run and drops it at a run that uses none.
+    # The two fast options exist only where the ENGINE says they can run on this GPU (quantfunc_quality_fast_available) — the
+    # plugin keeps no GPU list; everywhere else a two-way choice.
+    # User-facing text states only the speed / quality trade (user 「介绍上不要透露技术细节」).
+    _QUALITY_FAST_OPTIONS = ["super_fast", "fast", "balance", "best_quality"]
+    _QUALITY_BASE_OPTIONS = ["balance", "best_quality"]
+    _QUALITY_DEFAULT = "balance"   # every GPU; the fast options are opt-in (user 「默认balance」)
+    _QUALITY_TOOLTIP_FAST = ("Speed or quality. super_fast: the fastest; details can differ from best_quality. fast: faster, and "
+                             "closer to best_quality. balance (default): can be a little faster than best_quality, with almost "
+                             "the same result. best_quality: the highest quality, and the slowest. On turbo models, super_fast and fast "
+                             "can produce a different variation of the same seed.")
+    _QUALITY_TOOLTIP_BASE = ("Speed or quality. balance (default): can be faster, with almost the same result as best_quality. "
+                             "best_quality: the highest quality, and slower.")
+    # Saved workflows (migration): they carry the retired quality_enhance switch — API-format prompts under its NAME (declared
+    # hidden, in ComfyUI's (type, options) input form, so ComfyUI hands it to load() and can validate it when it is linked; an
+    # undeclared key would be dropped silently), UI workflows as a boolean in this widget's POSITION (widget values are stored by
+    # position). Old ON (full quality) → best_quality, old OFF (the speed default) → balance.
+    _QUALITY_LEGACY_HIDDEN = {"quality_enhance": ("BOOLEAN", {})}
+    _quality_engine_cache = {}
 
-    # Qwen-Image-2.1: the same video_enhance switch (ON = full quality, OFF = the engine's speed policy), an image tooltip — the
-    # engine prunes every one-cond-group run without references (text-to-image, img2img, mask inpainting; CFG 1, batch 1 — the
-    # official recipe); edit, CFG > 1 and batch > 1 run full.
-    _QWEN21_QUALITY_ENHANCE_INPUT = ("BOOLEAN", {"default": False,
-                     "tooltip": "Quality-enhance. OFF (default) = faster, LOSSY: token-prune at keep-fraction "
-                                "0.8 for every CFG-1, batch-1 run without reference images — text-to-image, "
-                                "img2img and SetLatentNoiseMask inpainting (recompute 80% of the image tokens "
-                                "per step; the last step is always full). Measured on Qwen-Image-2.1 int4 "
-                                "against full compute, same seed: text-to-image at 1024x1024 ~16% faster sampling, "
-                                "PSNR 25.6-31.3 dB / SSIM 0.92-0.97 (same composition, no artifacts); img2img "
-                                "(denoise 0.6) PSNR 39.5 dB / SSIM 0.97; mask inpainting PSNR 28.9 dB inside the "
-                                "mask (33.5 dB / SSIM 0.98 over the whole image). ON = full compute (prune OFF). "
-                                "Image edit (reference images), CFG > 1 and batch > 1 always run full. Runtime "
-                                "session knob — takes effect next run, never rebuilds."})
+    def _quality_engine(idx=None):
+        """(speaks, fast) for a GPU (default: the one ComfyUI computes on — a load passes the device IT captured), asked of the
+        ENGINE once per device: speaks = the engine takes the
+        `quality` session key (it exports quantfunc_quality_fast_available — the key and the query ship together); fast =
+        super_fast / fast can take effect on that GPU (the engine's own arming rule; the plugin keeps no GPU list). An older
+        engine, no CUDA device, or any failure → (False, False): the two-way form, never a silently inert option."""
+        idx = _comfy_device_index() if idx is None else int(idx)
+        if idx not in _quality_engine_cache:
+            try:
+                lib = qfe.load_lib()
+                speaks = hasattr(lib, "quantfunc_quality_fast_available")
+                _quality_engine_cache[idx] = (speaks, bool(speaks and lib.quantfunc_quality_fast_available(idx) == 1))
+            except Exception:
+                _quality_engine_cache[idx] = (False, False)
+        return _quality_engine_cache[idx]
+
+    def _quality_fast_for_file(transformer, model_config, idx=None):
+        """super_fast / fast also depend on the model FILE (a checkpoint with no layer the fast mode speeds up, or one stored in
+        a form it cannot use): the engine answers for this file on this GPU (quantfunc_quality_fast_available_file). An engine
+        without that query keeps its GPU answer; any other answer than yes — including an error — runs balance."""
+        try:
+            key, surl = _read_auth()
+            ans = qfe.quality_fast_available_file(qfe.load_lib(), _load_model_config(model_config)[0],
+                                                  _resolve_transformer(transformer),
+                                                  _comfy_device_index() if idx is None else idx, surl, key)
+        except Exception:
+            return False
+        return ans is None or ans == 1
+
+    def _quality_fast_tier(idx=None):
+        return _quality_engine(idx)[1]
+
+    def _loaded_device_index(patcher):
+        """The CUDA index the family load captured (its load_device) — the ONE device capture of a load drives the quality
+        decision too, never a second read of ComfyUI's device."""
+        dev = getattr(patcher, "load_device", None)
+        return int(dev.index) if getattr(dev, "type", "") == "cuda" and dev.index is not None else 0
+
+    def _quality_input():
+        fast = _quality_fast_tier()
+        return (list(_QUALITY_FAST_OPTIONS if fast else _QUALITY_BASE_OPTIONS),
+                {"default": _QUALITY_DEFAULT, "tooltip": _QUALITY_TOOLTIP_FAST if fast else _QUALITY_TOOLTIP_BASE})
+
+    def _validate_quality(quality):
+        """The loaders' VALIDATE_INPUTS body (it replaces ComfyUI's own list check for `quality`): any of the four names on every
+        GPU (a workflow saved on a GPU with the fast options still opens), a boolean (the retired switch, positional), or None —
+        ComfyUI's value for a LINKED input (resolved at run time, where _resolve_quality refuses anything else)."""
+        if quality is None or isinstance(quality, bool) or quality in _QUALITY_FAST_OPTIONS:
+            return True
+        return f"quality must be one of {', '.join(_QUALITY_FAST_OPTIONS)} (got {quality!r})"
+
+    def _resolve_quality(quality=None, quality_enhance=None, transformer=None, model_config=None, device_idx=None):
+        """The node's quality → the mode this run uses. An explicit quality wins; the retired switch (a boolean in quality's
+        position, or by name when quality is absent) maps old ON → best_quality, OFF → balance; nothing given → the default. A
+        fast option that cannot run — on this GPU, or (given the loader's transformer + model_config) for this model file —
+        runs balance, with one console line, whatever the reason."""
+        if isinstance(quality, bool):
+            q = "best_quality" if quality else "balance"
+        elif quality is not None:
+            q = str(quality)
+        elif quality_enhance is not None:
+            q = "best_quality" if bool(quality_enhance) else "balance"
+        else:
+            q = _QUALITY_DEFAULT
+        if q not in _QUALITY_FAST_OPTIONS:
+            raise ValueError(_validate_quality(q))
+        if q in ("super_fast", "fast") and not (_quality_fast_tier(device_idx) and
+                                                (transformer is None or _quality_fast_for_file(transformer, model_config, device_idx))):
+            print(f"[QuantFunc] '{q}' is not available here; using balance.", flush=True)   # this GPU / file, or an older engine
+            q = "balance"
+        return q
+
+    def _apply_quality(_mm, q, device_idx=None):
+        """Hand the resolved quality to the model's sessions. An engine that predates `quality` refuses that key, so it gets the
+        retired switch instead (best_quality = video_enhance ON, else OFF — the engine's speed policy); the fast options never
+        reach it — with no query symbol _resolve_quality already ran them as balance."""
+        if _quality_engine(device_idx)[0]:
+            _mm.set_quality(q)   # mandatory + unguarded, like the retired switch: a patcher without it is a wiring error
+        else:
+            _mm.set_video_enhance(q == "best_quality")
+
 
     # [audio_enhance switch, user 2026-09-13] H3-only. OFF (default) = byte-identical to no knob.
     # ON = after the normal (video) denoise, run EXTRA AUDIO-ONLY sub-steps so video_steps +
@@ -725,13 +795,9 @@ if _IMPORT_OK:
     # runs >= 16 steps. Drives engine extra_audio_steps; the exact top-up is computed at session
     # begin from the sampler's step count (qf_h3_modelpatcher.set_audio_enhance / _begin).
     _AUDIO_ENHANCE_INPUT = ("BOOLEAN", {"default": False,
-                     "tooltip": "Audio-enhance (MiniMax-H3 only). OFF (default) = no extra audio "
-                                "denoise (byte-identical). ON = run EXTRA audio-only denoise "
-                                "sub-steps after the video denoise so the video steps + extra "
-                                "audio steps total 16 (e.g. a 4-step video gets 12 extra audio-only "
-                                "sub-steps) — sharper/cleaner AUDIO at fixed per-sub-step cost, the "
-                                "VIDEO is untouched (byte-identical). No effect when the video "
-                                "already runs >= 16 steps. Runtime session knob — next run, no rebuild."})
+                     "tooltip": "MiniMax-H3 only. On: adds a short extra pass after the video is finished that makes the "
+                                "sound clearer and sharper; the video itself is unchanged. Off (default): no extra time. "
+                                "Most useful with fast turbo settings; it has no effect at long, high-quality settings."})
 
     # [sol-tau dial 2026-08-31] the ONE user-facing Sol-Attn knob (user "就一个就好"). Applies to
     # the flash/sage backends — the engine's applySolTauDial engages the Sol-Attn keep-ratio per
@@ -739,12 +805,9 @@ if _IMPORT_OK:
     # runtime-session-knob class as step_cache/sparse: re-sent each run, no rebuild; 1.0 default is
     # omitted (older engines refuse unknown keys loud) and the engine resets an absent key to 1.0.
     _SOL_TAU_INPUT = ("FLOAT", {"default": 1.0, "min": 0.02, "max": 1.0, "step": 0.01,
-                     "tooltip": "Sol-Attn keep-ratio (flash/sage backends). 1.0 = OFF "
-                                "(the backend's original dense attention). <1 = sol engaged; "
-                                "value ~= fraction of attention blocks computed exactly: "
-                                "SMALLER = sparser = FASTER. 0.15-0.2 = the measured speed "
-                                "optimum (recommended start); 0.05-0.1 = faster (watch "
-                                "quality); 0.3-0.5 = quality-leaning."})
+                     "tooltip": "Attention speed-up. 1.0 (default) turns it off. Lower values are faster and give up "
+                                "some quality: 0.15–0.2 is a good start, below 0.1 check the result carefully, 0.3–0.5 "
+                                "keeps more quality. Takes effect on the next run."})
 
     def _arm_session_caches(_mm, step_cache, block_cache):
         """Arm the EasyCache (step) + FBCache (block) session knobs on a loaded model.
@@ -758,11 +821,9 @@ if _IMPORT_OK:
         if hasattr(_mm, "set_block_cache"):
             _mm.set_block_cache(float(block_cache or 0.0))
     _COMMON_LIMITS = (
-        "Sampler/scheduler/CFG stay ENTIRELY ComfyUI-side — the engine only denoises per step "
-        "(latents in, velocity out). Limits: (1) ControlNet is not consumed by this seam "
-        "(refused loud). (2) Interrupt stops BETWEEN denoise steps. (3) On Linux a fail-closed "
-        "CUDA-toolchain check refuses a torch/.so CUDA-major mismatch; on Windows/macOS set "
-        "QF_NATIVE_ALLOW_UNVERIFIED_TOOLCHAIN=1 after confirming they share a CUDA major.")
+        "Notes: ControlNet is not supported. Interrupting stops at the next safe point of the run. The loader checks "
+        "that ComfyUI and this plugin use a matching CUDA version; if they do not, it stops with a message that "
+        "explains the fix.")
 
     # [attention backend selector, user 2026-08-27] one user-facing dropdown per loader.
     # SM-GATED: SM80+ offers the full set; SM75 (Turing) has NO int8-QK sage and NO
@@ -794,11 +855,9 @@ if _IMPORT_OK:
         # default isn't offered on this SM (e.g. H3 wants 'flash' but SM75 has no flash).
         d = default if default in choices else choices[0]
         return (choices, {"default": d,
-                "tooltip": "Self-attention backend. auto = engine picks per-SM (default). "
-                           "flash = fp16 flash-attn (most robust; H3 high-res needs this). "
-                           "sage = int8-QK sage (fastest, SM80+). fp16_native = portable "
-                           "fp16/fp32-score fallback. SM75 (Turing) offers only fp16_native. "
-                           "Runtime session knob — takes effect on the next run, no rebuild."})
+                "tooltip": "How attention is computed. auto picks the best choice for your GPU. flash is the most "
+                           "robust; sage can be faster on newer GPUs; fp16_native works on every GPU. Takes effect "
+                           "on the next run."})
 
     def _attn_backend_to_engine(v):
         # widget display name -> engine comp_opts attention_backend string
@@ -833,9 +892,7 @@ if _IMPORT_OK:
                 "transformer2": (_xfms, {"tooltip": "The LOW-noise expert .safetensors (wan A14B "
                                                     "ships them as a *-high-* / *-low-* pair)."}),
                 "model_config": (_model_config_choices(family="wan"),
-                                 {"tooltip": "The OFFICIAL wan model config preset (arch + VAE "
-                                             "geometry + expected-file naming). "
-                                             + _preset_file_expectations()}),
+                                 {"tooltip": "The Wan 2.2 preset that matches the chosen model files."}),
             }, "optional": {
                 "attention_backend": _attn_backend_input(),
                 "step_cache": _STEP_CACHE_INPUT,
@@ -887,32 +944,30 @@ if _IMPORT_OK:
         def INPUT_TYPES(cls):
             return {"required": {
                 "transformer": (_transformer_choices(),
-                                {"tooltip": "The LTX-2 transformer .safetensors under "
-                                            "models/diffusion_models (the QuantFunc int4 "
-                                            "single-file export — connector + audio blocks "
-                                            "packed inside)."}),
+                                {"tooltip": "The QuantFunc LTX-2 model file in models/diffusion_models."}),
                 "model_config": (_model_config_choices(family="ltx2"),
-                                 {"tooltip": "The OFFICIAL LTX-2 model config preset. "
-                                             + _preset_file_expectations()}),
+                                 {"tooltip": "The LTX-2 preset that matches the chosen model file."}),
             }, "optional": {
                 "attention_backend": _attn_backend_input(),
                 "sol_tau": _SOL_TAU_INPUT,
-                "quality_enhance": _QUALITY_ENHANCE_INPUT,
+                "quality": _quality_input(),
                 "step_cache": _STEP_CACHE_INPUT,
                 "block_cache": _BLOCK_CACHE_INPUT,
-            }}
+            }, "hidden": dict(_QUALITY_LEGACY_HIDDEN)}
+
+        @classmethod
+        def VALIDATE_INPUTS(cls, quality=None):
+            return _validate_quality(quality)
 
         RETURN_TYPES = ("MODEL",)
         FUNCTION = "load"
         CATEGORY = "loaders"
-        DESCRIPTION = ("QuantFunc LTX-2 loader (svdq, denoise_only): one native MODEL a stock "
-                       "sampler drives with latents. i2v: wire the official "
-                       "LTXVImgToVideoInplace into the LATENT path (wan-aligned — the model "
-                       "only consumes latents; comfy's sampler applies the frame-0 mask). "
-                       + _COMMON_LIMITS)
+        DESCRIPTION = ("Loads a QuantFunc LTX-2 model (video with sound) for ComfyUI's standard samplers — use it in place "
+                       "of the usual diffusion-model loader. For image-to-video, add the official LTXVImgToVideoInplace node on "
+                       "the latent input. " + _COMMON_LIMITS)
 
         def load(self, transformer, model_config,
-                 attention_backend="auto", sol_tau=1.0, quality_enhance=False, step_cache=0.0, block_cache=0.0):
+                 attention_backend="auto", sol_tau=1.0, quality=None, step_cache=0.0, block_cache=0.0, quality_enhance=None):
             # [aux-auto] NO aux file widgets and NO image socket (user 2026-08-22 "只保留
             # transformer/block/model_config … 只关注latent"): te/audio-vae/connectors
             # resolve from the preset manifest's aux_files inside _run_family_load; i2v is
@@ -921,12 +976,14 @@ if _IMPORT_OK:
             _p = _run_family_load("ltx2", transformer, model_config,
                                    None,
                                    sparse_opts=None)
+            _dev = _loaded_device_index(_p)
+            q = _resolve_quality(quality, quality_enhance, transformer, model_config, _dev)
             _mm = getattr(_p, "model", None)
             if _mm is not None and hasattr(_mm, "set_attn_backend"):
                 _mm.set_attn_backend(_attn_backend_to_engine(attention_backend))
             if _mm is not None and hasattr(_mm, "set_sol_tau"):
                 _mm.set_sol_tau(sol_tau)
-            _mm.set_video_enhance(quality_enhance)
+            _apply_quality(_mm, q, _dev)
             _arm_session_caches(_mm, step_cache, block_cache)
             return (_p,)
 
@@ -939,34 +996,37 @@ if _IMPORT_OK:
         def INPUT_TYPES(cls):
             return {"required": {
                 "transformer": (_transformer_choices(),
-                                {"tooltip": "The Krea-2 Turbo transformer .safetensors under "
-                                            "models/diffusion_models (the QuantFunc int4 "
-                                            "export)."}),
+                                {"tooltip": "The QuantFunc Krea-2 Turbo model file in models/diffusion_models."}),
                 "model_config": (_model_config_choices(family="krea2"),
-                                 {"tooltip": "The OFFICIAL Krea-2 model config preset. "
-                                             + _preset_file_expectations()}),
+                                 {"tooltip": "The Krea-2 Turbo preset that matches the chosen model file."}),
             }, "optional": {
                 "attention_backend": _attn_backend_input(),
-                "quality_enhance": _QUALITY_ENHANCE_INPUT,
-            }}
+                "quality": _quality_input(),
+            }, "hidden": dict(_QUALITY_LEGACY_HIDDEN)}
+
+        @classmethod
+        def VALIDATE_INPUTS(cls, quality=None):
+            return _validate_quality(quality)
 
         RETURN_TYPES = ("MODEL",)
         FUNCTION = "load"
         CATEGORY = "loaders"
-        DESCRIPTION = ("QuantFunc Krea-2 Turbo loader (svdq, denoise_only): one native t2i "
-                       "MODEL a stock sampler drives with latents. " + _COMMON_LIMITS)
+        DESCRIPTION = ("Loads a QuantFunc Krea-2 Turbo model (text-to-image) for ComfyUI's standard samplers — use it in "
+                       "place of the usual diffusion-model loader. " + _COMMON_LIMITS)
 
         def load(self, transformer, model_config, attention_backend="auto",
-                 quality_enhance=False):
-            # [runtime dials] backend + video_enhance (quality_enhance) are SESSION knobs
-            # (NOT create keys — a widget change never re-keys the engine = no rebuild).
+                 quality=None, quality_enhance=None):
+            # [runtime dials] backend + quality are SESSION knobs (NOT create keys — a widget change never re-keys the
+            # engine = no rebuild).
             _p = _run_family_load("krea2", transformer, model_config,
                                   None,
                                   sparse_opts=None)
+            _dev = _loaded_device_index(_p)
+            q = _resolve_quality(quality, quality_enhance, transformer, model_config, _dev)
             _mm = getattr(_p, "model", None)
             if _mm is not None and hasattr(_mm, "set_attn_backend"):
                 _mm.set_attn_backend(_attn_backend_to_engine(attention_backend))
-            _mm.set_video_enhance(quality_enhance)
+            _apply_quality(_mm, q, _dev)
             return (_p,)
 
     class QuantFuncQwenImage21Loader:
@@ -979,34 +1039,37 @@ if _IMPORT_OK:
         def INPUT_TYPES(cls):
             return {"required": {
                 "transformer": (_transformer_choices(),
-                                {"tooltip": "The Qwen-Image-2.1 transformer .safetensors under "
-                                            "models/diffusion_models (the QuantFunc int4 export)."}),
+                                {"tooltip": "The QuantFunc Qwen-Image-2.1 model file in models/diffusion_models."}),
                 "model_config": (_model_config_choices(family="qwenimage21"),
-                                 {"tooltip": "The OFFICIAL Qwen-Image-2.1 model config preset. "
-                                             + _preset_file_expectations()}),
+                                 {"tooltip": "The Qwen-Image-2.1 preset that matches the chosen model file."}),
             }, "optional": {
                 "attention_backend": _attn_backend_input(),
-                "quality_enhance": _QWEN21_QUALITY_ENHANCE_INPUT,
-            }}
+                "quality": _quality_input(),
+            }, "hidden": dict(_QUALITY_LEGACY_HIDDEN)}
+
+        @classmethod
+        def VALIDATE_INPUTS(cls, quality=None):
+            return _validate_quality(quality)
 
         RETURN_TYPES = ("MODEL",)
         FUNCTION = "load"
         CATEGORY = "loaders"
-        DESCRIPTION = ("QuantFunc Qwen-Image-2.1 loader (svdq, denoise_only): one native MODEL a stock "
-                       "sampler drives with latents — text-to-image, and image edit with "
-                       "TextEncodeQwenImage21 reference images (+ its VAE). RGBA: VAEDecode + SaveImage "
-                       "keep the alpha channel (transparent PNG). " + _COMMON_LIMITS)
+        DESCRIPTION = ("Loads a QuantFunc Qwen-Image-2.1 model for ComfyUI's standard samplers: text-to-image, and image "
+                       "editing with TextEncodeQwenImage21 reference images (plus its VAE). Transparent images: VAE Decode + "
+                       "Save Image keep the transparency. " + _COMMON_LIMITS)
 
-        def load(self, transformer, model_config, attention_backend="auto", quality_enhance=False):
-            # [runtime dials] backend + video_enhance (quality_enhance) are SESSION knobs (NOT create keys —
-            # a widget change never re-keys the engine = no rebuild), exactly like the Krea2 node.
+        def load(self, transformer, model_config, attention_backend="auto", quality=None, quality_enhance=None):
+            # [runtime dials] backend + quality are SESSION knobs (NOT create keys — a widget change never re-keys the engine =
+            # no rebuild), exactly like the Krea2 node.
             _p = _run_family_load("qwenimage21", transformer, model_config,
                                   None,
                                   sparse_opts=None)
+            _dev = _loaded_device_index(_p)
+            q = _resolve_quality(quality, quality_enhance, transformer, model_config, _dev)
             _mm = getattr(_p, "model", None)
             if _mm is not None and hasattr(_mm, "set_attn_backend"):
                 _mm.set_attn_backend(_attn_backend_to_engine(attention_backend))
-            _mm.set_video_enhance(quality_enhance)
+            _apply_quality(_mm, q, _dev)
             return (_p,)
 
 
@@ -1017,11 +1080,9 @@ if _IMPORT_OK:
         def INPUT_TYPES(cls):
             return {"required": {
                 "transformer": (_transformer_choices(),
-                                {"tooltip": "The MiniMax-H3 transformer .safetensors under "
-                                            "models/diffusion_models."}),
+                                {"tooltip": "The QuantFunc MiniMax-H3 model file in models/diffusion_models."}),
                 "model_config": (_model_config_choices(family="minimax-h3"),
-                                 {"tooltip": "The OFFICIAL MiniMax-H3 model config preset. "
-                                             + _preset_file_expectations()}),
+                                 {"tooltip": "The MiniMax-H3 preset that matches the chosen model file."}),
             }, "optional": {
                 # [sparse, user 2026-08-25 ONE-number dial; #659 session knob — no rebuild]
                 # H3 default = flash: this model's auto resolves to sage2 int8-QK, which is
@@ -1031,7 +1092,7 @@ if _IMPORT_OK:
                 # auto/sage/native. (Wan/LTX → auto is fine → they keep 'auto'.)
                 "attention_backend": _attn_backend_input("flash"),
                 "sol_tau": _SOL_TAU_INPUT,
-                "quality_enhance": _QUALITY_ENHANCE_INPUT,
+                "quality": _quality_input(),
                 "audio_enhance": _AUDIO_ENHANCE_INPUT,
                 "step_cache": _STEP_CACHE_INPUT,
                 "block_cache": _BLOCK_CACHE_INPUT,
@@ -1039,26 +1100,32 @@ if _IMPORT_OK:
                     "default": False,
                     "tooltip": "Opt in to split/trimmed sigma schedules for intentional H3 double-sampling workflows.",
                 }),
-            }}
+            }, "hidden": dict(_QUALITY_LEGACY_HIDDEN)}
+
+        @classmethod
+        def VALIDATE_INPUTS(cls, quality=None):
+            return _validate_quality(quality)
 
         RETURN_TYPES = ("MODEL",)
         FUNCTION = "load"
         CATEGORY = "loaders"
-        DESCRIPTION = ("QuantFunc MiniMax-H3 loader (svdq, denoise_only): one native AV MODEL a "
-                       "stock sampler drives with latents. " + _COMMON_LIMITS)
+        DESCRIPTION = ("Loads a QuantFunc MiniMax-H3 model (video with sound) for ComfyUI's standard samplers — use it in "
+                       "place of the usual diffusion-model loader. " + _COMMON_LIMITS)
 
         def load(self, transformer, model_config,
-                 attention_backend="flash", sol_tau=1.0, quality_enhance=False, audio_enhance=False,
-                 step_cache=0.0, block_cache=0.0, allow_partial_denoise=False):  # H3: flash default (auto→sage is broken)
+                 attention_backend="flash", sol_tau=1.0, quality=None, audio_enhance=False,
+                 step_cache=0.0, block_cache=0.0, allow_partial_denoise=False, quality_enhance=None):  # H3: flash default (auto→sage is broken)
             _p = _run_family_load("minimax-h3", transformer, model_config,
                                    None,
                                    sparse_opts=None)
+            _dev = _loaded_device_index(_p)
+            q = _resolve_quality(quality, quality_enhance, transformer, model_config, _dev)
             _mm = getattr(_p, "model", None)
             if _mm is not None and hasattr(_mm, "set_attn_backend"):
                 _mm.set_attn_backend(_attn_backend_to_engine(attention_backend))
             if _mm is not None and hasattr(_mm, "set_sol_tau"):
                 _mm.set_sol_tau(sol_tau)
-            _mm.set_video_enhance(quality_enhance)
+            _apply_quality(_mm, q, _dev)
             if _mm is not None and hasattr(_mm, "set_audio_enhance"):
                 _mm.set_audio_enhance(audio_enhance)
             _mm.set_allow_partial_denoise(bool(allow_partial_denoise))
