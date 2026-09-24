@@ -4,6 +4,7 @@ verbatim from the PROVEN tests/scripts/native_session_t1.py). No tests/lib depen
 """
 import ctypes
 from contextvars import ContextVar
+import glob
 import json
 import mmap
 import os
@@ -1526,6 +1527,99 @@ def _sidecar_preloads(so_path):
     return sorted(want)
 
 
+# The CUDA toolkit libraries whose copy must be torch's: one process holds one cuBLAS/cuSOLVER set. The driver
+# (libcuda.so.1) is the system's and is never matched.
+_CUDA_LIB_RE = re.compile(r"lib(?:cudart|cublas|cublasLt|cusolver|cusolverMg|cusparse|cufft|cufftw|curand|nvrtc"
+                          r"|nvJitLink|cudnn\w*)\.so\.\d+")
+_TORCH_CUDA_ANCHOR_RE = re.compile(r"lib(?:cudart|cublas)\.so\.\d+(?:\.\d+)*")
+
+
+def _mapped_files(maps_text=None):
+    """{basename: {path, ...}} of the files mapped into this process, from /proc/self/maps ({} where there is none).
+    The kernel prints the resolved file, so a soname symlink shows as its versioned target (libcusolver.so.11.6.4.69)."""
+    if maps_text is None:
+        try:
+            with open("/proc/self/maps", encoding="utf-8", errors="replace") as f:
+                maps_text = f.read()
+        except OSError:
+            return {}
+    out = {}
+    for line in maps_text.splitlines():
+        cols = line.split(None, 5)
+        if len(cols) == 6 and cols[5].startswith("/"):
+            path = cols[5].removesuffix(" (deleted)")
+            out.setdefault(os.path.basename(path), set()).add(path)
+    return out
+
+
+def _mapped_as(mapped, soname):
+    """The mapped files that serve `soname`: the file of that name, or its versioned target (soname + '.x.y')."""
+    return {p for name, paths in mapped.items() if name == soname or name.startswith(soname + ".") for p in paths}
+
+
+def _engine_cuda_needs(so_path):
+    """The CUDA toolkit sonames the engine's DT_NEEDED closure asks for: the host's, and those of the files next to it
+    that the closure reaches (its kernel .so, its sidecars)."""
+    d = os.path.dirname(so_path)
+    seen, todo, cuda = {os.path.basename(so_path)}, [os.path.basename(so_path)], set()
+    while todo:
+        for n in _elf_needed(os.path.join(d, todo.pop())):
+            if _CUDA_LIB_RE.fullmatch(n):
+                cuda.add(n)
+            elif n not in seen and os.path.isfile(os.path.join(d, n)):
+                seen.add(n)
+                todo.append(n)
+    return cuda
+
+
+def _torch_cuda_plan(needs, mapped):
+    """(dirs, provided, preloads) for the engine's CUDA sonames `needs`, in a process whose maps are `mapped`.
+    dirs: the folders of torch's CUDA set, found from what torch mapped at import: its libcudart / libcublas. pip
+    spreads the set over sibling <package>/lib folders (nvidia/cublas/lib, nvidia/cuda_runtime/lib, ...), so when two
+    of those anchors sit in different '<x>/lib' folders under one parent, every '<parent>/*/lib' is the set too: torch's
+    cuSOLVER waits there until a linalg call maps it. conda and a system CUDA keep the set in one folder; nothing beside
+    it is added (a sibling conda env is another set).
+    provided: the sonames torch's set has (mapped from dirs, or a file there). preloads: torch's file for each of those
+    not mapped at all yet. Loaded before the engine, it is what the engine's NEEDED soname binds to, instead of the
+    build host's RPATH copy or ld.so.cache's (measured: a CUDA 12.9 libcusolver.so.11 beside torch cu128's cuBLAS ->
+    "undefined symbol: cublasSetEnvironmentMode")."""
+    # ponytail: every mapped libcudart/libcublas is an anchor, so a second copy some other extension mapped widens the
+    # set to its folder; _assert_torch_cuda_family still refuses two copies of one soname.
+    anchors = {os.path.dirname(p) for name, paths in mapped.items() if _TORCH_CUDA_ANCHOR_RE.fullmatch(name)
+               for p in paths}
+    dirs = set(anchors)
+    parents = [os.path.dirname(os.path.dirname(a)) for a in anchors if os.path.basename(a) == "lib"]
+    for parent in {p for p in parents if parents.count(p) > 1}:
+        dirs.update(os.path.realpath(d) for d in glob.glob(os.path.join(parent, "*", "lib")))
+    provided, preloads = set(), []
+    for soname in sorted(needs):
+        if any(os.path.dirname(p) in dirs for p in _mapped_as(mapped, soname)):
+            provided.add(soname)
+            continue
+        path = next((os.path.join(d, soname) for d in sorted(dirs) if os.path.exists(os.path.join(d, soname))), None)
+        if path:
+            provided.add(soname)
+            if not _mapped_as(mapped, soname):
+                preloads.append(path)
+            dirs.add(os.path.dirname(os.path.realpath(path)))   # maps will show the file the soname resolves to
+    return dirs, provided, preloads
+
+
+def _assert_torch_cuda_family(provided, dirs, mapped=None):
+    """After the engine load, each CUDA soname torch's set provides must be mapped from that set only. A copy from
+    anywhere else (the build host's toolkit through the engine's RPATH, a system CUDA through ld.so.cache, a second
+    set another extension loaded) puts two cuBLAS/cuSOLVER families into torch's process: REFUSE, naming the file."""
+    mapped = _mapped_files() if mapped is None else mapped
+    for soname in sorted(provided):
+        foreign = sorted(p for p in _mapped_as(mapped, soname) if os.path.dirname(p) not in dirs)
+        if foreign:
+            raise RuntimeError(
+                f"qf_native: REFUSING the engine — it links {soname}, and this process maps {foreign[0]}, which is not "
+                f"torch's copy (torch's CUDA libraries are in {', '.join(sorted(dirs))}). One process must use one "
+                f"cuBLAS/cuSOLVER set: two of them fail to load or compute wrong. Find what loads that file (another "
+                f"custom node, LD_PRELOAD, LD_LIBRARY_PATH) and remove it.")
+
+
 def load_lib():
     """Load + bind the engine library once. Path comes ONLY from resolve_so_path() (never a workflow
     input). Takes NO argument on purpose — a `so_path` parameter is the attack surface just removed.
@@ -1539,6 +1633,16 @@ def load_lib():
             return _LIB
         so_path = resolve_so_path()
         assert_toolchain_compatible(so_path)   # FORK-2 fail-closed torch-CUDA / .so-CUDA match check
+        # torch's own copy of each CUDA library the engine needs goes in first (_torch_cuda_plan): torch maps its
+        # cuSOLVER only after a linalg call, so without it the engine's libcusolver.so.11 comes from the build host's
+        # RPATH or ld.so.cache — a copy that need not match torch's cuBLAS. After the load _assert_torch_cuda_family
+        # checks every one of them is torch's.
+        cuda_dirs, cuda_provided, cuda_preloads = _torch_cuda_plan(_engine_cuda_needs(so_path), _mapped_files())
+        for p in cuda_preloads:
+            try:
+                ctypes.CDLL(p, mode=ctypes.RTLD_LOCAL)
+            except OSError as e:
+                raise RuntimeError(f"qf_native: could not load torch's own {p}: {e}") from e
         # Sidecar preloads: a library the engine NEEDS that sits next to it may differ from this machine's copy
         # (measured: a scratch engine linked the build box's dynamic OpenCV 4.5d; this box ships 4.6 -> dlopen refused
         # — the SS7.5 portability class); preloaded, it satisfies the engine's NEEDED soname from the loaded image.
@@ -1550,7 +1654,7 @@ def load_lib():
         # bundled cv2. A sidecar that never loads is skipped silently here: the engine dlopen below then fails LOUD with
         # the true unresolved soname.
         so_dir = os.path.dirname(so_path)
-        pending = _sidecar_preloads(so_path)
+        pending = [f for f in _sidecar_preloads(so_path) if f not in cuda_provided]   # torch's copy serves those
         for _ in range(max(1, len(pending))):
             still = []
             for f in pending:
@@ -1569,6 +1673,7 @@ def load_lib():
             # an installed pair that will not load: re-download it once per release, never in a loop
             raise RuntimeError(f"qf_native: {_engine_load_failed(so_path, e)}") from e
         _engine_load_ok(so_path)
+        _assert_torch_cuda_family(cuda_provided, cuda_dirs)
         bound = _bind(lib)
         _LIB_PATH = so_path   # before _LIB: a concurrent caller that sees the library must see its path (the cache key)
         _LIB = bound
