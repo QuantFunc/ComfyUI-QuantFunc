@@ -560,9 +560,8 @@ if _IMPORT_OK:
         if pats and not name_matches_hints(transformer1, pats):
             raise RuntimeError(
                 f"qf_native: transformer1={transformer1!r} does not look like a '{model_config}' "
-                f"transformer1 weight (expected a name matching {pats}). Pick the file the "
-                f"preset names — see the model_config tooltip — or choose the preset "
-                f"matching this file.")
+                f"transformer1 weight (expected a name matching {pats}). Pick a file with such a "
+                f"name, or choose the preset matching this file.")
         # NO aux resolution (user 2026-08-22 "引擎层不应该依赖这个"): the loader depends on
         # nothing but the transformer file(s) themselves. The retired [aux-auto] manifest
         # fallback layer (te/audio_vae/connectors conventional-filename resolution) served
