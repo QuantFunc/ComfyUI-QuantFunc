@@ -102,7 +102,7 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
         self._out_video = None            # reused velocity_out buffer [1,24,T,H,W]
         self._out_audio = None            # reused audio velocity_out buffer [1, K*T, 32]
         self._max_ctx_seq = 0
-        # [step-cache-key] symbolic per-conditioning cfg_context_key (mirrors QFWanModel #B3;
+        # [step-cache-key] symbolic per-conditioning cfg_context_key (_CtxKeyAssigner, engine lighting CLAUDE.md #B3;
         # was constant 0 = kNoCtxKey — the merged the step cache session gate force-computes at
         # key=0, silently disabling EC on this seam). fl2va is single-branch today; the
         # uuid-derived key stays correct if a second cond branch ever appears.
@@ -420,7 +420,7 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
         dev = x_video.device
         B = int(x_video.shape[0])
         cou = transformer_options.get("cond_or_uncond") if isinstance(transformer_options, dict) else None
-        # [step-cache-key] comfy's per-conditioning uuids — symbolic-key source (QFWanModel #B3).
+        # [step-cache-key] comfy's per-conditioning uuids — symbolic-key source (_CtxKeyAssigner).
         cuuids = transformer_options.get("uuids") if isinstance(transformer_options, dict) else None
         if B > 1 and (cou is None or len(cou) != B):
             raise RuntimeError(f"qf_native H3: engine forward is B==1 per cond group but got batch={B} "

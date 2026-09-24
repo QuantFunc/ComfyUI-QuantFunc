@@ -12,19 +12,17 @@
 
 # ComfyUI-QuantFunc
 
-[中文说明](README_zh.md)
-
 ## 1. Introduction
 
 ComfyUI plugin for **QuantFunc** — the fastest diffusion model inference engine. Run quantized text-to-image and image editing models at 2x–11x speed with zero Python model dependencies.
 
 **Key features:**
 - Native C++/CUDA acceleration via `libquantfunc.so` / `quantfunc.dll`
-- SVDQ (offline quantization) + Lighting (runtime quantization) dual engine
-- Zero-cost LoRA stacking
-- Image editing with reference images
-- Export runtime-quantized models with LoRA fusion support
-- Auto-update from ModelScope
+- QuantFunc loaders for MiniMax-H3, LTX-2.5, Krea-2 and Qwen-Image-2.1 that work with ComfyUI's own text encoder, VAE and
+  sampler nodes
+- Changing quality, attention, caches or LoRAs reuses the loaded model: only a different model file loads again
+- Image editing with reference images (Qwen-Image-2.1)
+- The engine installs itself on Linux, checked against the release's published SHA-256 manifest
 
 ## Version History
 
@@ -101,7 +99,9 @@ cd ComfyUI/custom_nodes
 git clone https://github.com/RealJonathanYip/ComfyUI-QuantFunc.git
 ```
 
-The plugin will **automatically download** the latest compatible `libquantfunc.so` (Linux) or `quantfunc.dll` (Windows) from ModelScope on first startup. No manual binary download needed.
+On Linux the plugin **installs its engine by itself** when ComfyUI starts (see [2.5](#25-engine-install-linux)); no
+manual download is needed. On Windows, put `quantfunc.dll` in `bin/windows/` (the automatic install is Linux-only in this
+release).
 
 ### 2.2 Method B: Manual Installation
 
@@ -111,22 +111,24 @@ The plugin will **automatically download** the latest compatible `libquantfunc.s
 ComfyUI/
 └── custom_nodes/
     └── ComfyUI-QuantFunc/
-        ├── __init__.py
-        ├── nodes.py
-        ├── worker.py
-        ├── auto_update.py
+        ├── __init__.py                the loaders (MiniMax-H3, LTX-2, Krea-2, Qwen-Image-2.1) and QuantFunc Native LoRA
+        ├── qf_engine.py               the engine bridge and the engine installer
+        ├── qf_*_modelpatcher.py       one per model family
+        ├── configs/                   one folder per model preset
+        ├── example_workflows/
         └── bin/
             ├── linux/
-            │   └── version.json
+            │   ├── version.json       this plugin's version: it picks the compatible engine
+            │   └── <version>-<class>-cu<major>/   the installed engine (created by the plugin, see 2.5)
             └── windows/
                 └── version.json
 ```
 
-2. Start ComfyUI — the plugin auto-downloads the library binary on first run.
+2. Start ComfyUI. On Linux the plugin installs the engine on the first start (see 2.5).
 
-3. (Optional) To skip auto-download, manually place the binary:
-   - **Linux:** Download `libquantfunc.so` → `bin/linux/`
-   - **Windows:** Download `quantfunc.dll` → `bin/windows/`
+3. To run an engine you built or downloaded yourself instead:
+   - **Linux:** put it at `bin/linux/libquantfunc.so` and create an empty `bin/linux/.dev_lib_lock` (see 2.5).
+   - **Windows:** put `quantfunc.dll` in `bin/windows/`.
 
 ### 2.3 System Requirements
 
@@ -170,68 +172,58 @@ sudo apt install libcudnn9-cuda-13
 - **Visual C++ Redistributable** 2015-2022 ([download](https://aka.ms/vs/17/release/vc_redist.x64.exe))
 - **cuDNN 9.x** ([download](https://developer.nvidia.com/cudnn))
 
-### 2.5 ModelScope Dependency (for auto-update)
+### 2.5 Engine Install (Linux)
 
-Auto-update requires `modelscope` Python package:
+No extra Python package is needed: the installer uses Python's standard library. At every ComfyUI start, in the
+background, it:
 
-```bash
-pip install modelscope
-```
+1. reads the release list on [ModelScope `QuantFunc/Plugin`](https://www.modelscope.cn/models/QuantFunc/Plugin) (HTTPS
+   only) and picks the newest engine compatible with this plugin;
+2. picks the engine for your setup: the host library for torch's CUDA version (12 or 13), and the kernel library for your
+   GPU class, from the release's `sets.json`;
+3. downloads both, checks each file's SHA-256 against the release's `verify.json` and that both come from one build, and
+   installs them into `bin/linux/<version>-<class>-cu<major>/` — all or nothing.
 
-If `modelscope` is not installed, auto-update is silently skipped. You can manually download binaries from:
-- https://www.modelscope.cn/models/QuantFunc/Plugin
+Before every load the plugin hashes the installed files again: a file that changed on disk is not loaded, and it is
+downloaded again. Offline, the installed engine stays in use. Several ComfyUI instances with different GPUs can share one
+plugin folder; each uses the engine for its own GPU.
 
-To keep a locally-built engine library, create an empty `bin/<platform>/.dev_lib_lock`.
-Auto-update then skips its integrity check, which would otherwise see the SHA
-mismatch and re-download the release library over your build. Delete the marker to
-restore normal updating.
+`verify.json` proves the files are the ones published in that same ModelScope repository. It is an integrity check, not a
+signature: it does not protect against the repository itself being changed.
+
+**Your own engine build:** put it at `bin/linux/libquantfunc.so` and create an empty `bin/linux/.dev_lib_lock`. The plugin
+then loads exactly that file, and the installer does not download or change anything (one console line says so). Delete
+the marker to go back to the installed engine. Without the marker a file there is not used: it is usually a copy left by
+an earlier plugin version. (Developers can also point `QF_NATIVE_SO_PATH` at a library; the installer then keeps out too.)
 
 ### 2.6 Verify Installation
 
-After starting ComfyUI, check the console for:
+After ComfyUI starts, the console shows one of:
 
 ```
-[QuantFunc] Checking for updates (plugin v0.0.01, lib v0.0.01)...
-[QuantFunc] Library is up to date (v0.0.01)
+[qf_native] installed QuantFunc engine <version> for <class> GPUs, CUDA <major>
+[qf_native] QuantFunc engine not installed: <why this machine cannot take one>
+[qf_native] QuantFunc engine update failed (<reason>); the installed engine <version> stays in use
+[qf_native] QuantFunc engine install skipped: bin/linux/.dev_lib_lock keeps the local build bin/linux/libquantfunc.so
 ```
 
-If the library was not found:
-
-```
-[QuantFunc] No library found, checking ModelScope for download (plugin v0.0.01)...
-[QuantFunc] Downloading libquantfunc.so v0.0.01 from ModelScope...
-[QuantFunc] Updated libquantfunc.so to v0.0.01. Restart ComfyUI to use the new version.
-```
+A loader run during the first download stops with "still downloading": queue the prompt again after the `installed` line.
 
 ## 3. Usage
 
-See [doc/](doc/) for detailed tutorials and [workflow_sample/README.md](workflow_sample/README.md) for node reference.
+### Quick Start
 
-### Quick Start for Beginners
+Put a QuantFunc model file in ComfyUI's `models/diffusion_models/`, add the QuantFunc loader for it (**QuantFunc
+MiniMax-H3**, **LTX-2**, **Krea-2** or **Qwen-Image-2.1 Loader**) where ComfyUI's diffusion-model loader would go, pick
+the file and its `model_config` preset, and keep ComfyUI's own text encoder, VAE and sampler nodes. The Qwen-Image-2.1
+workflows in [`example_workflows/`](example_workflows/) show the wiring.
 
-The easiest way to get started — add a **Model Auto Loader**, pick a model series from the dropdown, wire it into **Build Pipeline → Generate**, and the plugin auto-downloads everything. No manual model downloads or path configuration needed.
+### 3.1 QuantFunc Models
 
-> **[Quick Start & documentation index →](doc/README.md)**
+QuantFunc's 4-bit models are on [ModelScope](https://www.modelscope.cn/models/QuantFunc) and
+[HuggingFace](https://huggingface.co/QuantFunc).
 
-### 3.1 Runtime Quantization: Quantize BF16/FP16 Models to 4bit for Accelerated Inference
-
-The **Lighting backend** provides **runtime quantization** — it quantizes any diffusers-format BF16/FP16 model (e.g., [Qwen/Qwen-Image-Edit-2511](https://huggingface.co/Qwen/Qwen-Image-Edit-2511)) to 4bit at load time for accelerated inference. Just point **Model Loader** at the FP16 model and leave `transformer_path` empty; the backend is auto-detected — no pre-quantized model download needed.
-
-> **[Model Loading & Runtime Quantization →](doc/model-loading-and-apikey_zh.md)** (Chinese)
-
-### 3.2 Export Runtime-Quantized Models (with LoRA Fusion Support)
-
-The Lighting export saves all runtime-quantized models to disk, so you don't need to re-quantize on every startup. If you've also stacked LoRAs, they are permanently fused into the exported weights — no LoRA nodes needed, no re-quantization, load and go.
-
-> **[Export Quantized Models →](doc/export-quantized-models.md)**
-
-### 3.3 Download and Use Pre-exported Quantized Models
-
-QuantFunc has pre-exported commonly used models (runtime-quantized and ready to use). Download them directly from [ModelScope](https://www.modelscope.cn/models/QuantFunc) or [HuggingFace](https://huggingface.co/QuantFunc) — same 2x–11x inference speedup as runtime quantization, but with faster loading since the quantization step is skipped.
-
-> **[Model Loading & Downloads →](doc/model-loading-and-apikey_zh.md)** (Chinese)
-
-### 3.4 LoRA Format Conversion (Native Loaders)
+### 3.2 LoRA Format Conversion (Native Loaders)
 
 The native loaders (Krea-2 / Qwen-Image-2.1 / LTX-2 / MiniMax-H3) adapt ONE LoRA format — diffusers/PEFT
 canonical. Convert kohya / ai-toolkit LoRAs once with the bundled pure-Python tool (no
@@ -243,16 +235,7 @@ python3 scripts/qf_lora_convert.py --in my_kohya_lora.safetensors --out my_lora-
 
 > **[LoRA Format Converter →](doc/lora-convert.md)**
 
-### 3.5 Example Workflows
-
-Import from [`workflow_sample/`](workflow_sample/):
-
-| File | Use Case |
-|------|----------|
-| `QuantFunc-Sample-WorkFlow-All-In-One.json` | **All-in-one** — every node × 3 model-loading methods × text-to-image / editing / export |
-| `QuantFunc-Ideogram4.json` | Ideogram4 text-to-image with prompt builder |
-| `QuantFunc-QwenImage-Layered.json` | Layered (transparent RGBA) generation + layer viewer |
-| `QuantFunc-ControlNet.json` | ControlNet structure-guided generation |
+### 3.3 Example Workflows
 
 Qwen-Image-2.1 native-loader workflows are in [`example_workflows/`](example_workflows/) — ComfyUI lists them under
 **Templates → ComfyUI-QuantFunc**. They use the stock `CLIPLoader` (type `qwen_image`), `TextEncodeQwenImage21`, VAE and
@@ -277,12 +260,11 @@ on other GPUs its loader shows no `quality` choice and always gives the highest 
 
 | Issue | Solution |
 |-------|----------|
-| Worker failed to start | Check CUDA driver ≥ 560, ensure CUDA runtime libs installed |
-| DLL/SO not found | Check `bin/linux/` or `bin/windows/` contains the library; restart ComfyUI to trigger auto-download |
+| "no QuantFunc engine is installed" / "still downloading" | Linux: the console's `[qf_native]` line from the start says why (still downloading, not installable here, update failed); see 2.5 and 2.6 |
+| Engine library not found (Windows) | Put `quantfunc.dll` in `bin/windows/` |
 | Console shows only warnings | That is the default: the engine prints only warnings and errors |
 | cuDNN BAD_PARAM | Delete cuDNN algo cache and retry |
-| Noisy output | Ensure model backend matches transformer weights (svdq vs lighting) |
-| Auto-update fails | Install `modelscope` package, or manually download from ModelScope |
+| The engine cannot be downloaded (offline) | Put an engine build at `bin/linux/libquantfunc.so` with an empty `bin/linux/.dev_lib_lock` (2.5) |
 
 ## 5. License
 

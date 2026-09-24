@@ -511,7 +511,8 @@ def main():
     #     option NAMES are the user's and stay (a whole-word match, so the step_cache widget name is not a hit).
     import re as _re
     _BANNED = _re.compile(r"prun|token|int4|int8|fp4|w4a4|quanti[sz]|sidecar|rowscale|fast.path|fast.law|\bsteps?\b|precision|"
-                          r"kernel|svdq|denoise_only|easycache|first.block|sol.attn|\bseam\b|lora rank", _re.I)
+                          r"kernel|svdq|denoise_only|easycache|first.block|sol.attn|\bseam\b|lora rank|"
+                          r"\bflash\b|\bsage\b", _re.I)   # A4c: the attention options are named, never explained
     _texts = []
     for _tier_ans in (1, 0):   # both quality forms
         qfn._quality_fast_cache.clear()

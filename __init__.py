@@ -798,9 +798,8 @@ if _IMPORT_OK:
         # default isn't offered on this SM (e.g. H3 wants 'flash' but SM75 has no flash).
         d = default if default in choices else choices[0]
         return (choices, {"default": d,
-                "tooltip": "How attention is computed. auto picks the best choice for your GPU. flash is the most "
-                           "robust; sage can be faster on newer GPUs; fp16_native works on every GPU. Takes effect "
-                           "on the next run."})
+                "tooltip": "auto (default) picks the best setting for your GPU. Try another setting only if a "
+                           "result looks wrong or a run fails on your GPU. Takes effect on the next run."})
 
     def _attn_backend_to_engine(v):
         # widget display name -> engine comp_opts attention_backend string

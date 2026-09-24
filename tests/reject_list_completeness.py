@@ -235,7 +235,7 @@ def _derived_roster_defects():
         # `class QF<Name>Model(comfy.model_base.<Base>):` — the native-seam pattern. <Base> (WAN21/LTXV/…) is
         # the comfy class whose extra_conds the subclass bypasses, i.e. exactly the _AUDITED_MODELS.comfy_class.
         # The base list may carry OTHER bases before the comfy one (the seams are
-        # `class QFWanModel(QFSessionModelMixin, comfy.model_base.WAN21)`), so match the whole
+        # `class QFKrea2Model(QFSessionModelMixin, comfy.model_base.Krea2)`), so match the whole
         # base list and find the comfy base inside it. Pinning comfy.model_base to the FIRST
         # position is what made this scan match NOTHING once the shared mixin was introduced —
         # i.e. the completeness check silently certified nothing (MEASURED, pre-existing).

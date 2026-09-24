@@ -393,14 +393,14 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
         self._step_i = 0
         self._sess_denoise = 0
         self._out = None                     # reused packed velocity_out buffer [1,N,128]
-        # [step-cache-key] symbolic per-conditioning cfg_context_key (mirrors QFWanModel #B3).
+        # [step-cache-key] symbolic per-conditioning cfg_context_key (_CtxKeyAssigner; engine lighting CLAUDE.md #B3).
         # Historically LTX passed 0 (kNoCtxKey) because it engaged NO key-trusting cache
         # (dossier seq-229) — the merged the step cache session gate NOW trusts the key (its §6.5
         # no-key guard force-computes at key=0, silently disabling EC). uuid-derived keys give
         # each cond branch its own EcEntry (no cross-branch collapse) at zero cost when EC off.
         self._ctx_key_assigner = qfmp._CtxKeyAssigner()
         # Max POST-CONNECTOR seq len across a run's cond groups (pos+neg), accumulated in extra_conds and used
-        # to size the engine begin context MAXIMA (see _begin). Ported from QFWanModel: pos/neg can have
+        # to size the engine begin context MAXIMA (see _begin). pos/neg can have
         # DIFFERENT prompt lengths and reach the engine as SEPARATE B==1 step calls against ONE session, while
         # _begin runs on the first group only — so it must be sized to the LARGEST group, not just the first.
         # ★ POST-connector, NOT raw (§6.5 correctness NO-GO): comfy's Embeddings1DConnector does NOT preserve
@@ -410,12 +410,12 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
         self._max_ctx_seq = 0
         self._post_seq_cache = {}            # raw S -> measured post-connector S (see _post_connector_seq)
 
-    # ── engine-conditioning safety layer (mirror of QFWanModel; ported for the CR conformance NO-GO) ──
+    # ── engine-conditioning safety layer (added for the CR conformance NO-GO) ──
     # LTXV.extra_conds (+ the LTXV.concat_cond / BaseModel.extra_conds callees) can consume mask / keyframe /
     # guide / c_concat / controlnet / i2v-concat channels when a corresponding node is wired. This external-
     # session seam runs the engine's OWN t2v schedule from the loader widgets + the connector video_embeds and
     # consumes NONE of them, so a bare _apply_model(**kwargs) would SILENTLY drop them → a plausible-but-wrong
-    # video with no warning. FAIL LOUD instead. This is a DEFENSIVE SUPERSET (like QFWanModel's) — every
+    # video with no warning. FAIL LOUD instead. This is a DEFENSIVE SUPERSET — every
     # consumable key that is neither emitted (cross_attn) nor documented-accepted (attention_mask/frame_rate);
     # its completeness against THIS comfy is machine-checked by tests/reject_list_completeness.py (LTXV entry).
     # denoise_mask is deliberately NOT in this tuple: the Inplace i2v latent route rides it
@@ -474,14 +474,12 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
                     f"'{_k}', which would be silently ignored. Remove the node feeding it. For "
                     f"image-to-video use LTXVImgToVideoInplace on the LATENT path (its noise_mask is "
                     f"applied by comfy's sampler and IS supported); LTXVAddGuide / keyframe nodes are not.")
-        # MIRROR ONLY c_crossattn (the engine's connector consumes it), building `out` BY HAND like QFWanModel —
+        # MIRROR ONLY c_crossattn (the engine's connector consumes it), building `out` BY HAND —
         # we deliberately do NOT call super().extra_conds. Reason: emit EXACTLY the one channel the engine takes,
         # and don't re-enter comfy's cond-building (LTXV.extra_conds + its concat_cond/encode_adm callees), which
-        # would re-populate the very keys we reject. (QFWanModel additionally MUST avoid super() because
-        # WAN21.concat_cond UNCONDITIONALLY derefs the _QFStub's absent patch_embedding.weight; LTXV does NOT
-        # override concat_cond — the effective BaseModel.concat_cond is concat_keys-gated and never touches
-        # diffusion_model — so LTX does not hit that specific crash, but the by-hand pattern is kept for
-        # consistency + a minimal, explicit emitted set.) frame_rate is unused by this seam; attention_mask IS consumed (the connector mask — 19B mask fix).
+        # would re-populate the very keys we reject. (LTXV does not override concat_cond — the effective
+        # BaseModel.concat_cond is concat_keys-gated and never touches diffusion_model — so calling super() would
+        # not crash here; building by hand keeps the emitted set minimal and explicit.) frame_rate is unused by this seam; attention_mask IS consumed (the connector mask — 19B mask fix).
         out = {}
         cross_attn = kwargs.get("cross_attn", None)
         if cross_attn is not None:
@@ -696,7 +694,7 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
         # vemb.shape[1], so the max compares like with like), NOT just this first group's — a longer
         # different-length negative reaches the engine as a SEPARATE B==1 step against this SAME session and
         # must fit the begin maxima. max(...) with this group is the safe fallback if the accumulator was
-        # never populated (cross_attn-less flow). (Ported from QFWanModel; POST-length fix per §6.5.)
+        # never populated (cross_attn-less flow). (POST-length fix per §6.5.)
         _max_seq = max(self._max_ctx_seq, int(vemb_group.shape[1]))
         bpx.max_context_dims = (ctypes.c_int * 3)(int(vemb_group.shape[0]), _max_seq,
                                                   int(vemb_group.shape[2]))
@@ -754,7 +752,7 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
         B = int(xin.shape[0])
         cou = transformer_options.get("cond_or_uncond") if isinstance(transformer_options, dict) else None
         # [step-cache-key] comfy's per-conditioning uuids (aligned with cond_or_uncond) — the
-        # symbolic-key source (see QFWanModel #B3 comment for why NOT the 0/1 role index).
+        # symbolic-key source (see _CtxKeyAssigner for why NOT the 0/1 role index).
         cuuids = transformer_options.get("uuids") if isinstance(transformer_options, dict) else None
         if B > 1 and (cou is None or len(cou) != B):
             raise RuntimeError(f"qf_native LTX: engine forward is B==1 per cond group but got batch={B} "

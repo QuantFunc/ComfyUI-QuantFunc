@@ -25,12 +25,12 @@ bin/windows/resource_cache.json
 # Local Claude Code settings — never publish
 .claude/
 
-# SHA-256 integrity verify: runtime cache + heal-state (per-version manifest cache + marker)
-bin/*/verify-*.json
-bin/*/verify.state
+# The engine installer's files (qf_engine.install_engine): each installed pair's folder, its marker, the install lock.
+bin/*/*-cu[0-9]*/
+bin/*/.engine-*
 
-# Dev-lib lock: local marker that disables auto-update so a self-built engine
-# .so is not clobbered. Never publish — its presence is a per-machine choice.
+# Local-build marker: with bin/<platform>/.dev_lib_lock the plugin loads bin/<platform>/<engine library> (your build)
+# and the installer touches nothing. Never publish — its presence is a per-machine choice.
 bin/*/.dev_lib_lock
 
 # Ad-hoc file/dir backups from deploy + rollback scripts
