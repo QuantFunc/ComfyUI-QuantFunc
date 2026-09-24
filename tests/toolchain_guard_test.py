@@ -10,9 +10,11 @@ must REFUSE such a load, not warn. This test asserts:
       assert_toolchain_compatible directly, so a silent removal of the CALL from load_lib would be
       invisible to them — this arm goes through the PRODUCTION entry point, per the "a suite that bypasses
       the production entry point won't notice a de-wiring" lesson);
-  (C) the real ELF DT_NEEDED parser extracts NEEDED from a genuine binary.
-It monkeypatches _is_elf / _so_cuda_major + installs a fake torch, so it runs anywhere (no CUDA / no real
-torch / no engine .so needed).
+  (C) the real ELF DT_NEEDED parser extracts NEEDED from a genuine binary;
+  (D) Windows: the real PE import reader and the real guard on built PE32+ images (cudart64_N / cuBLAS-only /
+      delay-loaded / no CUDA / truncated / mismatch).
+(A) monkeypatches _is_elf / _so_cuda_major; every arm installs a fake torch, so it runs anywhere (no CUDA / no real
+torch / no engine library needed).
 
 Run: python3 toolchain_guard_test.py   (exit 0 = all correct; exit 1 = a check is wrong)
 """
@@ -58,8 +60,97 @@ _CASES = [
     ("ELF static cudart -> REFUSE",           "13.0", None, False, True,  True),
     ("no torch CUDA (CPU torch) -> REFUSE",   None,   13,   False, True,  True),
     ("override on mismatch -> LOAD",          "12.4", 13,   True,  True,  False),
-    ("NON-ELF (Windows .dll) -> REFUSE",      "13.0", 13,   False, False, True),
+    ("neither ELF nor PE (macOS) -> REFUSE",  "13.0", 13,   False, False, True),
 ]
+
+
+def mk_pe(imports, delay=()):
+    """A minimal PE32+ image (x64): DOS + PE headers and ONE section holding the import table, the delay-load table and
+    the DLL names — what an import reader needs, nothing more."""
+    import struct
+    rva0, off0 = 0x1000, 0x200
+    imp = 20 * (len(imports) + 1)                       # IMAGE_IMPORT_DESCRIPTOR x n + the zero terminator
+    dly = 32 * (len(delay) + 1) if delay else 0          # IMAGE_DELAYLOAD_DESCRIPTOR x n + the zero terminator
+    strings, at = b"", {}
+    for n in (*imports, *delay):
+        at[n] = rva0 + imp + dly + len(strings)
+        strings += n.encode() + b"\0"
+    sec = bytearray(imp + dly) + strings
+    for i, n in enumerate(imports):
+        struct.pack_into("<I", sec, 20 * i + 12, at[n])                   # Name RVA
+    for i, n in enumerate(delay):
+        struct.pack_into("<II", sec, imp + 32 * i, 1, at[n])              # Attributes (RVA-based), DllNameRVA
+    head = bytearray(off0)
+    head[0:2] = b"MZ"
+    struct.pack_into("<I", head, 0x3C, 0x40)
+    head[0x40:0x44] = b"PE\0\0"
+    struct.pack_into("<HHIIIHH", head, 0x44, 0x8664, 1, 0, 0, 0, 240, 0x2022)   # one section, PE32+ optional header
+    opt = 0x44 + 20
+    struct.pack_into("<H", head, opt, 0x20B)
+    struct.pack_into("<I", head, opt + 108, 16)                          # NumberOfRvaAndSizes
+    struct.pack_into("<II", head, opt + 112 + 8 * 1, rva0, imp)          # data directory 1: imports
+    if delay:
+        struct.pack_into("<II", head, opt + 112 + 8 * 13, rva0 + imp, dly)   # data directory 13: delay-load imports
+    sh = opt + 240
+    head[sh:sh + 8] = b".idata\0\0"
+    struct.pack_into("<IIII", head, sh + 8, len(sec), rva0, len(sec), off0)
+    return bytes(head) + bytes(sec)
+
+
+def _pe_arms():
+    """(D) Windows DLLs: the REAL PE import reader and the REAL guard (no monkeypatching): the CUDA major comes from the
+    imported cudart64_N.dll, else cuBLAS's DLL name (a static-cudart DLL), from the import or the delay-load table."""
+    import tempfile
+    tmp = tempfile.mkdtemp(prefix="qf_pe_")
+    bad = 0
+
+    def pe(name, imports, delay=()):
+        p = os.path.join(tmp, name)
+        open(p, "wb").write(mk_pe(imports, delay))
+        return p
+
+    majors = {
+        "cudart 12": (pe("a.dll", ["KERNEL32.dll", "cudart64_12.dll", "cublas64_12.dll"]), 12),
+        "static cudart, cuBLAS 13": (pe("b.dll", ["cublas64_13.dll", "cublasLt64_13.dll", "cudnn64_9.dll"]), 13),
+        "cudart decides over cuBLAS": (pe("c.dll", ["cudart64_12.dll", "cublas64_13.dll"]), 12),
+        "two cudart majors": (pe("d.dll", ["cudart64_12.dll", "cudart64_13.dll"]), None),
+        "no CUDA import": (pe("e.dll", ["KERNEL32.dll", "MSVCP140.dll"]), None),
+        "delay-loaded cudart 13": (pe("f.dll", ["KERNEL32.dll"], delay=["cudart64_13.dll"]), 13),
+    }
+    for label, (p, want) in majors.items():
+        got = qfe._so_cuda_major(p)
+        ok = got == want and qfe._is_pe(p) and not qfe._is_elf(p)
+        print(f"  [{'OK ' if ok else 'FAIL'}] PE {label}: CUDA major {got} (expected {want})")
+        bad += not ok
+    imports = qfe._pe_imports(majors["delay-loaded cudart 13"][0])
+    ok = imports == ["kernel32.dll", "cudart64_13.dll"]
+    print(f"  [{'OK ' if ok else 'FAIL'}] PE import reader: import + delay-load names, lowercased -> {imports}")
+    bad += not ok
+    trunc = os.path.join(tmp, "trunc.dll")
+    open(trunc, "wb").write(mk_pe(["cudart64_12.dll"])[:0x150])        # headers cut: the reader must not guess
+    ok = qfe._pe_imports(trunc) == [] and qfe._so_cuda_major(trunc) is None
+    print(f"  [{'OK ' if ok else 'FAIL'}] PE truncated image: no imports, CUDA major undeterminable")
+    bad += not ok
+    os.environ.pop(qfe._ENV_ALLOW_UNVERIFIED_TOOLCHAIN, None)
+    verdicts = {}
+    for label, torch_cuda, path in (("torch 12 + cudart64_12 DLL -> LOAD", "12.8", majors["cudart 12"][0]),
+                                    ("torch 13 + static-cudart cuBLAS-13 DLL -> LOAD", "13.0",
+                                     majors["static cudart, cuBLAS 13"][0]),
+                                    ("torch 13 + cudart64_12 DLL -> REFUSE (mismatch)", "13.0", majors["cudart 12"][0]),
+                                    ("torch 12 + DLL without CUDA imports -> REFUSE", "12.8", majors["no CUDA import"][0]),
+                                    ("torch 12 + truncated DLL -> REFUSE", "12.8", trunc)):
+        _set_fake_torch(torch_cuda)
+        try:
+            qfe.assert_toolchain_compatible(path)
+            verdicts[label] = "LOAD"
+        except RuntimeError as e:
+            verdicts[label] = "REFUSE (mismatch)" if "MISMATCH" in str(e) else "REFUSE"
+        ok = label.endswith("-> " + verdicts[label])
+        print(f"  [{'OK ' if ok else 'FAIL'}] guard on a real PE: {label}: got {verdicts[label]}")
+        bad += not ok
+    import shutil
+    shutil.rmtree(tmp, ignore_errors=True)
+    return bad
 
 
 def _wiring_ok():
@@ -126,6 +217,7 @@ def main():
         bad += 1
     if not _parser_smoke():
         bad += 1
+    bad += _pe_arms()
     print("TOOLCHAIN_GUARD:", "PASS" if bad == 0 else f"FAIL ({bad} wrong)")
     return 1 if bad else 0
 

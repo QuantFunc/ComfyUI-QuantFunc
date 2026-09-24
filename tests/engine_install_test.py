@@ -117,6 +117,64 @@ def per_arch_release(version="0.0.14"):
     return rel
 
 
+WIN_DLLS = {13: "quantfunc.dll", 12: "quantfunc-12.dll"}
+WIN_SETS = {"sm75": [75], "sm86": [86], "sm89": [89], "sm120a": [120]}   # consumer GPUs only (the Windows ship)
+
+
+class WinRelease(Release):
+    """The Windows per-arch layout (verify_manifest fa97df1d5 on ship-win-perarch): {ver}/windows/sets.json — written by a
+    Windows echo, so CRLF-terminated — and ONE self-contained DLL per set and CUDA major, {ver}/windows/<set>/<dll> (the
+    CLI .exe sits beside it and is never fetched); verify.json section "win32", keyed by those paths."""
+
+    def __init__(self, version="0.0.13", plugin_req="0.0.07"):   # noqa: super().__init__ builds the Linux layout
+        self.files, self.fetched, self.offline, self.version = {}, [], False, version
+        self.entries = {"0.0.12": {"comfy": "0.0.06", "comfy-12": "0.0.06", "lib": "0.0.12", "lib-12": "0.0.12"}}
+        self.add(version, plugin_req)
+
+    def add(self, version, plugin_req="0.0.07", tamper=None):
+        """Publish `version`; tamper=<key>: verify.json lists another SHA-256 for that file (a corrupt/tampered DLL)."""
+        raw = json.dumps({"schema": 2, "sets": WIN_SETS}).encode() + b"\r\n"
+        self.files[f"{version}/windows/sets.json"] = raw
+        body = {"sets.json": sha(raw)}
+        for gset in WIN_SETS:
+            for major, dll in WIN_DLLS.items():
+                for name, data in ((dll, f"DLL-{version}-{gset}-cu{major}".encode()), (dll[:-4] + ".exe", b"CLI")):
+                    self.files[f"{version}/windows/{gset}/{name}"] = data
+                    body[f"{gset}/{name}"] = sha(b"tampered" if tamper == f"{gset}/{name}" else data)
+        self.files[f"{version}/verify.json"] = json.dumps({"schema": 1, "win32": body}).encode()
+        self.entries[version] = {"comfy": plugin_req, "comfy-12": plugin_req, "lib": version, "lib-12": version,
+                                 "kernel_so": True}
+        self.files["version.json"] = json.dumps({"linux": {}, "win32": self.entries}).encode()
+
+
+class _FakeMsvcrt(types.ModuleType):
+    """msvcrt on Linux: records the installer's byte-range lock calls."""
+    LK_UNLCK, LK_LOCK = 0, 1
+
+    def __init__(self):
+        super().__init__("msvcrt")
+        self.calls = []
+
+    def locking(self, fd, mode, nbytes):
+        self.calls.append(("lock" if mode == self.LK_LOCK else "unlock", nbytes))
+
+
+@contextlib.contextmanager
+def windows():
+    """Run qf_engine's Windows paths: its platform constants are read per call; msvcrt is a recorder."""
+    saved = qfe._BIN_SUBDIR, qfe._LIB_BASENAME, sys.modules.get("msvcrt")
+    fake = _FakeMsvcrt()
+    qfe._BIN_SUBDIR, qfe._LIB_BASENAME, sys.modules["msvcrt"] = "windows", "quantfunc.dll", fake
+    try:
+        yield fake
+    finally:
+        qfe._BIN_SUBDIR, qfe._LIB_BASENAME = saved[0], saved[1]
+        if saved[2] is None:
+            sys.modules.pop("msvcrt", None)
+        else:
+            sys.modules["msvcrt"] = saved[2]
+
+
 def fake_needed(path):
     """DT_NEEDED of a fake host: its kernel for the CUDA major it was built for."""
     try:
@@ -839,32 +897,33 @@ def main():
             got = os.path.relpath(qfe.resolve_so_path(), env.dir)
         check(f"two markers claim the SM (legacy folder, newer release in '{newer_set}'): the newest release loads",
               got == f"0.0.14-{newer_set}-cu13/{HOSTS[13]}", got)
-    # 23) not Linux (self-CR round 6, A): the library placed in bin/<platform>/ is what loads there, so a start with it in
-    #     place installs nothing and prints nothing; only a missing library gets the "not installed" hint.
-    saved_sub = qfe._BIN_SUBDIR
+    # 23) a platform with no published engine (macOS; self-CR round 6, A): the library placed in bin/<platform>/ is what
+    #     loads there, so a start with it in place fetches nothing and prints nothing; a missing one gets the hint naming
+    #     the two published platforms.
+    saved = qfe._BIN_SUBDIR, qfe._LIB_BASENAME
     try:
         with Env(Release()) as env:
-            qfe._BIN_SUBDIR = "windows"
-            open(os.path.join(env.dir, qfe._LIB_BASENAME), "wb").write(b"DLL")
+            qfe._BIN_SUBDIR, qfe._LIB_BASENAME = "darwin", "libquantfunc.dylib"
+            open(env.path(qfe._LIB_BASENAME), "wb").write(b"DYLIB")
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
-                try:
-                    placed = qfe.install_engine()
-                except Exception as e:  # noqa: BLE001 — reported by the check, not a crash
-                    placed = f"raised {type(e).__name__}: {e}"
-            placed_status = qfe.engine_install_status()
-            os.remove(os.path.join(env.dir, qfe._LIB_BASENAME))
+                placed = qfe.install_engine()
+            placed_status, placed_path = qfe.engine_install_status(), os.path.relpath(qfe.resolve_so_path(), env.dir)
+            os.remove(env.path(qfe._LIB_BASENAME))
             try:
                 qfe.install_engine()
                 missing = "installed?"
             except qfe.EngineNotInstallable as e:
                 missing = str(e)
+            fetched = list(env.release.fetched)
     finally:
-        qfe._BIN_SUBDIR = saved_sub
-    check("not Linux: a placed library means a quiet start (nothing installed, nothing printed); a missing one gets the "
-          "Linux-only hint", placed is None and buf.getvalue() == "" and "Linux-only" in missing
-          and "local" in str(placed_status), f"placed={placed} printed={buf.getvalue()!r} status={placed_status} "
-          f"missing={missing[:60]!r}")
+        qfe._BIN_SUBDIR, qfe._LIB_BASENAME = saved
+    check("no published engine (macOS): a placed library means a quiet start that loads it; a missing one gets the "
+          "'Linux and Windows only' hint; nothing is fetched",
+          placed is None and buf.getvalue() == "" and "local" in str(placed_status) and placed_path == "libquantfunc.dylib"
+          and "Linux and Windows only" in missing and fetched == [],
+          f"placed={placed} printed={buf.getvalue()!r} status={placed_status} path={placed_path} missing={missing[:70]!r} "
+          f"fetched={fetched}")
     # 27) a crash between the claim and the chosen marker (tests-07 round 6c, A): the other markers give up the SMs FIRST
     #     and the chosen marker is written LAST, so the window leaves NO claimant (refused, reinstalled next start) —
     #     never two for the resolver to guess between.
@@ -1052,6 +1111,118 @@ def main():
                 res[label] = "schema" in str(e) and not env.pairs()
     check("a sets.json that is not schema 2 (the old schema 1, or a float 2.0) is refused loudly, nothing installed",
           res == {"schema 1": True, "float 2.0": True}, res)
+
+    # ── Windows: the SAME installer (tests-07 dispatch, user 「根据自己的显卡型号下载对应so」): one DLL per set + CUDA major ──
+    # 36) every consumer GPU x CUDA major installs EXACTLY its set's DLL into its own folder, marker last: the fetches are
+    #     version.json, verify.json, windows/sets.json and that ONE DLL (never another set, never the CLI .exe), under the
+    #     byte-range lock (lock, then unlock), and the resolver loads it. SM 89 + cu12 -> sm89/quantfunc-12.dll.
+    got, want = {}, {}
+    for sm, gset in ((75, "sm75"), (86, "sm86"), (89, "sm89"), (120, "sm120a")):
+        for major, dll in WIN_DLLS.items():
+            rel = WinRelease()
+            with windows() as ms, Env(rel, torch_major=major, driver_major=13, sm=sm, machine="AMD64") as env:
+                m = qfe.install_engine() or {}
+                folder = f"0.0.13-{gset}-cu{major}"
+                got[(sm, major)] = (m.get("set"), m.get("host"), m.get("kernel"), sorted(m.get("sha256", {})),
+                                    env.read(folder, dll) == rel.files[f"0.0.13/windows/{gset}/{dll}"],
+                                    os.path.relpath(qfe.resolve_so_path(), env.dir), rel.fetched, ms.calls,
+                                    env.marker(gset, major) == m, env.leftovers())
+                want[(sm, major)] = (gset, dll, None, [dll], True, f"{folder}/{dll}",
+                                     ["version.json", "0.0.13/verify.json", "0.0.13/windows/sets.json",
+                                      f"0.0.13/windows/{gset}/{dll}"], [("lock", 1), ("unlock", 1)], True, [])
+    check("Windows: each consumer GPU x CUDA major installs exactly its own DLL (SM 89 + cu12 -> sm89/quantfunc-12.dll), "
+          "fetches nothing else, locks, and loads it", got == want,
+          {k: v for k, v in got.items() if v != want[k]} or "all 8")
+    # 37) a wrong SHA-256: nothing of the new release is put in place and the older verified DLL stays installed + loaded.
+    rel = WinRelease("0.0.13")
+    with windows(), Env(rel, torch_major=12, sm=89, machine="AMD64") as env:
+        qfe.install_engine()
+        rel.add("0.0.14", tamper="sm89/quantfunc-12.dll")
+        try:
+            qfe.install_engine()
+            outcome = "installed!"
+        except RuntimeError as e:
+            outcome = "published SHA-256" in str(e)
+        kept = (env.marker("sm89", 12) or {}).get("version"), os.path.relpath(qfe.resolve_so_path(), env.dir)
+        new_dll = env.read("0.0.14-sm89-cu12", "quantfunc-12.dll")
+        left = env.leftovers()
+    check("Windows: a DLL whose SHA-256 does not match is never put in place; the older verified DLL stays installed and "
+          "loaded", outcome is True and kept == ("0.0.13", "0.0.13-sm89-cu12/quantfunc-12.dll") and new_dll is None
+          and left == [], f"{outcome} kept={kept} new={new_dll is not None} left={left}")
+    # 38) a GPU with no Windows set (the server classes are Linux-only): refused by name with the published SMs, nothing
+    #     installed, never the nearest set's DLL.
+    refused = {}
+    for sm in (80, 90, 100):
+        with windows(), Env(WinRelease(), torch_major=13, sm=sm, machine="AMD64") as env:
+            try:
+                qfe.install_engine()
+                refused[sm] = "installed!"
+            except qfe.EngineNotInstallable as e:
+                refused[sm] = (f"SM {sm // 10}.{sm % 10}" in str(e) and "7.5, 8.6, 8.9, 12.0" in str(e)
+                               and not env.pairs())
+    check("Windows: a GPU with no published set is refused by name (with the published SMs), nothing installed",
+          refused == {80: True, 90: True, 100: True}, refused)
+    # 39) a newer compatible release replaces the older one on the next start (into a NEW folder, the marker flips); the
+    #     replaced folder stays until the following install (a process may still have that DLL loaded), and a release
+    #     that needs a newer plugin is not taken.
+    rel = WinRelease("0.0.13")
+    with windows(), Env(rel, torch_major=13, sm=120, machine="AMD64") as env:
+        qfe.install_engine()
+        rel.add("0.0.14")
+        rel.add("0.0.15", plugin_req="0.0.08")                   # needs a newer plugin: never picked by 0.0.07
+        m14 = qfe.install_engine() or {}
+        after14 = (m14.get("version"), os.path.relpath(qfe.resolve_so_path(), env.dir), env.pairs())
+        rel.add("0.0.16")
+        qfe.install_engine()
+        after16 = env.pairs()
+    check("Windows: a newer compatible release replaces the older on the next start (new folder, marker flips); the "
+          "replaced folder goes at the following install; one needing a newer plugin is not taken",
+          after14 == ("0.0.14", "0.0.14-sm120a-cu13/quantfunc.dll", ["0.0.13-sm120a-cu13", "0.0.14-sm120a-cu13"])
+          and after16 == ["0.0.14-sm120a-cu13", "0.0.16-sm120a-cu13"], f"after 0.0.14: {after14}; after 0.0.16: {after16}")
+    # 40) the gate: a win32 entry without "kernel_so": true (the classic monolith 0.0.12) is never installed by this
+    #     installer, whatever the plugin version; nothing but version.json is fetched.
+    rel = WinRelease("0.0.13")
+    del rel.entries["0.0.13"]
+    rel.files["version.json"] = json.dumps({"linux": {}, "win32": rel.entries}).encode()
+    with windows(), Env(rel, torch_major=13, sm=89, machine="AMD64") as env:
+        try:
+            qfe.install_engine()
+            gated = "installed!"
+        except qfe.EngineNotInstallable as e:
+            gated = "per-architecture layout" in str(e) and rel.fetched == ["version.json"] and not env.pairs()
+    check("Windows: only a release gated with kernel_so is installed (the classic 0.0.12 monolith never is)", gated is True,
+          f"{gated} fetched={rel.fetched}")
+    # 41) the classic updater's bin/windows/quantfunc.dll (left by 0.0.06): WITHOUT the lock it is ignored — the per-set
+    #     DLL is installed and loads; WITH bin/windows/.dev_lib_lock it is the local build: nothing fetched, one line.
+    rel = WinRelease("0.0.13")
+    with windows(), Env(rel, torch_major=12, sm=89, machine="AMD64") as env:
+        open(env.path("quantfunc.dll"), "wb").write(b"CLASSIC-0.0.12")
+        qfe.install_engine()
+        unlocked = os.path.relpath(qfe.resolve_so_path(), env.dir)
+    rel = WinRelease("0.0.13")
+    with windows(), Env(rel, torch_major=12, sm=89, machine="AMD64") as env:
+        open(env.path("quantfunc.dll"), "wb").write(b"LOCAL-BUILD")
+        open(env.path(qfe._ENGINE_LOCAL_BUILD_LOCK), "w").close()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            skipped = qfe.install_engine()
+        locked = os.path.relpath(qfe.resolve_so_path(), env.dir), rel.fetched, buf.getvalue().count("install skipped")
+    check("Windows: a placed quantfunc.dll without the lock is ignored (the per-set DLL loads); under the lock it is the "
+          "local build (nothing fetched, one line)",
+          unlocked == "0.0.13-sm89-cu12/quantfunc-12.dll" and skipped is None and locked == ("quantfunc.dll", [], 1),
+          f"unlocked={unlocked} locked={locked}")
+    # 42) one engine per process = one GPU architecture on Windows too: GPU 0 (SM 89) installs sm89; a pipeline on GPU 1
+    #     (SM 86) is refused with the hint.
+    with windows(), Env(WinRelease(), torch_major=12, sm={0: 89, 1: 86}, machine="AMD64") as env:
+        qfe.install_engine()
+        second = {}
+        for dev in (0, 1):
+            try:
+                qfe.make_create_params(model_dir=env.dir, device_idx=dev)
+                second[dev] = "ok"
+            except RuntimeError as e:
+                second[dev] = "refused" if "one ComfyUI per GPU architecture" in str(e) else f"other: {str(e)[:60]}"
+    check("Windows: a second GPU architecture in one process is refused loudly", second == {0: "ok", 1: "refused"}, second)
     print("ENGINE_INSTALL:", "PASS" if bad == 0 else f"FAIL ({bad} wrong)")
     return 1 if bad else 0
 

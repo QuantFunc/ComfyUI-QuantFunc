@@ -2,6 +2,7 @@
 native ComfyUI loader. Structs mirror include/quantfunc.h (session structs copied
 verbatim from the PROVEN tests/scripts/native_session_t1.py). No tests/lib dependency.
 """
+import contextlib
 import ctypes
 from contextvars import ContextVar
 import glob
@@ -812,22 +813,37 @@ def info(msg, *args, flush=True):
     if _LOG_LEVEL is not None and _LOG_LEVEL <= _LOG_INFO:
         print(msg % args if args else msg, flush=flush)
 
-# ── Engine library install (option C, user 2026-09-24 「在原生加载器里实现」) ─────────────────────────────────────────
-# The plugin installs the engine it needs into bin/linux/: ONE pair — the host library for torch's CUDA major (the FORK-2
-# guard refuses any other) and the kernel library of this GPU's class — SHA-256-verified against the release's published
-# verify.json, and one build (the same .qf_pair_id in both). The release publishes one host per CUDA major
-# ({ver}/linux/<host>) and one kernel per class and major ({ver}/linux/<set>/<kernel>), keyed by those paths in
-# verify.json. Installed layout; every pair is self-contained (the host finds its kernel in its folder through $ORIGIN):
-#   bin/linux/<version>-<set>-cu<major>/{host, kernel}   one pair per (release, GPU class, CUDA major)
-#   bin/linux/.engine-<set>-cu<major>.json              its marker: names the loadable pair, records both SHA-256s
-# The marker is written LAST (an atomic rename), so a pair becomes loadable only once both files are verified and in
-# place, and a marked pair is never modified (a same-version re-install drops the marker first). Two ComfyUI instances of
-# different GPU classes (or CUDA majors) sharing this folder keep separate pairs and markers. resolve_so_path loads only
-# a marked pair whose files still hash to its marker (R5: a failed or unverified library never runs). The installer
-# keeps out entirely when QF_NATIVE_SO_PATH names the library or bin/<platform>/.dev_lib_lock marks a local build there.
+# ── Engine library install (option C, user 2026-09-24 「在原生加载器里实现」「根据自己的显卡型号下载对应so」) ──────────
+# The plugin installs the engine it needs into bin/<platform>/, SHA-256-verified against the release's published
+# verify.json. ONE installer for both published platforms; what differs is one row of _ENGINE_PLATFORMS:
+#   Linux: a pair — the host library for torch's CUDA major (the FORK-2 guard refuses any other) and the kernel library of
+#     this GPU's class, one build (the same .qf_pair_id in both). Published as {ver}/linux/<host> (one per CUDA major) and
+#     {ver}/linux/<set>/<kernel> (one per class and major); the host finds its kernel in its folder through $ORIGIN.
+#   Windows: ONE self-contained DLL per class and CUDA major, {ver}/windows/<set>/<dll> (no companion, no pair id).
+# Both are keyed by those paths in verify.json (section "linux" / "win32"), with sets.json under {ver}/<folder>/.
+# Installed layout, one folder per (release, GPU class, CUDA major):
+#   bin/<platform>/<version>-<set>-cu<major>/{host[, kernel]}
+#   bin/<platform>/.engine-<set>-cu<major>.json          its marker: names the loadable files, records their SHA-256s
+# The marker is written LAST (an atomic rename), so a folder becomes loadable only once its files are verified and in
+# place, and a marked folder is never modified (a same-version re-install drops the marker first). A new release always
+# goes into a NEW folder: a loaded Windows DLL cannot be replaced, and a folder whose DLL another process still has loaded
+# cannot be deleted either (it stays, ignored, until the next install removes it). Two ComfyUI instances of different GPU
+# classes (or CUDA majors) sharing this folder keep separate folders and markers. resolve_so_path loads only a marked
+# folder whose files still hash to its marker (R5: a failed or unverified library never runs). The installer keeps out
+# entirely when QF_NATIVE_SO_PATH names the library or bin/<platform>/.dev_lib_lock marks a local build there.
 # EVERY name this installer uses lives in this block; nothing it writes or fetches is named by the server.
 _ENGINE_BASE_URL = "https://www.modelscope.cn/models/QuantFunc/Plugin/resolve/master"   # HTTPS only (checked per fetch)
-_ENGINE_HOSTS = {13: "libquantfunc.so", 12: "libquantfunc-12.so"}   # Linux host library per CUDA major
+# The published platforms, by bin/<platform>/ name. key: the platform's section of version.json and verify.json; folder:
+# its folder under {ver}/; arches: platform.machine() of the published engines; hosts: the engine library per CUDA major;
+# kernel: True = a host plus one kernel library per GPU class (Linux), False = one self-contained library per class.
+# version.json gates a release for this installer with "kernel_so": true on BOTH platforms ("published in the per-arch
+# installer layout"; tests-07 ruling 2026-09-24: no second field).
+_ENGINE_PLATFORMS = {
+    "linux": {"key": "linux", "folder": "linux", "arches": ("x86_64",), "kernel": True,
+              "hosts": {13: "libquantfunc.so", 12: "libquantfunc-12.so"}},
+    "windows": {"key": "win32", "folder": "windows", "arches": ("AMD64",), "kernel": False,
+                "hosts": {13: "quantfunc.dll", 12: "quantfunc-12.dll"}},
+}
 _ENGINE_KERNEL_RE = re.compile(r"libquantfunc_kernels[-A-Za-z0-9_.]*\.so")   # the host's DT_NEEDED names its kernel
 _ENGINE_VERSION_RE = re.compile(r"\d+\.\d+\.\d+")    # a release version: a URL path segment and part of a folder name
 _ENGINE_SET_RE = re.compile(r"[a-z][a-z0-9_]{0,31}")  # a GPU class from sets.json: a URL path segment, part of a name
@@ -836,7 +852,6 @@ _ENGINE_SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _ENGINE_PAIR_ID_RE = re.compile(r"[0-9a-f]{32}")      # .qf_pair_id: one id per release and CUDA major, in every file
 _ENGINE_MARKER_RE = re.compile(r"\.engine-([a-z][a-z0-9_]{0,31})-cu(\d+)\.json")
 _ENGINE_PAIR_RE = re.compile(r"(\d+\.\d+\.\d+)-([a-z][a-z0-9_]{0,31})-cu(\d+)")
-_ENGINE_ARCHES = ("x86_64",)                          # platform.machine() of the published Linux engines
 _ENGINE_LOCAL_BUILD_LOCK = ".dev_lib_lock"            # bin/<platform>/.dev_lib_lock: bin/<platform>/<lib> is a local build
 _ENGINE_INSTALL_LOCKFILE = ".engine-install.lock"     # flock: one installer per plugin folder, across ComfyUI instances
 _ENGINE_REINSTALLED = ".reinstalled"                  # in a pair folder: re-downloaded once already after a failed load
@@ -868,6 +883,11 @@ def _engine_bin_dir():
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "bin", _BIN_SUBDIR)
 
 
+def _engine_platform():
+    """This platform's row of _ENGINE_PLATFORMS, or None where no engine is published (read per call, never cached)."""
+    return _ENGINE_PLATFORMS.get(_BIN_SUBDIR)
+
+
 def _torch_cuda_major():
     """torch's CUDA major (13 for "13.0"), or None for a CPU-only / unreadable torch. The ONE parse of it."""
     try:
@@ -880,7 +900,7 @@ def _torch_cuda_major():
 def _driver_cuda_major():
     """The newest CUDA major the installed driver runs (cuDriverGetVersion 13010 -> 13), or None."""
     try:
-        cuda = ctypes.CDLL("libcuda.so.1")
+        cuda = ctypes.CDLL("nvcuda.dll" if _BIN_SUBDIR == "windows" else "libcuda.so.1")
         v = ctypes.c_int(0)
         if cuda.cuDriverGetVersion(ctypes.byref(v)) != 0:
             return None
@@ -952,11 +972,11 @@ def engine_choice(device_idx=0):
     if torch_major is None:   # the resolver loads the pair for torch's CUDA major: nothing else would ever load
         raise EngineNotInstallable("PyTorch reports no CUDA version (a CPU-only PyTorch?); the QuantFunc engine needs a "
                                    "CUDA build of PyTorch; no engine was installed")
-    major = torch_major
-    if major not in _ENGINE_HOSTS:
+    major, hosts = torch_major, _engine_platform()["hosts"]
+    if major not in hosts:
         raise EngineNotInstallable(
             f"no QuantFunc engine is published for CUDA {major if major is not None else 'unknown'} "
-            f"(torch CUDA {torch_major}, driver CUDA {driver_major}); published: CUDA {sorted(_ENGINE_HOSTS)}")
+            f"(torch CUDA {torch_major}, driver CUDA {driver_major}); published: CUDA {sorted(hosts)}")
     if driver_major is not None and driver_major < major:
         raise EngineNotInstallable(
             f"your NVIDIA driver runs up to CUDA {driver_major}, but torch uses CUDA {major}: update the driver; "
@@ -1004,13 +1024,16 @@ def _read_marker(path):
     """A pair's marker, or None. Every field is checked before it can name anything: the marker is a local file, but
     its fields become the folder and file names the loader opens."""
     name = _ENGINE_MARKER_RE.fullmatch(os.path.basename(path))
+    plat = _engine_platform()
     try:
         with open(path, encoding="utf-8") as f:
             m = json.load(f)
+        files = [m["host"], m["kernel"]] if plat["kernel"] else [m["host"]]
         ok = (name is not None and m["set"] == name.group(1) and type(m["cuda"]) is int and m["cuda"] == int(name.group(2))
-              and _ENGINE_VERSION_RE.fullmatch(m["version"]) is not None and m["host"] == _ENGINE_HOSTS.get(m["cuda"])
-              and _ENGINE_KERNEL_RE.fullmatch(m["kernel"]) is not None and all(type(s) is int for s in m["sms"])
-              and sorted(m["sha256"]) == sorted((m["host"], m["kernel"]))
+              and _ENGINE_VERSION_RE.fullmatch(m["version"]) is not None and m["host"] == plat["hosts"].get(m["cuda"])
+              and (_ENGINE_KERNEL_RE.fullmatch(m["kernel"]) is not None if plat["kernel"] else m["kernel"] is None)
+              and all(type(s) is int for s in m["sms"])
+              and sorted(m["sha256"]) == sorted(files)
               and all(_ENGINE_SHA256_RE.fullmatch(h) for h in m["sha256"].values()))
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         return None
@@ -1086,9 +1109,10 @@ def _pair_intact(m):
 
 
 def _manifest_key(gpu_set, name):
-    """A file's key in verify.json, which is also its path under {ver}/linux/: a host is one per CUDA major, a kernel
-    one per class."""
-    return name if name in _ENGINE_HOSTS.values() else f"{gpu_set}/{name}"
+    """A file's key in verify.json, which is also its path under {ver}/<folder>/: a Linux host is one per CUDA major, a
+    kernel (Linux) or a whole library (Windows) one per class."""
+    plat = _engine_platform()
+    return name if plat["kernel"] and name in plat["hosts"].values() else f"{gpu_set}/{name}"
 
 
 def _engine_sets(version, hashes):
@@ -1097,7 +1121,7 @@ def _engine_sets(version, hashes):
     if "sets.json" not in hashes:
         raise RuntimeError(f"the {version} release publishes no sets.json, so its GPU classes are unknown; no engine "
                            f"was installed")
-    raw = _engine_http_get(f"{_ENGINE_BASE_URL}/{version}/linux/sets.json")
+    raw = _engine_http_get(f"{_ENGINE_BASE_URL}/{version}/{_engine_platform()['folder']}/sets.json")
     import hashlib
     if hashlib.sha256(raw).hexdigest() != hashes["sets.json"]:
         raise RuntimeError(f"the {version} sets.json does not match its published SHA-256")
@@ -1143,25 +1167,48 @@ def install_engine(device_idx=None):
         _engine_status("local", why)
         print(f"[qf_native] QuantFunc engine install skipped: {why}", flush=True)
         return None
-    if _BIN_SUBDIR != "linux":
-        # ponytail: Linux only — the host/kernel split ships for Linux; Windows ships one dll whose install layout is
-        # not published yet. Add it here when it is. The library placed in bin/<platform>/ (or the package root) is
-        # what loads there (resolve_so_path): with it in place there is nothing to install or to say at every start.
+    plat = _engine_platform()
+    if plat is None:
+        # No engine is published for this platform: the library placed in bin/<platform>/ (or the package root) is what
+        # loads here (resolve_so_path); with it in place there is nothing to install or to say at every start.
         if any(os.path.isfile(os.path.join(d, _LIB_BASENAME))
                for d in (_engine_bin_dir(), os.path.dirname(os.path.abspath(__file__)))):
             _engine_status("local", f"bin/{_BIN_SUBDIR}/{_LIB_BASENAME}")
             return None
-        raise EngineNotInstallable(f"automatic engine install is Linux-only in this release; put the engine library in "
-                                   f"bin/{_BIN_SUBDIR}/")
-    if platform.machine() not in _ENGINE_ARCHES:
-        raise EngineNotInstallable(f"QuantFunc engines are published for {'/'.join(_ENGINE_ARCHES)} Linux only, and this "
+        raise EngineNotInstallable(f"QuantFunc engines are published for Linux and Windows only; put the engine library "
+                                   f"in bin/{_BIN_SUBDIR}/")
+    if platform.machine() not in plat["arches"]:
+        raise EngineNotInstallable(f"QuantFunc engines are published for {'/'.join(plat['arches'])} only, and this "
                                    f"machine is {platform.machine() or 'unknown'}; no engine was installed")
     bin_dir = _engine_bin_dir()
     os.makedirs(bin_dir, exist_ok=True)
-    import fcntl
-    with open(os.path.join(bin_dir, _ENGINE_INSTALL_LOCKFILE), "a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)     # released when the file closes, also when the process dies
+    with _install_lock(os.path.join(bin_dir, _ENGINE_INSTALL_LOCKFILE)):
         return _install_pair(bin_dir, _ENGINE_DEVICE if device_idx is None else int(device_idx))
+
+
+@contextlib.contextmanager
+def _install_lock(path):
+    """One installer per plugin folder at a time, across ComfyUI instances: flock on Linux, a byte-range lock on Windows.
+    Waits for the other installer like flock does; released when this block ends, also when the process dies."""
+    with open(path, "a+b") as f:
+        if _BIN_SUBDIR == "windows":
+            import msvcrt
+            f.seek(0)
+            while True:
+                try:
+                    msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)   # LK_LOCK itself retries for ~10 s, then raises
+                    break
+                except OSError:
+                    continue                                        # still held by the other installer: keep waiting
+            try:
+                yield
+            finally:
+                f.seek(0)
+                msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(f, fcntl.LOCK_EX)
+            yield
 
 
 def _install_pair(bin_dir, device_idx):
@@ -1174,25 +1221,26 @@ def _install_pair(bin_dir, device_idx):
         raise RuntimeError(f"cannot read this plugin's version from bin/{_BIN_SUBDIR}/{_ENGINE_PLUGIN_VERSION_FILE}: {e}")
     if not _ENGINE_VERSION_RE.fullmatch(plugin_version):
         raise RuntimeError(f"malformed plugin version {plugin_version!r}")
-    versions = json.loads(_engine_http_get(f"{_ENGINE_BASE_URL}/version.json")).get("linux")
+    plat = _engine_platform()
+    versions = json.loads(_engine_http_get(f"{_ENGINE_BASE_URL}/version.json")).get(plat["key"])
     version = _engine_pick_version(versions, plugin_version, major)
     if version is None:
-        raise EngineNotInstallable(f"no published engine with the host/kernel split is compatible with this plugin "
+        raise EngineNotInstallable(f"no published engine with the per-architecture layout is compatible with this plugin "
                                    f"({plugin_version}, CUDA {major})")
     manifest = json.loads(_engine_http_get(f"{_ENGINE_BASE_URL}/{version}/verify.json"))
     # verify.json = {"schema": 1, "<platform>": {"<set>/<file>": sha256}} (the engine's verify_manifest.py); its release
     # is its path, so there is no version key to check.
     if not (isinstance(manifest, dict) and isinstance(manifest.get("schema"), int)
-            and 1 <= manifest["schema"] <= _ENGINE_VERIFY_SCHEMA_MAX and isinstance(manifest.get("linux"), dict)):
+            and 1 <= manifest["schema"] <= _ENGINE_VERIFY_SCHEMA_MAX and isinstance(manifest.get(plat["key"]), dict)):
         raise RuntimeError(f"the {version} verify.json is not a manifest this plugin understands")
-    hashes = manifest["linux"]
+    hashes = manifest[plat["key"]]
     sets = _engine_sets(version, hashes)
     gpu_set = next((k for k, sms in sets.items() if sm in sms), None)   # EXACT architecture: never a nearest match
     if gpu_set is None:
         published = ", ".join(f"{s // 10}.{s % 10}" for s in sorted({s for v in sets.values() for s in v}))
         raise EngineNotInstallable(f"no QuantFunc engine is published for this GPU's architecture (SM {sm // 10}.{sm % 10}); "
                                    f"the {version} release has kernels for SM {published}; no engine was installed")
-    host = _ENGINE_HOSTS[major]
+    host = plat["hosts"][major]
     marker = os.path.join(bin_dir, f".engine-{gpu_set}-cu{major}.json")
     have = _read_marker(marker)
     known_bad = None
@@ -1205,28 +1253,29 @@ def _install_pair(bin_dir, device_idx):
         known_bad, have = version, None
     pair = os.path.join(bin_dir, f"{version}-{gpu_set}-cu{major}")
     os.makedirs(pair, exist_ok=True)
-    got, parts = {}, []
+    got, parts, kernel = {}, [], None
     try:
-        for name in (host, None):                   # the host first: its DT_NEEDED names the kernel
+        for name in ((host, None) if plat["kernel"] else (host,)):   # the host first: its DT_NEEDED names the kernel
             if name is None:
                 needed = [n for n in _elf_needed(parts[0]) if _ENGINE_KERNEL_RE.fullmatch(n)]
                 if len(needed) != 1:
                     raise RuntimeError(f"the {version} host library names {len(needed)} QuantFunc kernel libraries "
                                        f"(expected exactly one): {needed}")
-                name = needed[0]
+                name = kernel = needed[0]
             key = _manifest_key(gpu_set, name)
             if not _ENGINE_SHA256_RE.fullmatch(str(hashes.get(key, ""))):
                 raise RuntimeError(f"the {version} manifest has no SHA-256 for {key}")
             parts.append(os.path.join(pair, f".{name}.part"))
-            got[name] = _engine_fetch_to(f"{_ENGINE_BASE_URL}/{version}/linux/{key}", parts[-1], f"engine {version}: {name}")
+            got[name] = _engine_fetch_to(f"{_ENGINE_BASE_URL}/{version}/{plat['folder']}/{key}", parts[-1],
+                                         f"engine {version}: {name}")
             if got[name] != hashes[key]:
                 raise RuntimeError(f"{key} does not match its published SHA-256 (download corrupt or tampered)")
-        kernel = next(n for n in got if n != host)
-        ids = [_elf_pair_id(p) for p in parts]      # [host, kernel]
-        if ids[0] is None or ids[0] != ids[1]:
-            raise RuntimeError(f"the {version} host and kernel libraries are not one build (pair ids {ids[0]} / {ids[1]}); "
-                               f"nothing was installed")
-        for n in (kernel, host):                    # the KERNEL first: a host is never in place without its kernel
+        if kernel:
+            ids = [_elf_pair_id(p) for p in parts]      # [host, kernel]
+            if ids[0] is None or ids[0] != ids[1]:
+                raise RuntimeError(f"the {version} host and kernel libraries are not one build (pair ids {ids[0]} / "
+                                   f"{ids[1]}); nothing was installed")
+        for n in ([kernel] if kernel else []) + [host]:   # the KERNEL first: a host is never in place without its kernel
             os.replace(os.path.join(pair, f".{n}.part"), os.path.join(pair, n))
     except Exception as e:
         if known_bad:
@@ -1240,7 +1289,7 @@ def _install_pair(bin_dir, device_idx):
             except OSError:
                 pass
     m = {"version": version, "set": gpu_set, "cuda": major, "sms": sets[gpu_set], "host": host, "kernel": kernel,
-         "sha256": {host: got[host], kernel: got[kernel]}}
+         "sha256": got}
     _claim(bin_dir, marker, sets[gpu_set], chosen=m)       # the other markers give up its SMs, then this marker, LAST
     keep = {_pair_dir(m), have and _pair_dir(have)}
     for d in os.listdir(bin_dir):
@@ -1326,9 +1375,9 @@ def resolve_so_path():
       2. bin/<platform>/.dev_lib_lock present — the local build bin/<platform>/<basename> (or the package
          root); the installer keeps out of that folder. Without the lock a library there is ignored: on an
          upgraded install it is the previous updater's copy.
-      3. Linux: the installed pair for this process (torch's CUDA major, ComfyUI's device), returned only
-         while both its files hash to its marker; a pair that does not is refused, its marker dropped and
-         a re-download started. Other platforms: a library placed in bin/<platform>/ (or the package root).
+      3. Linux and Windows: the installed engine for this process (torch's CUDA major, ComfyUI's device),
+         returned only while its files hash to its marker; one that does not is refused, its marker dropped
+         and a re-download started. Other platforms: a library placed in bin/<platform>/ (or the package root).
     Returns a realpath; raises loudly if nothing usable exists."""
     pkg = os.path.dirname(os.path.abspath(__file__))
     bin_dir = _engine_bin_dir()
@@ -1338,7 +1387,7 @@ def resolve_so_path():
             raise RuntimeError(f"qf_native: {_ENV_SO_OVERRIDE} names {override!r}, which is not a file")
         return os.path.realpath(override)
     local = os.path.exists(os.path.join(bin_dir, _ENGINE_LOCAL_BUILD_LOCK))
-    if local or _BIN_SUBDIR != "linux":
+    if local or _engine_platform() is None:
         for c in (os.path.join(bin_dir, _LIB_BASENAME), os.path.join(pkg, _LIB_BASENAME)):
             if os.path.isfile(c):
                 return os.path.realpath(c)
@@ -1460,14 +1509,62 @@ def _is_elf(path):
         return False
 
 
+def _is_pe(path):
+    """True iff `path` begins with the PE/DOS magic ("MZ"): a Windows DLL, whose imports _pe_imports reads."""
+    try:
+        with open(path, "rb") as f:
+            return f.read(2) == b"MZ"
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _pe_imports(path):
+    """The DLL names a Windows PE image imports (its import table and its delay-load table), lowercased, via a
+    pure-stdlib parse. Returns [] on ANY parse failure (the toolchain guard then fails closed)."""
+    def read(data):
+        if data[:2] != b"MZ":
+            return []
+        pe = struct.unpack_from("<I", data, 0x3C)[0]
+        if data[pe:pe + 4] != b"PE\0\0":
+            return []
+        nsec, opt_size = struct.unpack_from("<H", data, pe + 6)[0], struct.unpack_from("<H", data, pe + 20)[0]
+        opt = pe + 24
+        dirs = opt + (112 if struct.unpack_from("<H", data, opt)[0] == 0x20B else 96)   # PE32+ / PE32 data directories
+        secs = [struct.unpack_from("<IIII", data, opt + opt_size + 40 * i + 8) for i in range(nsec)]
+
+        def at(rva):   # file offset of an RVA: through the section that holds it
+            return next(ptr + rva - va for vsize, va, raw, ptr in secs if va <= rva < va + max(vsize, raw))
+
+        names = []
+        for index, size, name_at in ((1, 20, 12), (13, 32, 4)):   # (directory, descriptor size, name RVA offset)
+            rva = struct.unpack_from("<I", data, dirs + 8 * index)[0]
+            if not rva:
+                continue
+            off = at(rva)
+            while True:
+                name_rva = struct.unpack_from("<I", data, off + name_at)[0]
+                if not name_rva:
+                    break
+                names.append(_cstr(data, at(name_rva)).lower())
+                off += size
+        return names
+    return _elf_map(path, read) or []
+
+
 def _so_cuda_major(so_path):
-    """The CUDA runtime MAJOR the engine .so DYNAMICALLY links (libcudart.so.<major>), or None if it
-    cannot be determined (e.g. a statically-linked cudart, or a non-ELF binary). The regex is NOT
-    end-anchored so a versioned SONAME like `libcudart.so.11.0` (CUDA ≤11) still yields major 11."""
+    """The CUDA MAJOR the engine binary DYNAMICALLY links, or None if it cannot be determined. ELF (Linux): its
+    libcudart.so.<major> (the regex is NOT end-anchored, so a versioned SONAME like `libcudart.so.11.0` still yields 11).
+    PE (Windows): cudart64_<major>.dll, else cublas64_<major>.dll / cublasLt64_<major>.dll — a DLL built with nvcc's
+    default static cudart imports no cudart, and cuBLAS's DLL name carries the CUDA major; two majors -> None."""
     for lib in _elf_needed(so_path):
         m = re.match(r"libcudart\.so\.(\d+)", lib)
         if m:
             return int(m.group(1))
+    imports = _pe_imports(so_path)
+    for pat in (r"cudart64_(\d+)\.dll", r"cublas(?:lt)?64_(\d+)\.dll"):
+        majors = {int(m.group(1)) for m in (re.fullmatch(pat, n) for n in imports) if m}
+        if majors:
+            return majors.pop() if len(majors) == 1 else None
     return None
 
 
@@ -1482,51 +1579,45 @@ def assert_toolchain_compatible(so_path):
     cannot be read). Escape hatch for a knowingly-safe combo (e.g. a static-cudart .so):
     QF_NATIVE_ALLOW_UNVERIFIED_TOOLCHAIN=1 (process env only — a workflow.json cannot set it).
 
-    PLATFORM SCOPE (disclosed): the CUDA-version detection is Linux/ELF-only today. A NON-ELF engine
-    binary — a Windows PE `.dll` or a macOS Mach-O `.dylib` — cannot be inspected by the DT_NEEDED reader,
-    so on those platforms the guard fail-closes with a DISTINCT, disclosed message (naming the platform +
-    the Linux-only limitation) that points at the override, rather than a silent generic refuse. Full
-    PE/Mach-O toolchain detection is a follow-up; until it lands, Windows/macOS users set the override
-    after confirming their torch + engine binary share a CUDA major."""
+    PLATFORM SCOPE: the CUDA major is read from a Linux ELF .so (its libcudart NEEDED entry) and from a
+    Windows PE .dll (its imported cudart64_N / cublas64_N DLL, _so_cuda_major). Any other binary — a macOS
+    Mach-O `.dylib` — cannot be read, so the guard fail-closes with a DISTINCT, disclosed message (naming
+    the platform + the limitation) that points at the override, rather than a silent generic refuse."""
     if os.environ.get(_ENV_ALLOW_UNVERIFIED_TOOLCHAIN, "").strip().lower() in ("1", "true", "yes"):
         return
     torch_major = _torch_cuda_major()           # e.g. 13; None on a CPU-only torch build
-    # Non-ELF engine binary (Windows PE .dll / macOS Mach-O .dylib): the DT_NEEDED reader is ELF-only so
-    # the .so's CUDA major cannot be read here. Fail closed (per the FORK-2 constraint) but with a
-    # DISTINCT, DISCLOSED message naming the platform + the Linux-only-detection limitation + the override
-    # — NOT the silent generic refuse that would deny every Windows/macOS load (matched or not) with no
-    # explanation. Full PE/Mach-O toolchain detection is a follow-up (see the loader node's DESCRIPTION).
-    if not _is_elf(so_path):
+    # Neither ELF nor PE (a macOS Mach-O .dylib): nothing here reads its CUDA major. Fail closed (per the FORK-2
+    # constraint) but with a DISTINCT, DISCLOSED message naming the platform + the limitation + the override.
+    if not _is_elf(so_path) and not _is_pe(so_path):
         import platform as _pf
         raise RuntimeError(
-            f"qf_native: REFUSING to load — the CUDA-toolchain compatibility check is currently "
-            f"Linux/ELF-only, and the engine binary ({so_path}) is a non-ELF {_pf.system() or 'non-Linux'} "
-            f"binary whose CUDA version cannot be read here. torch is built for CUDA "
-            f"{torch_major or 'none / CPU-only'}. Ensure your torch and the engine binary use the SAME CUDA "
-            f"major, then set {_ENV_ALLOW_UNVERIFIED_TOOLCHAIN}=1 to proceed. (Full Windows/macOS toolchain "
-            f"detection is a follow-up.)")
+            f"qf_native: REFUSING to load — the CUDA-toolchain compatibility check reads Linux (ELF) and "
+            f"Windows (PE) engine libraries only, and the engine binary ({so_path}) is a "
+            f"{_pf.system() or 'non-Linux'} binary whose CUDA version cannot be read here. torch is built for "
+            f"CUDA {torch_major or 'none / CPU-only'}. Ensure your torch and the engine binary use the SAME CUDA "
+            f"major, then set {_ENV_ALLOW_UNVERIFIED_TOOLCHAIN}=1 to proceed.")
     so_major = _so_cuda_major(so_path)
     if torch_major is None or so_major is None:
         raise RuntimeError(
             f"qf_native: REFUSING to load — cannot verify the engine's CUDA toolchain matches torch's "
-            f"(torch CUDA={torch_major or 'none / CPU-only'}, engine .so libcudart major="
+            f"(torch CUDA={torch_major or 'none / CPU-only'}, engine library CUDA major="
             f"{so_major if so_major is not None else 'undeterminable'}). The engine loads in-process and "
             f"shares torch's CUDA context; an unverified toolchain combination can silently corrupt "
-            f"output, so this is fail-closed. Install a torch + engine .so built for the SAME CUDA major, "
+            f"output, so this is fail-closed. Install a torch + engine library built for the SAME CUDA major, "
             f"or set {_ENV_ALLOW_UNVERIFIED_TOOLCHAIN}=1 if you KNOW this combination is safe.")
     if torch_major != so_major:
         raise RuntimeError(
             f"qf_native: REFUSING to load — CUDA toolchain MISMATCH. torch is built for CUDA {torch_major} "
-            f"but the engine .so ({so_path}) links libcudart.so.{so_major}. Running "
+            f"but the engine library ({so_path}) links CUDA {so_major}. Running "
             f"a CUDA-{so_major} engine in-process with a CUDA-{torch_major} torch is an unverified "
-            f"combination that can SILENTLY corrupt generated images/video (no crash). Use an engine .so "
+            f"combination that can SILENTLY corrupt generated images/video (no crash). Use an engine library "
             f"built for CUDA {torch_major}, or a torch built for CUDA {so_major}. (Override only if you "
             f"know it is safe: {_ENV_ALLOW_UNVERIFIED_TOOLCHAIN}=1.)")
 
 
 def _sidecar_preloads(so_path):
     """The libraries load_lib preloads before the engine, in name order: the files next to it that its DT_NEEDED
-    closure names — never a QuantFunc engine image. Not another host (_ENGINE_HOSTS: after a torch CUDA-major change
+    closure names — never a QuantFunc engine image. Not another host (the platform's hosts: after a torch CUDA-major change
     both can sit in one folder, and neither is a dependency of the other), not a kernel (the host's DT_NEEDED and
     $ORIGIN load its own kernel as a member of its dlopen group, where the ~20 host symbols the BIND_NOW kernel imports
     resolve; preloading it first fails on those). Anything else in that folder — another engine build, a backup copy —
@@ -1536,7 +1627,7 @@ def _sidecar_preloads(so_path):
         present = set(os.listdir(d))
     except OSError:
         return []
-    never = set(_ENGINE_HOSTS.values()) | {os.path.basename(so_path)}
+    never = set((_engine_platform() or {"hosts": {}})["hosts"].values()) | {os.path.basename(so_path)}
     want, todo = set(), [os.path.basename(so_path)]
     while todo:
         for n in _elf_needed(os.path.join(d, todo.pop())):
@@ -1803,7 +1894,7 @@ def _refuse_second_arch(device_idx):
     installed for ComfyUI's device. A pipeline on a device whose SM that pair does not cover would fail inside a kernel
     launch ("no kernel image is available"), so it is refused here, before anything is created. A local build or the dev
     override is not an installed pair (its architectures are unknown), and neither is an unreadable SM: not checked."""
-    if device_idx == _ENGINE_DEVICE or _BIN_SUBDIR != "linux" or _engine_local_choice():
+    if device_idx == _ENGINE_DEVICE or _engine_platform() is None or _engine_local_choice():
         return
     sm, m = _gpu_sm(device_idx), _installed_pair()[1]
     if sm is None or m is None or sm in m["sms"]:

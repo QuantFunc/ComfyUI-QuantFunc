@@ -22,7 +22,7 @@ ComfyUI plugin for **QuantFunc** — the fastest diffusion model inference engin
   sampler nodes
 - Changing quality, attention, caches or LoRAs reuses the loaded model: only a different model file loads again
 - Image editing with reference images (Qwen-Image-2.1)
-- The engine installs itself on Linux, checked against the release's published SHA-256 manifest
+- The engine installs itself on Linux and Windows, checked against the release's published SHA-256 manifest
 
 ## Version History
 
@@ -38,7 +38,7 @@ ComfyUI plugin for **QuantFunc** — the fastest diffusion model inference engin
 - **One `quality` option** on the loaders: `super_fast` / `fast` / `balance` / `best_quality` (default `balance`). `fast` and `super_fast` are faster and can give a different variation of the same seed. Some GPUs (for example the RTX 50 series, SM 12.0) offer only `balance` and `best_quality`. Details in section 3.
 - **No rebuild when you change settings or LoRAs**: the loaded pipeline is reused; only different model weights load a new one.
 - **One LoRA format**: diffusers / PEFT. Convert other formats with `scripts/qf_lora_convert.py`; LyCORIS LoHa / LoKr files are not supported.
-- **An engine per GPU architecture (Linux)**: the plugin downloads only the engine for your GPU's architecture (about 150-175 MB) and installs it automatically. One ComfyUI serves one GPU architecture; for GPUs of different architectures, run one ComfyUI per architecture (section 2.5).
+- **An engine per GPU architecture (Linux and Windows)**: the plugin downloads only the engine for your GPU's architecture (about 150-175 MB) and installs it automatically. One ComfyUI serves one GPU architecture; for GPUs of different architectures, run one ComfyUI per architecture (section 2.5).
 - **Quieter console**: the engine prints only warnings and errors by default.
 - **MiniMax-H3 at 1920x1120 on 32 GB cards**: the two-stage video generation now completes at that size.
 - **Supported models**: MiniMax-H3, LTX-2.5, Krea-2 and Qwen-Image-2.1.
@@ -112,9 +112,8 @@ cd ComfyUI/custom_nodes
 git clone https://github.com/RealJonathanYip/ComfyUI-QuantFunc.git
 ```
 
-On Linux the plugin **installs its engine by itself** when ComfyUI starts (see [2.5](#25-engine-install-linux)); no
-manual download is needed. On Windows, put `quantfunc.dll` in `bin/windows/` (the automatic install is Linux-only in this
-release).
+On Linux and Windows the plugin **installs its engine by itself** when ComfyUI starts (see
+[2.5](#25-engine-install-linux-and-windows)); no manual download is needed.
 
 ### 2.2 Method B: Manual Installation
 
@@ -137,11 +136,11 @@ ComfyUI/
                 └── version.json
 ```
 
-2. Start ComfyUI. On Linux the plugin installs the engine on the first start (see 2.5).
+2. Start ComfyUI. The plugin installs the engine on the first start (see 2.5).
 
 3. To run an engine you built or downloaded yourself instead:
    - **Linux:** put it at `bin/linux/libquantfunc.so` and create an empty `bin/linux/.dev_lib_lock` (see 2.5).
-   - **Windows:** put `quantfunc.dll` in `bin/windows/`.
+   - **Windows:** put it at `bin/windows/quantfunc.dll` and create an empty `bin/windows/.dev_lib_lock` (see 2.5).
 
 ### 2.3 System Requirements
 
@@ -186,18 +185,20 @@ sudo apt install libcudnn9-cuda-13
 - **Visual C++ Redistributable** 2015-2022 ([download](https://aka.ms/vs/17/release/vc_redist.x64.exe))
 - **cuDNN 9.x** ([download](https://developer.nvidia.com/cudnn))
 
-### 2.5 Engine Install (Linux)
+### 2.5 Engine Install (Linux and Windows)
 
 No extra Python package is needed: the installer uses Python's standard library. At every ComfyUI start, in the
 background, it:
 
 1. reads the release list on [ModelScope `QuantFunc/Plugin`](https://www.modelscope.cn/models/QuantFunc/Plugin) (HTTPS
    only) and picks the newest engine compatible with this plugin;
-2. picks the engine for your setup: the host library for torch's CUDA version (12 or 13), and the kernel library for your
-   GPU's architecture (the GPU ComfyUI runs on), from the release's `sets.json`. A kernel library holds exactly one
-   architecture; an architecture the release does not publish is refused with its SM number, never given another's;
-3. downloads both, checks each file's SHA-256 against the release's `verify.json` and that both come from one build, and
-   installs them into `bin/linux/<version>-<architecture>-cu<major>/` — all or nothing.
+2. picks the engine for your setup, for torch's CUDA version (12 or 13) and your GPU's architecture (the GPU ComfyUI runs
+   on), from the release's `sets.json`. An engine holds exactly one architecture; an architecture the release does not
+   publish is refused with its SM number, never given another's. On Linux that is a host library plus the kernel library
+   of your architecture; on Windows one DLL;
+3. downloads it, checks each file's SHA-256 against the release's `verify.json` (on Linux also that host and kernel come
+   from one build), and installs it into `bin/<linux|windows>/<version>-<architecture>-cu<major>/` — all or nothing.
+   A new version goes into a new folder, so an engine in use is never overwritten.
 
 Before every load the plugin hashes the installed files again: a file that changed on disk is not loaded, and it is
 downloaded again. Offline, the installed engine stays in use. Several ComfyUI instances with different GPUs can share one
@@ -208,15 +209,16 @@ another architecture is refused. To use both, run one ComfyUI per GPU architectu
 `verify.json` proves the files are the ones published in that same ModelScope repository. It is an integrity check, not a
 signature: it does not protect against the repository itself being changed.
 
-**Your own engine build:** put it at `bin/linux/libquantfunc.so` and create an empty `bin/linux/.dev_lib_lock`. The plugin
-then loads exactly that file, and the installer does not download or change anything (one console line says so). Delete
-the marker to go back to the installed engine. Without the marker a file there is not used: it is usually a copy left by
-an earlier plugin version. (Developers can also point `QF_NATIVE_SO_PATH` at a library; the installer then keeps out too.)
+**Your own engine build:** put it at `bin/linux/libquantfunc.so` (Windows: `bin/windows/quantfunc.dll`) and create an
+empty `.dev_lib_lock` in the same folder. The plugin then loads exactly that file, and the installer does not download or
+change anything (one console line says so). Delete the marker to go back to the installed engine. Without the marker a
+file there is not used: it is usually a copy left by an earlier plugin version. (Developers can also point
+`QF_NATIVE_SO_PATH` at a library; the installer then keeps out too.)
 
 ### 2.6 Verify Installation
 
 After ComfyUI starts, the console shows one of these lines when the installer installs, cannot install, fails or keeps
-out; a start whose engine is already current (or, outside Linux, whose engine library is in place) prints nothing:
+out; a start whose engine is already current prints nothing:
 
 ```
 [qf_native] installed QuantFunc engine <version> for <class> GPUs, CUDA <major>
@@ -279,10 +281,10 @@ offer `super_fast` (a workflow saved with it runs `fast`, or `balance` on a GPU 
 | Issue | Solution |
 |-------|----------|
 | "no QuantFunc engine is installed" / "still downloading" | Linux: the console's `[qf_native]` line from the start says why (still downloading, not installable here, update failed); see 2.5 and 2.6 |
-| Engine library not found (Windows) | Put `quantfunc.dll` in `bin/windows/` |
+| Engine library not found | Check the console's `[qf_native]` install line (2.6); the engine installs on the next start |
 | Console shows only warnings | That is the default: the engine prints only warnings and errors |
 | cuDNN BAD_PARAM | Delete cuDNN algo cache and retry |
-| The engine cannot be downloaded (offline) | Put an engine build at `bin/linux/libquantfunc.so` with an empty `bin/linux/.dev_lib_lock` (2.5) |
+| The engine cannot be downloaded (offline) | Put an engine build at `bin/linux/libquantfunc.so` (Windows: `bin/windows/quantfunc.dll`) with an empty `.dev_lib_lock` beside it (2.5) |
 
 ## 5. License
 
