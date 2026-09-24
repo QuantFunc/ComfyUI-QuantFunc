@@ -760,12 +760,66 @@ def main():
         qfe.install_engine()                          # the next start
         again = qfe.resolve_so_path()
         want = os.path.realpath(env.path("0.0.14-server-cu13", HOSTS[13]))
-        check("an SM moved to another GPU class: the newest pair loads, now and on the next start; the old class's pair "
-              "is left for its other SMs",
+        claims = {g: (env.marker(g) or {}).get("sms") for g in ("consumer", "server")}
+        check("an SM moved to another GPU class: the pair the installer chose loads, now and on the next start; only its "
+              "marker claims the SM, and the old class keeps its pair for its other SMs",
               first == os.path.realpath(env.path("0.0.13-consumer-cu13", HOSTS[13])) and moved == want and again == want
-              and os.path.isdir(env.path("0.0.13-consumer-cu13")),
+              and os.path.isdir(env.path("0.0.13-consumer-cu13")) and 89 not in claims["consumer"]
+              and 86 in claims["consumer"] and 89 in claims["server"],
               f"first={os.path.relpath(first, env.dir)} moved={os.path.relpath(moved, env.dir)} "
-              f"again={os.path.relpath(again, env.dir)}")
+              f"again={os.path.relpath(again, env.dir)} claims={claims}")
+        # 24) the release is PULLED (self-CR round 7, A): version.json lists 0.0.13 again. The installer keeps the 0.0.13
+        #     consumer pair — and the resolver must load that one, not the newer 0.0.14 still on disk.
+        qfe._engine_http_open = old.open
+        qfe.install_engine()
+        pulled = qfe.resolve_so_path()
+        claims = {g: (env.marker(g) or {}).get("sms") for g in ("consumer", "server")}
+        check("a pulled release: the pair the installer keeps (0.0.13) is the one that loads; it alone claims the SM",
+              pulled == os.path.realpath(env.path("0.0.13-consumer-cu13", HOSTS[13])) and 89 in claims["consumer"]
+              and 89 not in (claims["server"] or []), f"pulled={os.path.relpath(pulled, env.dir)} claims={claims}")
+    # 25) a hash failure after a move (self-CR round 7, A): the chosen pair is refused and re-downloaded — the old class's
+    #     pair must not load in its place (it no longer claims the SM).
+    old = Release("0.0.13")
+    with Env(old, sm=89) as env:
+        qfe.install_engine()
+        new = Release("0.0.14")
+        new.set_sets(json.dumps({"schema": 1, "sets": {"consumer": [75, 86, 120],
+                                                        "server": [80, 89, 90, 100, 103]}}).encode())
+        qfe._engine_http_open = new.open
+        qfe.install_engine()
+        open(env.path("0.0.14-server-cu13", HOSTS[13]), "wb").write(b"CHANGED ON DISK")
+        restarted = []
+        saved_start = qfe.start_engine_install
+        qfe.start_engine_install = lambda *a, **k: restarted.append(1)
+        got = []
+        try:
+            for _ in range(2):                           # this prompt, and the next one while the re-download runs
+                try:
+                    got.append(os.path.relpath(qfe.resolve_so_path(), env.dir))
+                except RuntimeError as e:
+                    got.append(f"refused: {str(e)[:60]}")
+        finally:
+            qfe.start_engine_install = saved_start
+        check("a hash failure after a move: refused and re-downloaded; the old class's pair is not loaded instead, on "
+              "this prompt or the next", all(g.startswith("refused") for g in got) and restarted[:1] == [1], got)
+    # 26) two markers claiming one SM exist only in a folder the installer has not run in since (offline, after an older
+    #     plugin): the newest release wins, whichever name sorts first.
+    for newer_set, older_set in (("server", "consumer"), ("consumer", "server")):
+        older, newer = Release("0.0.13"), Release("0.0.14")
+        for rel, gset, extra in ((older, older_set, [75]), (newer, newer_set, [])):
+            other = "consumer" if gset == "server" else "server"   # the older class keeps SM 75, so its marker stays
+            rel.set_sets(json.dumps({"schema": 1, "sets": {gset: [89, 120] + extra,
+                                                           other: [s for s in (75, 80, 86, 90) if s not in extra]}}).encode())
+        with Env(older, sm=89) as env:
+            qfe.install_engine()
+            qfe._engine_http_open = newer.open
+            qfe.install_engine()
+            stale = env.marker(older_set)                   # an older plugin's folder: its marker still claims 89
+            stale["sms"] = sorted(set(stale["sms"]) | {89})
+            open(env.path(f".engine-{older_set}-cu13.json"), "w").write(json.dumps(stale))
+            got = os.path.relpath(qfe.resolve_so_path(), env.dir)
+        check(f"two markers claim the SM (legacy folder, newer release in '{newer_set}'): the newest release loads",
+              got == f"0.0.14-{newer_set}-cu13/{HOSTS[13]}", got)
     # 23) not Linux (self-CR round 6, A): the library placed in bin/<platform>/ is what loads there, so a start with it in
     #     place installs nothing and prints nothing; only a missing library gets the "not installed" hint.
     saved_sub = qfe._BIN_SUBDIR

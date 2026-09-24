@@ -205,6 +205,7 @@ out; a start whose engine is already current (or, outside Linux, whose engine li
 [qf_native] installed QuantFunc engine <version> for <class> GPUs, CUDA <major>
 [qf_native] QuantFunc engine not installed: <why this machine cannot take one>
 [qf_native] QuantFunc engine update failed (<reason>); the installed engine <version> stays in use
+[qf_native] QuantFunc engine update failed (<reason>); no engine is installed
 [qf_native] QuantFunc engine install skipped: bin/linux/.dev_lib_lock keeps the local build bin/linux/libquantfunc.so
 ```
 
@@ -244,8 +245,8 @@ Qwen-Image-2.1 native-loader workflows are in [`example_workflows/`](example_wor
 The loader's `quality` choice (default `balance` on the MiniMax-H3, LTX-2, Krea-2 and Qwen-Image-2.1 loaders): `balance`
 can be a little faster than `best_quality`; the subject and scene stay the same, but details such as poses, faces or small
 objects can differ from `best_quality`. On GPUs that offer them, `fast` and `super_fast` are usually faster still and can
-give a different variation of the same seed. `best_quality` gives the highest quality. The LTX-2 loader offers `fast` but
-not `super_fast` (a workflow saved with `super_fast` runs `fast`, or `balance` on a GPU without `fast`). On GPUs without
+give a different variation of the same seed. `best_quality` gives the highest quality. The LTX-2 loader never offers
+`super_fast` (a workflow saved with it runs `fast`, or `balance` on a GPU without `fast`). On GPUs without
 `fast` and `super_fast`, the Qwen-Image-2.1 loader shows no `quality` choice and always gives the highest quality.
 
 | File | Use Case |

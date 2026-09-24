@@ -764,7 +764,7 @@ def _bind(lib):
 
 _LIB = None
 _LIB_PATH = None             # the engine library load_lib loaded — constant for the process (loaded_so_path)
-_FINGERPRINT_PENDING = None  # (lib, path) whose fingerprint line waits for the first info-level loader
+_FINGERPRINT_PENDING = None  # (lib, path, file identity at load) whose fingerprint waits for the first info-level loader
 _LIB_LOCK = threading.Lock()  # one first load per process: two could resolve two different pairs (a marker switched between)
 _LOG_LEVEL = None   # the level a loader asked for (qf_log_level); applied when/after the library loads
 
@@ -1026,11 +1026,31 @@ def _markers():
 
 def _installed_pair():
     """(marker path, marker) of the pair THIS process loads — torch's CUDA major, the SM of ComfyUI's device — or
-    (None, None). The NEWEST matching marker: a release may move an SM to another GPU class, and the old class's marker
-    stays (it still serves that class's other SMs), so the first one by name would keep this GPU on the old release."""
+    (None, None). The installer keeps exactly one marker per CUDA major claiming an SM (_claim): the pair it chose.
+    Two claimants exist only in a folder the installer has not run in since (an offline start after an older plugin);
+    then the newest release wins, deterministically."""
     major, sm = _torch_cuda_major(), _gpu_sm(_ENGINE_DEVICE)
     mine = [(p, m) for p, m in _markers() if m["cuda"] == major and sm in m["sms"]]
     return max(mine, key=lambda pm: _version_key(pm[1]["version"])) if mine else (None, None)
+
+
+def _claim(bin_dir, marker, sms):
+    """The installer chose `marker` for `sms` (its release's list for that GPU class): make it the ONLY marker of its
+    CUDA major that claims them, so the resolver loads the pair the installer chose. A release may move an SM to another
+    class, and a pulled release or an older plugin can move it back. Other markers keep their other SMs (another GPU of
+    their class may use them); a marker left claiming nothing goes, with its pair. Markers are rewritten atomically."""
+    major = int(_ENGINE_MARKER_RE.fullmatch(os.path.basename(marker)).group(2))
+    for p, m in _markers():
+        if m["cuda"] != major:
+            continue
+        want = sorted(set(sms)) if p == marker else [s for s in m["sms"] if s not in sms]
+        if sorted(m["sms"]) == sorted(want):
+            continue
+        if want:
+            _engine_write_file(p, json.dumps(dict(m, sms=want)).encode())
+        else:
+            os.remove(p)
+            shutil.rmtree(os.path.join(bin_dir, _pair_dir(m)), ignore_errors=True)
 
 
 def _marker_of(so_path):
@@ -1157,6 +1177,7 @@ def _install_pair(bin_dir, device_idx):
     known_bad = None
     if have and have["version"] == version:
         if all(hashes.get(_manifest_key(gpu_set, n)) == h for n, h in have["sha256"].items()):
+            _claim(bin_dir, marker, sets[gpu_set])
             _engine_status("installed", f"engine {version} ({gpu_set}, CUDA {major})")
             return have
         os.remove(marker)    # KNOWN mismatch: the release no longer publishes these bytes — never loaded again
@@ -1200,6 +1221,7 @@ def _install_pair(bin_dir, device_idx):
     m = {"version": version, "set": gpu_set, "cuda": major, "sms": sets[gpu_set], "host": host, "kernel": kernel,
          "sha256": {host: got[host], kernel: got[kernel]}}
     _engine_write_file(marker, json.dumps(m).encode())     # LAST: the pair becomes loadable
+    _claim(bin_dir, marker, sets[gpu_set])
     keep = {_pair_dir(m), have and _pair_dir(have)}
     for d in os.listdir(bin_dir):
         p = _ENGINE_PAIR_RE.fullmatch(d)
@@ -1540,6 +1562,7 @@ def load_lib():
             if not still:
                 break
             pending = still
+        ident = _file_identity(so_path)   # BEFORE the load: a file swapped in during it fails the check below, closed
         try:
             lib = ctypes.CDLL(so_path, mode=ctypes.RTLD_GLOBAL)
         except OSError as e:
@@ -1551,7 +1574,7 @@ def load_lib():
         _LIB = bound
         if _LOG_LEVEL is not None:   # a loader asked for a level before the library was loaded
             _LIB.quantfunc_set_log_level(_LOG_LEVEL)
-        _FINGERPRINT_PENDING = (_LIB, so_path, _file_identity(so_path))
+        _FINGERPRINT_PENDING = (_LIB, so_path, ident if _file_identity(so_path) == ident else None)
         _emit_fingerprint()
     return _LIB
 
@@ -1565,7 +1588,7 @@ def _file_identity(path):
     return st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns
 
 
-def _log_lib_fingerprint(lib, so_path, ident=None):
+def _log_lib_fingerprint(lib, so_path, ident):
     """[F6, 2026-09-19] ONE line naming the engine library this process actually dlopen'd — path, size, mtime,
     md5, and the engine's own quantfunc_version(). MEASURED need: the 远程-linux 5090 box ran a 4-day-old engine
     for days, and later a deployed library was silently replaced by an older file (found from a backup's mtime,
@@ -1578,8 +1601,9 @@ def _log_lib_fingerprint(lib, so_path, ident=None):
         h = hashlib.md5()
         with open(so_path, "rb") as fh:
             st = os.fstat(fh.fileno())      # the file this descriptor reads: no swap between the check and the hash
-            if ident is not None and (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns) != ident:
-                raise RuntimeError("the file at this path changed after the engine loaded it")
+            if ident is None or (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns) != ident:
+                raise RuntimeError("the file at this path changed after the engine loaded it (or could not be "
+                                   "identified at the load)")
             for chunk in iter(lambda: fh.read(1 << 20), b""):
                 h.update(chunk)
         ver = "?"
