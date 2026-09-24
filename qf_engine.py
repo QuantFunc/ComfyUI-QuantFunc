@@ -912,18 +912,22 @@ def engine_choice(device_idx=0):
 
 
 def _engine_pick_version(versions, plugin_version, major):
-    """The newest published engine this plugin may use: its "comfy" (CUDA 13) / "comfy-12" (CUDA 12) requirement is
-    at most this plugin's version, and it ships the host/kernel split ("kernel_so": true)."""
-    need_key = "comfy" if major == 13 else "comfy-12"
-    best = None
-    for v, info in (versions or {}).items():
-        if not (isinstance(v, str) and _ENGINE_VERSION_RE.fullmatch(v) and isinstance(info, dict)):
+    """The release this plugin installs: the classic updater's rule (f53e39d _find_best_compatible_version). Among the
+    entries that ship the host/kernel split ("kernel_so": true) and whose "comfy" / "comfy-12" requirement (falling back
+    to "comfy") is at most this plugin's version, the one with the highest "lib" / "lib-12" (falling back to "lib", then
+    to the key). Returns that entry's KEY, which is the release's path segment on the repo."""
+    suffix = "-12" if major == 12 else ""
+    best = best_lib = None
+    for key, info in (versions or {}).items():
+        if not (isinstance(key, str) and _ENGINE_VERSION_RE.fullmatch(key) and isinstance(info, dict)
+                and info.get("kernel_so")):
             continue
-        req = info.get(need_key)
-        if not (isinstance(req, str) and _ENGINE_VERSION_RE.fullmatch(req)) or not info.get("kernel_so"):
+        req = info.get("comfy" + suffix, info.get("comfy"))
+        lib = info.get("lib" + suffix, info.get("lib", key))
+        if not all(isinstance(x, str) and _ENGINE_VERSION_RE.fullmatch(x) for x in (req, lib)):
             continue
-        if _version_key(req) <= _version_key(plugin_version) and (best is None or _version_key(v) > _version_key(best)):
-            best = v
+        if _version_key(req) <= _version_key(plugin_version) and (best is None or _version_key(lib) > _version_key(best_lib)):
+            best, best_lib = key, lib
     return best
 
 
@@ -978,8 +982,10 @@ def install_engine(device_idx=0):
         raise EngineNotInstallable(f"no published engine with the host/kernel split is compatible with this plugin "
                                    f"({plugin_version}, CUDA {major})")
     manifest = json.loads(_engine_http_get(f"{_ENGINE_BASE_URL}/{version}/verify.json"))
-    if not (isinstance(manifest, dict) and int(manifest.get("schema", 0)) <= _ENGINE_VERIFY_SCHEMA_MAX
-            and manifest.get("version") == version and isinstance(manifest.get(platform_key), dict)):
+    # verify.json = {"schema": 1, "<platform>": {"<set>/<file>": sha256}} (the engine's verify_manifest.py); its release
+    # is its path, so there is no version key to check.
+    if not (isinstance(manifest, dict) and isinstance(manifest.get("schema"), int)
+            and 1 <= manifest["schema"] <= _ENGINE_VERIFY_SCHEMA_MAX and isinstance(manifest.get(platform_key), dict)):
         raise RuntimeError(f"the {version} verify.json is not a manifest this plugin understands")
     hashes = manifest[platform_key]
     sets = dict(_ENGINE_SETS_FALLBACK)
@@ -1333,11 +1339,13 @@ def load_lib():
         # "double free or corruption" from their colliding static destructors.
         # A QuantFunc KERNEL library (libquantfunc_kernels*.so, every spelling the builds ship: the consumer/server
         # sets, -12 for CUDA 12) is NOT preloaded as a sidecar. The engine .so DT_NEEDEDs it and finds it via its own
-        # $ORIGIN rpath, so it loads as a member of the ENGINE's dlopen group — where the host<->kernel
-        # symbols (engine's kernel launchers + the kernel's cachedConvPlanWorkspaceCap) resolve
-        # bidirectionally in-group. Eagerly preloading it here (before the engine) would fail: its
-        # host symbol is not yet available. Keeping it OUT of a preload also keeps the kernel's many
-        # exported symbols out of the process-global scope (no clash with torch's own kernels).
+        # $ORIGIN rpath (DT_RPATH, searched before LD_LIBRARY_PATH), so it loads as a member of the ENGINE's dlopen
+        # group, where the host<->kernel symbols resolve both ways: the host's kernel launchers, and the ~20 host
+        # symbols the kernel imports (qf::state accessors, the caching allocator, qf::vram workspace hooks; measured
+        # on the shipped pair by the ship build). The kernel links BIND_NOW, so preloading it here, before the host,
+        # fails on those imports. That is a LOAD-ORDER rule only: the host is dlopen'ed RTLD_GLOBAL, and glibc puts
+        # that dlopen's whole NEEDED tree into the global scope, so the kernel's exports (quantfunc-namespaced) do
+        # become global either way.
         pending = _sidecar_preloads(entries, base)
         for _ in range(max(1, len(pending))):
             still = []

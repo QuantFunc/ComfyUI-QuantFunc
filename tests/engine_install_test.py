@@ -4,8 +4,8 @@
 qf_engine is loaded standalone (no ComfyUI, no torch, no GPU, no network). The ONE network entry (_engine_http_open),
 torch's CUDA major, the driver's CUDA major, the GPU's SM and the ELF DT_NEEDED reader are replaced, and the plugin's
 bin/ is a temp dir. The fake release has the layout the engine ships:
-  version.json                    {"linux": {"<ver>": {"comfy", "comfy-12", "kernel_so"}}}
-  <ver>/verify.json               {"schema", "version", "linux": {"<set>/<file>": sha256}}
+  version.json                    {"linux": {"<key>": {"comfy", "comfy-12", "lib", "lib-12", "kernel_so"}}}
+  <ver>/verify.json               {"schema", "linux": {"<set>/<file>": sha256}}   (no version key: it is the path)
   <ver>/linux/<set>/<file>        host + kernel per (GPU class, CUDA major)
 Matrix: GPU class x CUDA major x {missing, present, corrupt, offline}, plus the rules each tested both ways.
 """
@@ -62,12 +62,13 @@ class Release:
                 self.files[f"{version}/linux/{gset}/{HOSTS[major]}"] = h
                 self.files[f"{version}/linux/{gset}/{KERNELS[major]}"] = k
                 body[f"{gset}/{HOSTS[major]}"], body[f"{gset}/{KERNELS[major]}"] = sha(h), sha(k)
-        self.manifest = {"schema": 1, "version": version, "linux": body}
+        self.manifest = {"schema": 1, "linux": body}      # verify_manifest.py's shape: no version key (it is the path)
         self.files[f"{version}/verify.json"] = json.dumps(self.manifest).encode()
-        self.files["version.json"] = json.dumps({"linux": {
-            "0.0.12": {"comfy": "0.0.06", "comfy-12": "0.0.06", "lib": "0.0.12"},     # monolithic: never picked
-            version: {"comfy": plugin_req, "comfy-12": plugin_req, "lib": version, "kernel_so": True},
-        }}).encode()
+        self.entries = {
+            "0.0.12": {"comfy": "0.0.06", "comfy-12": "0.0.06", "lib": "0.0.12", "lib-12": "0.0.12"},   # monolithic
+            version: {"comfy": plugin_req, "comfy-12": plugin_req, "lib": version, "lib-12": version, "kernel_so": True},
+        }
+        self.files["version.json"] = json.dumps({"linux": self.entries}).encode()
 
     def open(self, url):
         if self.offline:
@@ -203,6 +204,19 @@ def main():
         qfe.install_engine()
         check("a newer compatible release replaces the installed one",
               json.loads(env.read(qfe._ENGINE_MARKER))["version"] == "0.0.14")
+    # 4b) per CUDA flavor (the classic rule): 0.0.14's CUDA 12 build needs a newer plugin, so CUDA 12 stays on 0.0.13
+    both = Release("0.0.13")
+    newer = Release("0.0.14")
+    both.files.update({k: v for k, v in newer.files.items() if k != "version.json"})
+    both.entries["0.0.14"] = dict(newer.entries["0.0.14"], **{"comfy-12": "0.0.99"})
+    both.files["version.json"] = json.dumps({"linux": both.entries}).encode()
+    picked = {}
+    for major in (13, 12):
+        with Env(both, torch_major=major) as env:
+            qfe.install_engine()
+            picked[major] = json.loads(env.read(qfe._ENGINE_MARKER))["version"]
+    check("per CUDA flavor: CUDA 13 takes 0.0.14, CUDA 12 (its build needs plugin 0.0.99) stays on 0.0.13",
+          picked == {13: "0.0.14", 12: "0.0.13"}, picked)
     # 5) all-or-nothing: the host downloads, the kernel is missing -> nothing replaced, no temp files left
     rel = Release()
     with Env(rel) as env:
@@ -234,7 +248,9 @@ def main():
                   f"{state}: {detail[:60]}")
     # 7) never a server-supplied path: a traversal "version" is never picked; a kernel name must be a QuantFunc kernel
     rel = Release()
-    rel.files["version.json"] = json.dumps({"linux": {"../../../tmp/x": {"comfy": "0.0.01", "kernel_so": True}}}).encode()
+    # valid lib/lib-12 so ONLY the key (the path segment) can stop it
+    rel.files["version.json"] = json.dumps({"linux": {"../../../tmp/x": {
+        "comfy": "0.0.01", "comfy-12": "0.0.01", "lib": "0.0.99", "lib-12": "0.0.99", "kernel_so": True}}}).encode()
     with Env(rel) as env:
         try:
             qfe.install_engine()
