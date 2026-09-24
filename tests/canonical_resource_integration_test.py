@@ -532,48 +532,52 @@ class CanonicalIntegration(unittest.TestCase):
         self.assertIsNone(bare.scaled_fp8)
         self.assertEqual(bare.optimizations, {})
 
-    def test_cold_request_asks_comfy_for_the_engines_create_time_need_not_its_floor(self):
-        """#738 (G3 landed): with an engine that reports its cold create-time need (quantfunc_resource_vram_need_bytes),
-        the cold reserve is comfy side + that need — comfy's torch estimate is no longer the floor — so ComfyUI evicts its
-        idle models before our create. MEASURED without it: "engine need 0 MB cold" kept a 4.4 GB idle TE resident and
-        Krea-2's create failed physically on a 6 GB card. Never a create during the estimate; an engine without the
-        entry keeps the floor (test_official_prepare_sampling_cold_request_takes_comfys_estimate_as_floor...)."""
+    def test_cold_request_is_the_larger_of_comfys_estimate_and_the_engines_create_time_need(self):
+        """#738: with an engine that reports its cold create-time need (quantfunc_resource_vram_need_bytes), the cold
+        reserve is comfy side + that need, so ComfyUI evicts its idle models before our create (MEASURED without it:
+        "engine need 0 MB cold" kept a 4.4 GB idle TE resident and Krea-2's create failed physically on a 6 GB card).
+        Comfy's own estimate stays the FLOOR: the create-time need carries no forward working set and the first forward
+        follows this one ask (#716: LTX-2.5 1920x1088 cold). Both ways: a large need wins, a small one leaves the floor.
+        Never a create during the estimate; an engine without the entry keeps the floor alone
+        (test_official_prepare_sampling_cold_request_takes_comfys_estimate_as_floor...)."""
         import comfy.sampler_helpers as sampler_helpers
         import comfy.supported_models as supported_models
         from qf_loader_contract import qf_krea2_modelpatcher as krea2
 
-        cold_need = 3 << 30
-        asked = []
-
-        def vram_need_bytes(pointer, out):
-            asked.append(pointer)
-            out._obj.value = cold_need
-            return 0
-        self.lib.quantfunc_resource_vram_need_bytes = vram_need_bytes
         self.lib.capacity_bytes = 32 << 30
         noise_shape = (1, 16, 32, 32)
-        cfg = supported_models.Krea2({"image_model": "krea2", "disable_unet_model_creation": True})
-        qfm.ensure_model_config_attrs(cfg)
-        lazy = qfm.QFLazyEngine(lambda: plugin._get_engine("cold-need-chain"))
-        model = krea2.QFKrea2Model(cfg, lazy, device=torch.device("cuda:0"))
-        patcher = qfm.QFModelPatcher(model, torch.device("cuda:0"), torch.device("cpu"))
         full_shape = [noise_shape[0] * 2, *noise_shape[1:]]
-        comfy_side = model._qf_comfy_side_bytes(full_shape, {})
-        torch_estimate = int(super(qfm.QFSessionModelMixin, model).memory_required(full_shape, cond_shapes={}))
-        self.assertNotEqual(comfy_side + cold_need, torch_estimate)   # discriminating: need vs floor
-        observed = {}
+        for cold_need, floor_wins in ((3 << 30, False), (16 << 20, True)):
+            with self.subTest(cold_need_mb=cold_need >> 20):
+                asked = []
 
-        def admit(models, *, memory_required, minimum_memory_required, force_full_load=False, **_kwargs):
-            observed.update(memory_required=memory_required)
-            self.assertEqual(plugin._PIPELINE_CACHE, {}, "cold estimate must not materialize the native pipeline")
+                def vram_need_bytes(pointer, out, cold_need=cold_need, asked=asked):
+                    asked.append(pointer)
+                    out._obj.value = cold_need
+                    return 0
+                self.lib.quantfunc_resource_vram_need_bytes = vram_need_bytes
+                cfg = supported_models.Krea2({"image_model": "krea2", "disable_unet_model_creation": True})
+                qfm.ensure_model_config_attrs(cfg)
+                lazy = qfm.QFLazyEngine(lambda: plugin._get_engine("cold-need-chain"))
+                model = krea2.QFKrea2Model(cfg, lazy, device=torch.device("cuda:0"))
+                patcher = qfm.QFModelPatcher(model, torch.device("cuda:0"), torch.device("cpu"))
+                comfy_side = model._qf_comfy_side_bytes(full_shape, {})
+                torch_estimate = int(super(qfm.QFSessionModelMixin, model).memory_required(full_shape, cond_shapes={}))
+                # discriminating: exactly one of the two terms is the larger
+                self.assertEqual(torch_estimate > comfy_side + cold_need, floor_wins)
+                observed = {}
 
-        with mock.patch.object(mm, "load_models_gpu", side_effect=admit):
-            sampler_helpers.prepare_sampling(patcher, noise_shape, {}, model_options=patcher.model_options)
-        self.assertTrue(asked, "the cold need was never asked")
-        self.assertEqual(observed["memory_required"], comfy_side + cold_need)
-        # recorded for the grant: the larger (full cond+uncond shape) of prepare_sampling's two answers
-        self.assertEqual(qfm._host_inference_bytes(torch.device("cuda:0")), comfy_side)
-        self.assertFalse(lazy.materialized)
+                def admit(models, *, memory_required, minimum_memory_required, force_full_load=False, **_kwargs):
+                    observed.update(memory_required=memory_required)
+                    self.assertEqual(plugin._PIPELINE_CACHE, {}, "cold estimate must not materialize the native pipeline")
+
+                with mock.patch.object(mm, "load_models_gpu", side_effect=admit):
+                    sampler_helpers.prepare_sampling(patcher, noise_shape, {}, model_options=patcher.model_options)
+                self.assertTrue(asked, "the cold need was never asked")
+                self.assertEqual(observed["memory_required"], max(torch_estimate, comfy_side + cold_need))
+                # recorded for the grant: the larger (full cond+uncond shape) of prepare_sampling's two answers
+                self.assertEqual(qfm._host_inference_bytes(torch.device("cuda:0")), comfy_side)
+                self.assertFalse(lazy.materialized)
 
     def test_domain_actual_and_load_delta_never_sum_per_resource_residency(self):
         patcher = self.wrapper("coherent-domain")

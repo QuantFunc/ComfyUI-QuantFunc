@@ -503,13 +503,14 @@ class QFSessionModelMixin:
             else:
                 # #738 COLD: the engine's own create-time need (the plan side's number, header facts only) — so comfy
                 # evicts its idle models before our create (MEASURED: "need 0 MB cold" left a 4.4 GB idle TE resident
-                # and Krea-2's create failed physically on a 6 GB card). Unknown -> comfy's estimate stays the floor.
+                # and Krea-2's create failed physically on a 6 GB card). It stays UNDER comfy's own estimate as the
+                # floor: the create-time need has no forward working set, and the first forward follows this one ask
+                # (#716: LTX-2.5 1920x1088 cold needed comfy to evict an 11 GB TE for it). Unknown -> the floor alone.
                 reader = getattr(lazy, "cold_vram_need_bytes", None)
                 cold_need = reader() if callable(reader) else None
         if cold_need is not None:
             need = int(cold_need)
-        floor = (int(super().memory_required(input_shape, cond_shapes=cond_shapes or {}))
-                 if eng is None and cold_need is None else 0)
+        floor = int(super().memory_required(input_shape, cond_shapes=cond_shapes or {})) if eng is None else 0
         total = int(max(floor, comfy_side + need))
         # #738: the host's OWN inference tensors for this sampling (comfy side) stay outside our grant
         _note_host_inference_bytes(getattr(self, "device", None), comfy_side)
@@ -525,8 +526,9 @@ class QFSessionModelMixin:
             qfe.info("[qf_native] VRAM ledger: memory_required%s = %d MB (comfy-side %d MB, engine need %d MB%s); "
                   "engine hold %s"
                   % (list(sig[0]), total >> 20, comfy_side >> 20, need >> 20,
-                     (" (cold: no pipeline yet; the engine's create-time need)" if cold_need is not None else
-                      " (cold: no pipeline yet; comfy's own estimate %d MB is the floor)" % (floor >> 20))
+                     (" (cold: no pipeline yet; the engine's create-time need, floored by comfy's own estimate %d MB)"
+                      if cold_need is not None else " (cold: no pipeline yet; comfy's own estimate %d MB is the floor)")
+                     % (floor >> 20)
                      if eng is None else
                      "" if need else " (0: covered by what it holds, or nothing measured yet)",
                      hold), flush=True)
