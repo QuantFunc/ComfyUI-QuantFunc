@@ -223,6 +223,9 @@ def _canon_leaf(role):
     return None
 
 
+_PEFT_ADAPTER = re.compile(r"(.+)\.(lora_A|lora_B|lora_down|lora_up)\.(?!weight$)[^.]+\.weight$")
+
+
 def _split_role(key):
     """Return (module_body, role) or (None, None). role in
     {lora_down,lora_up,lora_A,lora_B,alpha,lora_linear_layer.down/up}."""
@@ -235,6 +238,11 @@ def _split_role(key):
                       (".alpha", "alpha")):
         if key.endswith(suf):
             return key[:-len(suf)], role
+    # PEFT adapter-name form `<module>.lora_A.<adapter>.weight` (peft saves with its adapter name, commonly "default"
+    # — e.g. DiffSynth-Studio LoRAs): the same rule as the engine's DiffusersAdapter (one identifier, no dots).
+    m = _PEFT_ADAPTER.match(key)
+    if m:
+        return m.group(1), m.group(2)
     return None, None
 
 
@@ -399,8 +407,9 @@ def self_test(diffusers_path):
     return ok
 
 
-def krea2_self_test():
-    """The Krea-2 rename on synthetic keys (no file): a raw community file, a kohya file, and files it must not touch."""
+def key_names_self_test():
+    """The key-name rules on synthetic keys (no file): the Krea-2 rename of a raw community file and of a kohya file,
+    files it must not touch, and the PEFT adapter-name form."""
     def run(keys, fmt):
         return [nk for _, nk in convert_keys(keys, fmt)[0]]
     raw = ["diffusion_model.blocks.3.attn.wq.lora_A.weight", "diffusion_model.blocks.3.attn.wo.lora_B.weight",
@@ -421,14 +430,17 @@ def krea2_self_test():
              "txt_in.linear_2.lora_B.weight", "text_fusion.projector.lora_A.weight",
              "transformer_blocks.0.attn.to_v.lora_A.weight"]
     native = ["transformer.transformer_blocks.0.attn.to_q.lora_A.weight", "transformer.img_in.lora_B.weight"]
+    peft = ["transformer_blocks.0.attn.to_k.lora_A.default.weight", "blocks.25.attn.out_proj.lora_B.default.weight"]
+    pwant = ["transformer_blocks.0.attn.to_k.lora_A.weight", "blocks.25.attn.out_proj.lora_B.weight"]
     other = ["diffusion_model.blocks.0.self_attn.q.lora_A.weight", "diffusion_model.first.lora_A.weight"]   # no marker
     ok = True
     for name, got, exp in (("raw BFL", run(raw, "diffusers"), want), ("kohya", run(kohya, "kohya"), kwant),
-                           ("diffusers", run(native, "diffusers"), native), ("no marker", run(other, "diffusers"), other)):
+                           ("diffusers", run(native, "diffusers"), native), ("no marker", run(other, "diffusers"), other),
+                           ("peft adapter", run(peft, "diffusers"), pwant)):
         good = got == exp
         ok &= good
         print("  %-9s %s" % (name, "ok" if good else "FAIL %s" % [g for g, e in zip(got, exp) if g != e]))
-    print("KREA2 SELF-TEST:", "PASS" if ok else "FAIL")
+    print("KEY-NAME SELF-TEST:", "PASS" if ok else "FAIL")
     return ok
 
 
@@ -438,11 +450,11 @@ def main():
     ap.add_argument("--out", dest="out", help="output .safetensors (diffusers canonical)")
     ap.add_argument("--model", dest="model", help="target checkpoint .safetensors — derives the EXACT module-name inverse (any family, zero vocabulary)")
     ap.add_argument("--self-test", dest="selftest", help="round-trip a diffusers LoRA through a synthesized kohya twin")
-    ap.add_argument("--self-test-krea2", dest="selftest_krea2", action="store_true",
-                    help="check the Krea-2 BFL -> engine rename on synthetic keys (no file needed)")
+    ap.add_argument("--self-test-names", dest="selftest_names", action="store_true",
+                    help="check the key-name rules (Krea-2 BFL -> engine rename, PEFT adapter form) on synthetic keys")
     a = ap.parse_args()
-    if a.selftest_krea2:
-        sys.exit(0 if krea2_self_test() else 1)
+    if a.selftest_names:
+        sys.exit(0 if key_names_self_test() else 1)
     if a.selftest:
         sys.exit(0 if self_test(a.selftest) else 1)
     if not a.inp or not a.out:
