@@ -443,7 +443,9 @@ def main():
             _hidden = (_qo[1].get("hidden") is True and _qo[1].get("socketless") is True and _qo[1]["default"] == "best_quality"
                        and _qo[0] == _Q4)
             check(f"QI-2.1 quality ({label}): shown with four options on a fast GPU, else hidden in its slot, best_quality",
-                  (_shown if want == _Q4 else _hidden) and list(_it.keys())[:2] == ["attention_backend", "quality"],
+                  (_shown if want == _Q4 else _hidden)
+                  and (list(qfn.NODE_CLASS_MAPPINGS[_QI21].INPUT_TYPES()["required"]) + list(_it.keys()))[:4]
+                  == ["transformer", "model_config", "attention_backend", "quality"],
                   f"-> {_qo[0]} {_qo[1]} keys={list(_it.keys())}")
             _QR = qfn._qi21_resolve_quality
             _runs = [_QR(x) for x in _Q4 + [True, False, None]] + [_QR(None, quality_enhance=True), _QR(None, quality_enhance=False)]

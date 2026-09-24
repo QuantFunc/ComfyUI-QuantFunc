@@ -555,8 +555,8 @@ if _IMPORT_OK:
             if model_config not in shipped:
                 raise RuntimeError(
                     f"qf_native: this workflow was saved with model_config {model_config!r}, which is not a "
-                    f"{expect_family} model config of this plugin (it ships: {', '.join(shipped) or 'none'}). "
-                    f"The loader has no model_config choice any more; re-save the workflow.")
+                    f"{expect_family} model config of this plugin (it ships: {', '.join(shipped) or 'none'}). Omit "
+                    f"model_config (the loader picks its model config itself) or name the one it ships.")
         bundle_dir, manifest = _load_model_config(model_config)
         family = str(manifest["family"])
         if family != expect_family:
