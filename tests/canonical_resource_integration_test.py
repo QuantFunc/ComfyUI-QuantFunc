@@ -819,6 +819,30 @@ class CanonicalIntegration(unittest.TestCase):
                                   self.lib.device_limit), (10 + growth, growth, 10 + growth))
                 self.lib.resources[key].update(held=0)
 
+    def test_every_grant_publication_logs_one_ascii_line_with_its_numbers(self):
+        """#738 (tests-07): the published grant is observable -- one "[qf_native] grant:" line per publication (info level,
+        hidden at the production default warning) with the device / owner / shared ceilings, what Comfy left free, the
+        host reserve (comfy side + --reserve-vram) and the engine's resident bytes. ASCII only (a Windows console)."""
+        MB = 1 << 20
+        patcher = self.wrapper("grant-line")
+        owner, _ = patcher.model_patches_models()
+        key = owner._resource._pointer.value
+        self.lib.resources[key].update(held=10 * MB, limit=0, phase=qfe.QUANTFUNC_RESOURCE_PHASE_ATTACHED)
+        self.lib.resources[1].update(held=0, limit=0)
+        self.lib.device_limit = 0
+        qfm._QF_HOST_INFERENCE_BYTES.clear()
+        qfm._note_host_inference_bytes(torch.device("cuda:0"), 6 * MB)
+        with mock.patch.object(mm, "get_free_memory", return_value=30 * MB), \
+                mock.patch.object(mm, "extra_reserved_memory", return_value=4 * MB), \
+                mock.patch.object(qfe, "info") as info:
+            self.assertEqual(owner.partially_load(owner.load_device, 5 * MB), 0)
+        lines = [c.args[0] % c.args[1:] for c in info.call_args_list
+                 if c.args and str(c.args[0]).startswith("[qf_native] grant:")]
+        self.assertEqual(lines, ["[qf_native] grant: device=30 MB owner=30 MB shared=20 MB comfy_free=30 MB "
+                                 "host_reserve=10 MB engine_resident=10 MB (comfy budget 5 MB; growth 20 MB)"])
+        self.assertTrue(lines[0].isascii())
+        self.lib.resources[key].update(held=0)
+
     def test_host_inference_bytes_key_one_card_however_comfy_names_it(self):
         """torch.device("cuda") and torch.device("cuda:0") are the same card to ComfyUI: one reserve entry."""
         qfm._QF_HOST_INFERENCE_BYTES.clear()

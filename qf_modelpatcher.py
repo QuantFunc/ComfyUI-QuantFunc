@@ -1472,6 +1472,7 @@ def _publish_domain_grants(adapter, *, publish_owner=False, growth_allowance=0):
         total = min(total, _QF_UINT64_MAX)
         domain_actual = min(_ready_read(shared._resource.query_domain_residency, "domain residency").resident_bytes,
                             total)
+        free = host_reserve = None
         if growth_allowance is None:
             allowance = None
             device_limit = total
@@ -1515,6 +1516,18 @@ def _publish_domain_grants(adapter, *, publish_owner=False, growth_allowance=0):
                     qfe.QUANTFUNC_RESOURCE_GRANT_DEVICE)
             _set_domain_grants(shared, target_owner._resource, mask, owner_limit_bytes=owner_target,
                                shared_limit_bytes=shared_target, device_limit_bytes=device_limit)
+        # #738 (tests-07): the published grant is observable in the log, one line per publication (info level: hidden at
+        # the production default). A cell that never pages would otherwise show no grant at all.
+        qfe.info("[qf_native] grant: device=%d MB owner=%s shared=%d MB comfy_free=%s host_reserve=%s "
+                 "engine_resident=%d MB (%s)",
+                 device_limit >> 20,
+                 "%d MB" % (owner_target >> 20) if target_owner is not None else "-",
+                 shared_target >> 20,
+                 "%d MB" % (free >> 20) if free is not None else "-",
+                 "%d MB" % (host_reserve >> 20) if host_reserve is not None else "-",
+                 domain_actual >> 20,
+                 "full load: no growth ceiling" if allowance is None
+                 else "comfy budget %d MB; growth %d MB" % (int(growth_allowance) >> 20, allowance >> 20))
         domain.shared_growth_fenced = False
         return device_limit
 
