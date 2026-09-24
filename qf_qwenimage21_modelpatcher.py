@@ -124,12 +124,11 @@ class QFQwenImage21Model(QFSessionModelMixin, comfy.model_base.QwenImage21):
         ab = str(getattr(self, "_attn_backend", "auto") or "auto")
         if ab != "auto":
             _o["attention_backend"] = ab
-        # token-prune keep-fraction (the quality_enhance switch, Krea2's emission): absent = the engine
-        # resets to 1.0 (no prune). The engine prunes a ONE-cond-group session without references only — text-to-image,
-        # img2img and mask inpainting (the mask blend is the sampler's); edit, CFG > 1 and batch > 1 run full.
-        _tp = getattr(self, "_token_prune", 1.0)          # set_token_prune stores a float (1.0 = no prune)
-        if 0.0 < _tp < 1.0:
-            _o["token_prune_keep_ratio"] = _tp
+        # [enhance switch] the quality_enhance widget is the mixin's ONE video_enhance switch (user 2026-09-19), emitted
+        # HERE because this _begin builds its own _o (as Krea-2's does) — otherwise the widget is silently dropped.
+        # Always sent, boolean; the prune behind it is engine law. The engine prunes a one-cond-group session without
+        # references only (text-to-image, img2img, mask inpainting); edit, CFG > 1 and batch > 1 run full.
+        _o["video_enhance"] = bool(getattr(self, "_video_enhance", False))
         bpx._opts = json.dumps(_o).encode()
         bpx.options_json = bpx._opts
         session = ctypes.c_void_p()

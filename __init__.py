@@ -712,7 +712,7 @@ if _IMPORT_OK:
                                 "ON = full quality. Runtime session knob — takes effect next run, "
                                 "never rebuilds."})
 
-    # Qwen-Image-2.1: the same switch and mapping (_quality_enhance_to_token_prune), an image tooltip — the
+    # Qwen-Image-2.1: the same video_enhance switch (ON = full quality, OFF = the engine's speed policy), an image tooltip — the
     # engine prunes every one-cond-group run without references (text-to-image, img2img, mask inpainting; CFG 1, batch 1 — the
     # official recipe); edit, CFG > 1 and batch > 1 run full.
     _QWEN21_QUALITY_ENHANCE_INPUT = ("BOOLEAN", {"default": False,
@@ -1006,7 +1006,7 @@ if _IMPORT_OK:
                        "keep the alpha channel (transparent PNG). " + _COMMON_LIMITS)
 
         def load(self, transformer, model_config, attention_backend="auto", quality_enhance=False):
-            # [runtime dials] backend + token-prune (quality_enhance) are SESSION knobs (NOT create keys —
+            # [runtime dials] backend + video_enhance (quality_enhance) are SESSION knobs (NOT create keys —
             # a widget change never re-keys the engine = no rebuild), exactly like the Krea2 node.
             _p = _run_family_load("qwenimage21", transformer, model_config,
                                   None,
@@ -1014,8 +1014,7 @@ if _IMPORT_OK:
             _mm = getattr(_p, "model", None)
             if _mm is not None and hasattr(_mm, "set_attn_backend"):
                 _mm.set_attn_backend(_attn_backend_to_engine(attention_backend))
-            if _mm is not None and hasattr(_mm, "set_token_prune"):
-                _mm.set_token_prune(_quality_enhance_to_token_prune(quality_enhance))
+            _mm.set_video_enhance(quality_enhance)
             return (_p,)
 
 
