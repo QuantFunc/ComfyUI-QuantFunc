@@ -146,14 +146,14 @@ ComfyUI/
 
 | Requirement | Minimum |
 |-------------|---------|
-| **GPU** | NVIDIA, compute capability 7.5 / 8.0 / 8.6 / 8.9 / 9.0 / 10.0 / 10.3 / 12.0 (RTX 20/30/40/50, T4, A100, A10/A40, L4/L40, H100/H200, B200/GB200, B300/GB300, RTX PRO 6000 Blackwell). Not published: 8.7, 11.0, 12.1 (aarch64 parts) |
+| **GPU** | NVIDIA, on an x86_64 host. Linux: compute capability 7.5 / 8.0 / 8.6 / 8.9 / 9.0 / 10.0 / 10.3 / 12.0 (RTX 20/30/40/50, T4, A100, A10/A40, L4/L40, H100/H200, B200, B300, RTX PRO 6000 Blackwell). Windows: 7.5 / 8.6 / 8.9 / 12.0 (RTX 20/30/40/50, T4, A10/A40, L4/L40, RTX PRO 6000 Blackwell). Not published: 8.7, 11.0, 12.1 and Grace (aarch64) systems such as GB200/GB300 |
 | **VRAM** | 8 GB |
 | **Driver** | NVIDIA ≥ 575 (CUDA 12 engine) or ≥ 580 (CUDA 13 engine) |
 | **CUDA Runtime** | PyTorch built for CUDA 12.6 or newer (CUDA 12 engine) or CUDA 13.0 or newer (CUDA 13 engine); the engine matches PyTorch's CUDA major |
 | **cuDNN** | 9.x |
 | **OS** | Linux (glibc 2.31+) or Windows 10/11 |
 | **Python** | 3.9+ (ComfyUI's embedded Python) |
-| **Engine build** (0.0.13) | CUDA 13.0 + cuDNN 9.13 (CUDA 13 engine), CUDA 12.9.2 + cuDNN 9.3 (CUDA 12 engine); gcc 11.4; OpenCV / OpenSSL / curl linked statically |
+| **Engine build** (0.0.13, Linux) | CUDA 13.0 + cuDNN 9.13 (CUDA 13 engine), CUDA 12.9.2 + cuDNN 9.3 (CUDA 12 engine); gcc 11.4; OpenCV / OpenSSL / curl linked statically |
 
 ### 2.4 Runtime Dependencies
 
@@ -280,7 +280,7 @@ offer `super_fast` (a workflow saved with it runs `fast`, or `balance` on a GPU 
 
 | Issue | Solution |
 |-------|----------|
-| "no QuantFunc engine is installed" / "still downloading" | Linux: the console's `[qf_native]` line from the start says why (still downloading, not installable here, update failed); see 2.5 and 2.6 |
+| "no QuantFunc engine is installed" / "still downloading" | The console's `[qf_native]` line from the start says why (still downloading, not installable here, update failed); see 2.5 and 2.6 |
 | Engine library not found | Check the console's `[qf_native]` install line (2.6); the engine installs on the next start |
 | Console shows only warnings | That is the default: the engine prints only warnings and errors |
 | cuDNN BAD_PARAM | Delete cuDNN algo cache and retry |

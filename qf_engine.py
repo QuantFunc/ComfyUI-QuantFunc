@@ -833,15 +833,15 @@ def info(msg, *args, flush=True):
 # entirely when QF_NATIVE_SO_PATH names the library or bin/<platform>/.dev_lib_lock marks a local build there.
 # EVERY name this installer uses lives in this block; nothing it writes or fetches is named by the server.
 _ENGINE_BASE_URL = "https://www.modelscope.cn/models/QuantFunc/Plugin/resolve/master"   # HTTPS only (checked per fetch)
-# The published platforms, by bin/<platform>/ name. key: the platform's section of version.json and verify.json; folder:
-# its folder under {ver}/; arches: platform.machine() of the published engines; hosts: the engine library per CUDA major;
-# kernel: True = a host plus one kernel library per GPU class (Linux), False = one self-contained library per class.
+# The published platforms, by bin/<platform>/ name — also the release's folder under {ver}/. key: the platform's section
+# of version.json and verify.json; arches: platform.machine() of the published engines; hosts: the engine library per CUDA
+# major; kernel: True = a host plus one kernel library per GPU class (Linux), False = one self-contained library per class.
 # version.json gates a release for this installer with "kernel_so": true on BOTH platforms ("published in the per-arch
 # installer layout"; tests-07 ruling 2026-09-24: no second field).
 _ENGINE_PLATFORMS = {
-    "linux": {"key": "linux", "folder": "linux", "arches": ("x86_64",), "kernel": True,
+    "linux": {"key": "linux", "arches": ("x86_64",), "kernel": True,
               "hosts": {13: "libquantfunc.so", 12: "libquantfunc-12.so"}},
-    "windows": {"key": "win32", "folder": "windows", "arches": ("AMD64",), "kernel": False,
+    "windows": {"key": "win32", "arches": ("AMD64",), "kernel": False,
                 "hosts": {13: "quantfunc.dll", 12: "quantfunc-12.dll"}},
 }
 _ENGINE_KERNEL_RE = re.compile(r"libquantfunc_kernels[-A-Za-z0-9_.]*\.so")   # the host's DT_NEEDED names its kernel
@@ -853,7 +853,7 @@ _ENGINE_PAIR_ID_RE = re.compile(r"[0-9a-f]{32}")      # .qf_pair_id: one id per 
 _ENGINE_MARKER_RE = re.compile(r"\.engine-([a-z][a-z0-9_]{0,31})-cu(\d+)\.json")
 _ENGINE_PAIR_RE = re.compile(r"(\d+\.\d+\.\d+)-([a-z][a-z0-9_]{0,31})-cu(\d+)")
 _ENGINE_LOCAL_BUILD_LOCK = ".dev_lib_lock"            # bin/<platform>/.dev_lib_lock: bin/<platform>/<lib> is a local build
-_ENGINE_INSTALL_LOCKFILE = ".engine-install.lock"     # flock: one installer per plugin folder, across ComfyUI instances
+_ENGINE_INSTALL_LOCKFILE = ".engine-install.lock"     # _install_lock: one installer per plugin folder, across instances
 _ENGINE_REINSTALLED = ".reinstalled"                  # in a pair folder: re-downloaded once already after a failed load
 _ENGINE_VERIFY_SCHEMA_MAX = 1
 _ENGINE_HTTP_TIMEOUT_S = 120
@@ -989,7 +989,7 @@ def engine_choice(device_idx=0):
 
 def _engine_pick_version(versions, plugin_version, major):
     """The release this plugin installs: the classic updater's rule (f53e39d _find_best_compatible_version). Among the
-    entries that ship the host/kernel split ("kernel_so": true) and whose "comfy" / "comfy-12" requirement (falling back
+    entries published in the per-architecture layout ("kernel_so": true) and whose "comfy" / "comfy-12" requirement (falling back
     to "comfy") is at most this plugin's version, the one with the highest "lib" / "lib-12" (falling back to "lib", then
     to the key). Returns that entry's KEY, which is the release's path segment on the repo."""
     suffix = "-12" if major == 12 else ""
@@ -1100,7 +1100,7 @@ def _marker_of(so_path):
 
 
 def _pair_intact(m):
-    """Both files of the marked pair still hash to what its marker recorded at install."""
+    """Every file of the marked engine (Linux: host + kernel; Windows: the DLL) still hashes to what its marker recorded."""
     pair = os.path.join(_engine_bin_dir(), _pair_dir(m))
     try:
         return all(_sha256_of(os.path.join(pair, n)) == h for n, h in m["sha256"].items())
@@ -1109,7 +1109,7 @@ def _pair_intact(m):
 
 
 def _manifest_key(gpu_set, name):
-    """A file's key in verify.json, which is also its path under {ver}/<folder>/: a Linux host is one per CUDA major, a
+    """A file's key in verify.json, which is also its path under {ver}/<platform>/: a Linux host is one per CUDA major, a
     kernel (Linux) or a whole library (Windows) one per class."""
     plat = _engine_platform()
     return name if plat["kernel"] and name in plat["hosts"].values() else f"{gpu_set}/{name}"
@@ -1121,7 +1121,7 @@ def _engine_sets(version, hashes):
     if "sets.json" not in hashes:
         raise RuntimeError(f"the {version} release publishes no sets.json, so its GPU classes are unknown; no engine "
                            f"was installed")
-    raw = _engine_http_get(f"{_ENGINE_BASE_URL}/{version}/{_engine_platform()['folder']}/sets.json")
+    raw = _engine_http_get(f"{_ENGINE_BASE_URL}/{version}/{_BIN_SUBDIR}/sets.json")
     import hashlib
     if hashlib.sha256(raw).hexdigest() != hashes["sets.json"]:
         raise RuntimeError(f"the {version} sets.json does not match its published SHA-256")
@@ -1154,13 +1154,13 @@ def install_engine(device_idx=None):
     Remote-first: the release's version.json, verify.json and sets.json are read every time, so a newer compatible
     engine replaces an older one. The marked pair of the wanted release is kept while the release still publishes the
     hashes its marker recorded; when it does not, that is a KNOWN mismatch — its marker goes first, so it is never loaded
-    again. Otherwise, into the pair's own folder:
-      - download the host, verify it; read its kernel's name from its DT_NEEDED; download the kernel, verify it;
-      - check both carry the same .qf_pair_id (one build), else install nothing;
-      - rename the KERNEL into place first, then the host;
-      - write the marker LAST: only now is the pair loadable. Older pairs of the same class and CUDA major go, except
-        the one just replaced (a process may be between reading its marker and loading it).
-    A failure installs nothing and keeps a verified older pair (never bricks). Returns the marker, or None when the
+    again. Otherwise, into the release's own folder:
+      - download the host (Windows: the one DLL of this class), verify its SHA-256;
+      - Linux: read the kernel's name from the host's DT_NEEDED, download the kernel, verify it, and check both carry
+        the same .qf_pair_id (one build), else install nothing; the KERNEL is renamed into place first, then the host;
+      - write the marker LAST: only now is the engine loadable. Older folders of the same class and CUDA major go,
+        except the one just replaced (a process may be between reading its marker and loading it).
+    A failure installs nothing and keeps a verified older engine (never bricks). Returns the marker, or None when the
     installer keeps out (a local build, or the dev override)."""
     why = _engine_local_choice()
     if why:
@@ -1192,14 +1192,17 @@ def _install_lock(path):
     Waits for the other installer like flock does; released when this block ends, also when the process dies."""
     with open(path, "a+b") as f:
         if _BIN_SUBDIR == "windows":
+            import errno
             import msvcrt
+            held = {errno.EACCES, getattr(errno, "EDEADLOCK", errno.EDEADLK)}   # "locked by someone else" (MS CRT)
             f.seek(0)
             while True:
                 try:
                     msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)   # LK_LOCK itself retries for ~10 s, then raises
                     break
-                except OSError:
-                    continue                                        # still held by the other installer: keep waiting
+                except OSError as e:
+                    if e.errno not in held:                         # anything but "held" fails the install loudly
+                        raise
             try:
                 yield
             finally:
@@ -1266,7 +1269,7 @@ def _install_pair(bin_dir, device_idx):
             if not _ENGINE_SHA256_RE.fullmatch(str(hashes.get(key, ""))):
                 raise RuntimeError(f"the {version} manifest has no SHA-256 for {key}")
             parts.append(os.path.join(pair, f".{name}.part"))
-            got[name] = _engine_fetch_to(f"{_ENGINE_BASE_URL}/{version}/{plat['folder']}/{key}", parts[-1],
+            got[name] = _engine_fetch_to(f"{_ENGINE_BASE_URL}/{version}/{_BIN_SUBDIR}/{key}", parts[-1],
                                          f"engine {version}: {name}")
             if got[name] != hashes[key]:
                 raise RuntimeError(f"{key} does not match its published SHA-256 (download corrupt or tampered)")
@@ -1498,10 +1501,8 @@ def _elf_pair_id(path):
 
 
 def _is_elf(path):
-    """True iff `path` begins with the ELF magic. Distinguishes a Linux .so (which the DT_NEEDED reader
-    CAN inspect) from a non-ELF engine binary — a Windows PE `.dll` ("MZ..") or a macOS Mach-O `.dylib` —
-    which it CANNOT, so the toolchain guard must special-case those platforms rather than refuse them all
-    as if they were unverifiable Linux binaries."""
+    """True iff `path` begins with the ELF magic: a Linux .so, whose DT_NEEDED the toolchain guard reads. A Windows PE
+    `.dll` ("MZ..") is read through _pe_imports instead; anything else (a macOS Mach-O `.dylib`) is refused."""
     try:
         with open(path, "rb") as f:
             return f.read(4) == b"\x7fELF"
@@ -1627,7 +1628,7 @@ def _sidecar_preloads(so_path):
         present = set(os.listdir(d))
     except OSError:
         return []
-    never = set((_engine_platform() or {"hosts": {}})["hosts"].values()) | {os.path.basename(so_path)}
+    never = set((_engine_platform() or {}).get("hosts", {}).values()) | {os.path.basename(so_path)}
     want, todo = set(), [os.path.basename(so_path)]
     while todo:
         for n in _elf_needed(os.path.join(d, todo.pop())):

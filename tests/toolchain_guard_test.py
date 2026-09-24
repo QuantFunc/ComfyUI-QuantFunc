@@ -115,15 +115,16 @@ def _pe_arms():
         "cudart decides over cuBLAS": (pe("c.dll", ["cudart64_12.dll", "cublas64_13.dll"]), 12),
         "two cudart majors": (pe("d.dll", ["cudart64_12.dll", "cudart64_13.dll"]), None),
         "no CUDA import": (pe("e.dll", ["KERNEL32.dll", "MSVCP140.dll"]), None),
-        "delay-loaded cudart 13": (pe("f.dll", ["KERNEL32.dll"], delay=["cudart64_13.dll"]), 13),
+        "delay-loaded cudart 13 (2nd delay entry)": (pe("f.dll", ["KERNEL32.dll"], delay=["nvcuda.dll", "cudart64_13.dll"]),
+                                                     13),
     }
     for label, (p, want) in majors.items():
         got = qfe._so_cuda_major(p)
         ok = got == want and qfe._is_pe(p) and not qfe._is_elf(p)
         print(f"  [{'OK ' if ok else 'FAIL'}] PE {label}: CUDA major {got} (expected {want})")
         bad += not ok
-    imports = qfe._pe_imports(majors["delay-loaded cudart 13"][0])
-    ok = imports == ["kernel32.dll", "cudart64_13.dll"]
+    imports = qfe._pe_imports(majors["delay-loaded cudart 13 (2nd delay entry)"][0])
+    ok = imports == ["kernel32.dll", "nvcuda.dll", "cudart64_13.dll"]   # both tables, every descriptor (strides 20 / 32)
     print(f"  [{'OK ' if ok else 'FAIL'}] PE import reader: import + delay-load names, lowercased -> {imports}")
     bad += not ok
     trunc = os.path.join(tmp, "trunc.dll")

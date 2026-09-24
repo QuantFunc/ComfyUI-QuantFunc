@@ -153,10 +153,13 @@ class _FakeMsvcrt(types.ModuleType):
 
     def __init__(self):
         super().__init__("msvcrt")
-        self.calls = []
+        self.calls, self.fail = [], []          # fail: errnos the next LK_LOCK calls raise, in order
 
     def locking(self, fd, mode, nbytes):
         self.calls.append(("lock" if mode == self.LK_LOCK else "unlock", nbytes))
+        if mode == self.LK_LOCK and self.fail:
+            code = self.fail.pop(0)
+            raise OSError(code, os.strerror(code))
 
 
 @contextlib.contextmanager
@@ -1223,6 +1226,41 @@ def main():
             except RuntimeError as e:
                 second[dev] = "refused" if "one ComfyUI per GPU architecture" in str(e) else f"other: {str(e)[:60]}"
     check("Windows: a second GPU architecture in one process is refused loudly", second == {0: "ok", 1: "refused"}, second)
+    # 43) a Windows marker is ONE file with "kernel": null — a marker naming a kernel (a Linux-shaped or tampered marker
+    #     in bin/windows) is not followed: nothing loads from it.
+    with windows(), Env(WinRelease(), torch_major=12, sm=89, machine="AMD64") as env:
+        m = qfe.install_engine()
+        mp = env.path(".engine-sm89-cu12.json")
+        good = qfe._read_marker(mp) is not None
+        followed = {}
+        for label, bad_m in (("kernel named", dict(m, kernel="quantfunc_kernels.dll")),   # only the kernel field
+                             ("second sha256", dict(m, sha256=dict(m["sha256"], **{"x.dll": "0" * 64})))):
+            open(mp, "w").write(json.dumps(bad_m))
+            followed[label] = qfe._read_marker(mp) is not None
+        try:
+            qfe.resolve_so_path()
+            loaded = "loaded!"
+        except RuntimeError as e:
+            loaded = "no QuantFunc engine is installed" in str(e)
+    check("Windows: a marker naming a kernel, or recording a second file, is not a Windows marker and is never followed",
+          good and followed == {"kernel named": False, "second sha256": False} and loaded is True,
+          f"good={good} followed={followed} loaded={loaded}")
+    # 44) the Windows install lock waits ONLY while another installer holds it (the CRT's EDEADLOCK / EACCES after its
+    #     own ~10 s of retries); any other error fails the install loudly instead of spinning forever.
+    import errno as _errno
+    held = getattr(_errno, "EDEADLOCK", _errno.EDEADLK)
+    with windows() as ms, Env(WinRelease(), torch_major=12, sm=89, machine="AMD64") as env:
+        ms.fail = [held, _errno.EACCES]
+        waited = (qfe.install_engine() or {}).get("set"), [c[0] for c in ms.calls]
+    with windows() as ms, Env(WinRelease(), torch_major=12, sm=89, machine="AMD64") as env:
+        ms.fail = [_errno.EBADF]
+        try:
+            qfe.install_engine()
+            broken = "installed!"
+        except OSError as e:
+            broken = e.errno == _errno.EBADF and not env.pairs()
+    check("Windows: the install lock waits while held (EDEADLOCK/EACCES) and fails loudly on anything else",
+          waited == ("sm89", ["lock", "lock", "lock", "unlock"]) and broken is True, f"waited={waited} broken={broken}")
     print("ENGINE_INSTALL:", "PASS" if bad == 0 else f"FAIL ({bad} wrong)")
     return 1 if bad else 0
 
