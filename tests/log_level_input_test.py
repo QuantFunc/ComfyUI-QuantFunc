@@ -18,7 +18,11 @@
       ValueError naming the accepted ones, before the level is set or the loader runs;
   L9  a node that already declares hidden inputs (the quality loaders' retired quality_enhance) keeps them, and
       the node's own spec dicts are never modified.
-MUTATION: make _run skip set_level -> L2/L3 go RED; forward log_level to the loader -> L2 goes RED; move the
+  L10 qf_engine.info (the plugin's own per-run detail lines) prints only at info: silent before any loader ran and
+      at warning (tests-07 ruling: the production default is warning for the plugin's output too);
+  L11 those lines (loaded / SESSION OPEN / CLOSED / VRAM ledger / engine lib) reach the console only through it (AST).
+MUTATION: make info() print at every level -> L10 goes RED; turn one converted line back into print -> L11 goes RED;
+make _run skip set_level -> L2/L3 go RED; forward log_level to the loader -> L2 goes RED; move the
 attach loop above the cloud-TE registration -> L5 goes RED; drop the __signature__ -> L6 goes RED; make
 set_log_level call load_lib(), or drop the pending-level apply in load_lib -> L7 goes RED; declare the input
 optional again -> L1 goes RED; drop the value check in _run -> L8 goes RED; write log_level into the node's
@@ -191,6 +195,37 @@ def main():
     check("L7 load_lib applies the recorded level right after loading", applied == [2])
     eng.set_log_level(3)
     check("L7 once loaded, a new level applies at once", applied == [2, 3])
+
+    # L10: the plugin's own detail lines follow the same level (tests-07 ruling on R3, 「生产环境默认只打warning日志」):
+    #      qf_engine.info is silent before any loader ran and at warning, and prints (formatted) at info.
+    import contextlib
+    import io
+    heard = {}
+    for label, level in (("never set", None), ("warning", 3), ("info", 2)):
+        eng._LOG_LEVEL = level
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            eng.info("[qf_native] detail %d", 7)
+        heard[label] = buf.getvalue()
+    check("L10 qf_engine.info: silent before any loader ran and at warning, printed at info",
+          heard == {"never set": "", "warning": "", "info": "[qf_native] detail 7\n"})
+    # L11: the per-run detail lines reach the console ONLY through that helper (AST over every plugin module): a bare
+    #      print / logging.info of one of them would print at the production level again.
+    tokens = ("loaded QuantFuncNativeLoader", "SESSION OPEN", "SESSION CLOSED", "VRAM ledger", "engine lib:")
+    bare = []
+    for fn in sorted(os.listdir(_PLUGIN)):
+        if not fn.endswith(".py"):
+            continue
+        for node in ast.walk(ast.parse(open(os.path.join(_PLUGIN, fn), encoding="utf-8").read())):
+            if not (isinstance(node, ast.Call) and node.args):
+                continue
+            f = node.func
+            helper = (isinstance(f, ast.Name) and f.id == "info") or (
+                isinstance(f, ast.Attribute) and f.attr == "info" and isinstance(f.value, ast.Name) and f.value.id == "qfe")
+            text = "".join(v.value for v in ast.walk(node.args[0]) if isinstance(v, ast.Constant) and isinstance(v.value, str))
+            if not helper and any(t in text for t in tokens):
+                bare.append(f"{fn}:{node.lineno}")
+    check(f"L11 the per-run detail lines print only through qf_engine.info (bare: {bare or 'none'})", not bare)
 
     print(f"LOG_LEVEL_INPUT: {'PASS' if not failures else 'FAIL'} ({len(failures)} failure(s))")
     return 1 if failures else 0

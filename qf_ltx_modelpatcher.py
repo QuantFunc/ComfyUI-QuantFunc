@@ -305,7 +305,7 @@ def _load_ltx_video_connector(connector_ckpt, device, dtype=torch.bfloat16, _bud
             f"unexpected={len(unexpected)}; derived n_layers={n_layers} heads={num_heads}) -- arch mismatch. "
             f"unexpected(sample)={sorted(unexpected)[:4]} missing(sample)={sorted(missing)[:4]}")
     conn = conn.to(device=device, dtype=dtype).eval()
-    logging.info("[qf_native] LTX video connector loaded CLEAN (n_layers=%d heads=%d head_dim=%d regs=%d "
+    qfe.info("[qf_native] LTX video connector loaded CLEAN (n_layers=%d heads=%d head_dim=%d regs=%d "
                  "gated=%s; 0/0)", n_layers, num_heads, head_dim, n_registers, has_gate)
     return conn
 
@@ -364,7 +364,7 @@ def _load_ltx_audio_connector(connector_ckpt, device, dtype=torch.bfloat16, _bud
             f"unexpected={len(unexpected)}; derived n_layers={n_layers} heads={num_heads}) -- arch mismatch. "
             f"unexpected(sample)={sorted(unexpected)[:4]} missing(sample)={sorted(missing)[:4]}")
     conn = conn.to(device=device, dtype=dtype).eval()
-    logging.info("[qf_native] LTX audio connector loaded CLEAN (n_layers=%d heads=%d head_dim=%d regs=%d; 0/0)",
+    qfe.info("[qf_native] LTX audio connector loaded CLEAN (n_layers=%d heads=%d head_dim=%d regs=%d; 0/0)",
                  n_layers, num_heads, head_dim, n_registers)
     return conn
 
@@ -448,7 +448,7 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
         # correctly). Cleared at the gate; re-armed every run start.
         self._qf_needs_begin = True
         if was_open:
-            print("[qf_native] LTX: closed a pre-existing session at run start "
+            qfe.info("[qf_native] LTX: closed a pre-existing session at run start "
                   f"(prior run interrupted/uncleaned); end ok={ok}", flush=True)
         # masked-latent i2v (comfy LTXVImgToVideoInplace): capture the run's denoise_mask
         # as PER-LATENT-FRAME sigma scales for the engine session. This is the comfy
@@ -737,7 +737,7 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
         self._qf.unloaded = False
         self._step_i = 0
         self._sess_denoise = 0
-        print(f"[qf_native] LTX SESSION OPEN handle={session.value:#x} steps={self._num_steps} "
+        qfe.info(f"[qf_native] LTX SESSION OPEN handle={session.value:#x} steps={self._num_steps} "
               f"cond={tuple(vemb_group.shape)} frames={self._num_frames}", flush=True)
 
     def _apply_model(self, x, t, c_concat=None, c_crossattn=None, control=None,
@@ -855,7 +855,7 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
                 # The session is always t2v-shape: engine finalize early-returns (buffer
                 # read-not-written) — keep the original fp32 latent untouched (bit-exact).
                 # i2v frame-0 imposition lives comfy-side (X0Inpaint), never in finalize.
-                print(f"[qf_native] LTX SESSION CLOSED after {self._step_i} sampler steps, "
+                qfe.info(f"[qf_native] LTX SESSION CLOSED after {self._step_i} sampler steps, "
                       f"{self._sess_denoise} denoise_step calls, finalize=OK", flush=True)
             finally:
                 self._qf.end_session_if_open()
@@ -1118,7 +1118,7 @@ class QFLTXAVModel(QFLTXModel):
                 fst = lib.quantfunc_denoise_finalize(self._qf.current_session, ctypes.byref(fp))
                 if fst != qfe.QUANTFUNC_OK:
                     raise RuntimeError(f"qf_native: LTX-AV denoise_finalize failed: {qfe.last_err(lib)}")
-                print(f"[qf_native] LTX-AV SESSION CLOSED after {self._step_i} sampler steps, "
+                qfe.info(f"[qf_native] LTX-AV SESSION CLOSED after {self._step_i} sampler steps, "
                       f"{self._sess_denoise} denoise_step_multi calls, finalize=OK", flush=True)
             finally:
                 self._qf.end_session_if_open()
@@ -1229,7 +1229,7 @@ def register(deps):
             if _qualified:
                 conn_src = _qualified[0]   # deterministic: sorted-first
                 if len(_qualified) > 1:
-                    print(f"[qf_native] ltx2: {len(_qualified)} qualifying connectors "
+                    qfe.info(f"[qf_native] ltx2: {len(_qualified)} qualifying connectors "
                           f"completion files in {_dir!r}; using the alphabetically-first "
                           f"{os.path.basename(conn_src)} (others: "
                           f"{', '.join(os.path.basename(p) for p in _qualified[1:])})",
@@ -1248,7 +1248,7 @@ def register(deps):
                     f"itself (official comfy contract: TE output is unprocessed_ltxav_embeds), "
                     f"so a source is required. Fix: place the shared ltx-2.5-connectors file "
                     f"in the same folder, or use an ALL-IN export (*-allin-*.safetensors).")
-            print(f"[qf_native] ltx2: transformer-only export — connectors completion file: "
+            qfe.info(f"[qf_native] ltx2: transformer-only export — connectors completion file: "
                   f"{os.path.basename(conn_src)}", flush=True)
         extra = {"connectors": conn_src}
         model_dir = qfmp.stage_denoise_only_package(bundle_dir, transformer1_path, extra_links=extra)
@@ -1329,7 +1329,7 @@ def register(deps):
                 model = QFLTXAVModel(model_config, engine, device=device)
                 _register_model(model)
                 patcher = QFModelPatcher(model, load_device=device, offload_device=offload)
-                print(f"[qf_native] loaded QuantFuncNativeLoader (LTX-2.5 JOINT-AV svdq) "
+                qfe.info(f"[qf_native] loaded QuantFuncNativeLoader (LTX-2.5 JOINT-AV svdq) "
                       f"package={model_name} "
                       f"capacity=native Prepared query (create deferred)", flush=True)
                 return qfmp.tag_lora_rebuild(patcher, lora_entries, _build)
@@ -1406,7 +1406,7 @@ def register(deps):
                                audio_connector=audio_connector)
             _register_model(model)
             patcher = QFModelPatcher(model, load_device=device, offload_device=offload)
-            print(f"[qf_native] loaded QuantFuncNativeLoader (LTX-2 svdq) package={model_name} "
+            qfe.info(f"[qf_native] loaded QuantFuncNativeLoader (LTX-2 svdq) package={model_name} "
                   f"capacity=native Prepared query (create deferred)", flush=True)
             return qfmp.tag_lora_rebuild(patcher, lora_entries, _build)
 

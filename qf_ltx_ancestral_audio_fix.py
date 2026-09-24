@@ -95,7 +95,7 @@ def _log_once(name, how):
     if name in _logged_samplers:
         return
     _logged_samplers.add(name)
-    logging.info("[qf_native] LTX-2.5 AV: sampler '%s' -> %s for the QF AV model — the engine's stateless "
+    logging.warning("[qf_native] LTX-2.5 AV: sampler '%s' -> %s for the QF AV model — the engine's stateless "
                  "flow-match forward needs a non-re-noised (deterministic) trajectory or the audio lane is "
                  "silenced. Video is deterministic here (accepted tradeoff).", name, how)
 
@@ -192,7 +192,7 @@ def install():
             skipped_renoising.append(sname)
     _installed = True
     if wrapped_names:
-        logging.info("[qf_native] LTX-2.5 AV euler-force audio-fix installed (%d user-selectable re-noising "
+        logging.debug("[qf_native] LTX-2.5 AV euler-force audio-fix installed (%d user-selectable re-noising "
                      "samplers wrapped: %s). QF-AV models run these on a deterministic trajectory so the "
                      "audio lane is not silenced; non-QF-AV models are unaffected.%s",
                      len(wrapped_names), ", ".join(sorted(wrapped_names)),

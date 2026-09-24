@@ -318,7 +318,7 @@ def _retire_handle(ckey, eng, requester=None, *, keep_binding=False, reason=""):
                 continue
             foreign.append(consumer)
         if foreign:
-            print(f"[qf_native] retire refused ({reason or 'unspecified'}): {len(foreign)} live "
+            qfe.info(f"[qf_native] retire refused ({reason or 'unspecified'}): {len(foreign)} live "
                   "foreign consumer(s) still bound to this cache entry", flush=True)
             return False
         _PIPELINE_CACHE.pop(ckey, None)
@@ -357,7 +357,7 @@ def _sweep_dead_pipelines(keep_key):
             eng = _PIPELINE_CACHE.get(k)
         # requester=None ⇒ _retire_handle refuses while ANY consumer is live (only-all-dead sweeps)
         if eng is not None and _retire_handle(k, eng, None, reason="host-RAM sweep"):
-            print("[qf_native] host-RAM sweep: destroyed a cached pipeline whose model was GC'd "
+            qfe.info("[qf_native] host-RAM sweep: destroyed a cached pipeline whose model was GC'd "
                   "(comfy dropped its patcher) — freed its CPU backup", flush=True)
 
 

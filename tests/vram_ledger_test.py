@@ -54,6 +54,7 @@ except Exception as e:  # noqa: BLE001
 
 Mixin, Patcher = qfmp.QFSessionModelMixin, qfmp.QFModelPatcher
 torch = qfmp.torch
+qfmp.qfe.set_log_level(2)   # the harness's level: the VRAM ledger is an info line (users run at warning, see none)
 MB = 1 << 20
 SHAPE = [2, 16, 31, 48, 50]          # comfy's [B*2, C, T, H, W] at estimate time
 COND = {"c_crossattn": [(2, 616, 5120)]}
@@ -116,6 +117,10 @@ check("engine need 12000 MB" in log, "arm1: ledger line names the engine need")
 r2, log2 = _quiet(m.memory_required, SHAPE, cond_shapes=COND)
 check(r2 == r and log2 == "", "arm1: same question again → same answer, no second log line (change-only)")
 check(_TorchBase.asked == [], "arm1: a HOT engine never asks comfy's torch estimate (no floor, D3)")
+qfmp.qfe.set_log_level(3)   # the production default: warning
+r3, log3 = _quiet(m.memory_required, [2] + SHAPE[1:], cond_shapes=COND)
+qfmp.qfe.set_log_level(2)
+check(log3 == "" and r3 > 0, "arm1: at the production level (warning) the ledger is silent; the answer is unchanged")
 
 # ---- arm 1b: a PACKED AV latent [B,1,N] (H3 / LTX-AV) is unpacked to the VIDEO stream's engine geometry ------------
 PACKED = [2, 1, 24 * 31 * 48 * 50 + 32 * 2 * 207]          # comfy.utils.pack_latents(video, audio) → [B,1,N]

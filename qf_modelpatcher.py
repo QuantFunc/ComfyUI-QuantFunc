@@ -509,7 +509,7 @@ class QFSessionModelMixin:
                 hold = f"{int(eng.resident_vram_bytes()) >> 20} MB" if eng is not None else "0 MB"
             except Exception as error:  # diagnostic only; never invent a measured zero
                 hold = f"unknown ({type(error).__name__}: {error})"
-            print("[qf_native] VRAM ledger: memory_required%s = %d MB (comfy-side %d MB, engine need %d MB%s); "
+            qfe.info("[qf_native] VRAM ledger: memory_required%s = %d MB (comfy-side %d MB, engine need %d MB%s); "
                   "engine hold %s"
                   % (list(sig[0]), total >> 20, comfy_side >> 20, need >> 20,
                      " (cold: no pipeline yet; comfy's own estimate %d MB is the floor)" % (floor >> 20)
@@ -711,7 +711,7 @@ class QFLazyEngine:
         real.applied_lora_sig = None
         real.pipeline_update({"lora": lora})
         real.applied_lora_sig = want
-        print(f"[qf_native] LoRA set applied in place (no reload): {len(lora)} LoRA(s)", flush=True)
+        qfe.info(f"[qf_native] LoRA set applied in place (no reload): {len(lora)} LoRA(s)", flush=True)
         return True
 
     @property
@@ -1598,7 +1598,7 @@ class QFNativeResourcePatcher(comfy.model_patcher.ModelPatcher):
                 # row died at session begin on "requires a positive Owned host grant". The shrink is now followed
                 # by the same formal admission as any load, with no weights budget of its own: the ceiling is
                 # what Comfy left free (its inference reserve), which is exactly the room it made for this run.
-                print(f"[qf_native] Comfy's budget is negative: shrinking {-allowance >> 20} MB, then admitting "
+                qfe.info(f"[qf_native] Comfy's budget is negative: shrinking {-allowance >> 20} MB, then admitting "
                       "the run without a weights budget", flush=True)
                 self.partially_unload(device_to, -allowance,
                                       force_patch_weights=force_patch_weights)

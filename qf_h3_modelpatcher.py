@@ -152,7 +152,7 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
         # correctly). Cleared at the gate; re-armed every run start.
         self._qf_needs_begin = True
         if was_open:
-            print("[qf_native] H3: closed a pre-existing session at run start (prior run interrupted); "
+            qfe.info("[qf_native] H3: closed a pre-existing session at run start (prior run interrupted); "
                   f"end ok={ok}", flush=True)
         # fl2va keyframes / ref2va references / #633 token tags: VALIDATED here, then passed
         # per-cond-group through the conditioning as ONE payload (comfy.conds.CONDConstant —
@@ -246,7 +246,7 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
                 f"'allow_partial_denoise' on QuantFuncH3Loader only for an intentional split-sigma "
                 f"or double-sampling workflow; otherwise use one full-range sampler.")
         if partial:
-            print(f"[qf_native] H3: partial denoise explicitly enabled: "
+            qfe.info(f"[qf_native] H3: partial denoise explicitly enabled: "
                   f"{s_first:.4f}→{s_last:.4f}, stage_steps={self._num_steps}", flush=True)
 
     def _begin(self, x_video, x_audio, vemb, av_payload=None):
@@ -383,7 +383,7 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
         self._kf_keep = []          # engine copy-bound the keyframes/refs at begin; release the pins
         self._step_i = 0
         self._sess_denoise = 0
-        print(f"[qf_native] H3 SESSION OPEN handle={session.value:#x} steps={self._num_steps} "
+        qfe.info(f"[qf_native] H3 SESSION OPEN handle={session.value:#x} steps={self._num_steps} "
               f"cond={tuple(vemb.shape)} audio_dims={audio_dims} frames={self._num_frames} "
               f"shift={audio_dims and getattr(ms,'shift',None)}/{getattr(ms,'audio_shift',None)}", flush=True)
 
@@ -531,7 +531,7 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
         # close the session (t2va: engine finalize early-returns; keep the sampler's latent untouched).
         if self._qf.current_session is not None:
             try:
-                print(f"[qf_native] H3 SESSION CLOSED after {self._step_i} sampler steps, "
+                qfe.info(f"[qf_native] H3 SESSION CLOSED after {self._step_i} sampler steps, "
                       f"{self._sess_denoise} denoise_step_multi calls", flush=True)
             finally:
                 self._qf.end_session_if_open()
@@ -612,7 +612,7 @@ def register(deps):
             model = QFH3Model(model_config, engine, device=device)
             _register_model(model)
             patcher = QFModelPatcher(model, load_device=device, offload_device=offload)
-            print(f"[qf_native] loaded QuantFuncNativeLoader (MiniMax-H3 svdq AV) package={model_name} "
+            qfe.info(f"[qf_native] loaded QuantFuncNativeLoader (MiniMax-H3 svdq AV) package={model_name} "
                   f"capacity=native Prepared query (create deferred)", flush=True)
             return qfmp.tag_lora_rebuild(patcher, lora_entries, _build)
 

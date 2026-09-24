@@ -348,8 +348,13 @@ class HostSchedulerContract(unittest.TestCase):
         model._qf = self.engine
         self.library.query_status = 1
         output = io.StringIO()
-        with contextlib.redirect_stdout(output):
-            model.memory_required([1, 16, 1, 8, 8])
+        level = qfm.qfe._LOG_LEVEL
+        qfm.qfe.set_log_level(2)   # the ledger is an info line (the harness's level)
+        try:
+            with contextlib.redirect_stdout(output):
+                model.memory_required([1, 16, 1, 8, 8])
+        finally:
+            qfm.qfe._LOG_LEVEL = level
         self.assertIn("engine hold unknown", output.getvalue())
         self.assertNotIn("engine hold 0 MB", output.getvalue())
 

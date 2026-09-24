@@ -81,7 +81,7 @@ class QFQwenImage21Model(QFSessionModelMixin, comfy.model_base.QwenImage21):
         was_open, ok = self._qf.end_session_if_open()   # run-start clean slate (#2 lifecycle)
         self._qf_needs_begin = True
         if was_open:
-            print("[qf_native] qwenimage21: closed a pre-existing session at run start "
+            qfe.info("[qf_native] qwenimage21: closed a pre-existing session at run start "
                   f"(prior run interrupted/uncleaned); end ok={ok}", flush=True)
         for _k in self._ENGINE_IGNORED_COND_KEYS:
             if kwargs.get(_k) is not None:
@@ -132,7 +132,7 @@ class QFQwenImage21Model(QFSessionModelMixin, comfy.model_base.QwenImage21):
         self._sess_denoise = 0
         self._max_batch = 0
         self._ctx_key_assigner.reset()
-        print(f"[qf_native] QWENIMAGE21 SESSION OPEN handle={session.value:#x} steps={self._num_steps} "
+        qfe.info(f"[qf_native] QWENIMAGE21 SESSION OPEN handle={session.value:#x} steps={self._num_steps} "
               f"latent={tuple(x_group.shape)} cond={tuple(ctx_group.shape)}", flush=True)
 
     def _apply_model(self, x, t, c_concat=None, c_crossattn=None, control=None,
@@ -249,7 +249,7 @@ class QFQwenImage21Model(QFSessionModelMixin, comfy.model_base.QwenImage21):
         # masked-blend); an INTERRUPT skips this and extra_conds closes at the next run start.
         if self._qf.current_session is not None:
             self._qf.end_session_if_open()
-            print(f"[qf_native] QWENIMAGE21 SESSION CLOSED after {self._step_i} sampler steps, "
+            qfe.info(f"[qf_native] QWENIMAGE21 SESSION CLOSED after {self._step_i} sampler steps, "
                   f"{self._sess_denoise} denoise_step calls", flush=True)
         return super().process_latent_out(latent)
 
@@ -285,7 +285,7 @@ def register(deps):
             model = QFQwenImage21Model(model_config, engine, device=device)
             _register_model(model)
             patcher = QFModelPatcher(model, load_device=device, offload_device=offload)
-            print(f"[qf_native] loaded QuantFuncNativeLoader (Qwen-Image-2.1 svdq) package={model_name} "
+            qfe.info(f"[qf_native] loaded QuantFuncNativeLoader (Qwen-Image-2.1 svdq) package={model_name} "
                   f"capacity=native Prepared query (create deferred)", flush=True)
             return qfmp.tag_lora_rebuild(patcher, lora_entries, _build)
 

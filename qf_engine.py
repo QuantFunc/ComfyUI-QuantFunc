@@ -776,6 +776,17 @@ def set_log_level(level):
         _LIB.quantfunc_set_log_level(_LOG_LEVEL)
 
 
+_LOG_INFO = 2   # info on the engine's scale (qf_log_level.LOG_LEVELS): the plugin's own detail lines follow the same level
+
+
+def info(msg, *args, flush=True):
+    """The plugin's own detail line — loaded / SESSION OPEN / CLOSED / the VRAM ledger / the library fingerprint and the
+    like — printed only while a loader asked for info: the hidden log_level input (users get warning, and before any
+    loader ran it is warning too; the harness sends info). A warning or an error never goes through here: it always
+    prints. `args` %-format `msg` (the logging idiom the converted lines used)."""
+    if _LOG_LEVEL is not None and _LOG_LEVEL <= _LOG_INFO:
+        print(msg % args if args else msg, flush=flush)
+
 # ── Engine library install (option C, user 2026-09-24 「在原生加载器里实现」) ─────────────────────────────────────────
 # The plugin installs the engine it needs into bin/linux/: ONE pair — the host library for torch's CUDA major (the FORK-2
 # guard refuses any other) and the kernel library of this GPU's class — SHA-256-verified against the release's published
@@ -1525,11 +1536,11 @@ def _log_lib_fingerprint(lib, so_path):
             ver = (fn() or b"?").decode("utf-8", "replace")
         except Exception:  # noqa: BLE001 — an old .so without the symbol still gets the file fingerprint
             pass
-        print("[qf_native] engine lib: %s  size=%d  mtime=%s  md5=%s  quantfunc_version=%s"
+        info("[qf_native] engine lib: %s  size=%d  mtime=%s  md5=%s  quantfunc_version=%s"
               % (so_path, st.st_size, time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st.st_mtime)),
                  h.hexdigest(), ver), flush=True)
     except Exception as e:  # noqa: BLE001
-        print("[qf_native] engine lib: %s (fingerprint unavailable: %r)" % (so_path, e), flush=True)
+        info("[qf_native] engine lib: %s (fingerprint unavailable: %r)" % (so_path, e), flush=True)
 
 
 def last_err(lib):
