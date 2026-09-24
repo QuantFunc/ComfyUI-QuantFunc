@@ -91,24 +91,8 @@ class QFKrea2Model(QFSessionModelMixin, comfy.model_base.Krea2):
             int(ctx_group.shape[0]), _max_seq, int(ctx_group.shape[2]))
         self._max_ctx_seq = 0
         bpx.cond_dtype = _qf_dtype(ctx_group.dtype)
-        # IMAGE session: the video-flavored residency_opts CACHE/SPARSE keys are
-        # engine-REFUSED here (E3, correctly) — send only the knobs the image seam
-        # consumes: the runtime attn-backend dial (applyAttnBackendDial) and the
-        # video_enhance switch (quality_enhance widget).
-        _o = {}
-        ab = str(getattr(self, "_attn_backend", "auto") or "auto")
-        if ab != "auto":
-            _o["attention_backend"] = ab
-        # [enhance switch] the krea2 _begin builds its own _o (video residency_opts keys are
-        # engine-REFUSED here), so the mixin's generic emission never runs — emit the switch HERE
-        # or the widget is silently dropped (the field 2026-09-01 lesson). Always sent, boolean;
-        # the number behind it is engine law (never the raw token_prune_keep_ratio key).
-        _q = getattr(self, "_quality", None)
-        if _q:
-            _o["quality"] = _q   # [quality] the loader's choice; the engine resolves it (never sent with video_enhance)
-        else:
-            _o["video_enhance"] = bool(getattr(self, "_video_enhance", False))
-        bpx._opts = json.dumps(_o).encode()
+        # IMAGE session: only the dials every family takes (the video residency_opts keys are engine-refused here).
+        bpx._opts = json.dumps(self.dial_opts()).encode()
         bpx.options_json = bpx._opts
         session = ctypes.c_void_p()
         st = lib.quantfunc_denoise_begin(self._qf.pipeline, ctypes.byref(bpx), ctypes.byref(session))
@@ -227,19 +211,14 @@ def register(deps):
     bind_pipeline_model = deps["bind_pipeline_model"]
     retire_handle = deps["retire_handle"]
 
-    def build(transformer1_path, transformer2_path, bundle_dir=None,
-              lora_entries=(), sparse_opts=None):
+    def build(transformer1_path, bundle_dir=None, lora_entries=()):
         """File-based Krea-2 Turbo t2i — the H3 single-expert staging pattern: stage the
         shipped config bundle (configs/krea2-turbo-*/, minimal official skeleton) + symlink
         the transformer file; engine create runs denoise_only=True (TE + VAE weights
         skipped — comfy's krea2 CLIP owns conditioning, comfy's VAEDecode decodes; the
         engine reads the staged configs for session geometry only)."""
-        if transformer2_path:
-            raise RuntimeError("qf_native krea2: single-expert family — transformer2 must be empty")
-        model_dir = qfmp.stage_denoise_only_package(bundle_dir, transformer1_path, None)
+        model_dir = qfmp.stage_denoise_only_package(bundle_dir, transformer1_path)
         create_extra = {"denoise_only": True}
-        if sparse_opts:
-            create_extra.update(sparse_opts)
         model_name = os.path.basename(transformer1_path)
 
         def _build(lora_entries):
@@ -252,7 +231,6 @@ def register(deps):
                                    device_idx=device_idx),
                 bind_pipeline_model)
             engine = qfmp.QFLazyEngine(_factory, retire=retire_handle)
-            engine.set_lora_side("all", lora_entries)
             offload = comfy.model_management.unet_offload_device()
             unet_config = {"image_model": "krea2", "disable_unet_model_creation": True}
             model_config = comfy.supported_models.Krea2(unet_config)

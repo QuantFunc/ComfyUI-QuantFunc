@@ -25,15 +25,7 @@ Design (measured from comfy 0.27.0 + include/quantfunc.h + the proven native_ses
   workstream — the standing `batch_size>1 across all models` goal). cfg==1 (distilled / no-CFG) runs ONE
   forward per step and is unaffected. This 2× forward cost is confirmed by the cfg=1-vs-cfg=7 A/B (both
   complete, MSE 4459 → the uncond forward genuinely runs; it is not skipped).
-- ★ i2v REFERENCE (Option C): the engine's wan i2v channel-concat takes the reference frame as a FILE
-  PATH it VAE-encodes ITSELF (WanVideoPipeline.cpp:754-825; the denoise ABI has no ref-latent field).
-  It CANNOT consume comfy's VAE-encoded `concat_latent_image`. So the reference arrives as an IMAGE
-  GRAPH input on the loader (fanned from a stock LoadImage), which we save to a disposable temp file
-  and hand to denoise_begin_edit — the engine VAE-encodes the ORIGINAL pixels (no dependence on comfy
-  having loaded a matching VAE). A user who ALSO wires WanImageToVideo.start_image produces a
-  `concat_latent_image` the engine would silently ignore — extra_conds() FAILS LOUDLY on that (the
-  silent-discard must be closed, not relocated).
-- Session lifecycle: LAZY denoise_begin_edit on the FIRST step of a run; finalize+end at
+- Session lifecycle: LAZY denoise_begin on the FIRST step of a run; finalize+end at
   process_latent_out (normal end); extra_conds closes at RUN START any session STRANDED by an
   Interrupt (comfy skips process_latent_in for empty/denoise=1.0 latents + caches+reuses this
   instance across requeues), so the next run never continues an aborted one (its KV cache);
@@ -132,9 +124,8 @@ def _qf_dtype(torch_dtype):
 
 
 def _interrupt_poll_end_session_on_raise(qf):
-    """SHARED per-cond-group interrupt poll that never strands an open engine session (ONE copy for
-    QFWanModel + QFLTXModel — §6.5 simplicity: the session-clearing hardening was added to LTX and had
-    drifted from WAN, the exact maintenance-double-cost this helper removes). comfy's
+    """SHARED per-cond-group interrupt poll that never strands an open engine session (ONE copy for every
+    family's per-cond-group loop). comfy's
     throw_exception_if_processing_interrupted raises InterruptProcessingException, which subclasses
     BaseException (model_management.py), NOT Exception — so the guard ★ MUST be `except BaseException`
     (`except Exception` MISSES it; a self-CR test caught this on the LTX side). On ANY raise we end the
@@ -263,11 +254,11 @@ def make_engine_factory(get_engine_fn, bind_pipeline_model):
     family builder previously hand-copied 4x (Wan / H3 / LTX-AV / LTX-video — that
     exact drift left 3 of 4 sites unfixed in the leak class): a weakref LIST of
     this build-chain's models (weakrefs so a superseded chain model can still be
-    GC'd — the Wan discipline, no model<->engine cycle) + a factory that, at real
+    GC'd — no model<->engine cycle) + a factory that, at real
     engine create, binds every SURVIVING model to the resolved ckey.
 
     Returns (factory, register_model): pass `factory` to QFLazyEngine; call
-    `register_model(m)` for every model the build creates (Wan calls it twice)."""
+    `register_model(m)` for every model the build creates."""
     import weakref as _weakref
     engine_models = []
     def factory():
@@ -282,38 +273,6 @@ def make_engine_factory(get_engine_fn, bind_pipeline_model):
     return factory, register_model
 
 
-def save_ref_tempfile(image):
-    """Write a loader start_image IMAGE (comfy [B,H,W,C] float 0..1) to a disposable temp PNG the
-    engine can load_image()+VAE-encode (Option C — the engine encodes the pixels itself). Frame 0
-    is the reference first frame. The file lives ONLY across the begin_edit call (caller deletes it
-    in a finally) — no user images accumulate. SHARED by the WAN and LTX i2v seams."""
-    from PIL import Image
-    import numpy as np
-    img = image
-    if img.dim() == 4:
-        img = img[0]                                  # [H,W,C]
-    arr = (img.clamp(0, 1).cpu().float().numpy() * 255.0 + 0.5).astype(np.uint8)
-    if arr.shape[-1] == 1:
-        arr = np.repeat(arr, 3, axis=-1)
-    arr = arr[:, :, :3]
-    fd, path = tempfile.mkstemp(suffix=".png", prefix="qf_native_ref_")
-    os.close(fd)
-    try:
-        Image.fromarray(arr).save(path)
-    except Exception:
-        cleanup_ref_tempfile(path)   # a failed .save() must not leak the just-created temp file
-        raise
-    return path
-
-
-def cleanup_ref_tempfile(path):
-    if path:
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
-
-
 class QFSessionModelMixin:
     """Shared base for every QuantFunc native-session model wrapper (LTX-2.5 / MiniMax-H3 / Krea-2 / Qwen-Image-2.1).
 
@@ -325,20 +284,9 @@ class QFSessionModelMixin:
     (e.g. `class QFKrea2Model(QFSessionModelMixin, comfy.model_base.Krea2)` in the Krea-2 family
     module — this substrate is family-AGNOSTIC and defines no model class itself).
 
-    INCREMENT 1 (this commit — behavior-PRESERVING, low-risk): the two blocks that are
-    character-identical in QFWanModel._apply_model and QFLTXModel._apply_model — the
-    sigma-schedule-derived step index and the quantfunc_denoise_step call + session-clearing
-    error handling — are extracted here VERBATIM. Each model's _apply_model now calls these
-    instead of inlining them; the produced values/strings are unchanged (the only per-model
-    difference, the failure-message prefix, is passed in). No control flow is restructured.
-
-    INCREMENT 2 (follow-up, gated on the Wan/LTX GPU regression run): promote the rest of the
-    shared _apply_model skeleton (require-ctx / refuse-control / batch-refuse / begin-gate / the
-    per-cond-group loop with interrupt-poll + counters / finalize) into this mixin with hooks for
-    the divergent parts (_prepare_context, _begin_session, _alloc_out, _fill_and_run_step,
-    _final_prediction). That restructure changes the shape of behavior-critical generation code,
-    so it must be proven byte-identical by a real Wan+LTX generate regression, not just review —
-    deferred until a GPU box is available (same gate as the H3 fl2va proof).
+    It carries the pieces every family's _apply_model shares verbatim: the sigma-schedule-derived step index
+    and the quantfunc_denoise_step call with its session-clearing error handling (the per-family failure-message
+    prefix is passed in).
     """
 
     # ── [step-cache] runtime step-cache threshold (SAME session-knob class as residency:
@@ -431,9 +379,6 @@ class QFSessionModelMixin:
         # Engine-side: every session-capable video pipeline accepts the key
         # (begin capability gate), and this mixin is video-family-only.
         o["sparse_cdf"] = sp
-        ab = str(getattr(self, "_attn_backend", "auto") or "auto")
-        if ab != "auto":
-            o["attention_backend"] = ab   # [runtime dial] auto = engine default, key omitted
         # [sol-tau dial] omitted at the 1.0 default (old-engine compatible: an older
         # .so refuses unknown keys LOUD, and default users never send it). Ghost-proof
         # despite the omission: the ENGINE resets an absent sol_tau to 1.0 at every
@@ -442,14 +387,22 @@ class QFSessionModelMixin:
         st = float(getattr(self, "_sol_tau", 1.0) or 1.0)
         if abs(st - 1.0) > 1e-6:
             o["sol_tau"] = st
-        # [enhance switch] ALWAYS sent (both states are meaningful: OFF = the engine's speed policy, ON = full
-        # quality; an absent key would leave the engine on its raw-key default, which is neither). Requires the
-        # engine that ships with this plugin (an older .so refuses unknown begin keys LOUD — by design, never
-        # silently ignored). The raw token_prune_keep_ratio key is the harness/expert surface and is never
-        # built here; the engine refuses a begin that carries both.
+        o.update(self.dial_opts())
+        return o
+
+    def dial_opts(self):
+        """The begin keys EVERY family's session takes, image and video alike (the image families send only these;
+        the video residency keys are engine-refused there).
+        - attention_backend: ALWAYS sent, "auto" included. The engine KEEPS the current backend when the key is
+          absent, so omitting "auto" left the previous run's explicit choice in force (MEASURED: a run set back to
+          auto rendered byte-for-byte as the flash run before it). "auto" is every family's create-time default.
+        - quality (the engine resolves it and decides the prune), else the retired video_enhance switch for an
+          engine without it. Always one of the two: an absent key leaves the engine on its raw-key default, which
+          is neither; the engine refuses a begin that carries both, or the raw token_prune_keep_ratio key."""
+        o = {"attention_backend": str(getattr(self, "_attn_backend", "auto") or "auto")}
         q = getattr(self, "_quality", None)
         if q:
-            o["quality"] = q   # [quality] the engine resolves it (it decides the prune too — video_enhance is not sent with it)
+            o["quality"] = q
         else:
             o["video_enhance"] = bool(getattr(self, "_video_enhance", False))
         return o
@@ -580,7 +533,7 @@ class QFSessionModelMixin:
         per sampler step, not one batched B==2), so a per-call counter double-counts and overruns
         total_steps. The sigma is identical for cond and uncond of the same step, so its schedule
         index is the true step index. Falls back to the per-call counter (self._step_i) when the
-        sampler exposes no schedule. Verbatim-shared by QFWanModel + QFLTXModel."""
+        sampler exposes no schedule. Shared by every family."""
         step_index = self._step_i
         _sched = transformer_options.get("sample_sigmas") if isinstance(transformer_options, dict) else None
         if _sched is not None and len(_sched) >= 2:
@@ -592,8 +545,7 @@ class QFSessionModelMixin:
         """Run one quantfunc_denoise_step (or the same-contract `fn_name` export, e.g.
         quantfunc_denoise_step_refs), clearing the (GPU-resident) session on ANY failure so a
         mid-sample error never strands a stale session. `fail_prefix` is the model-specific
-        message head (e.g. 'denoise_step[step=..,group=..,key=..]' for WAN, 'LTX denoise_step[..]'
-        for LTX). Verbatim-shared by QFWanModel + QFLTXModel + QFQwenImage21Model."""
+        message head (e.g. 'LTX denoise_step[..]'). Shared by every family."""
         try:
             st = getattr(self._qf.lib, fn_name)(self._qf.current_session, ctypes.byref(p))
         except Exception:
@@ -652,9 +604,9 @@ class QFLazyEngine:
         self._real = None
         self._prepared_entry = None
         self._ckey = None                # the materialized handle's cache key (for retire)
-        # This consumer's declarative LoRA set (side 'all'): each chained LoRA node builds a fresh lazy engine with
-        # its whole cumulative stack, so a raw loader output holds [] and deleting a LoRA node needs no cleanup.
-        self._lora_sides = {}
+        # This consumer's declarative LoRA set, set by tag_lora_rebuild: each chained LoRA node builds a fresh lazy
+        # engine with its whole cumulative stack, so a raw loader output holds [] and deleting a LoRA node needs no cleanup.
+        self._lora = []
         # retire(ckey, eng, requester, *, keep_binding=False, reason="") -> bool: the cache
         # layer's SINGLE liveness-gated retire chokepoint (the only .destroy() site in the
         # plugin). None => this wrapper can NEVER destroy (fail-safe: a wrapper that cannot
@@ -674,8 +626,8 @@ class QFLazyEngine:
     def prepare_resource(self):
         """Resolve the actual cache recipe without calling model creation.
 
-        Runs every factory, including the custom dual-output factory, through
-        the shared _get_engine prepare-only branch. No lazy .lib access here.
+        Runs the family's factory through the shared _get_engine prepare-only
+        branch. No lazy .lib access here.
         """
         token = qfe.FACTORY_PREPARE_ONLY.set(True)
         try:
@@ -757,17 +709,22 @@ class QFLazyEngine:
             return False
         if getattr(real, "current_session", None):
             real.end_session_if_open()   # a stale session from an interrupted run blocks the mutation lease
+            if getattr(real, "current_session", None):
+                # the begin path's ONE bounded recovery: an interrupted run's last step may still be draining, and
+                # its refused end RETAINED the pointer, so one more end can win once the step lands
+                time.sleep(2.0)
+                real.end_session_if_open()
         if getattr(real, "current_session", None):
             raise RuntimeError(
                 "qf_native: the LoRA set changed while this model's generation is still running. The engine applies "
                 "a LoRA change only between generations; re-queue the prompt.")
-        union = self.lora_union()
+        lora = self.lora_set()
         # UNKNOWN until the engine confirms: a refused update may have left the previous set OR rolled the weights
         # back to the base mid-apply, so after any failure the next run must re-send its set, never trust a mark.
         real.applied_lora_sig = None
-        real.pipeline_update({"lora": union})
+        real.pipeline_update({"lora": lora})
         real.applied_lora_sig = want
-        print(f"[qf_native] LoRA set applied in place (no reload): {len(union)} LoRA(s)", flush=True)
+        print(f"[qf_native] LoRA set applied in place (no reload): {len(lora)} LoRA(s)", flush=True)
         return True
 
     @property
@@ -783,24 +740,13 @@ class QFLazyEngine:
         entry, _ = self.prepare_resource()
         return None if isinstance(entry, QFPreparedEntry) else entry
 
-    # ---- LoRA: the consumer's declarative set, applied in place at ensure() ----
-    # A family builds a fresh patcher + lazy engine per LoRA set (tag_lora_rebuild), passes the set here, and
-    # constructs the engine with retire=deps['retire_handle'] (the single liveness-gated destroy chokepoint, used
-    # by comfy's RAM release). The pipeline itself never depends on the set.
-    def set_lora_side(self, side, entries):
-        """REPLACE this consumer's cumulative LoRA stack (every family in this release uses side 'all')."""
-        self._lora_sides[str(side)] = [dict(e) for e in (entries or [])]
-
-    def lora_union(self):
-        """The declarative 'lora' list pipeline_update carries: every side's entries, side-sorted for a stable
-        signature (within a side the user's chain order is preserved)."""
-        out = []
-        for side in sorted(self._lora_sides):
-            out.extend(dict(e) for e in self._lora_sides[side])
-        return out
+    # ---- LoRA: the consumer's declarative set (tag_lora_rebuild sets it), applied in place at ensure() ----
+    def lora_set(self):
+        """The declarative 'lora' list pipeline_update carries, in the user's chain order."""
+        return [dict(e) for e in self._lora]
 
     def _lora_sig(self):
-        return json.dumps(self.lora_union(), sort_keys=True)
+        return json.dumps(self.lora_set(), sort_keys=True)
 
     # ---- members that NEED a live pipeline ----
     @property
@@ -919,17 +865,15 @@ def ensure_model_config_attrs(model_config):
     return model_config
 
 
-def stage_denoise_only_package(bundle_dir, transformer1_path, transformer2_path=None,
-                               extra_links=None):
+def stage_denoise_only_package(bundle_dir, transformer1_path, extra_links=None):
     """Build a config-complete PACKAGE dir the engine's `denoise_only` create can read WITHOUT
     copying the multi-GB weights.
 
-    The file-based loader hands us bare transformer .safetensors FILE(s) (INT8-Fast shape), but the
+    The file-based loader hands us a bare transformer .safetensors FILE (INT8-Fast shape), but the
     engine still needs the arch + VAE CONFIGS for session geometry (denoise_only skips the TE+VAE
     WEIGHTS, not the configs). So we stage: the family's shipped CONFIG bundle (model_index.json +
-    transformer/ transformer_2/ vae/ config.json — tiny JSON, no weights) COPIED in, and the user's
-    picked weight file(s) SYMLINKED as transformer/model.safetensors (+ transformer_2/ for wan's
-    low-noise expert). The engine (denoise_only=True) reads the configs, loads the transformer
+    transformer/ vae/ config.json — tiny JSON, no weights) COPIED in, and the user's picked weight
+    file SYMLINKED as transformer/model.safetensors. The engine (denoise_only=True) reads the configs, loads the transformer
     weights via the symlinks, and never touches TE/VAE weights (comfy owns CLIP + VAE).
 
     Staged under ComfyUI's OWN temp dir (folder_paths.get_temp_directory(), never system /tmp),
@@ -942,14 +886,13 @@ def stage_denoise_only_package(bundle_dir, transformer1_path, transformer2_path=
             f"qf_native: config bundle missing: {bundle_dir} — this family's arch/VAE configs are "
             f"not shipped in the plugin (configs/<family>/). Cannot stage a denoise_only package.")
     real1 = os.path.realpath(transformer1_path)
-    real2 = os.path.realpath(transformer2_path) if transformer2_path else None
     # extra_links: {subdir: target_path} — single-expert AV families link MORE weight files
     # into the staged package (ltx2: the SAME single xfm file into connectors/ [#565 comfy25
     # prefix branch], the gemma with-proj TE into text_encoder/ [connector aggregate_embed],
     # the audio_vae file [engine has_audio_ discriminant = weights presence]). Deterministic
     # key covers them so a re-pick restages.
     extra_links = {k: os.path.realpath(v) for k, v in (extra_links or {}).items() if v}
-    key_src = "|".join([bundle_dir, real1, real2 or ""] +
+    key_src = "|".join([bundle_dir, real1] +
                        [f"{k}={v}" for k, v in sorted(extra_links.items())])
     key = hashlib.sha1(key_src.encode()).hexdigest()[:16]
     root = os.path.join(folder_paths.get_temp_directory(), "qf_native_stage")
@@ -982,12 +925,6 @@ def stage_denoise_only_package(bundle_dir, transformer1_path, transformer2_path=
     _link_expert("transformer", real1)
     for sub, target in sorted(extra_links.items()):
         _link_expert(sub, target)
-    if real2:
-        _link_expert("transformer_2", real2)
-    else:
-        # single-expert: drop the bundle's transformer_2/ config so the engine's two-expert
-        # detection (boundary_ratio>0 AND transformer_2/config.json) resolves to single-expert.
-        shutil.rmtree(os.path.join(stage, "transformer_2"), ignore_errors=True)
     return stage
 
 
@@ -1011,8 +948,10 @@ def refuse_all_zero_initial_latent(xin, tag):
 
 
 def tag_lora_rebuild(patcher, lora_entries, rebuild):
-    """Mark a freshly built patcher's model with its LoRA set + how to re-create with a new one."""
+    """Mark a freshly built patcher's model with its LoRA set + how to re-create with a new one, and hand that set to
+    its lazy engine (applied in place at ensure()). Every family's build ends here, so this is the ONE wiring point."""
     m = patcher.model
+    m._qf._lora = [dict(e) for e in lora_entries]
     setattr(m, QF_LORA_STACK_ATTR, list(lora_entries))
     setattr(m, QF_LORA_REBUILD_ATTR, rebuild)
     return patcher

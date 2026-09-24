@@ -199,11 +199,20 @@ def main():
             target = preferred or self._materializers[0]
             return target._materialize_prepared(self)
 
+    _upd_log, _upd_status = [], [0]
+
     class _ContractEngine(qfn.qfe.QFEngineHandle):
         """Materialized handle carrying the exact Prepared resource identity."""
         def __init__(self, resource):
             super().__init__(self, object(), footprint_bytes=_DummyEngine.footprint_bytes,
                              resource=resource, capacity_bytes=4096)
+
+        # The quantfunc_pipeline_update ABI boundary (the handle is its own lib), recorded for the WHOLE file: a
+        # LoRA-free run must never send one (checked before arm 5b); arm 5b reads the same log and status.
+        @staticmethod
+        def quantfunc_pipeline_update(_pipe, payload):
+            _upd_log.append(json.loads(payload))
+            return _upd_status[0]
 
         def end_session_if_open(self):
             return (False, True)
@@ -416,6 +425,15 @@ def main():
     _qp.set_quality("fast")
     _dq = _qp.residency_opts()
     _du = _QProbe().residency_opts()
+    _qa = _QProbe()
+    _qa.set_attn_backend("flash")
+    _qa_flash = _qa.residency_opts().get("attention_backend")
+    _qa.set_attn_backend("auto")
+    check("session: attention_backend is ALWAYS sent, auto included (the engine keeps its previous backend when the key "
+          "is absent, so an omitted auto left a prior flash run's choice in force)",
+          _du.get("attention_backend") == "auto" and _qa_flash == "flash"
+          and _qa.residency_opts().get("attention_backend") == "auto" and _qa.dial_opts().get("attention_backend") == "auto",
+          f"-> unset={_du.get('attention_backend')!r} flash={_qa_flash!r} back={_qa.residency_opts().get('attention_backend')!r}")
     check("session: set_quality → residency_opts sends quality and never video_enhance with it (the engine refuses both); unset → "
           "no quality key, the retired switch instead",
           _dq.get("quality") == "fast" and "video_enhance" not in _dq and "token_prune_keep_ratio" not in _dq
@@ -939,8 +957,8 @@ def main():
         stAB = _qmp2.lora_stack_of(outAB)
         check("a second node accumulates FUNCTIONALLY (no loader-cache mutation)",
               [(os.path.basename(e["path"]), e["scale"]) for e in stAB] == [("a.safetensors", 0.8), ("b.safetensors", 0.3)]
-              and outAB.model._qf.lora_union() == stAB and _qmp2.lora_stack_of(base) == []
-              and base.model._qf.lora_union() == [],
+              and outAB.model._qf.lora_set() == stAB and _qmp2.lora_stack_of(base) == []
+              and base.model._qf.lora_set() == [],
               f"-> wire={stAB} loader_stack={_qmp2.lora_stack_of(base)}")
         # identity-gated retire: a FOREIGN live consumer on the same ckey must SKIP the destroy.
         class _W:                       # two distinct wrapper identities
@@ -1056,9 +1074,9 @@ def main():
     # A DEDICATED Krea-2 file gives this arm its own cache key. The C ABI is stubbed at the same boundary as the
     # capacity ABI above: the recorder takes the JSON body and answers the status in _rt_status.
     import struct as _rst
-    _rt_updates, _rt_status = [], [0]
-    _ContractEngine.quantfunc_pipeline_update = staticmethod(
-        lambda _pipe, payload: (_rt_updates.append(json.loads(payload)), _rt_status[0])[1])
+    check("runtime LoRA: every LoRA-free run before this arm sent no pipeline_update (an unchanged set sends none)",
+          _upd_log == [], f"-> updates={_upd_log}")
+    _rt_updates, _rt_status = _upd_log, _upd_status
     _ContractEngine.quantfunc_last_error = staticmethod(lambda: b"pipeline busy")
     _saved_resolve = qfn._resolve_lora
     try:
@@ -1144,7 +1162,8 @@ def main():
         check("runtime LoRA arm", False, f"-> raised {type(e).__name__}: {e}")
     finally:
         qfn._resolve_lora = _saved_resolve
-        del _ContractEngine.quantfunc_pipeline_update, _ContractEngine.quantfunc_last_error
+        _upd_status[0] = 0
+        del _ContractEngine.quantfunc_last_error
 
     # ── 5c) a LoRA rebuild keeps the loader's session dials ──
     # The loader sets its widgets (attention backend, quality, caches, H3's audio / partial-denoise opt-ins) on the MODEL;
@@ -1197,6 +1216,26 @@ def main():
                                     _dviol.append(f"{_mn}.{_cn.name}.{_fn.name} writes {_t.attr}")
         check("every session-dial setter's attribute is carried across a LoRA rebuild (AST, family modules derived)",
               _dseen >= 9 and not _dviol, f"-> setters={_dseen} uncarried={_dviol}")
+        # DEATH RULE: the begin dials are emitted in ONE place, dial_opts — no other function reads them, so no family
+        # can drift from the always-send rule (the image families once built their own copies that omitted "auto").
+        _eviol, _ereads = [], 0
+        for _mn, _mod in _dmods.items():
+            for _fn in _dast.walk(_dast.parse(open(_mod.__file__).read())):
+                if not isinstance(_fn, _dast.FunctionDef):
+                    continue
+                for _n in _dast.walk(_fn):
+                    _nm = None
+                    if (isinstance(_n, _dast.Call) and isinstance(_n.func, _dast.Name) and _n.func.id == "getattr"
+                            and len(_n.args) >= 2 and isinstance(_n.args[1], _dast.Constant)):
+                        _nm = _n.args[1].value
+                    elif isinstance(_n, _dast.Attribute) and isinstance(_n.ctx, _dast.Load):
+                        _nm = _n.attr
+                    if _nm in ("_attn_backend", "_quality", "_video_enhance"):
+                        _ereads += _fn.name == "dial_opts"
+                        if _fn.name != "dial_opts":
+                            _eviol.append(f"{_mn}.{_fn.name} reads {_nm}")
+        check("the begin dials (attention backend, quality) are read ONLY by dial_opts (AST, family modules derived)",
+              _ereads >= 3 and not _eviol, f"-> dial_opts reads={_ereads} others={_eviol}")
     except Exception as e:  # noqa: BLE001
         check("session-dial carry arm", False, f"-> raised {type(e).__name__}: {e}")
     finally:
@@ -1317,7 +1356,7 @@ def main():
         for d in presets:
             mf = json.load(open(os.path.join(real_cfg, d, "qf_native.json")))
             hints = mf.get("file_hints")
-            need = ["transformer1"] + (["transformer2"] if mf.get("dual_expert") else [])
+            need = ["transformer1"]
             check(f"preset {d} declares file_hints for {need}",
                   isinstance(hints, dict) and all(hints.get(a) for a in need),
                   f"-> {hints and sorted(hints.keys())}")

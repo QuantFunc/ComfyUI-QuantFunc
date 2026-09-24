@@ -558,25 +558,16 @@ def register(deps):
     retire_handle = deps["retire_handle"]
 
 
-    def build(transformer1_path, transformer2_path, bundle_dir=None,
-              lora_entries=(), sparse_opts=None):
-        """File-based loading for MiniMax-H3 — the wan staging pattern, single-expert:
+    def build(transformer1_path, bundle_dir=None, lora_entries=()):
+        """File-based loading for MiniMax-H3 — the shared staging pattern:
         stage the shipped config bundle (configs/minimax-h3-*/, official configs) + symlink
         the single transformer file; engine create runs denoise_only=True (TE + VAE weights
         skipped — comfy's stock MiniMaxH3 nodes own conditioning/refs and comfy decodes;
         the engine reads the staged configs for session geometry only). No extra weight
         links: unlike ltx2 the H3 external session needs no engine-side connector/projection
         weights (refs arrive as av_conds latents from comfy)."""
-        if transformer2_path:
-            raise RuntimeError("qf_native minimax-h3: single-expert family — transformer2 must be empty")
-        model_dir = qfmp.stage_denoise_only_package(bundle_dir, transformer1_path, None)
-        # [sparse switch] the selector/backend are CREATE keys the engine's transformer
-        # factory parses (attention_backend / sparse_selector / sparse_cdf — the shared
-        # the engine's sparse-config parse); merged here they also enter the pipeline-cache identity
-        # via create_cfg, so off↔on never collides with a cached dense handle.
+        model_dir = qfmp.stage_denoise_only_package(bundle_dir, transformer1_path)
         create_extra = {"denoise_only": True}
-        if sparse_opts:
-            create_extra.update(sparse_opts)
         return _build_from_package(model_dir, os.path.basename(transformer1_path),
                                    lora_entries=lora_entries,
                                    create_extra=create_extra)
@@ -613,7 +604,6 @@ def register(deps):
             # accumulated set; the pipeline is created only for the model the sampler touches, and every LoRA
             # set of this model shares it (the set goes on in place at run start).
             engine = qfmp.QFLazyEngine(_factory, retire=retire_handle)
-            engine.set_lora_side("all", lora_entries)
             offload = comfy.model_management.unet_offload_device()
 
             unet_config = {"image_model": "minimax_h3", "disable_unet_model_creation": True}

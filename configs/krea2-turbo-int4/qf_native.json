@@ -1,7 +1,6 @@
 {
  "family": "krea2",
  "display": "Krea-2 Turbo (t2i, INT4)",
- "dual_expert": false,
  "notes": "Krea-2 Turbo single-stream MMDiT (28 blocks, Qwen3-VL 12-layer-tap cond); engine denoise_only skips TE/VAE weights — comfy owns CLIP/VAE/sampler; expected file: krea2 QuantFunc int4 export",
  "file_hints": {
   "transformer1": [

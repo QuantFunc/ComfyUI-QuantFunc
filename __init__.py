@@ -50,7 +50,7 @@ def _model_config_choices(family=None):
     the old any-family node for family-scoped UX, so the code surface for a new family is the
     node class + module entry, stated here so nobody trusts the old data-only claim. `family`
     filters the list for the
-    PER-FAMILY loader nodes (user 2026-08-21 pivot: one loader node per model family), so a wan
+    PER-FAMILY loader nodes (user 2026-08-21 pivot: one loader node per model family), so an H3
     preset can never appear in the LTX node's dropdown; a manifest whose family key is unreadable
     is simply not listed for a filtered call (the unfiltered call still shows it, and load()
     fail-louds on it)."""
@@ -100,8 +100,7 @@ _XFM_NONE = "(none)"
 def _transformer_choices():
     """The .safetensors FILES under comfy's models/diffusion_models — the SAME surface the
     reference INT8-Fast UNetLoaderINTW8A8 lists (folder_paths.get_filename_list). The user picks a
-    transformer weight FILE directly (transformer1 = the / high-noise expert; transformer2 = the
-    optional low-noise expert for wan A14B). NOT a package DIRECTORY — the engine's denoise-only
+    transformer weight FILE directly. NOT a package DIRECTORY — the engine's denoise-only
     create builds ONLY the transformer from this file (CLIP + VAE stay native comfy nodes)."""
     if _folder_paths is None:
         return [_NO_XFM_HINT]
@@ -492,10 +491,9 @@ def _get_engine(model_dir, create_cfg=None, device_idx=0):
 
 if _IMPORT_OK:
     # ── family REGISTRY: assembled from the per-family modules. Family LOGIC lives in the family
-    #    modules; what remains here is the shared NODE SURFACE — transformer1/transformer2 FILE
-    #    dropdowns + model_type (the LoRA node's target is WIRE-derived,
-    #    no combo — chaining on the high output acts on the high expert). That
-    #    surface is family-neutral as long as a new family fits the "1-2 transformer files +
+    #    modules; what remains here is the shared NODE SURFACE — the transformer FILE
+    #    dropdown + model_type (the LoRA node applies to the model it is wired to). That
+    #    surface is family-neutral as long as a new family fits the "one transformer file +
     #    shipped config bundle" shape; one needing a NEW input must extend INPUT_TYPES here, so
     #    "add a family = one module + one _FAMILY_MODULES line" holds for the common case, not
     #    unconditionally. ──
@@ -531,8 +529,7 @@ if _IMPORT_OK:
 
 
 
-    def _run_family_load(expect_family, transformer1, model_config,
-                         transformer2, sparse_opts=None):
+    def _run_family_load(expect_family, transformer1, model_config):
         """The SHARED loader core behind the per-family nodes (user 2026-08-21 pivot). All
         validation is preserved verbatim from the original single-node load(); the per-family
         nodes add only (a) a family-filtered preset dropdown and (b) this family guard —
@@ -554,12 +551,6 @@ if _IMPORT_OK:
                 f"{sorted(_FAMILY_BUILDERS)}). An import of the seam module probably failed "
                 f"at startup — check the log for a [qf_native] warning.")
         xfm1 = _resolve_transformer(transformer1)
-        xfm2 = None if transformer2 in (_XFM_NONE, "", None) else _resolve_transformer(transformer2)
-        if bool(manifest.get("dual_expert")) and xfm2 is None:
-            raise RuntimeError(
-                f"qf_native: model_config '{model_config}' is DUAL-expert — transformer1 = the "
-                f"HIGH-noise expert AND transformer2 = the LOW-noise expert are both required "
-                f"(the export ships them as a *-high-* / *-low-* pair).")
         # file_hints validation (DATA-driven; the manifest names what its transformers look
         # like). DESIGN BOUNDARY, recorded deliberately: comfy combo values must be the REAL
         # relative filenames (they resolve through folder_paths) and INPUT_TYPES is rendered
@@ -567,23 +558,13 @@ if _IMPORT_OK:
         # widget without frontend JS. The correspondence contract is therefore enforced HERE,
         # fail-loud at load, with the expected patterns named.
         from .qf_file_hints import name_matches_hints  # one predicate, pinned by tests/published_names_test.py
-        hints = manifest.get("file_hints") or {}
-        for arm, val in (("transformer1", transformer1),
-                         ("transformer2", None if xfm2 is None else transformer2)):
-            pats = hints.get(arm) or []
-            if val is None or not pats:
-                continue
-            if not name_matches_hints(val, pats):
-                raise RuntimeError(
-                    f"qf_native: {arm}={val!r} does not look like a '{model_config}' "
-                    f"{arm} weight (expected a name matching {pats}). Pick the file the "
-                    f"preset names — see the model_config tooltip — or choose the preset "
-                    f"matching this file.")
-        if not manifest.get("dual_expert") and xfm2 is not None:
+        pats = (manifest.get("file_hints") or {}).get("transformer1") or []
+        if pats and not name_matches_hints(transformer1, pats):
             raise RuntimeError(
-                f"qf_native: model_config '{model_config}' is single-transformer — leave "
-                f"transformer2 = \"(none)\" (a second expert here would be silently ignored "
-                f"at best; refused instead).")
+                f"qf_native: transformer1={transformer1!r} does not look like a '{model_config}' "
+                f"transformer1 weight (expected a name matching {pats}). Pick the file the "
+                f"preset names — see the model_config tooltip — or choose the preset "
+                f"matching this file.")
         # NO aux resolution (user 2026-08-22 "引擎层不应该依赖这个"): the loader depends on
         # nothing but the transformer file(s) themselves. The retired [aux-auto] manifest
         # fallback layer (te/audio_vae/connectors conventional-filename resolution) served
@@ -598,13 +579,7 @@ if _IMPORT_OK:
         # 2026-08-28 "调整sparse要重建pipeline完全没必要" + "调整block/step cache
         # 能复用pipeline"). OFF values (0.0 / 1.0) omit the begin keys entirely →
         # the engine paths are byte-identical.
-        _kw = {}
-        if sparse_opts:
-            # create-LEVEL keys only (attention backend / quant toggles). The
-            # sparse dial itself is a SESSION knob (below) and never rides here.
-            _kw["sparse_opts"] = sparse_opts
-        out = builder(transformer1_path=xfm1, transformer2_path=xfm2,
-                      bundle_dir=bundle_dir, **_kw)
+        out = builder(transformer1_path=xfm1, bundle_dir=bundle_dir)
         # [cache/sparse surface REMOVED, user 2026-08-29 「移除所有loader的cache以及
         # 稀疏入口 整体默认不生效」] The per-model set_step_cache/set_block_cache/
         # set_sparse arming that lived here is GONE with the loader widgets — the
@@ -616,7 +591,7 @@ if _IMPORT_OK:
 
     # [cache surface RE-ENABLED, user 2026-08-31 「step cache 以及 fbcache 的开关重新开启」]
     # The step_cache (EasyCache) + block_cache (First-Block Cache = "fbcache") widgets
-    # restored to the video loaders (wan/LTX/H3) — the two loader widgets + their arming
+    # restored to the video loaders (LTX/H3) — the two loader widgets + their arming
     # loop that the 2026-08-29 removal dropped. SPARSE is deliberately NOT re-enabled
     # (the user named only the two caches). Both are RUNTIME SESSION knobs (mixin
     # set_step_cache/set_block_cache → residency_opts begin keys; 0.0 = OFF = byte-identical,
@@ -812,18 +787,6 @@ if _IMPORT_OK:
         # widget display name -> engine comp_opts attention_backend string
         return "native" if v == "fp16_native" else (v or "auto")
 
-    def _merge_attn_backend(create_opts, attention_backend):
-        """Fold the user's backend choice into the create-time opts dict. An EXPLICIT
-        choice (anything but 'auto') always WINS; 'auto' leaves create_opts untouched
-        (engine per-model default). Returns the dict (possibly newly created) or None
-        when nothing to pass."""
-        eng = _attn_backend_to_engine(attention_backend)
-        if eng == "auto":
-            return create_opts or None
-        d = dict(create_opts or {})
-        d["attention_backend"] = eng
-        return d
-
     class QuantFuncLTXLoader:
         """LTX-2 loader — single MODEL output (single-expert family)."""
 
@@ -855,14 +818,10 @@ if _IMPORT_OK:
 
         def load(self, transformer, model_config,
                  attention_backend="auto", sol_tau=1.0, quality=None, step_cache=0.0, block_cache=0.0, quality_enhance=None):
-            # [aux-auto] NO aux file widgets and NO image socket (user 2026-08-22 "只保留
-            # transformer/block/model_config … 只关注latent"): te/audio-vae/connectors
-            # resolve from the preset manifest's aux_files inside _run_family_load; i2v is
-            # the workflow's own latent conditioning (LTXVImgToVideoInplace), exactly like
-            # wan's cond-latent shape.
-            _p = _run_family_load("ltx2", transformer, model_config,
-                                   None,
-                                   sparse_opts=None)
+            # NO aux file widgets and NO image socket (user 2026-08-22 "只保留
+            # transformer/block/model_config … 只关注latent"): i2v is the workflow's own latent
+            # conditioning (LTXVImgToVideoInplace).
+            _p = _run_family_load("ltx2", transformer, model_config)
             _dev = _loaded_device_index(_p)
             q = _resolve_quality(quality, quality_enhance, transformer, model_config, _dev)
             _mm = getattr(_p, "model", None)
@@ -905,9 +864,7 @@ if _IMPORT_OK:
                  quality=None, quality_enhance=None):
             # [runtime dials] backend + quality are SESSION knobs (NOT create keys — a widget change never re-keys the
             # engine = no rebuild).
-            _p = _run_family_load("krea2", transformer, model_config,
-                                  None,
-                                  sparse_opts=None)
+            _p = _run_family_load("krea2", transformer, model_config)
             _dev = _loaded_device_index(_p)
             q = _resolve_quality(quality, quality_enhance, transformer, model_config, _dev)
             _mm = getattr(_p, "model", None)
@@ -948,9 +905,7 @@ if _IMPORT_OK:
         def load(self, transformer, model_config, attention_backend="auto", quality=None, quality_enhance=None):
             # [runtime dials] backend + quality are SESSION knobs (NOT create keys — a widget change never re-keys the engine =
             # no rebuild), exactly like the Krea2 node.
-            _p = _run_family_load("qwenimage21", transformer, model_config,
-                                  None,
-                                  sparse_opts=None)
+            _p = _run_family_load("qwenimage21", transformer, model_config)
             _dev = _loaded_device_index(_p)
             q = _resolve_quality(quality, quality_enhance, transformer, model_config, _dev)
             _mm = getattr(_p, "model", None)
@@ -1002,9 +957,7 @@ if _IMPORT_OK:
         def load(self, transformer, model_config,
                  attention_backend="flash", sol_tau=1.0, quality=None, audio_enhance=False,
                  step_cache=0.0, block_cache=0.0, allow_partial_denoise=False, quality_enhance=None):  # H3: flash default (auto→sage is broken)
-            _p = _run_family_load("minimax-h3", transformer, model_config,
-                                   None,
-                                   sparse_opts=None)
+            _p = _run_family_load("minimax-h3", transformer, model_config)
             _dev = _loaded_device_index(_p)
             q = _resolve_quality(quality, quality_enhance, transformer, model_config, _dev)
             _mm = getattr(_p, "model", None)

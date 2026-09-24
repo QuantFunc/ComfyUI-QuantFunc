@@ -716,8 +716,6 @@ def _bind(lib):
     if hasattr(lib, "quantfunc_denoise_step_refs"):
         lib.quantfunc_denoise_step_refs.restype = ctypes.c_int
         lib.quantfunc_denoise_step_refs.argtypes = [v, ctypes.POINTER(DenoiseStepRefsParams)]
-    # i2v cond-latent begin (cond-ABI builds only; hasattr-gated like step_multi — an old .so
-    # simply lacks the symbol and the wan i2v sampling path then refuses with guidance).
     if hasattr(lib, "quantfunc_quality_fast_available"):
         # [quality] can the loaders' super_fast / fast take effect on CUDA device N — the ENGINE's own arming rule for
         # that GPU (the plugin keeps no GPU list): 1 yes, 0 no (balance / best_quality only), -1 bad device.
@@ -725,7 +723,7 @@ def _bind(lib):
         lib.quantfunc_quality_fast_available.argtypes = [ctypes.c_int]
     if hasattr(lib, "quantfunc_denoise_cond_tail_supported"):
         # CR A-1 capability query (per-pipeline): 1 = this pipeline consumes a
-        # begin_edit_cond cond-latent. Probe THIS (presence + answer), not the wan-era
+        # begin_edit_cond cond-latent. Probe THIS (presence + answer), not the
         # begin_edit_cond symbol.
         lib.quantfunc_denoise_cond_tail_supported.restype = ctypes.c_int
         lib.quantfunc_denoise_cond_tail_supported.argtypes = [v]

@@ -1164,9 +1164,8 @@ def register(deps):
     retire_handle = deps["retire_handle"]
 
 
-    def build(transformer1_path, transformer2_path, bundle_dir=None,
-              lora_entries=(), sparse_opts=None):
-        """File-based (ComfyUI single-file) loading for LTX-2.5 — the wan staging pattern.
+    def build(transformer1_path, bundle_dir=None, lora_entries=()):
+        """File-based (ComfyUI single-file) loading for LTX-2.5 — the shared staging pattern.
         CONNECTORS-SOURCE contract (user 2026-08-31 — fully support the transformer-only
         export; supersedes the 2026-08-22 one-file-only ruling):
         - transformer/  <- the transformer export (ALL-IN or transformer-only);
@@ -1195,8 +1194,6 @@ def register(deps):
         always arms AV); audio decode is the workflow's own audio
         VAELoader, never engine-side.
         Engine create runs denoise_only=True (VAE decode weights skipped; TE lazy)."""
-        if transformer2_path:
-            raise RuntimeError("qf_native ltx2: single-expert family — transformer2 must be empty")
         # CONNECTORS-SOURCE resolution (user 2026-08-31). The engine applies the
         # embeddings-connector tail itself on the unprocessed dual-proj cond — the
         # official comfy contract (lt.py marks TE output `unprocessed_ltxav_embeds`;
@@ -1255,8 +1252,7 @@ def register(deps):
             print(f"[qf_native] ltx2: transformer-only export — connectors completion file: "
                   f"{os.path.basename(conn_src)}", flush=True)
         extra = {"connectors": conn_src}
-        model_dir = qfmp.stage_denoise_only_package(bundle_dir, transformer1_path, None,
-                                                    extra_links=extra)
+        model_dir = qfmp.stage_denoise_only_package(bundle_dir, transformer1_path, extra_links=extra)
         return _build_from_package(model_dir, os.path.basename(transformer1_path),
                                    lora_entries=lora_entries,
                                    # use_pinned_memory (perf, 2026-08-23): the two-stage flow
@@ -1265,14 +1261,7 @@ def register(deps):
                                    # ~2-4GB/s (nsys: memcpy = 86% of API time). Pinned host
                                    # backups cut every offload/reload 3-6x. RAM budget: one
                                    # model's footprint, freed with the backup.
-                                   # [sparse switch] the selector/backend are CREATE keys
-                                   # (attention_backend / sparse_selector / sparse_cdf —
-                                   # the shared the engine's sparse-config parse); merged here they
-                                   # also enter the pipeline-cache identity, so sparse
-                                   # on/off never collides with a cached dense handle.
-                                   create_extra={"denoise_only": True,
-                                                 "use_pinned_memory": True,
-                                                 **(sparse_opts or {})})
+                                   create_extra={"denoise_only": True, "use_pinned_memory": True})
 
     def _build_from_package(model_dir, model_name,
               connector_ckpt="(none)", lora_entries=(), create_extra=None):
@@ -1334,7 +1323,6 @@ def register(deps):
                 # accumulated set; the pipeline is created only for the model the sampler touches, and every LoRA
                 # set of this model shares it (the set goes on in place at run start).
                 engine = qfmp.QFLazyEngine(_factory, retire=retire_handle)
-                engine.set_lora_side("all", lora_entries)
                 offload = comfy.model_management.unet_offload_device()
                 unet_config = {"image_model": "ltxav", "disable_unet_model_creation": True}
                 model_config = comfy.supported_models.LTXAV(unet_config)
@@ -1375,7 +1363,6 @@ def register(deps):
             # accumulated set; the pipeline is created only for the model the sampler touches, and every LoRA
             # set of this model shares it (the set goes on in place at run start).
             engine = qfmp.QFLazyEngine(_factory, retire=retire_handle)
-            engine.set_lora_side("all", lora_entries)
             # [19B non-gated connector] authoritative head count from the ORIGINAL model dir\'s diffusers
             # LTX2TextConnectors config (the 19B family ships NON-gated connector weights; the head split
             # lives ONLY here). Absent/malformed -> None (gated checkpoints need nothing; a non-gated one

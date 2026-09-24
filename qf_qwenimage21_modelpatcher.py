@@ -116,22 +116,10 @@ class QFQwenImage21Model(QFSessionModelMixin, comfy.model_base.QwenImage21):
             int(ctx_group.shape[0]), _max_seq, int(ctx_group.shape[2]))
         self._max_ctx_seq = 0
         bpx.cond_dtype = _qf_dtype(ctx_group.dtype)
-        # IMAGE session: only the runtime attn-backend dial (applyAttnBackendDial); the video
-        # residency_opts keys are engine-REFUSED here.
-        _o = {}
-        ab = str(getattr(self, "_attn_backend", "auto") or "auto")
-        if ab != "auto":
-            _o["attention_backend"] = ab
-        # [enhance switch] the quality_enhance widget is the mixin's ONE video_enhance switch (user 2026-09-19), emitted
-        # HERE because this _begin builds its own _o (as Krea-2's does) — otherwise the widget is silently dropped.
-        # Always sent, boolean; the prune behind it is engine law. The engine prunes a one-cond-group session without
-        # references only (text-to-image, img2img, mask inpainting); edit, CFG > 1 and batch > 1 run full.
-        _q = getattr(self, "_quality", None)
-        if _q:
-            _o["quality"] = _q   # [quality] the loader's choice; the engine resolves it (never sent with video_enhance)
-        else:
-            _o["video_enhance"] = bool(getattr(self, "_video_enhance", False))
-        bpx._opts = json.dumps(_o).encode()
+        # IMAGE session: only the dials every family takes (the video residency_opts keys are engine-refused here).
+        # The engine prunes a one-cond-group session without references only (text-to-image, img2img, mask
+        # inpainting); edit, CFG > 1 and batch > 1 run full.
+        bpx._opts = json.dumps(self.dial_opts()).encode()
         bpx.options_json = bpx._opts
         session = ctypes.c_void_p()
         st = lib.quantfunc_denoise_begin(self._qf.pipeline, ctypes.byref(bpx), ctypes.byref(session))
@@ -271,19 +259,14 @@ def register(deps):
     bind_pipeline_model = deps["bind_pipeline_model"]
     retire_handle = deps["retire_handle"]
 
-    def build(transformer1_path, transformer2_path, bundle_dir=None,
-              lora_entries=(), sparse_opts=None):
+    def build(transformer1_path, bundle_dir=None, lora_entries=()):
         """File-based Qwen-Image-2.1 (t2i + edit) — the Krea2 single-expert staging pattern: stage the shipped
         config bundle (configs/qwen-image-2.1-*/, model_index.json only — the engine synthesizes the
         per-component configs from the reference arch) + symlink the transformer file; engine create
         runs denoise_only=True (TE + VAE weights skipped — comfy's TextEncodeQwenImage21 owns
         conditioning, comfy's VAEDecode decodes)."""
-        if transformer2_path:
-            raise RuntimeError("qf_native qwenimage21: single-expert family — transformer2 must be empty")
-        model_dir = qfmp.stage_denoise_only_package(bundle_dir, transformer1_path, None)
+        model_dir = qfmp.stage_denoise_only_package(bundle_dir, transformer1_path)
         create_extra = {"denoise_only": True}
-        if sparse_opts:
-            create_extra.update(sparse_opts)
         model_name = os.path.basename(transformer1_path)
 
         def _build(lora_entries):
@@ -296,7 +279,6 @@ def register(deps):
                                    device_idx=device_idx),
                 bind_pipeline_model)
             engine = qfmp.QFLazyEngine(_factory, retire=retire_handle)
-            engine.set_lora_side("all", lora_entries)
             offload = comfy.model_management.unet_offload_device()
             unet_config = {"image_model": "qwen_image21", "disable_unet_model_creation": True}
             model_config = comfy.supported_models.QwenImage21(unet_config)

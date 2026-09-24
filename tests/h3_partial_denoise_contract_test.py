@@ -580,7 +580,7 @@ class H3ProductionPathContract(unittest.TestCase):
 
         cpu = plugin.qfmp.torch.device("cpu")
         with mock.patch.object(plugin, "_load_model_config", return_value=(
-                "/contract/minimax-h3", {"family": "minimax-h3", "dual_expert": False})), \
+                "/contract/minimax-h3", {"family": "minimax-h3"})), \
              mock.patch.object(plugin, "_resolve_transformer",
                                return_value="/contract/minimax-h3-transformer.safetensors"), \
              mock.patch.object(plugin, "_get_engine", side_effect=forbid_engine_create), \

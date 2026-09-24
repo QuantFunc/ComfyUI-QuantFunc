@@ -1,7 +1,6 @@
 {
   "family": "minimax-h3",
   "display": "MiniMax-H3 fl2va (single-expert AV, INT4 stackA)",
-  "dual_expert": false,
   "notes": "official MiniMax-H3 fl2va configs (stackA-refq provenance); single transformer file; engine denoise_only skips TE/VAE weights — comfy owns conditioning + decode; expected file: minimax-h3 QuantFunc int4 export",
   "file_hints": {
     "transformer1": [
