@@ -26,7 +26,8 @@ make _run skip set_level -> L2/L3 go RED; forward log_level to the loader -> L2 
 attach loop above the cloud-TE registration -> L5 goes RED; drop the __signature__ -> L6 goes RED; make
 set_log_level call load_lib(), or drop the pending-level apply in load_lib -> L7 goes RED; declare the input
 optional again -> L1 goes RED; drop the value check in _run -> L8 goes RED; write log_level into the node's
-own hidden dict -> L9 goes RED.
+own hidden dict -> L9 goes RED; take the file identity after the dlopen, or skip the identity check when it is
+unknown -> L14 goes RED.
 
 Run:  python tests/log_level_input_test.py   (pure Python; no ComfyUI, torch or engine library)
 """
@@ -276,6 +277,37 @@ def main():
           f"same path (moved in, or rewritten) gets none ({ {c: v.strip()[-70:] for c, v in lines.items()} })",
           f"md5={good}" in lines["untouched"]
           and all("md5=" not in lines[c] and "fingerprint unavailable" in lines[c] for c in ("moved in", "rewritten")))
+
+    # L14: the identity is taken BEFORE the load, and an unknown one certifies nothing (self-CR round 8, A, rules 4+5).
+    #      "swapped during load": the process mapped the old file and a new one landed at the path before the load
+    #      returned, so the new file's md5 must never be printed. "identity unavailable": the file could not be identified
+    #      at the load (a failed stat); an unverified file is never certified.
+    lines14 = {}
+    for case in ("swapped during load", "identity unavailable"):
+        eng4 = _load_qf_engine()
+        with tempfile.TemporaryDirectory() as d:
+            lib_file = os.path.join(d, "engine-under-test")
+            open(lib_file, "wb").write(b"LOADED-ENGINE")
+
+            def cdll(*a, f=lib_file, swap=(case == "swapped during load"), **k):
+                if swap:
+                    open(f + ".new", "wb").write(b"ANOTHER-ENGINE")
+                    os.replace(f + ".new", f)
+                return object()
+            eng4.resolve_so_path = lambda f=lib_file: f
+            eng4.assert_toolchain_compatible = lambda so_path: None
+            eng4.ctypes = types.SimpleNamespace(RTLD_GLOBAL=0, RTLD_LOCAL=0, CDLL=cdll)
+            eng4._bind = lambda raw: types.SimpleNamespace(quantfunc_set_log_level=lambda level: None)
+            if case == "identity unavailable":
+                eng4._file_identity = lambda path: None
+            eng4.load_lib()
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                eng4.set_log_level(2)
+            lines14[case] = buf.getvalue()
+    check("L14 the identity is taken before the load, and an unknown one certifies nothing: a file swapped during the "
+          f"load, or one that could not be identified, gets no md5 ({ {c: v.strip()[-70:] for c, v in lines14.items()} })",
+          all("md5=" not in v and "fingerprint unavailable" in v for v in lines14.values()))
 
     print(f"LOG_LEVEL_INPUT: {'PASS' if not failures else 'FAIL'} ({len(failures)} failure(s))")
     return 1 if failures else 0

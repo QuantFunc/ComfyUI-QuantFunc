@@ -1041,7 +1041,9 @@ def _claim(bin_dir, marker, sms, chosen=None):
     their class may use them); a marker left claiming nothing goes, with its pair. Markers are rewritten atomically.
     ORDER: the other markers give the SMs up FIRST and the chosen marker is written LAST, so a crash in between leaves no
     marker claiming them — the resolver says no engine is installed and the next start installs again — never two
-    claimants it would have to choose between. `chosen`: the new marker (an install); None re-claims the kept one."""
+    claimants it would have to choose between. `chosen`: the new marker (an install); None re-claims the kept one.
+    A pair removed here may be the one another ComfyUI sharing this folder has just resolved: its load then refuses
+    loudly with nothing loaded, and its next prompt resolves again (engine_install_test arm 31)."""
     major = int(_ENGINE_MARKER_RE.fullmatch(os.path.basename(marker)).group(2))
     want = sorted(set(sms))
     for p, m in _markers():

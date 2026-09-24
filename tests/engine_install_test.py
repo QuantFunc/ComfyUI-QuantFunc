@@ -478,7 +478,7 @@ def main():
         qfe.ctypes.CDLL = lambda p, mode=0: (calls.append(os.path.basename(p)), object())[1]
         qfe._bind = lambda lib: types.SimpleNamespace(quantfunc_set_log_level=lambda level: None)
         qfe._engine_load_ok = lambda p: None
-        qfe._log_lib_fingerprint = lambda lib, p: None
+        qfe._log_lib_fingerprint = lambda lib, p, ident: None
         qfe.load_lib()
         check("through load_lib: the stray engine build and the other CUDA major's host are never dlopened",
               sorted(calls[:-1]) == ["libopencv_core.so.4.6", "libquantfunc_attention.so"] and calls[-1] == HOSTS[13],
@@ -772,7 +772,10 @@ def main():
         #     consumer pair — and the resolver must load that one, not the newer 0.0.14 still on disk.
         qfe._engine_http_open = old.open
         qfe.install_engine()
-        pulled = qfe.resolve_so_path()
+        try:
+            pulled = qfe.resolve_so_path()
+        except RuntimeError as e:                  # a regression here is a FAIL line, not a crash of the suite
+            pulled = f"refused: {str(e)[:60]}"
         claims = {g: (env.marker(g) or {}).get("sms") for g in ("consumer", "server")}
         check("a pulled release: the pair the installer keeps (0.0.13) is the one that loads; it alone claims the SM",
               pulled == os.path.realpath(env.path("0.0.13-consumer-cu13", HOSTS[13])) and 89 in claims["consumer"]
@@ -894,6 +897,93 @@ def main():
         open(env.path(".engine-consumer-cu13.json"), "w").write(json.dumps(mk))
         check("a marker whose cuda is a float (13.0) is not a marker", qfe._read_marker(env.path(".engine-consumer-cu13.json"))
               is None)
+    # 29) a class RENAMED, then the release PULLED (self-CR round 8, A, rules 1+2): 0.0.14 calls the consumer class
+    #     "desktop", so the consumer marker is left claiming nothing and goes with its pair; version.json then lists
+    #     0.0.13 again, so "desktop" is left claiming nothing in turn. 0.0.13 must load, and neither the emptied marker
+    #     nor its ~2 GB pair may survive (nothing else would ever remove a vanished class).
+    old = Release("0.0.13")
+    renamed = Release("0.0.14")
+    for major in (13, 12):
+        k = f"KERNEL-0.0.14-desktop-cu{major}".encode()
+        renamed.files[f"0.0.14/linux/desktop/{KERNELS[major]}"] = k
+        renamed.manifest["linux"][f"desktop/{KERNELS[major]}"] = sha(k)
+    renamed.set_sets(json.dumps({"schema": 1, "sets": {"desktop": [75, 86, 89, 120], "server": [80, 90, 100, 103]}}).encode())
+    with Env(old, sm=89) as env:
+        qfe.install_engine()
+        qfe._engine_http_open = renamed.open
+        qfe.install_engine()
+        after_rename = (env.marker("consumer") is None, os.path.isdir(env.path("0.0.13-consumer-cu13")))
+        qfe._engine_http_open = old.open
+        qfe.install_engine()
+        try:
+            got = os.path.relpath(qfe.resolve_so_path(), env.dir)
+        except RuntimeError as e:
+            got = f"refused: {str(e)[:60]}"
+        check("a renamed class, then the release pulled: 0.0.13 loads; each emptied marker went with its pair",
+              got == f"0.0.13-consumer-cu13/{HOSTS[13]}" and after_rename == (True, False)
+              and env.marker("desktop") is None and not os.path.exists(env.path("0.0.14-desktop-cu13")),
+              f"got={got} after_rename(consumer marker gone, consumer pair still on disk)={after_rename} "
+              f"desktop_marker={env.marker('desktop') is not None} desktop_pair={os.path.exists(env.path('0.0.14-desktop-cu13'))}")
+    # 30) torch's CUDA major 13 -> 12 -> 13 in ONE folder (self-CR round 8, A, rule 3): a claim is per CUDA major, so the
+    #     cu12 install must leave the cu13 marker (same SMs) alone, and switching back re-downloads nothing.
+    with Env(Release(), sm=89) as env:
+        qfe.install_engine()
+        qfe._torch_cuda_major = lambda: 12
+        qfe.install_engine()
+        both = (env.marker("consumer", 13) is not None, env.marker("consumer", 12) is not None)
+        qfe._torch_cuda_major = lambda: 13
+        before = len(env.release.fetched)
+        qfe.install_engine()
+        refetched = [f for f in env.release.fetched[before:] if f.endswith((HOSTS[13], KERNELS[13]))]
+        got = os.path.relpath(qfe.resolve_so_path(), env.dir)
+        check("torch CUDA 13 -> 12 -> 13 in one folder: both markers kept, the cu13 pair loads, nothing re-downloaded",
+              both == (True, True) and env.marker("consumer", 13) is not None and not refetched
+              and got == f"0.0.13-consumer-cu13/{HOSTS[13]}", f"both={both} refetched={refetched} got={got}")
+    # 31) a STARTING instance whose pair a concurrent install just removed (self-CR round 8, A, LOW; tests-07: fail loud,
+    #     re-resolve, never half a pair): this process resolved the consumer pair, then another instance sharing the folder
+    #     installed the renamed release, which emptied that class and removed its pair. The load must refuse loudly with
+    #     nothing loaded, and the next prompt must resolve again and load the pair that installer chose.
+    with Env(old, sm=89) as env:
+        qfe.install_engine()
+        real_resolve, real_cdll = qfe.resolve_so_path, qfe.ctypes.CDLL
+        loaded = []
+
+        def resolve_then_concurrent_install():
+            p = real_resolve()
+            qfe._engine_http_open = renamed.open       # the other instance's installer, between resolve and load
+            qfe.install_engine()
+            return p
+
+        def fake_cdll(path, mode=0):
+            if not os.path.isfile(path):
+                raise OSError(f"{path}: cannot open shared object file: No such file or directory")
+            loaded.append(os.path.relpath(path, env.dir))
+            return object()
+        saved = (qfe.assert_toolchain_compatible, qfe._bind, qfe._LIB, qfe._LIB_PATH, qfe._FINGERPRINT_PENDING,
+                 qfe.start_engine_install)
+        qfe.assert_toolchain_compatible = lambda so_path: None
+        qfe._bind = lambda raw: types.SimpleNamespace(quantfunc_set_log_level=lambda level: None)
+        qfe.start_engine_install = lambda *a, **k: None
+        qfe._LIB, qfe._LIB_PATH = None, None
+        qfe.resolve_so_path, qfe.ctypes.CDLL = resolve_then_concurrent_install, fake_cdll
+        try:
+            try:
+                qfe.load_lib()
+                first = "loaded?"
+            except RuntimeError as e:
+                first = f"refused: {str(e)[:50]}"
+            first_loaded, lib_after_refusal = list(loaded), qfe._LIB
+            qfe.resolve_so_path = real_resolve
+            qfe.load_lib()
+            second = qfe._LIB_PATH and os.path.relpath(qfe._LIB_PATH, env.dir)
+        finally:
+            qfe.resolve_so_path, qfe.ctypes.CDLL = real_resolve, real_cdll
+            (qfe.assert_toolchain_compatible, qfe._bind, qfe._LIB, qfe._LIB_PATH, qfe._FINGERPRINT_PENDING,
+             qfe.start_engine_install) = saved
+        check("a starting instance whose pair a concurrent install removed: refused loudly with nothing loaded; the next "
+              "prompt resolves again and loads the chosen pair", first.startswith("refused") and first_loaded == []
+              and lib_after_refusal is None and second == f"0.0.14-desktop-cu13/{HOSTS[13]}",
+              f"first={first} first_loaded={first_loaded} second={second}")
     print("ENGINE_INSTALL:", "PASS" if bad == 0 else f"FAIL ({bad} wrong)")
     return 1 if bad else 0
 
