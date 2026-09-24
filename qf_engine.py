@@ -2,6 +2,7 @@
 native ComfyUI loader. Structs mirror include/quantfunc.h (session structs copied
 verbatim from the PROVEN tests/scripts/native_session_t1.py). No tests/lib dependency.
 """
+import builtins
 import contextlib
 import ctypes
 from contextvars import ContextVar
@@ -891,9 +892,12 @@ def logger(name):
 
 
 def _console_safe_one(exc):
-    """console_safe on one exception's printed text (its args, OSError/SyntaxError fields, notes); the original message
-    stays readable as exc.qf_console_original. Returns whether it now prints safely."""
-    notes = getattr(exc, "__notes__", None)
+    """console_safe on one exception's printed text (its args, OSError/SyntaxError fields, notes), in place; the original
+    message stays readable as exc.qf_console_original. Returns whether it now prints safely. One whose text is still
+    unsafe (a __str__ computed from other state) is put back as it was: its stand-in carries it (_stand_in)."""
+    fields = (("strerror", "filename", "filename2") if isinstance(exc, OSError) else
+              ("msg", "filename", "text") if isinstance(exc, SyntaxError) else ())
+    args, values, notes = exc.args, [getattr(exc, attr, None) for attr in fields], getattr(exc, "__notes__", None)
     if isinstance(notes, list):
         exc.__notes__ = [console_safe(n) if isinstance(n, str) else n for n in notes]
     try:
@@ -902,46 +906,88 @@ def _console_safe_one(exc):
         return True
     if console_safe(text) == text:
         return True
-    try:
-        exc.qf_console_original = text
-    except (AttributeError, TypeError):
-        pass
-    exc.args = tuple(console_safe(a) if isinstance(a, str) else a for a in exc.args)
-    fields = (("strerror", "filename", "filename2") if isinstance(exc, OSError) else
-              ("msg", "filename", "text") if isinstance(exc, SyntaxError) else ())
-    for attr in fields:
-        value = getattr(exc, attr, None)
+    exc.args = tuple(console_safe(a) if isinstance(a, str) else a for a in args)
+    for attr, value in zip(fields, values):
         if isinstance(value, str):
             setattr(exc, attr, console_safe(value))
     try:
-        text = str(exc)
+        now = str(exc)
     except Exception:  # noqa: BLE001
+        now = ""
+    if console_safe(now) == now:
+        try:
+            exc.qf_console_original = text
+        except (AttributeError, TypeError):
+            pass
         return True
-    return console_safe(text) == text
+    exc.args = args
+    for attr, value in zip(fields, values):
+        if isinstance(value, str):
+            setattr(exc, attr, value)
+    if isinstance(notes, list):
+        exc.__notes__ = notes
+    return False
+
+
+def _group_members(e):
+    """The members a traceback prints for an exception group (Python 3.11+); none for any other exception."""
+    return e.exceptions if isinstance(e, getattr(builtins, "BaseExceptionGroup", ())) else ()
+
+
+def _stand_in(e):
+    """A RuntimeError printed in place of `e`, whose text cannot be rewritten (a __str__ computed from other state):
+    e's text escaped, e's traceback and chain, and e itself as `qf_console_original`."""
+    safe = RuntimeError(console_safe("".join(traceback.format_exception_only(type(e), e)).strip()))
+    safe.qf_console_original = e
+    safe.__cause__, safe.__context__ = e.__cause__, e.__context__
+    safe.__suppress_context__ = e.__suppress_context__
+    return safe.with_traceback(e.__traceback__)
 
 
 def console_safe_exception(exc):
-    """Rewrite `exc` IN PLACE so that everything a traceback prints for it holds on the console's code page: its message,
-    its notes and every exception chained to it (cause, context, group members). ComfyUI logs an uncaught node
-    exception and its traceback to its strict console, and one character the code page lacks makes that logging raise a
-    second exception inside ComfyUI's error handling (#738). The object and its type stay the same; each rewritten
-    exception keeps its original text as `qf_console_original`. Returns False when some text could not be rewritten
-    (a __str__ built from other state)."""
-    seen, pending, ok = set(), [exc], True
+    """Make everything a traceback prints for `exc` hold on the console's code page: its message, its notes and every
+    exception chained to it (cause, context, group members). ComfyUI logs an uncaught node exception and its traceback
+    to its strict console, and one character the code page lacks makes that logging raise a second exception inside
+    ComfyUI's error handling (#738).
+    - Text that comes from an exception's args is rewritten in place: the object and its type stay, the original text
+      is kept as `qf_console_original`.
+    - A CHAINED exception whose text cannot be rewritten (a __str__ computed from other state) is replaced, in the
+      links that hold it, by a stand-in RuntimeError carrying its text escaped and its own chain (_stand_in). A group
+      with such a member is replaced as a whole (its members cannot be replaced one by one), so its members are
+      then on the stand-in's qf_console_original, not in the log.
+    Returns the exception to raise: `exc` itself whenever its own text is safe, so ComfyUI still sees its type
+    (execution.py tells an OOM and a user cancel by type), else its stand-in, which keeps its chain."""
+    order, pending, seen = [], [exc], set()
     while pending:
         e = pending.pop()
         if e is None or id(e) in seen:
             continue
         seen.add(id(e))
-        ok = _console_safe_one(e) and ok
-        pending += [e.__cause__, e.__context__, *getattr(e, "exceptions", ())]
-    return ok
+        order.append((e, _console_safe_one(e)))
+        pending += [e.__cause__, e.__context__, *_group_members(e)]
+    unsafe = {id(e) for e, ok in order if not ok}
+    grown = True
+    while grown:   # a group that prints an unsafe member is unsafe itself
+        grown = False
+        for e, _ in order:
+            if id(e) not in unsafe and any(id(m) in unsafe for m in _group_members(e)):
+                unsafe.add(id(e))
+                grown = True
+    stand = {id(e): _stand_in(e) for e, _ in order if id(e) in unsafe}
+    for e in [e for e, _ in order if id(e) not in unsafe] + list(stand.values()):
+        for attr in ("__cause__", "__context__"):
+            link = getattr(e, attr)
+            if link is not None and id(link) in stand:
+                suppress = e.__suppress_context__   # assigning __cause__ sets it
+                setattr(e, attr, stand[id(link)])
+                e.__suppress_context__ = suppress
+    return stand.get(id(exc), exc)
 
 
 def console_safe_errors(fn):
     """Wrap `fn` (a node FUNCTION, a method ComfyUI calls) so that an exception leaving it is console-safe
-    (console_safe_exception) and re-raised as the same object. One whose text cannot be rewritten is replaced by a
-    RuntimeError carrying its safe text and its traceback, with the original object as `qf_console_original`."""
+    (console_safe_exception). It is re-raised as the same object whenever its own text can be made safe, so its type
+    reaches ComfyUI; only one whose own text cannot be rewritten is replaced by its stand-in (chain kept)."""
     if getattr(fn, "__qf_console_safe__", False):
         return fn
 
@@ -950,11 +996,10 @@ def console_safe_errors(fn):
         try:
             return fn(*args, **kwargs)
         except Exception as exc:
-            if console_safe_exception(exc):
+            safe = console_safe_exception(exc)
+            if safe is exc:
                 raise
-            safe = RuntimeError(console_safe("".join(traceback.format_exception_only(type(exc), exc)).strip()))
-            safe.qf_console_original = exc
-            raise safe.with_traceback(exc.__traceback__) from None
+        raise safe   # outside the handler, so Python does not chain the stand-in to the exception it replaces
     wrapper.__qf_console_safe__ = True
     try:   # what a caller introspects stays fn's, for inspect.getfullargspec too (it ignores __wrapped__): ComfyUI
         wrapper.__signature__ = inspect.signature(fn)   # passes VALIDATE_INPUTS only the inputs it names (execution.py)

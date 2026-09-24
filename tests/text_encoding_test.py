@@ -42,7 +42,10 @@ cannot hold raises UnicodeEncodeError out of the print() / log call, and out of 
               LTX audio fix wraps never raises a second exception either, keeps its type and its original text
               (qf_console_original), and is unchanged where the console holds it (cp936, UTF-8); one whose text
               comes from its __str__ becomes a RuntimeError carrying that text escaped; the loaders' VALIDATE_INPUTS
-              message, logged the way execution.py logs it, is never lost.
+              message, logged the way execution.py logs it, is never lost. An OOM or a user cancel raised while
+              handling (or from) an exception whose text cannot be rewritten keeps its type, which is how
+              execution.py tells them apart, and the chained text stays in the traceback, escaped; so does the chain
+              of a replaced top.
   boundary    static: every class ComfyUI calls into (its base named by module path or by a name imported from comfy)
               carries @qfe.console_safe_methods, every registered node's entry points are wrapped by
               qfe.console_safe_nodes after the last registration, and no wrapped method is async or a generator.
@@ -497,6 +500,39 @@ def _console_child(job):
     else:   # no boundary: the same error reaches ComfyUI's logging as it is
         out.update({arm: _boundary_outcome(qfe, fail) for arm in arms})
         out["console fallback error"] = _fallback_outcome(qfe, opaque)
+    import subprocess
+    process_error = subprocess.CalledProcessError(1, ["nvidia-smi", _CONSOLE_PATH])   # its text is computed from cmd
+    key_error = KeyError((_CONSOLE_PATH,))   # its text reprs a non-str key: neither can be rewritten in place
+
+    def oom_while_handling():   # an OOM raised while handling one of them (the chain's context)
+        try:
+            raise process_error
+        except subprocess.CalledProcessError:
+            raise _OutOfMemoryError("CUDA out of memory. Tried to allocate 2.00 GiB")
+
+    def cancel_from():   # a user cancel raised from one (cause and context both point at it)
+        try:
+            raise key_error
+        except KeyError as e:
+            raise _InterruptProcessingException() from e
+
+    opaque = _Opaque(_CONSOLE_PATH)   # a str arg its __str__ ignores: rewriting it cannot help, so it must stay as is
+
+    def opaque_while_handling():   # the top's own text cannot be rewritten, and it has a chain
+        try:
+            raise OSError(2, "No such file or directory", _CONSOLE_PATH)
+        except OSError:
+            raise opaque
+    safe = getattr(qfe, "console_safe", lambda t: t)
+    chains = [("console oom keeps type", oom_while_handling, _OutOfMemoryError, safe(str(process_error))),
+              ("console cancel keeps type", cancel_from, _InterruptProcessingException, safe(str(key_error))),
+              ("console fallback keeps chain", opaque_while_handling,
+               _Opaque if safe(_BOUNDARY_MSG) == _BOUNDARY_MSG else RuntimeError, "No such file or directory")]
+    if hasattr(qfe, "console_safe_errors"):   # the boundary every node FUNCTION and comfy-facing method runs under
+        chains = [(arm, qfe.console_safe_errors(f), want, text) for arm, f, want, text in chains]
+    out.update({arm: _chain_outcome(qfe, f, want, text) for arm, f, want, text in chains})
+    if out["console fallback keeps chain"][0] == "ok" and opaque.args != (_CONSOLE_PATH,):   # the stand-in carries it
+        out["console fallback keeps chain"] = ["error", "Mutated", f"the replaced exception now has {opaque.args!r}"]
     validate = _extract(os.path.join(job["root"], "__init__.py"), "_validate_quality", {"qfe": qfe},
                         consts=("_QUALITY_FAST_OPTIONS",))
 
@@ -543,6 +579,30 @@ class _Opaque(Exception):
 
     def __str__(self):
         return _BOUNDARY_MSG
+
+
+class _OutOfMemoryError(RuntimeError):
+    """Stands in for torch's OutOfMemoryError: ComfyUI's is_oom() is isinstance(e, OOM_EXCEPTION)."""
+
+
+class _InterruptProcessingException(Exception):
+    """Stands in for comfy.model_management's: execution.py tells a user cancel from an error by its type."""
+
+
+def _chain_outcome(qfe, call, want, chained):
+    """ComfyUI's logging around one plugin call whose exception has a chain: logged without a second exception or a lost
+    line; the exception ComfyUI sees is of type `want` (execution.py tells an OOM and a user cancel by type); and the
+    chained exception's text (`chained`) is still in its traceback, escaped where the console cannot hold it."""
+    import traceback
+    caught, err = _comfy_logs(call)
+    if err:
+        return err
+    if type(caught) is not want:
+        return ["error", "TypeLost", f"ComfyUI sees {type(caught).__name__}, not {want.__name__}"]
+    text = "".join(traceback.format_exception(type(caught), caught, caught.__traceback__))
+    if chained not in text:
+        return ["error", "ChainLost", f"the traceback lacks the chained text {chained[:60]!r}"]
+    return ["ok", f"ComfyUI sees {want.__name__}, chain logged"]
 
 
 def _comfy_logs(call):
@@ -617,6 +677,7 @@ def _console_arms(root, tmp):
         for arm in ("console import", "console say", "console info", "console logger", "console exception",
                     "console engine error", "console node error", "console validate error", "console denoise error",
                     "console init error", "console property error", "console fallback error",
+                    "console oom keeps type", "console cancel keeps type", "console fallback keeps chain",
                     "console validate message", "console sampler error", "console audio-fix", "console loggers"):
             g = got.get(arm, ["error", "Missing", "the child did not run this arm"])
             ok, act = g[0] == "ok", _show(g)
