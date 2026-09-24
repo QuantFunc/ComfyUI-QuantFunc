@@ -286,14 +286,15 @@ def register(deps):
 
         def _build(lora_entries):
             _lora_cfg = dict(create_extra or {})
-            if lora_entries:
-                _lora_cfg["lora"] = list(lora_entries)   # engine svdq load: sidecar apply post-load
+            # NO "lora" in the create: the cache key is the weights only (user rule 2026-09-24), so every LoRA set of
+            # this model shares one pipeline; the engine below applies THIS build's set in place (runtime_lora).
             device, device_idx = qfmp.current_torch_device()
             _factory, _register_model = qfmp.make_engine_factory(
                 lambda: get_engine(model_dir, create_cfg=(_lora_cfg or None),
                                    device_idx=device_idx),
                 bind_pipeline_model)
-            engine = qfmp.QFLazyEngine(_factory, retire=retire_handle)
+            engine = qfmp.QFLazyEngine(_factory, retire=retire_handle, runtime_lora=True)
+            engine.set_lora_side("all", lora_entries)
             offload = comfy.model_management.unet_offload_device()
             unet_config = {"image_model": "qwen_image21", "disable_unet_model_creation": True}
             model_config = comfy.supported_models.QwenImage21(unet_config)

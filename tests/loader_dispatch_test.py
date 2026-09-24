@@ -1119,6 +1119,95 @@ def main():
     except Exception as e:  # noqa: BLE001
         check("wiring-derived dual LoRA arm", False, f"-> raised {type(e).__name__}: {e}")
 
+    # ── 5b) RUNTIME LoRA on a single-expert family (user rule 2026-09-24 「换 LoRA 也不重建」) ──
+    # The create carries the weights only, so every LoRA set of one model shares ONE pipeline, and each consumer's
+    # chained set goes on in place with ONE quantfunc_pipeline_update {"lora": [...]} before its run ([] = the base).
+    # A DEDICATED Krea-2 file gives this arm its own cache key. The C ABI is stubbed at the same boundary as the
+    # capacity ABI above: the recorder takes the JSON body and answers the status in _rt_status.
+    import struct as _rst
+    _rt_updates, _rt_status = [], [0]
+    _ContractEngine.quantfunc_pipeline_update = staticmethod(
+        lambda _pipe, payload: (_rt_updates.append(json.loads(payload)), _rt_status[0])[1])
+    _ContractEngine.quantfunc_last_error = staticmethod(lambda: b"pipeline busy")
+    _saved_resolve = qfn._resolve_lora
+    try:
+        rt_dir = os.path.join(tmp, "loras_rt"); os.makedirs(rt_dir, exist_ok=True)
+        for _n in ("rt-a.safetensors", "rt-b.safetensors"):
+            _hdr = json.dumps({"blocks.0.attn.to_q.lora_A.weight":
+                               {"dtype": "F16", "shape": [1, 1], "data_offsets": [0, 2]}}).encode()
+            with open(os.path.join(rt_dir, _n), "wb") as fh:   # a PEFT-shaped header passes the one-format sniff
+                fh.write(_rst.pack("<Q", len(_hdr)) + _hdr + b"\0\0")
+        qfn._resolve_lora = lambda n: os.path.join(rt_dir, n)
+        with open(os.path.join(dm, "rt-krea2-turbo-quantfunc-int4.safetensors"), "wb") as fh:
+            fh.write(b"\0" * 16)
+        RtLora = qfn.NODE_CLASS_MAPPINGS["QuantFuncNativeLoRA"]()
+        _rt_c0 = len(creates)
+        rt_base = KreaL.load("rt-krea2-turbo-quantfunc-int4.safetensors", "krea2-turbo-int4")[0]
+        rt_a = RtLora.apply(rt_base, "rt-a.safetensors", 0.7)[0]
+        rt_b = RtLora.apply(rt_base, "rt-b.safetensors", 1.0)[0]
+        rt_ab = RtLora.apply(rt_a, "rt-b.safetensors", 0.5)[0]
+        _pa = {"path": os.path.join(rt_dir, "rt-a.safetensors"), "scale": 0.7, "target": "all"}
+        _pb1 = {"path": os.path.join(rt_dir, "rt-b.safetensors"), "scale": 1.0, "target": "all"}
+        _pb5 = {"path": os.path.join(rt_dir, "rt-b.safetensors"), "scale": 0.5, "target": "all"}
+        # A queue in the user's order: base, LoRA A, base, LoRA B, LoRA B again, A+B chained, base.
+        _rt_seen = []
+        for _m in (rt_base, rt_a, rt_base, rt_b, rt_b, rt_ab, rt_base):
+            _ = _m.model._qf.lib                      # the run-start materialization (QFLazyEngine.ensure)
+            _rt_seen.append(_m.model._qf._real)
+        _rt_new = creates[_rt_c0:]
+        check("runtime LoRA: every LoRA set of one Krea-2 model shares ONE create, and the create has no 'lora'",
+              len(_rt_new) == 1 and "lora" not in _rt_new[0] and all(r is _rt_seen[0] for r in _rt_seen),
+              f"-> creates={_rt_new} one-handle={all(r is _rt_seen[0] for r in _rt_seen)}")
+        check("runtime LoRA: each set change is ONE in-place update (A, [], B, A+B, []); an unchanged set sends none",
+              _rt_updates == [{"lora": [_pa]}, {"lora": []}, {"lora": [_pb1]}, {"lora": [_pa, _pb5]},
+                              {"lora": []}],
+              f"-> updates={_rt_updates}")
+        # A refused update raises the engine's message and leaves the applied set alone, so the next run
+        # retries it (both ways).
+        _rt_status[0] = 7
+        _refused = ""
+        try:
+            _ = rt_a.model._qf.lib
+        except RuntimeError as _e:
+            _refused = str(_e)
+        _rt_real = rt_a.model._qf._real
+        _kept_sig = _rt_real.applied_lora_sig
+        _rt_status[0] = 0
+        _ = rt_a.model._qf.lib
+        check("runtime LoRA: a refused update raises the engine's message, keeps the applied set, and retries",
+              "pipeline_update failed (status 7)" in _refused and "pipeline busy" in _refused
+              and _kept_sig == "[]" and _rt_updates[-1] == {"lora": [_pa]}
+              and _rt_real.applied_lora_sig == rt_a.model._qf._lora_sig(),
+              f"-> refused={_refused!r} kept={_kept_sig} last={_rt_updates[-1]}")
+        # Mid-generation: a set change while a session is still open refuses LOUD; the SAME set passes
+        # without touching the engine (both ways).
+        _rt_real.current_session = object()           # the fixture's end_session_if_open never closes it
+        _n0 = len(_rt_updates)
+        _same_ok = True
+        try:
+            _ = rt_a.model._qf.lib
+        except RuntimeError:
+            _same_ok = False
+        _mid = ""
+        try:
+            _ = rt_b.model._qf.lib
+        except RuntimeError as _e:
+            _mid = str(_e)
+        _rt_real.current_session = None
+        check("runtime LoRA: a set change mid-generation refuses LOUD, the same set passes (both ways)",
+              _same_ok and "still running" in _mid and len(_rt_updates) == _n0,
+              f"-> same-ok={_same_ok} mid={_mid!r} updates-sent={len(_rt_updates) - _n0}")
+        # Wan keeps the create-time union (per-expert targets are create-only in the engine): a set change
+        # there never sends a runtime update.
+        check("runtime LoRA is single-expert only: the Wan engine keeps create-time LoRA",
+              base.model._qf._runtime_lora is False and rt_base.model._qf._runtime_lora is True,
+              f"-> wan={base.model._qf._runtime_lora} krea2={rt_base.model._qf._runtime_lora}")
+    except Exception as e:  # noqa: BLE001
+        check("runtime LoRA arm", False, f"-> raised {type(e).__name__}: {e}")
+    finally:
+        qfn._resolve_lora = _saved_resolve
+        del _ContractEngine.quantfunc_pipeline_update, _ContractEngine.quantfunc_last_error
+
     # ── 6) HOST-RAM honesty on a DEDICATED file pair (isolated ckey) ──
     try:
         for f in ("ram-t2v-high-quantfunc-int4.safetensors", "ram-t2v-low-quantfunc-int4.safetensors"):

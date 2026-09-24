@@ -60,7 +60,6 @@ class HostLoaderContract(unittest.TestCase):
         consumer._qf = other
         with mock.patch.dict(plugin._PIPELINE_CACHE, {other_key: other, selected_key: selected}, clear=True), \
              mock.patch.dict(plugin._PIPELINE_MODELS, {}, clear=True), \
-             mock.patch.dict(os.environ, {"QF_NATIVE_CREATE_EXTRA": ""}), \
              mock.patch.object(plugin.qfe, "resolve_so_path", return_value="contract.so"), \
              mock.patch.object(plugin.qfe, "load_lib", return_value=selected_lib), \
              mock.patch.object(plugin.qfe, "create_pipeline", side_effect=AssertionError("cache hit must not create")):

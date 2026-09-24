@@ -420,15 +420,6 @@ def _sweep_dead_pipelines(keep_key):
 
 def _engine_recipe(model_dir, create_cfg=None, device_idx=0):
     """Resolve immutable create inputs without entering a cache critical section."""
-    # [EXPERIMENT-ONLY 2026-08-23, internal A/B — remove after measurement; shipped
-    # form will be loader-node widgets, per the no-env-production-switch rule]:
-    # QF_NATIVE_CREATE_EXTRA merges extra create keys (internal dials /
-    # attention_backend...) BEFORE the cache key is computed, so每个 extra 配置有独立
-    # pipeline cache 身份 (never collides with the default config's handle).
-    extra = os.environ.get("QF_NATIVE_CREATE_EXTRA")
-    if extra:
-        create_cfg = {**(create_cfg or {}), **json.loads(extra)}
-        print(f"[qf_native] EXPERIMENT create-extra merged: {extra}", flush=True)
     lib = qfe.load_lib()
     ckey = (qfe.resolve_so_path(), model_dir, "svdq", int(device_idx),
             json.dumps(create_cfg or {}, sort_keys=True))
@@ -854,7 +845,8 @@ if _IMPORT_OK:
                                "ON=g32 (更细的激活量化组, 实测 -9.1% 激活量化误差, 前向 +~45%, 仅 SM89/86 是真杠杆; "
                                "SM120 上 int4 已用更细的 E0M3 g16, 此开关 no-op). 仅对 svdq int4 生效. "
                                "把 int4 画质往 fp8 靠的实验开关 —— 温和收益, 单靠它通常不足以完全追平 fp8 "
-                               "(根因是 int4 激活精度; 干净对齐 fp8 需 a8w4)."}),
+                               "(根因是 int4 激活精度; 干净对齐 fp8 需 a8w4). "
+                               "切换此项会重新加载模型 (引擎只在创建模型时读取它)."}),
             }}
 
         RETURN_TYPES = ("MODEL", "MODEL")
@@ -1077,9 +1069,12 @@ if _IMPORT_OK:
         """Sidecar LoRA for the QuantFunc native loader — MODEL in, MODEL out (LoraLoaderModelOnly
         shape). Chain several to stack them.
 
-        The engine merges sidecar LoRA at pipeline CREATE time (runtime hot-swap is not wired for
-        the video pipelines), so this node RE-CREATES the pipeline for the accumulated set — the
-        create itself is deferred (QFLazyEngine), so a chain of N nodes still builds ONE pipeline.
+        Single-expert families (LTX-2.5, H3, Krea-2, Qwen-Image-2.1; user rule 2026-09-24 「换 LoRA 也不重建」):
+        the pipeline is created WITHOUT LoRA, so every LoRA set of one model shares it, and the chained set is
+        applied in place before each run (one declarative quantfunc_pipeline_update {"lora": [...]}; QFLazyEngine
+        runtime_lora). Wan still merges its per-expert union at CREATE time (the engine cannot yet route a
+        high/low target at runtime), so a LoRA change there re-creates the pair's pipeline. Either way the create
+        is deferred (QFLazyEngine), so a chain of N nodes still builds ONE pipeline.
         Comfy-level patches applied upstream (ModelSampling*, set_model_* …) are TRANSPLANTED onto
         the rebuilt patcher, so this node may sit anywhere in the chain.
         """
@@ -1100,9 +1095,9 @@ if _IMPORT_OK:
         # is shaped after — use "model/loaders" (nodes.py); bare "loaders" is for file-loading
         # nodes. (ModelSampling* use "model/patch*", so the rule is per-precedent, not universal.)
         CATEGORY = "model/loaders"
-        DESCRIPTION = ("Attaches a sidecar LoRA to a QuantFunc native MODEL (wire downstream of the "
-                       "QuantFunc Native Loader; chain several to stack). The engine merges sidecar "
-                       "LoRA at create time, so the pipeline is re-created for the new set.")
+        DESCRIPTION = ("Attaches a sidecar LoRA to a QuantFunc native MODEL (wire downstream of a "
+                       "QuantFunc loader; chain several to stack). Changing the LoRA keeps the loaded "
+                       "model (no reload). On the Wan loader a LoRA change reloads the model.")
 
         @staticmethod
         def _refuse_foreign_lora_format(path):

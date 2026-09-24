@@ -199,7 +199,6 @@ class CanonicalIntegration(unittest.TestCase):
             mock.patch.dict(plugin._PIPELINE_CACHE, {}, clear=True),
             mock.patch.dict(plugin._PIPELINE_MODELS, {}, clear=True),
             mock.patch.dict(plugin._PREPARED_CACHE, {}, clear=True),
-            mock.patch.dict(os.environ, {"QF_NATIVE_CREATE_EXTRA": ""}),
             mock.patch.object(qfe, "load_lib", return_value=self.lib),
             mock.patch.object(qfe, "resolve_so_path", return_value="contract.so"),
             mock.patch.object(plugin, "_read_auth", return_value=("", "")),

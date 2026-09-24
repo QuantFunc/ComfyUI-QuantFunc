@@ -643,8 +643,13 @@ class QFLazyEngine:
     __getattr__ magic: a typo must fail loud, not silently forward.
     """
 
-    def __init__(self, factory, retire=None):
+    def __init__(self, factory, retire=None, runtime_lora=False):
         self._factory = factory          # () -> (QFEngineHandle, ckey)
+        # runtime_lora (single-expert families, user rule 2026-09-24 「换 LoRA 也不重建」): the create carries the
+        # weights only, so every LoRA set of one model shares ONE cached pipeline, and ensure() applies THIS
+        # consumer's set to it in place (_apply_runtime_lora). False (Wan, until the engine can route a per-expert
+        # target at runtime): the union is a create input and a change re-creates (reconcile_lora).
+        self._runtime_lora = bool(runtime_lora)
         self._real = None
         self._prepared_entry = None
         self._ckey = None                # the materialized handle's cache key (for retire)
@@ -750,7 +755,30 @@ class QFLazyEngine:
         # Busy/Unknown after the native grant was fenced. Cache hits are not a
         # new host admission and must not resume it implicitly.
         _require_engine_host_grants(self._real)
+        if self._runtime_lora:
+            self._apply_runtime_lora()
         return self._real
+
+    def _apply_runtime_lora(self):
+        """Put THIS consumer's LoRA set on the shared pipeline before its run: ONE declarative
+        quantfunc_pipeline_update {"lora": [...]} (the full set; [] restores the base), only when the pipeline's
+        applied set differs. The applied set lives on the REAL handle, shared by every lazy engine of the same
+        weights, so an unchanged set costs one string compare and never touches the engine. Returns True when an
+        update ran."""
+        real, want = self._real, self._lora_sig()
+        if getattr(real, "applied_lora_sig", "[]") == want:
+            return False
+        if getattr(real, "current_session", None):
+            real.end_session_if_open()   # a stale session from an interrupted run blocks the mutation lease
+        if getattr(real, "current_session", None):
+            raise RuntimeError(
+                "qf_native: the LoRA set changed while this model's generation is still running. The engine applies "
+                "a LoRA change only between generations; re-queue the prompt.")
+        union = self.lora_union()
+        real.pipeline_update({"lora": union})
+        real.applied_lora_sig = want
+        print(f"[qf_native] LoRA set applied in place (no reload): {len(union)} LoRA(s)", flush=True)
+        return True
 
     @property
     def materialized(self):
@@ -780,9 +808,11 @@ class QFLazyEngine:
     # single-worker execution the mid-generation drift guard in reconcile_lora is NOT
     # reachable — it is DEFENSIVE, kept for any future concurrent/out-of-band mutation
     # path). Never a silent stale-LoRA output.
-    # Single-expert families deliberately keep the OTHER architecture — a fresh _build per
-    # LoRA set (one consumer, no shared engine to keep coherent) — do not migrate them
-    # without need. Half-adoption fails LOUD: set_lora_side refuses without a retire chokepoint
+    # Single-expert families keep a fresh _build (patcher + lazy engine) per LoRA set, but since
+    # 2026-09-24 (user rule 「换 LoRA 也不重建」) their create carries NO LoRA: every set of one model
+    # shares ONE cached pipeline and ensure() applies each consumer's set in place (runtime_lora,
+    # _apply_runtime_lora). Wan keeps the create-time union below until the engine can route a
+    # per-expert target at runtime. Half-adoption fails LOUD: set_lora_side refuses without a retire chokepoint
     # (else a superseded handle would silently leak its host backup), and the drift-retire
     # runs inside ensure() itself (no per-family hook to forget).
     def set_lora_side(self, side, entries):
@@ -815,8 +845,9 @@ class QFLazyEngine:
         created union no longer matches the current side registry is RETIRED here (session
         closed, retired via the retire chokepoint) and the next ensure() re-creates
         with the current union. Unmaterialized (the common deferred path) or unchanged union
-        => no-op. Returns True when a retire happened (observable for tests/logs)."""
-        if self._real is None or self._created_lora_sig == self._lora_sig():
+        => no-op. Returns True when a retire happened (observable for tests/logs).
+        A runtime_lora engine never retires here: its create carries no LoRA (ensure() applies the set in place)."""
+        if self._runtime_lora or self._real is None or self._created_lora_sig == self._lora_sig():
             return False
         if getattr(self._real, "current_session", None):
             # Retention (2026-08-24): a REFUSED end now keeps the pointer, so first try to

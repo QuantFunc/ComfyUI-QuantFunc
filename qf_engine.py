@@ -1302,6 +1302,24 @@ class QFEngineHandle:
         self.step_count = 0                  # total denoise_step calls (instrument)
         self.sampler_step_count = 0          # distinct sampler steps (instrument)
         self.unloaded = False                # co-eviction: True after unload_vram() freed VRAM (auto-reloads on next generate)
+        # The LoRA set this pipeline currently runs, as QFLazyEngine._lora_sig() spells it. A pipeline is created with
+        # NO LoRA (the cache key is the weights only), so it starts at the base; pipeline_update swaps it in place.
+        self.applied_lora_sig = "[]"
+
+    def pipeline_update(self, update):
+        """ONE quantfunc_pipeline_update on this live pipeline (a runtime mutation between generations: no rebuild,
+        no reload). `update` is the JSON object the C API takes (e.g. {"lora": [...]}: the declarative full set, []
+        restores the base). A refusal (busy, an unsupported entry, an OOM) raises with the engine's own message."""
+        if self.pipeline is None:
+            raise RuntimeError("QuantFunc pipeline_update: no live pipeline")
+        fn = getattr(self.lib, "quantfunc_pipeline_update", None)
+        if fn is None:
+            raise RuntimeError("QuantFunc library lacks quantfunc_pipeline_update; update the native library")
+        fn.restype = ctypes.c_int
+        fn.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+        st = fn(self.pipeline, json.dumps(update).encode())
+        if st != QUANTFUNC_OK:
+            raise RuntimeError(f"QuantFunc pipeline_update failed (status {st}): {last_err(self.lib)}")
 
     def end_session_if_open(self):
         """Close the open denoise session if any. Returns (was_open, ok): a NON-OK engine status
