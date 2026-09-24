@@ -1004,7 +1004,7 @@ def _read_marker(path):
     try:
         with open(path, encoding="utf-8") as f:
             m = json.load(f)
-        ok = (name is not None and m["set"] == name.group(1) and m["cuda"] == int(name.group(2))
+        ok = (name is not None and m["set"] == name.group(1) and type(m["cuda"]) is int and m["cuda"] == int(name.group(2))
               and _ENGINE_VERSION_RE.fullmatch(m["version"]) is not None and m["host"] == _ENGINE_HOSTS.get(m["cuda"])
               and _ENGINE_KERNEL_RE.fullmatch(m["kernel"]) is not None and all(type(s) is int for s in m["sms"])
               and sorted(m["sha256"]) == sorted((m["host"], m["kernel"]))
@@ -1034,23 +1034,33 @@ def _installed_pair():
     return max(mine, key=lambda pm: _version_key(pm[1]["version"])) if mine else (None, None)
 
 
-def _claim(bin_dir, marker, sms):
+def _claim(bin_dir, marker, sms, chosen=None):
     """The installer chose `marker` for `sms` (its release's list for that GPU class): make it the ONLY marker of its
     CUDA major that claims them, so the resolver loads the pair the installer chose. A release may move an SM to another
     class, and a pulled release or an older plugin can move it back. Other markers keep their other SMs (another GPU of
-    their class may use them); a marker left claiming nothing goes, with its pair. Markers are rewritten atomically."""
+    their class may use them); a marker left claiming nothing goes, with its pair. Markers are rewritten atomically.
+    ORDER: the other markers give the SMs up FIRST and the chosen marker is written LAST, so a crash in between leaves no
+    marker claiming them — the resolver says no engine is installed and the next start installs again — never two
+    claimants it would have to choose between. `chosen`: the new marker (an install); None re-claims the kept one."""
     major = int(_ENGINE_MARKER_RE.fullmatch(os.path.basename(marker)).group(2))
+    want = sorted(set(sms))
     for p, m in _markers():
-        if m["cuda"] != major:
+        if m["cuda"] != major or p == marker:
             continue
-        want = sorted(set(sms)) if p == marker else [s for s in m["sms"] if s not in sms]
-        if sorted(m["sms"]) == sorted(want):
+        left = [s for s in m["sms"] if s not in sms]
+        if left == m["sms"]:
             continue
-        if want:
-            _engine_write_file(p, json.dumps(dict(m, sms=want)).encode())
+        if left:
+            _engine_write_file(p, json.dumps(dict(m, sms=left)).encode())
         else:
             os.remove(p)
             shutil.rmtree(os.path.join(bin_dir, _pair_dir(m)), ignore_errors=True)
+    if chosen is None:
+        chosen = _read_marker(marker)
+        if chosen is None or sorted(chosen["sms"]) == want:
+            return
+        chosen = dict(chosen, sms=want)
+    _engine_write_file(marker, json.dumps(chosen).encode())   # LAST: the chosen pair becomes the claimant
 
 
 def _marker_of(so_path):
@@ -1220,8 +1230,7 @@ def _install_pair(bin_dir, device_idx):
                 pass
     m = {"version": version, "set": gpu_set, "cuda": major, "sms": sets[gpu_set], "host": host, "kernel": kernel,
          "sha256": {host: got[host], kernel: got[kernel]}}
-    _engine_write_file(marker, json.dumps(m).encode())     # LAST: the pair becomes loadable
-    _claim(bin_dir, marker, sets[gpu_set])
+    _claim(bin_dir, marker, sets[gpu_set], chosen=m)       # the other markers give up its SMs, then this marker, LAST
     keep = {_pair_dir(m), have and _pair_dir(have)}
     for d in os.listdir(bin_dir):
         p = _ENGINE_PAIR_RE.fullmatch(d)

@@ -846,6 +846,54 @@ def main():
           "Linux-only hint", placed is None and buf.getvalue() == "" and "Linux-only" in missing
           and "local" in str(placed_status), f"placed={placed} printed={buf.getvalue()!r} status={placed_status} "
           f"missing={missing[:60]!r}")
+    # 27) a crash between the claim and the chosen marker (tests-07 round 6c, A): the other markers give up the SMs FIRST
+    #     and the chosen marker is written LAST, so the window leaves NO claimant (refused, reinstalled next start) —
+    #     never two for the resolver to guess between.
+    old = Release("0.0.13")
+    with Env(old, sm=89) as env:
+        qfe.install_engine()
+        new = Release("0.0.14")
+        new.set_sets(json.dumps({"schema": 1, "sets": {"consumer": [75, 86, 120],
+                                                        "server": [80, 89, 90, 100, 103]}}).encode())
+        qfe._engine_http_open = new.open
+        real_write = qfe._engine_write_file
+
+        def crash_on_chosen(path, data):
+            if os.path.basename(path) == ".engine-server-cu13.json":
+                raise OSError("killed before the chosen marker was written")
+            return real_write(path, data)
+        qfe._engine_write_file = crash_on_chosen
+        try:
+            qfe.install_engine()
+            crashed = "no crash?"
+        except OSError as e:
+            crashed = str(e)
+        finally:
+            qfe._engine_write_file = real_write
+        claimants = [n for n in os.listdir(env.dir) if qfe._ENGINE_MARKER_RE.fullmatch(n)
+                     and 89 in (json.loads(open(os.path.join(env.dir, n)).read()).get("sms") or [])]
+        saved_start = qfe.start_engine_install
+        qfe.start_engine_install = lambda *a, **k: None
+        try:
+            got = os.path.relpath(qfe.resolve_so_path(), env.dir)
+        except RuntimeError as e:
+            got = f"refused: {str(e)[:50]}"
+        finally:
+            qfe.start_engine_install = saved_start
+        qfe.install_engine()                                   # the next start installs again
+        again = os.path.relpath(qfe.resolve_so_path(), env.dir)
+        check("a crash between the claim and the chosen marker: no marker claims the SM (refused), and the next start "
+              "installs and loads the chosen pair", "killed" in crashed and claimants == [] and got.startswith("refused")
+              and again == f"0.0.14-server-cu13/{HOSTS[13]}", f"crash={crashed[:30]} claimants={claimants} got={got} "
+              f"again={again}")
+    # 28) a marker's cuda must be an int (tests-07 round 6c, B): 13.0 would name a "-cu13.0" folder
+    with Env(Release()) as env:
+        qfe.install_engine()
+        mk = env.marker("consumer", 13)
+        mk["cuda"] = 13.0
+        open(env.path(".engine-consumer-cu13.json"), "w").write(json.dumps(mk))
+        check("a marker whose cuda is a float (13.0) is not a marker", qfe._read_marker(env.path(".engine-consumer-cu13.json"))
+              is None)
     print("ENGINE_INSTALL:", "PASS" if bad == 0 else f"FAIL ({bad} wrong)")
     return 1 if bad else 0
 
