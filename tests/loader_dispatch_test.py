@@ -262,6 +262,18 @@ def main():
     H3L = qfn.NODE_CLASS_MAPPINGS["QuantFuncH3Loader"]()
     KreaL = qfn.NODE_CLASS_MAPPINGS["QuantFuncKrea2Loader"]()
 
+    # Every QuantFunc loader takes log_level as a HIDDEN input (qf_log_level, attached after every registration):
+    # users never see or choose it, and the per-family surface checks below see only the family's own inputs.
+    _ll_loaders = [n for n in qfn.NODE_CLASS_MAPPINGS if n.startswith("QuantFunc") and n.endswith("Loader")]
+    _ll_bad = []
+    for _n in _ll_loaders:
+        _s = qfn.NODE_CLASS_MAPPINGS[_n].INPUT_TYPES()
+        if ("log_level" in {**_s.get("required", {}), **_s.get("optional", {})}
+                or _s.get("hidden", {}).get("log_level") != ("STRING", {})):
+            _ll_bad.append(_n)
+    check("log_level is hidden (never a visible input) on every QuantFunc loader",
+          bool(_ll_loaders) and not _ll_bad, f"-> {len(_ll_loaders)} loaders, wrong: {_ll_bad}")
+
     # ── 1) UI surface (per-family pivot): wan = dual required transformers + DUAL MODEL outputs;
     #      single-expert nodes = one transformer; preset dropdowns are FAMILY-FILTERED ──
     it = WanL.INPUT_TYPES()

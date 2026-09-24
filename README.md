@@ -276,7 +276,7 @@ the same seed). For image edit, CFG above 1 and batches, `balance` runs like `be
 |-------|----------|
 | Worker failed to start | Check CUDA driver ≥ 560, ensure CUDA runtime libs installed |
 | DLL/SO not found | Check `bin/linux/` or `bin/windows/` contains the library; restart ComfyUI to trigger auto-download |
-| No log output | Update to latest library version (requires stderr log support) |
+| Console shows only warnings | That is the default: the engine prints only warnings and errors |
 | cuDNN BAD_PARAM | Delete cuDNN algo cache and retry |
 | Noisy output | Ensure model backend matches transformer weights (svdq vs lighting) |
 | Auto-update fails | Install `modelscope` package, or manually download from ModelScope |
