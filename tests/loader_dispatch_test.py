@@ -1158,6 +1158,36 @@ def main():
         check("runtime LoRA: a set change mid-generation refuses LOUD, the same set passes (both ways)",
               _same_ok and "still running" in _mid and len(_rt_updates) == _n0,
               f"-> same-ok={_same_ok} mid={_mid!r} updates-sent={len(_rt_updates) - _n0}")
+        # An interrupted run's end is refused while its last step drains: ONE bounded retry (the begin path's 2 s),
+        # then the set change goes through. time is shimmed inside qf_modelpatcher only (no real sleep, no global patch).
+        _ends, _slept, _late = [], [], ""
+
+        def _end_on_second_try():
+            _ends.append(1)
+            if len(_ends) == 2:
+                _rt_real.current_session = None
+            return (True, len(_ends) == 2)
+
+        class _TimeShim:
+            sleep = staticmethod(_slept.append)
+
+            def __getattr__(self, name):
+                return getattr(_real_time, name)
+        _real_time = qfn.qfmp.time
+        _rt_real.current_session = object()
+        _rt_real.end_session_if_open = _end_on_second_try
+        qfn.qfmp.time = _TimeShim()
+        try:
+            _ = rt_b.model._qf.lib
+        except RuntimeError as _e:
+            _late = str(_e)
+        finally:
+            qfn.qfmp.time = _real_time
+            del _rt_real.end_session_if_open
+            _rt_real.current_session = None
+        check("runtime LoRA: after an interrupted run's refused end, ONE 2 s retry, then the set change goes through",
+              not _late and len(_ends) == 2 and _slept == [2.0] and _rt_updates[-1] == {"lora": [_pb1]},
+              f"-> refused={_late!r} ends={len(_ends)} slept={_slept} last={_rt_updates[-1]}")
     except Exception as e:  # noqa: BLE001
         check("runtime LoRA arm", False, f"-> raised {type(e).__name__}: {e}")
     finally:
