@@ -841,6 +841,16 @@ class CanonicalIntegration(unittest.TestCase):
         self.assertEqual(lines, ["[qf_native] grant: device=30 MB owner=30 MB shared=20 MB comfy_free=30 MB "
                                  "host_reserve=10 MB engine_resident=10 MB (comfy budget 5 MB; growth 20 MB)"])
         self.assertTrue(lines[0].isascii())
+        # the two other publications change the ceilings too: a revoke (growth fenced) and a restore say so, once each
+        snapshot = qfm._capture_domain_grants(owner, qfm._query_identity(owner._resource))
+        with mock.patch.object(qfe, "info") as info:
+            qfm._revoke_domain_growth(owner)
+            qfm._restore_domain_grants(owner, snapshot)
+        more = [c.args[0] % c.args[1:] for c in info.call_args_list
+                if c.args and str(c.args[0]).startswith("[qf_native] grant:")]
+        self.assertEqual(more, ["[qf_native] grant: device=0 MB owner=0 MB shared=0 MB (revoked: growth fenced, what is held "
+                                "stays)", "[qf_native] grant: device=30 MB owner=30 MB shared=20 MB (restored)"])
+        self.assertTrue(all(line.isascii() for line in more))
         self.lib.resources[key].update(held=0)
 
     def test_host_inference_bytes_key_one_card_however_comfy_names_it(self):

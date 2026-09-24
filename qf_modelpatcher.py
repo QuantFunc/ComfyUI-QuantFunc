@@ -1516,8 +1516,9 @@ def _publish_domain_grants(adapter, *, publish_owner=False, growth_allowance=0):
                     qfe.QUANTFUNC_RESOURCE_GRANT_DEVICE)
             _set_domain_grants(shared, target_owner._resource, mask, owner_limit_bytes=owner_target,
                                shared_limit_bytes=shared_target, device_limit_bytes=device_limit)
+        domain.shared_growth_fenced = False
         # #738 (tests-07): the published grant is observable in the log, one line per publication (info level: hidden at
-        # the production default). A cell that never pages would otherwise show no grant at all.
+        # the production default), after the state it describes. A cell that never pages would otherwise show no grant.
         qfe.info("[qf_native] grant: device=%d MB owner=%s shared=%d MB comfy_free=%s host_reserve=%s "
                  "engine_resident=%d MB (%s)",
                  device_limit >> 20,
@@ -1528,7 +1529,6 @@ def _publish_domain_grants(adapter, *, publish_owner=False, growth_allowance=0):
                  domain_actual >> 20,
                  "full load: no growth ceiling" if allowance is None
                  else "comfy budget %d MB; growth %d MB" % (int(growth_allowance) >> 20, allowance >> 20))
-        domain.shared_growth_fenced = False
         return device_limit
 
 
@@ -1550,6 +1550,8 @@ def _revoke_domain_growth(adapter):
                     qfe.QUANTFUNC_RESOURCE_GRANT_DEVICE)
             _set_domain_grants(shared, target_owner._resource, mask, owner_limit_bytes=0,
                                shared_limit_bytes=0, device_limit_bytes=0)
+        qfe.info("[qf_native] grant: device=0 MB owner=%s shared=0 MB (revoked: growth fenced, what is held stays)",
+                 "0 MB" if target_owner is not None else "-")
 
 
 def _capture_domain_grants(adapter, identity):
@@ -1577,6 +1579,8 @@ def _restore_domain_grants(adapter, snapshot):
                            owner_limit_bytes=owner_limit, shared_limit_bytes=shared_limit,
                            device_limit_bytes=device_limit)
     adapter._domain.shared_growth_fenced = shared_fenced
+    qfe.info("[qf_native] grant: device=%d MB owner=%s shared=%d MB (restored)", device_limit >> 20,
+             "%d MB" % (owner_limit >> 20) if owner_limit is not None else "-", shared_limit >> 20)
 
 
 def canonical_resource_adapters(engine):
