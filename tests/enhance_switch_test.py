@@ -62,20 +62,8 @@ check(not hits, "arm1: no raw enhance knob reachable from the plugin path (%s)" 
 # not a workflow note. And the QI-2.1 notes carry the measured wording plus the no-choice rule (a GPU without the fast mode
 # shows no choice and always runs best_quality).
 _CLAIM = ("almost the same", "nearly the same", "closer to best", "picture stays the same")
-import re as _re
-_FAST_OPT = _re.compile(r"(?<![\w-])`?(?:super_fast|fast)`?(?![\w-])")   # the option NAMES (not "faster", "fast-moving")
-
-
-def tier_problems(text):
-    """The per-tier rule (user: few-step models may give another variation in the fast tiers, AND THE TEXT SAYS SO):
-    a text that offers fast / super_fast carries the variation clause, and the subject/scene claim (balance's) is never
-    in a sentence that names fast / super_fast. Shared with loader_dispatch_test's rendered-tooltip arm."""
-    probs = []
-    if _FAST_OPT.search(text) and "different variation of the same seed" not in text:
-        probs.append("offers fast / super_fast without the variation clause")
-    probs += [f"subject/scene claim on fast: {s[:70]!r}" for s in _re.split(r"(?<=\.)\s+", text)
-              if "subject and scene stay the same" in s and _FAST_OPT.search(s)]
-    return probs
+sys.path.insert(0, _HERE)
+from quality_tier_rules import tier_problems  # noqa: E402  (the per-tier rule, shared with loader_dispatch_test)
 _claims = []
 for _root, _dirs, _files in os.walk(_PLUGIN):
     if "/tests" in _root or "/.git" in _root:
