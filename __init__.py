@@ -699,9 +699,9 @@ if _IMPORT_OK:
     def _resolve_quality(quality=None, quality_enhance=None, device_idx=None):
         """The node's quality → the mode this run uses. An explicit quality wins; the retired switch (a boolean in quality's
         position, or by name when quality is absent) maps old ON → best_quality, OFF → balance; nothing given → the default. A
-        fast option this GPU cannot run runs balance, with one console line. Whether the model FILE has a fast form is the
-        engine's to say AFTER the load (at no I/O; it warns once when it has none): the plugin never reads the file for it
-        before the load (that read cost up to 66 s cold)."""
+        fast option this GPU cannot run (or an older engine) runs balance, with one console line. The model FILE is the engine's
+        call: a loaded model without the fast form runs such a call as balance and the engine warns once — the plugin reads no
+        file before the load (that read took 66 s for LTX-2.5 on a cold spinning disk)."""
         if isinstance(quality, bool):
             q = "best_quality" if quality else "balance"
         elif quality is not None:
