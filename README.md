@@ -241,11 +241,11 @@ Qwen-Image-2.1 native-loader workflows are in [`example_workflows/`](example_wor
 **Templates → ComfyUI-QuantFunc**. They use the stock `CLIPLoader` (type `qwen_image`), `TextEncodeQwenImage21`, VAE and
 `KSampler`; only the transformer loader is QuantFunc's. The VAE is RGBA, so `VAE Decode` + `Save Image` keep transparency.
 The loader's `quality` choice (default `balance` on the MiniMax-H3, LTX-2, Krea-2 and Qwen-Image-2.1 loaders): `balance`
-can be a little faster than `best_quality`, and on GPUs that offer them `fast` and `super_fast` are usually faster still.
-With these the subject and scene stay the same, but details such as poses, faces or small objects can differ from `best_quality`;
-`best_quality` gives the highest quality. The LTX-2 loader offers `fast` but not `super_fast` (a workflow saved with
-`super_fast` runs `fast`). On GPUs without `fast` and `super_fast`, the Qwen-Image-2.1 loader shows no `quality` choice
-and always gives the highest quality.
+can be a little faster than `best_quality`; the subject and scene stay the same, but details such as poses, faces or small
+objects can differ from `best_quality`. On GPUs that offer them, `fast` and `super_fast` are usually faster still and can
+give a different variation of the same seed. `best_quality` gives the highest quality. The LTX-2 loader offers `fast` but
+not `super_fast` (a workflow saved with `super_fast` runs `fast`, or `balance` on a GPU without `fast`). On GPUs without
+`fast` and `super_fast`, the Qwen-Image-2.1 loader shows no `quality` choice and always gives the highest quality.
 
 | File | Use Case |
 |------|----------|

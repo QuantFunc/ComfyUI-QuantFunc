@@ -546,6 +546,21 @@ def main():
     qfn.qfe.load_lib = _orig_load_lib
     qfn._quality_fast_cache.clear()
     _hits = [(w, m.group(0)) for w, t in _texts for m in [_BANNED.search(t)] if m]
+    # the per-tier quality wording on the RENDERED tooltips (every loader, both GPU forms): the same rule the README and the
+    # workflow notes are held to (enhance_switch_test.tier_problems)
+    import importlib.util as _ilu
+    _es_spec = _ilu.spec_from_file_location("_es_rules", os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                                                      "enhance_switch_test.py"))
+    _tier_bad = []
+    _src = open(_es_spec.origin, encoding="utf-8").read()
+    _ns = {}
+    exec(compile(_src[_src.index("import re as _re"):_src.index("    return probs") + len("    return probs")],
+                 _es_spec.origin, "exec"), _ns)
+    for _w, _t in _texts:
+        if _w.endswith(".quality"):
+            _tier_bad += [(_w, _p) for _p in _ns["tier_problems"](_t)]
+    check("every rendered quality tooltip states the per-tier wording (fast / super_fast: another variation; balance: the "
+          "subject and scene stay the same)", not _tier_bad, f"-> {_tier_bad}")
     check("the four loaders' user-visible text carries no technique word (DESCRIPTIONs + every tooltip, both quality forms)",
           not _hits and len(_texts) > 20, f"-> {len(_texts)} texts, hits {_hits[:4]}")
     try:
