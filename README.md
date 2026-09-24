@@ -38,7 +38,7 @@ ComfyUI plugin for **QuantFunc** — the fastest diffusion model inference engin
 - **One `quality` option** on the loaders: `super_fast` / `fast` / `balance` / `best_quality` (default `balance`). `fast` and `super_fast` are faster and can give a different variation of the same seed. Some GPUs (for example the RTX 50 series, SM 12.0) offer only `balance` and `best_quality`. Details in section 3.
 - **No rebuild when you change settings or LoRAs**: the loaded pipeline is reused; only different model weights load a new one.
 - **One LoRA format**: diffusers / PEFT. Convert other formats with `scripts/qf_lora_convert.py`; LyCORIS LoHa / LoKr files are not supported.
-- **An engine per GPU architecture (Linux and Windows)**: the plugin downloads only the engine for your GPU's architecture (on Linux about 150-175 MB) and installs it automatically. One ComfyUI serves one GPU architecture; for GPUs of different architectures, run one ComfyUI per architecture (section 2.5).
+- **An engine per GPU architecture (Linux and Windows)**: the plugin downloads only the engine for your GPU's architecture (on Linux about 125-175 MB) and installs it automatically. One ComfyUI serves one GPU architecture; for GPUs of different architectures, run one ComfyUI per architecture (section 2.5).
 - **Quieter console**: the engine prints only warnings and errors by default.
 - **MiniMax-H3 at 1920x1120 on 32 GB cards**: the two-stage video generation now completes at that size.
 - **Supported models**: MiniMax-H3, LTX-2.5, Krea-2 and Qwen-Image-2.1.
