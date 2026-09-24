@@ -12,16 +12,18 @@ What it accepts (auto-detected):
   * diffusers / PEFT  — already canonical; normalized (down/up -> A/B) + copied
   * kohya sd-scripts / ai-toolkit — ``lora_unet_``/``lora_transformer_`` keys,
     underscored module path, ``.lora_down/up.weight`` + ``.alpha``
-  * LyCORIS (LoHa/LoKr) — NOT SUPPORTED: refused loud (a factored decomposition,
-    not a rename; the native loaders do not load it either)
+  * LyCORIS (LoHa/LoKr), DoRA, OFT/BOFT — NOT SUPPORTED: refused loud (not a
+    plain (A,B) LoRA, so no rename converts it; the native loaders refuse it too)
   * Krea-2 BFL / ai-toolkit module names (the community Krea-2 LoRAs: ``blocks.N``,
     ``txtfusion.*``, ``first``/``tmlp.0``/…) — renamed to the engine's diffusers
     names (ComfyUI comfy/utils.py krea2_to_diffusers: MAP_BASIC + the block map).
     Recognized by a Krea-2-only name (``txtfusion.``, ``tmlp.``, ``txtmlp.``, ``tproj.``).
 
 Raw-safetensors byte-copy: tensor DTYPE is preserved exactly (bf16/fp16/fp32),
-no torch, no numpy, no model load, no GPU. Text-encoder LoRA keys (``lora_te*``)
-are dropped — the native loaders drive the transformer only.
+no torch, no numpy, no model load, no GPU. The source ``__metadata__`` is kept
+(the engine reads ``lora_adapter_metadata`` for alpha / rank). Text-encoder LoRA
+keys (``lora_te*``) are dropped — the native loaders drive the transformer only;
+any OTHER key this tool cannot map is refused, never dropped.
 """
 import json, struct, sys, argparse, os, re
 
@@ -199,6 +201,49 @@ def krea2_engine_body(body):
     return "%s%s.%s.%s" % (root, grp, m.group(2), _KREA2_TAIL.get(m.group(3), m.group(3)))
 
 
+_TE_PREFIXES = ("lora_te_", "lora_te1_", "lora_te2_")
+
+
+def unsupported_kind(keys):
+    """(kind, why) for a LoRA kind that no key rename turns into a plain (A,B) LoRA, else None. The QuantFunc engine
+    refuses the same kinds with the same words, so neither sends the user to the other."""
+    for k in keys:
+        if ".hada_" in k or ".lokr_" in k:
+            return "LyCORIS (LoHa/LoKr)", "it is a factored decomposition, not a plain (A,B) LoRA"
+        if ".dora_scale" in k or "lora_magnitude_vector" in k:
+            return "DoRA", ("its magnitude vectors rescale the merged weights, and without them the file is not the "
+                            "trained LoRA")
+        if ".oft_" in k or ".boft_" in k:
+            return "OFT/BOFT", "it is a multiplicative rotation, not an additive (A,B) delta"
+    return None
+
+
+def kind_refusal(kind):
+    name, why = kind
+    return ("qf_lora_convert: this is %s %s file, which is not supported — %s, so a key rename cannot convert it, and "
+            "the QuantFunc native loaders do not load it either. Re-export or merge it to a plain (A,B) LoRA with your "
+            "training tool first." % ("an" if name[0] in "AEIOU" else "a", name, why))
+
+
+def refusal(conv, meta, krea2):
+    """Why a converted file would not be the source LoRA, else None: a key this tool cannot map (text-encoder keys are
+    dropped on purpose), or per-module alpha / rank patterns that name modules the Krea-2 rename just renamed."""
+    lost = [k for k, nk in conv if nk is None and not k.startswith(_TE_PREFIXES)]
+    if lost:
+        return ("%d key(s) have a form this converter cannot map (first: %s) — refusing rather than writing a LoRA "
+                "without them" % (len(lost), lost[0]))
+    lam = meta.get("lora_adapter_metadata")
+    if krea2 and lam:
+        try:
+            cfg = json.loads(lam)
+        except ValueError:
+            cfg = None
+        if not isinstance(cfg, dict) or any(v for f, v in cfg.items() if f.endswith(("rank_pattern", "alpha_pattern"))):
+            return ("its lora_adapter_metadata carries per-module rank / alpha patterns, which would name the module "
+                    "names this conversion renames — refusing rather than changing the LoRA's strength")
+    return None
+
+
 def detect_format(keys):
     ky = list(keys)
     if any(".hada_" in k or ".lokr_" in k for k in ky):
@@ -299,14 +344,10 @@ def convert_file(in_path, out_path, verbose=True, model_path=None):
     hdr, blob = _read_st(in_path)
     meta = hdr.get("__metadata__", {})
     keys = [k for k in hdr if k != "__metadata__"]
+    kind = unsupported_kind(keys)
+    if kind:
+        raise SystemExit(kind_refusal(kind))
     fmt = detect_format(keys)
-    if fmt == "lycoris":
-        raise SystemExit(
-            "qf_lora_convert: this is a LyCORIS (LoHa/LoKr) file, which is not "
-            "supported — it is a factored decomposition, not a plain (A,B) LoRA, "
-            "so a key rename cannot convert it, and the QuantFunc native loaders "
-            "do not load it either. Re-export or merge it to a plain (A,B) LoRA "
-            "with your training tool first.")
     if fmt == "unknown":
         raise SystemExit(
             "qf_lora_convert: could not detect the LoRA format (no kohya "
@@ -321,6 +362,9 @@ def convert_file(in_path, out_path, verbose=True, model_path=None):
     dropped = 0
     seen = {}
     conv, krea2 = convert_keys(keys, fmt, model_inv)
+    why = refusal(conv, meta, krea2)
+    if why:
+        raise SystemExit("qf_lora_convert: %s." % why)
     for k, nk in conv:
         if nk is None:
             dropped += 1
@@ -333,11 +377,12 @@ def convert_file(in_path, out_path, verbose=True, model_path=None):
         out_tensors.append((nk, hdr[k]))
     if not out_tensors:
         raise SystemExit("qf_lora_convert: nothing to write (all keys dropped).")
-    new_meta = {"qf_lora_convert": "from %s (%s%s)" % (os.path.basename(in_path), fmt,
-                                                        ", Krea-2 BFL names renamed" if krea2 else "")}
+    new_meta = dict(meta)   # kept: the engine reads lora_adapter_metadata (alpha / rank) from it
+    new_meta["qf_lora_convert"] = "from %s (%s%s)" % (os.path.basename(in_path), fmt,
+                                                      ", Krea-2 BFL names renamed" if krea2 else "")
     _write_st(out_path, out_tensors, blob, new_meta)
     if verbose:
-        print("[qf_lora_convert] %s: source=%s%s  wrote %d tensors, dropped %d  -> %s"
+        print("[qf_lora_convert] %s: source=%s%s  wrote %d tensors, dropped %d text-encoder key(s)  -> %s"
               % (os.path.basename(in_path), fmt, " (Krea-2 BFL names -> engine names)" if krea2 else "",
                  len(out_tensors), dropped, out_path))
     return fmt, len(out_tensors), dropped
@@ -440,6 +485,27 @@ def key_names_self_test():
         good = got == exp
         ok &= good
         print("  %-9s %s" % (name, "ok" if good else "FAIL %s" % [g for g, e in zip(got, exp) if g != e]))
+    # refusals: a kind no rename converts, a key form this tool cannot map, per-module patterns a rename would orphan
+    ab = ["transformer_blocks.0.attn.to_q.lora_A.weight", "transformer_blocks.0.attn.to_q.lora_B.weight"]
+    pats = json.dumps({"r": 8, "lora_alpha": 8, "alpha_pattern": {"blocks.3.attn.wq": 4}})
+    conv_raw, renamed = convert_keys(raw, "diffusers")
+    checks = (
+        ("kind DoRA", (unsupported_kind(ab + ["transformer_blocks.0.attn.to_q.lora_magnitude_vector"]) or ("",))[0] == "DoRA"),
+        ("kind DoRA kohya", (unsupported_kind(["lora_unet_blocks_0_attn_wq.dora_scale"]) or ("",))[0] == "DoRA"),
+        ("kind LoKr", (unsupported_kind(["blocks.0.attn.wq.lokr_w1"]) or ("",))[0] == "LyCORIS (LoHa/LoKr)"),
+        ("kind OFT", (unsupported_kind(["blocks.0.attn.wq.oft_blocks"]) or ("",))[0] == "OFT/BOFT"),
+        ("kind plain", unsupported_kind(ab) is None),
+        ("kind message", "this is an OFT/BOFT file, which is not supported" in kind_refusal(unsupported_kind(["a.oft_R"]))),
+        ("unmappable", "cannot map" in (refusal(convert_keys(ab + ["transformer_blocks.0.attn.to_q.diff"], "diffusers")[0],
+                                                {}, False) or "")),
+        ("te dropped", refusal(convert_keys(["lora_te1_x.lora_down.weight", "lora_unet_blocks_0_attn_wq.lora_down.weight"],
+                                            "kohya")[0], {}, False) is None),
+        ("krea2 patterns", renamed and "patterns" in (refusal(conv_raw, {"lora_adapter_metadata": pats}, renamed) or "")),
+        ("krea2 plain meta", refusal(conv_raw, {"lora_adapter_metadata": json.dumps({"r": 8})}, renamed) is None),
+    )
+    for name, good in checks:
+        ok &= good
+        print("  %-9s %s" % (name, "ok" if good else "FAIL"))
     print("KEY-NAME SELF-TEST:", "PASS" if ok else "FAIL")
     return ok
 
