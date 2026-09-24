@@ -1531,8 +1531,9 @@ def load_lib():
             # an installed pair that will not load: re-download it once per release, never in a loop
             raise RuntimeError(f"qf_native: {_engine_load_failed(so_path, e)}") from e
         _engine_load_ok(so_path)
-        _LIB = _bind(lib)
-        _LIB_PATH = so_path
+        bound = _bind(lib)
+        _LIB_PATH = so_path   # before _LIB: a concurrent caller that sees the library must see its path (the cache key)
+        _LIB = bound
         if _LOG_LEVEL is not None:   # a loader asked for a level before the library was loaded
             _LIB.quantfunc_set_log_level(_LOG_LEVEL)
         _FINGERPRINT_PENDING = (_LIB, so_path)

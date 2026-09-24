@@ -693,6 +693,25 @@ def main():
                   and moved == os.path.realpath(env.path("0.0.14-consumer-cu13", HOSTS[13]))
                   and qfe.loaded_so_path() == loaded and again is first and resolves == [],
                   f"loaded={loaded} moved={moved} resolves={len(resolves)}")
+            # 20) the path is published BEFORE the library (tests-07 re-CR round 3, B): a concurrent first-load caller
+            #     that sees _LIB must see _LIB_PATH too, else its cache key is (None, ...) and one extra pipeline is
+            #     built. Traced line by line through a real first load_lib().
+            torn = []
+
+            def tracer(frame, event, arg):
+                if frame.f_code is not qfe.load_lib.__code__:
+                    return None
+                if event in ("line", "return") and qfe._LIB is not None and qfe._LIB_PATH is None:
+                    torn.append(frame.f_lineno)
+                return tracer
+            qfe._LIB = qfe._LIB_PATH = None
+            sys.settrace(tracer)
+            try:
+                qfe.load_lib()
+            finally:
+                sys.settrace(None)
+            check("the loaded path is published before the library: no line of load_lib shows _LIB without _LIB_PATH",
+                  torn == [] and qfe._LIB is not None and qfe._LIB_PATH is not None, f"torn at lines {torn}")
     finally:
         (qfe.assert_toolchain_compatible, qfe.ctypes.CDLL, qfe._bind, qfe._LIB, qfe._LIB_PATH,
          qfe._FINGERPRINT_PENDING) = saved
