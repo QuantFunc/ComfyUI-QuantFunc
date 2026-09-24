@@ -248,6 +248,35 @@ def main():
     check(f"L12 the library fingerprint waits for the first info-level loader, then prints once (seen {seen})",
           seen == [0, 0, 1, 0])
 
+    # L13: the late fingerprint names only the file this process LOADED (self-CR round 6, A). A library replaced at the
+    #      same path after the load (a new file moved in, or the old one rewritten) gets no md5; an untouched one does.
+    import hashlib
+    lines = {}
+    for case in ("untouched", "moved in", "rewritten"):
+        eng3 = _load_qf_engine()
+        with tempfile.TemporaryDirectory() as d:
+            lib_file = os.path.join(d, "engine-under-test")
+            open(lib_file, "wb").write(b"LOADED-ENGINE")
+            eng3.resolve_so_path = lambda f=lib_file: f
+            eng3.assert_toolchain_compatible = lambda so_path: None
+            eng3.ctypes = types.SimpleNamespace(RTLD_GLOBAL=0, RTLD_LOCAL=0, CDLL=lambda *a, **k: object())
+            eng3._bind = lambda raw: types.SimpleNamespace(quantfunc_set_log_level=lambda level: None)
+            eng3.load_lib()
+            if case == "moved in":
+                open(lib_file + ".new", "wb").write(b"ANOTHER-ENGINE")
+                os.replace(lib_file + ".new", lib_file)
+            elif case == "rewritten":
+                open(lib_file, "wb").write(b"ANOTHER-ENGINE-REWRITTEN-IN-PLACE")
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                eng3.set_log_level(2)
+            lines[case] = buf.getvalue()
+    good = hashlib.md5(b"LOADED-ENGINE").hexdigest()
+    check("L13 the late fingerprint hashes only the loaded file: an untouched library gets its md5; one replaced at the "
+          f"same path (moved in, or rewritten) gets none ({ {c: v.strip()[-70:] for c, v in lines.items()} })",
+          f"md5={good}" in lines["untouched"]
+          and all("md5=" not in lines[c] and "fingerprint unavailable" in lines[c] for c in ("moved in", "rewritten")))
+
     print(f"LOG_LEVEL_INPUT: {'PASS' if not failures else 'FAIL'} ({len(failures)} failure(s))")
     return 1 if failures else 0
 

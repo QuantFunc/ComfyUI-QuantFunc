@@ -794,9 +794,9 @@ def _emit_fingerprint():
     never computed."""
     global _FINGERPRINT_PENDING
     if _FINGERPRINT_PENDING is not None and _LOG_LEVEL is not None and _LOG_LEVEL <= _LOG_INFO:
-        lib, path = _FINGERPRINT_PENDING
+        lib, path, ident = _FINGERPRINT_PENDING
         _FINGERPRINT_PENDING = None
-        _log_lib_fingerprint(lib, path)
+        _log_lib_fingerprint(lib, path, ident)
 
 
 _LOG_INFO = 2   # info on the engine's scale (qf_log_level.LOG_LEVELS): the plugin's own detail lines follow the same level
@@ -1023,9 +1023,11 @@ def _markers():
 
 def _installed_pair():
     """(marker path, marker) of the pair THIS process loads — torch's CUDA major, the SM of ComfyUI's device — or
-    (None, None)."""
+    (None, None). The NEWEST matching marker: a release may move an SM to another GPU class, and the old class's marker
+    stays (it still serves that class's other SMs), so the first one by name would keep this GPU on the old release."""
     major, sm = _torch_cuda_major(), _gpu_sm(_ENGINE_DEVICE)
-    return next(((p, m) for p, m in _markers() if m["cuda"] == major and sm in m["sms"]), (None, None))
+    mine = [(p, m) for p, m in _markers() if m["cuda"] == major and sm in m["sms"]]
+    return max(mine, key=lambda pm: _version_key(pm[1]["version"])) if mine else (None, None)
 
 
 def _marker_of(so_path):
@@ -1101,7 +1103,12 @@ def install_engine(device_idx=None):
         return None
     if _BIN_SUBDIR != "linux":
         # ponytail: Linux only — the host/kernel split ships for Linux; Windows ships one dll whose install layout is
-        # not published yet. Add it here when it is.
+        # not published yet. Add it here when it is. The library placed in bin/<platform>/ (or the package root) is
+        # what loads there (resolve_so_path): with it in place there is nothing to install or to say at every start.
+        if any(os.path.isfile(os.path.join(d, _LIB_BASENAME))
+               for d in (_engine_bin_dir(), os.path.dirname(os.path.abspath(__file__)))):
+            _engine_status("local", f"bin/{_BIN_SUBDIR}/{_LIB_BASENAME}")
+            return None
         raise EngineNotInstallable(f"automatic engine install is Linux-only in this release; put the engine library in "
                                    f"bin/{_BIN_SUBDIR}/")
     if platform.machine() not in _ENGINE_ARCHES:
@@ -1541,21 +1548,35 @@ def load_lib():
         _LIB = bound
         if _LOG_LEVEL is not None:   # a loader asked for a level before the library was loaded
             _LIB.quantfunc_set_log_level(_LOG_LEVEL)
-        _FINGERPRINT_PENDING = (_LIB, so_path)
+        _FINGERPRINT_PENDING = (_LIB, so_path, _file_identity(so_path))
         _emit_fingerprint()
     return _LIB
 
 
-def _log_lib_fingerprint(lib, so_path):
+def _file_identity(path):
+    """(device, inode, size, mtime in ns) of the file at path now, or None."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns
+
+
+def _log_lib_fingerprint(lib, so_path, ident=None):
     """[F6, 2026-09-19] ONE line naming the engine library this process actually dlopen'd — path, size, mtime,
     md5, and the engine's own quantfunc_version(). MEASURED need: the 远程-linux 5090 box ran a 4-day-old engine
     for days, and later a deployed library was silently replaced by an older file (found from a backup's mtime,
-    not from any log). With this line the ComfyUI log states which binary produced every run. Never raises."""
+    not from any log). With this line the ComfyUI log states which binary produced every run. The line may print long
+    after the load (it waits for an info-level loader), so it hashes only the file the process LOADED: ident is that
+    file's identity at load, and a different file at the path now (replaced or rewritten) gets no md5 — naming it would
+    certify a library this process never mapped. Never raises."""
     try:
         import hashlib
-        st = os.stat(so_path)
         h = hashlib.md5()
         with open(so_path, "rb") as fh:
+            st = os.fstat(fh.fileno())      # the file this descriptor reads: no swap between the check and the hash
+            if ident is not None and (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns) != ident:
+                raise RuntimeError("the file at this path changed after the engine loaded it")
             for chunk in iter(lambda: fh.read(1 << 20), b""):
                 h.update(chunk)
         ver = "?"

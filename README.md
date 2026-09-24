@@ -136,8 +136,8 @@ ComfyUI/
 |-------------|---------|
 | **GPU** | NVIDIA RTX 20 series or newer (CC 7.5+) |
 | **VRAM** | 8 GB |
-| **Driver** | NVIDIA ≥ 560 |
-| **CUDA Runtime** | 13.0+ |
+| **Driver** | NVIDIA ≥ 575 (CUDA 12 engine) or ≥ 580 (CUDA 13 engine) |
+| **CUDA Runtime** | 12.9+ or 13.0+ (the engine matches PyTorch's CUDA version) |
 | **cuDNN** | 9.x |
 | **OS** | Linux (glibc 2.31+) or Windows 10/11 |
 | **Python** | 3.9+ (ComfyUI's embedded Python) |
@@ -148,9 +148,9 @@ ComfyUI/
 
 ```bash
 # CUDA 12 runtime libraries
-sudo apt install cuda-libraries-12-8
+sudo apt install cuda-libraries-12-9
 # or individual packages:
-sudo apt install libcublas-12-8 libcurand-12-8 libcusolver-12-8 libcusparse-12-8 libnvjitlink-12-8
+sudo apt install libcublas-12-9 libcurand-12-9 libcusolver-12-9 libcusparse-12-9 libnvjitlink-12-9
 
 # cuDNN 9
 sudo apt install libcudnn9-cuda-12
@@ -168,7 +168,7 @@ sudo apt install libcudnn9-cuda-13
 
 #### Windows
 
-- **NVIDIA Driver** ≥ 560 (provides CUDA runtime DLLs)
+- **NVIDIA Driver** ≥ 575 for a CUDA 12 engine, ≥ 580 for CUDA 13 (provides CUDA runtime DLLs)
 - **Visual C++ Redistributable** 2015-2022 ([download](https://aka.ms/vs/17/release/vc_redist.x64.exe))
 - **cuDNN 9.x** ([download](https://developer.nvidia.com/cudnn))
 
@@ -198,7 +198,8 @@ an earlier plugin version. (Developers can also point `QF_NATIVE_SO_PATH` at a l
 
 ### 2.6 Verify Installation
 
-After ComfyUI starts, the console shows one of:
+After ComfyUI starts, the console shows one of these lines when the installer installs, cannot install, fails or keeps
+out; a start whose engine is already current (or, outside Linux, whose engine library is in place) prints nothing:
 
 ```
 [qf_native] installed QuantFunc engine <version> for <class> GPUs, CUDA <major>

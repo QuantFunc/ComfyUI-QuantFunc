@@ -737,6 +737,54 @@ def main():
     finally:
         (qfe.assert_toolchain_compatible, qfe.ctypes.CDLL, qfe._bind, qfe._LIB, qfe._LIB_PATH,
          qfe._FINGERPRINT_PENDING) = saved
+    # 22) a release MOVES an SM to another GPU class (self-CR round 6, A): 0.0.13 installed SM 89 as "consumer"; 0.0.14's
+    #     sets.json puts SM 89 in "server". The old consumer marker stays (it still serves that class's other SMs), but
+    #     this GPU must load the NEWEST pair, now and on the next start — not the first marker by name.
+    old = Release("0.0.13")
+    with Env(old, sm=89) as env:
+        qfe.install_engine()
+        first = qfe.resolve_so_path()
+        new = Release("0.0.14")
+        new.set_sets(json.dumps({"schema": 1, "sets": {"consumer": [75, 86, 120],
+                                                        "server": [80, 89, 90, 100, 103]}}).encode())
+        qfe._engine_http_open = new.open
+        qfe.install_engine()
+        moved = qfe.resolve_so_path()
+        qfe.install_engine()                          # the next start
+        again = qfe.resolve_so_path()
+        want = os.path.realpath(env.path("0.0.14-server-cu13", HOSTS[13]))
+        check("an SM moved to another GPU class: the newest pair loads, now and on the next start; the old class's pair "
+              "is left for its other SMs",
+              first == os.path.realpath(env.path("0.0.13-consumer-cu13", HOSTS[13])) and moved == want and again == want
+              and os.path.isdir(env.path("0.0.13-consumer-cu13")),
+              f"first={os.path.relpath(first, env.dir)} moved={os.path.relpath(moved, env.dir)} "
+              f"again={os.path.relpath(again, env.dir)}")
+    # 23) not Linux (self-CR round 6, A): the library placed in bin/<platform>/ is what loads there, so a start with it in
+    #     place installs nothing and prints nothing; only a missing library gets the "not installed" hint.
+    saved_sub = qfe._BIN_SUBDIR
+    try:
+        with Env(Release()) as env:
+            qfe._BIN_SUBDIR = "windows"
+            open(os.path.join(env.dir, qfe._LIB_BASENAME), "wb").write(b"DLL")
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                try:
+                    placed = qfe.install_engine()
+                except Exception as e:  # noqa: BLE001 — reported by the check, not a crash
+                    placed = f"raised {type(e).__name__}: {e}"
+            placed_status = qfe.engine_install_status()
+            os.remove(os.path.join(env.dir, qfe._LIB_BASENAME))
+            try:
+                qfe.install_engine()
+                missing = "installed?"
+            except qfe.EngineNotInstallable as e:
+                missing = str(e)
+    finally:
+        qfe._BIN_SUBDIR = saved_sub
+    check("not Linux: a placed library means a quiet start (nothing installed, nothing printed); a missing one gets the "
+          "Linux-only hint", placed is None and buf.getvalue() == "" and "Linux-only" in missing
+          and "local" in str(placed_status), f"placed={placed} printed={buf.getvalue()!r} status={placed_status} "
+          f"missing={missing[:60]!r}")
     print("ENGINE_INSTALL:", "PASS" if bad == 0 else f"FAIL ({bad} wrong)")
     return 1 if bad else 0
 
