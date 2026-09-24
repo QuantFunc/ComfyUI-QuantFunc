@@ -912,6 +912,17 @@ def main():
           _mr_small < _mr < _mr_big, f"-> {_mr_small} < {_mr} < {_mr_big}")
     check("memory_required stays far below a torch activation estimate (thrash fix preserved)",
           _mr <= 1 << 30, f"-> {_mr}")
+    # #716: while NO pipeline exists for these weights, comfy's OWN estimate (the next class after the mixin in the
+    # real family MRO) is the floor; the hot model above never takes it (both ways, same shape).
+    open(os.path.join(dm, "cold-krea2-turbo-quantfunc-int4.safetensors"), "wb").write(b"\0" * 16)
+    _cold = KreaL.load("cold-krea2-turbo-quantfunc-int4.safetensors", "krea2-turbo-int4")[0]
+    _torch_est = int(super(qfn.qfmp.QFSessionModelMixin, _cold.model).memory_required(_shape, cond_shapes=_conds))
+    _cold_side = _cold.model._qf_comfy_side_bytes(_shape, _conds)
+    _n_cold = len(creates)
+    _mr_cold = _cold.model.memory_required(_shape, cond_shapes=_conds)
+    check("#716: a COLD model asks comfy's own estimate as the floor (no create); the hot one does not",
+          _mr_cold == max(_torch_est, _cold_side) and len(creates) == _n_cold and _torch_est > _mr,
+          f"-> cold={_mr_cold} torch={_torch_est} side={_cold_side} hot={_mr} creates+={len(creates) - _n_cold}")
 
     # ── 4) containment: traversal/absolute names cannot escape the model roots ──
     for evil in ("../../../../etc/passwd", "/etc/passwd", "fx-krea2-turbo-quantfunc-int4.safetensors/../../x"):

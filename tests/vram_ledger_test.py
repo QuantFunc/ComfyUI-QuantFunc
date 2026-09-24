@@ -8,7 +8,8 @@ Every branch, BOTH directions, against fake engine handles (no GPU, no comfy mod
   2. primary + engine UNKNOWN (0)           -> comfy-side only (never "needs nothing", never a broken sampler)
   3. shadow patcher's model                 -> same shared-engine demand as every logical output
   4. lazy proxy                             -> a CACHED handle answers (peek → materialize without create); an
-                                               uncreated engine is NEVER created here (comfy evicts AFTER this call)
+                                               uncreated engine is NEVER created here (comfy evicts AFTER this call);
+                                               COLD (no pipeline) → comfy's own estimate is the floor (#716), HOT never
   5. engine raises                          -> failure reaches host (not a zero estimate)
   6. logical ledger                         -> ordinary Torch model_size/loaded_size only;
                                                native residency stays on canonical dependencies
@@ -65,7 +66,18 @@ def check(cond, msg):
         fails += 1
 
 
-class _Model(Mixin):
+FLOOR_MB = 50000                      # comfy's torch estimate stand-in: bigger than every hot answer below
+
+
+class _TorchBase:
+    """comfy's BaseModel.memory_required stand-in (the next class after the mixin in a real family's MRO)."""
+    def memory_required(self, input_shape, cond_shapes=None):
+        _TorchBase.asked.append(list(input_shape))
+        return getattr(self, "_floor_mb", FLOOR_MB) * MB
+_TorchBase.asked = []
+
+
+class _Model(Mixin, _TorchBase):
     pass
 
 
@@ -103,6 +115,7 @@ check(m._qf.vram_need_bytes.asked == [SHAPE], "arm1: the engine was asked with t
 check("engine need 12000 MB" in log, "arm1: ledger line names the engine need")
 r2, log2 = _quiet(m.memory_required, SHAPE, cond_shapes=COND)
 check(r2 == r and log2 == "", "arm1: same question again → same answer, no second log line (change-only)")
+check(_TorchBase.asked == [], "arm1: a HOT engine never asks comfy's torch estimate (no floor, D3)")
 
 # ---- arm 1b: a PACKED AV latent [B,1,N] (H3 / LTX-AV) is unpacked to the VIDEO stream's engine geometry ------------
 PACKED = [2, 1, 24 * 31 * 48 * 50 + 32 * 2 * 207]          # comfy.utils.pack_latents(video, audio) → [B,1,N]
@@ -144,10 +157,14 @@ proxy = SimpleNamespace(vram_need_bytes=lambda s: 0, footprint_bytes=1, ensure_i
                         ensure=lambda: created.append(1), current_session=None)
 m = _Model(); m._qf = proxy
 r, log = _quiet(m.memory_required, SHAPE, cond_shapes=COND)
-check(r == side and created == [] and "cold: no pipeline yet" in log,
-      "arm4b: cache MISS → comfy-side only, ensure() NOT called (no create ahead of comfy's eviction)")
-# the real QFLazyEngine demand surface: cold native demand is zero and memory_required reserves the comfy side
-# only (D3: no ComfyUI torch-estimate floor); a hot retained handle supplies native need without a create.
+check(r == FLOOR_MB * MB and created == [] and "cold: no pipeline yet" in log and f"{FLOOR_MB} MB is the floor" in log
+      and _TorchBase.asked[-1:] == [SHAPE],
+      "arm4b: cache MISS → comfy's own estimate is the floor (#716), ensure() NOT called (no create ahead of eviction)")
+m = _Model(); m._qf = proxy; m._floor_mb = 1
+r, _ = _quiet(m.memory_required, SHAPE, cond_shapes=COND)
+check(r == side, "arm4b: a cold floor below the comfy-side bytes never lowers them (max)")
+# the real QFLazyEngine demand surface: cold native demand is zero (memory_required then takes comfy's floor,
+# arm4b); a hot retained handle supplies native need without a create.
 Lazy = qfmp.QFLazyEngine
 calls = []
 def _fac():

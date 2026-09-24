@@ -476,8 +476,9 @@ class QFSessionModelMixin:
                            "invoke through ComfyUI's OUTER_SAMPLE hook or supply request geometry")
 
     def memory_required(self, input_shape, cond_shapes=None, **_kw):
-        """ComfyUI's inference reserve for one forward of `input_shape`: ONLY native numbers (D3, tests-07 ruling
-        2026-09-24: "the plan side estimates; the upper layer doesn't invent numbers").
+        """ComfyUI's inference reserve for one forward of `input_shape`: native numbers once a pipeline exists (D3,
+        tests-07 ruling 2026-09-24: "the plan side estimates; the upper layer doesn't invent numbers"); comfy's own
+        estimate as the floor while none exists (#716, below).
 
         = comfy-side bytes (the plugin's own tensor copies) + the ENGINE's working set for that shape:
         quantfunc_vram_need_bytes(latent [B,C,(T,)H,W]) — the primary transformer's working set (MEASURED by an
@@ -485,16 +486,17 @@ class QFSessionModelMixin:
         plan margin − the allocator's cached pool it already holds. The engine is asked through the CACHED real
         handle when one exists and is NEVER created here (comfy's eviction pass runs after this call).
 
-        NOT here, on purpose:
-          * ComfyUI's own BaseModel.memory_required — a TORCH activation estimate for a model this engine does not
-            run (38 GB for a Wan 80x80x21 latent): used as a floor it made comfy evict every other model at each
-            stage, the inter-stage thrash the D3 fix removed (c71c315 had re-added it as a cold floor).
-          * the engine WEIGHTS — the canonical resource adapters carry them as their own LoadedModel (model_size =
-            the Prepared capacity), so counting them here would charge them twice.
-        A COLD request (no pipeline yet) therefore reserves the comfy side only: no native pre-create working-set
-        estimate exists in the ABI (listed as an engine gap). The engine then runs its first forward inside the
-        admission ceiling (what comfy left free) and pages on demand; missing ABI support and failed native queries
-        still propagate to the host.
+        COLD (no pipeline exists for these weights yet — #716, tests-07 ruling (a), interim): ComfyUI's own
+        BaseModel.memory_required for the shape is the FLOOR, so comfy makes room BEFORE the engine's first forward.
+        The engine has no pre-create working-set estimate yet (G3), and under the admission ceiling it cannot take
+        room from its own idle weight pages yet (E4). MEASURED without the floor: LTX-2.5 1920x1088 cold asked 127 MB,
+        comfy kept its 11 GB text encoder, and step 0 hit the ceiling (release-ltx25-allin-1); with it, 10/10
+        (host-vram-ltx25-accept-26). Both engine fixes delete this floor.
+        HOT (a pipeline exists; a stage-2 model shares it): native numbers only (D3). comfy's torch estimate is never
+        a floor there: at every stage it made comfy evict every other model (38 GB for a Wan 80x80x21 latent), the
+        inter-stage thrash D3 removed.
+        The engine WEIGHTS are never counted here: the canonical resource adapters carry them as their own
+        LoadedModel (model_size = the Prepared capacity). Missing ABI support and failed native queries propagate.
         Accepted by the user (2026-09-19 「comfyui 路径不合并 CFG 就好」): with a real need comfy runs cond/uncond
         un-batched on a card that cannot hold 1.5x the B=2 working set; our own full-pipeline path keeps CFG batched."""
         comfy_side = self._qf_comfy_side_bytes(input_shape, cond_shapes)
@@ -508,10 +510,11 @@ class QFSessionModelMixin:
                 eng = peek()
             if eng is not None:
                 need = int(eng.vram_need_bytes(self._qf_engine_latent_dims(input_shape)))
-        total = int(comfy_side + need)
+        floor = int(super().memory_required(input_shape, cond_shapes=cond_shapes or {})) if eng is None else 0
+        total = int(max(floor, comfy_side + need))
         # One line per CHANGE of the answer (comfy asks per estimate + per cond-batch decision): the numbers comfy
         # will act on, so a ledger question is answerable from the log, not a guess.
-        sig = (tuple(int(d) for d in input_shape), comfy_side, need, eng is None)
+        sig = (tuple(int(d) for d in input_shape), comfy_side, need, floor, eng is None)
         if sig != getattr(self, "_qf_ledger_last", None):
             self._qf_ledger_last = sig
             try:
@@ -521,7 +524,8 @@ class QFSessionModelMixin:
             print("[qf_native] VRAM ledger: memory_required%s = %d MB (comfy-side %d MB, engine need %d MB%s); "
                   "engine hold %s"
                   % (list(sig[0]), total >> 20, comfy_side >> 20, need >> 20,
-                     " (cold: no pipeline yet, no native pre-create working-set estimate)" if eng is None else
+                     " (cold: no pipeline yet; comfy's own estimate %d MB is the floor)" % (floor >> 20)
+                     if eng is None else
                      "" if need else " (0: covered by what it holds, or nothing measured yet)",
                      hold), flush=True)
         return total
