@@ -115,7 +115,7 @@ check("T4b partial_unload raises for a still-open session", refused and lib.part
 check("T4b refused partial reclaim retains the session pointer", h.current_session is not None)
 
 # T5: static death-rule for the needs-begin flag (silent session-REUSE hole)
-for fam in ("qf_h3_modelpatcher.py", "qf_ltx_modelpatcher.py", "qf_wan_modelpatcher.py"):
+for fam in ("qf_h3_modelpatcher.py", "qf_ltx_modelpatcher.py"):
     src = open(os.path.join(_HERE, "..", fam), errors="replace").read()
     check(f"T5 {fam} arms _qf_needs_begin at run start", "self._qf_needs_begin = True" in src)
     check(f"T5 {fam} lazy-begin gate consumes the flag",

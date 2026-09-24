@@ -211,13 +211,13 @@ class CanonicalIntegration(unittest.TestCase):
             patch.start()
             self.addCleanup(patch.stop)
 
-    def wrapper(self, recipe="A", engine=None, shadow=False):
+    def wrapper(self, recipe="A", engine=None):
         if engine is None:
             # Deliberately NOT make_engine_factory: custom family factory path.
             engine = qfm.QFLazyEngine(lambda: plugin._get_engine(recipe))
         model = torch.nn.Module()
         model.device = torch.device("cuda:0")
-        model._qf, model._qf_shadow = engine, shadow
+        model._qf = engine
         return qfm.QFModelPatcher(model, model.device, torch.device("cpu"))
 
     def parallel(self, calls, timeout=3):
@@ -389,13 +389,13 @@ class CanonicalIntegration(unittest.TestCase):
 
     def test_cold_factory_graph_is_canonical_before_any_model_create(self):
         a, same, b = self.wrapper(), self.wrapper(), self.wrapper("B")
-        shadow = self.wrapper(engine=a.model._qf, shadow=True)
-        groups = [p.model_patches_models() for p in (a, same, shadow, a.clone(), b)]
+        sibling = self.wrapper(engine=a.model._qf)   # a second patcher over the SAME lazy engine
+        groups = [p.model_patches_models() for p in (a, same, sibling, a.clone(), b)]
         self.assertTrue(all(group == groups[0] for group in groups[:4]))
         self.assertIs(groups[0][1], groups[4][1])
         self.assertIsNot(groups[0][0], groups[4][0])
         self.assertEqual(a.get_nested_additional_models(), groups[0])
-        self.assertEqual([p.loaded_size() for p in (a, same, shadow, b)], [0, 0, 0, 0])
+        self.assertEqual([p.loaded_size() for p in (a, same, sibling, b)], [0, 0, 0, 0])
         self.assertEqual(len(self.lib.resources), 3)  # Shared + A + B, not one per clone.
         self.assertLess(self.lib.events.index(("enroll", 1)), self.lib.events.index(("prepare", 2)))
         self.assertLess(self.lib.events.index(("configure", 2)), self.lib.events.index(("capacity", 2)))
@@ -540,7 +540,7 @@ class CanonicalIntegration(unittest.TestCase):
         model = torch.nn.Module()
         model.weight = torch.nn.Parameter(torch.ones(4, dtype=torch.float32))
         model.device = torch.device("cpu")
-        model._qf, model._qf_shadow = engine, False
+        model._qf = engine
         patcher = qfm.QFModelPatcher(model, torch.device("cpu"), torch.device("cpu"))
 
         owner, shared = patcher.model_patches_models()
@@ -1565,7 +1565,6 @@ class CanonicalIntegration(unittest.TestCase):
         warm = types.SimpleNamespace(resource=entry.resource, pipeline=object())
         lazy = p.model._qf
         lazy._real = warm
-        lazy._created_lora_sig = lazy._lora_sig()
         self.lib.capabilities = 7
         self.lib.resources[2]["held"] = 512
         for state in (1, 2):

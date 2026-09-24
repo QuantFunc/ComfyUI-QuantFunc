@@ -59,7 +59,6 @@ class QFKrea2Model(QFSessionModelMixin, comfy.model_base.Krea2):
                                  "concat_latent_image", "concat_mask", "denoise_mask")
 
     def extra_conds(self, **kwargs):
-        self._assert_wire_lora()
         was_open, ok = self._qf.end_session_if_open()   # run-start clean slate (#2 lifecycle)
         self._qf_needs_begin = True
         if was_open:
@@ -246,13 +245,13 @@ def register(deps):
         def _build(lora_entries):
             _lora_cfg = dict(create_extra or {})
             # NO "lora" in the create: the cache key is the weights only (user rule 2026-09-24), so every LoRA set of
-            # this model shares one pipeline; the engine below applies THIS build's set in place (runtime_lora).
+            # this model shares one pipeline; the lazy engine below applies THIS build's set in place (QFLazyEngine._apply_runtime_lora).
             device, device_idx = qfmp.current_torch_device()
             _factory, _register_model = qfmp.make_engine_factory(
                 lambda: get_engine(model_dir, create_cfg=(_lora_cfg or None),
                                    device_idx=device_idx),
                 bind_pipeline_model)
-            engine = qfmp.QFLazyEngine(_factory, retire=retire_handle, runtime_lora=True)
+            engine = qfmp.QFLazyEngine(_factory, retire=retire_handle)
             engine.set_lora_side("all", lora_entries)
             offload = comfy.model_management.unet_offload_device()
             unet_config = {"image_model": "krea2", "disable_unet_model_creation": True}

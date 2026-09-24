@@ -596,7 +596,7 @@ def register(deps):
             """Wrap the model's ONE pipeline (created without LoRA) in a patcher for THIS lora set, applied in place at run start."""
             _lora_cfg = dict(create_extra or {})   # file-mode: {"denoise_only": True}
             # NO "lora" in the create: the cache key is the weights only (user rule 2026-09-24), so every LoRA set of
-            # this model shares one pipeline; the engine below applies THIS build's set in place (runtime_lora).
+            # this model shares one pipeline; the lazy engine below applies THIS build's set in place (QFLazyEngine._apply_runtime_lora).
             # H3 svdq is PRE-quantized: create is MINIMAL. The svdquant metadata carries the
             # layout/precision; anything on top competes + mis-resolves (LTX minimal note).
             # [leak fix 2026-08-29] the Wan discipline: the factory must NOT capture `model`
@@ -613,7 +613,7 @@ def register(deps):
             # accumulated LoRA set, so an eager create here would build ONE PIPELINE PER
             # CHAIN LINK (and comfy's node-output cache would pin every intermediate's
             # multi-GB CPU backup). Only the model the sampler touches is ever created.
-            engine = qfmp.QFLazyEngine(_factory, retire=retire_handle, runtime_lora=True)
+            engine = qfmp.QFLazyEngine(_factory, retire=retire_handle)
             engine.set_lora_side("all", lora_entries)
             offload = comfy.model_management.unet_offload_device()
 

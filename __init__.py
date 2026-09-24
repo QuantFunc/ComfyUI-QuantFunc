@@ -1,4 +1,4 @@
-"""qf_native — native ComfyUI loader for the QuantFunc engine (wan svdq).
+"""qf_native — native ComfyUI loaders for the QuantFunc engine (LTX-2.5, MiniMax-H3, Krea-2, Qwen-Image-2.1; svdq).
 
 ONE loader node creates a QuantFunc pipeline and returns a native comfy MODEL (a QFModelPatcher)
 that native KSampler / KSamplerAdvanced drive via quantfunc_denoise_step. CLIP + VAE stay NATIVE
@@ -192,14 +192,6 @@ def _read_auth():
     return key, surl
 
 
-# ── Flow-matching schedule shift (the CHECKPOINT'S OWN, not comfy's WAN default) ────────────────────
-# comfy's WAN21_I2V model_sampling defaults to shift=8.0, but a QuantFunc wan svdq checkpoint carries
-# its OWN scheduler (diffusers scheduler_config.json `flow_shift`, e.g. 5.0 for the a14b i2v distilled
-# ckpt). The native seam has comfy's KSampler compute the sigma schedule that drives the engine forward,
-# so that schedule MUST be the checkpoint's — a 4-step DISTILLED model is extremely schedule-sensitive:
-# on comfy's shift-8.0 sigmas [1.0,0.96,0.889,0.727] instead of the checkpoint's shift-5.0 sigmas
-# [1.0,0.938,0.833,0.625], the mid-range denoising is under-resolved → mangled fine structure
-# (hands/hair) vs the engine's OWN pipeline (which uses flow_shift=5.0 UniPC). Read it and apply it.
 def _comfy_device_index():
     """The CUDA index of the GPU ComfyUI computes on (0 when it is not a CUDA device or comfy is unavailable)."""
     try:
@@ -209,52 +201,12 @@ def _comfy_device_index():
         return 0
 
 
-def _read_flow_shift(model_dir):
-    """The checkpoint's flow-matching shift from its diffusers scheduler config
-    (`flow_shift`, falling back to `shift`). Returns None (→ keep comfy's default) if the
-    config is absent/unreadable, so a model dir without a scheduler config is byte-unchanged."""
-    for rel in ("scheduler/scheduler_config.json", "scheduler_config.json"):
-        p = os.path.join(model_dir, rel)
-        if not os.path.exists(p):
-            continue
-        try:
-            c = json.load(open(p))
-        except Exception:  # noqa: BLE001
-            return None
-        v = c.get("flow_shift", c.get("shift"))
-        try:
-            return float(v) if v is not None else None
-        except (TypeError, ValueError):
-            return None
-    return None
-
-
-def _apply_checkpoint_flow_shift(model, model_dir):
-    """Set comfy `model_sampling`'s shift to the checkpoint's own flow_shift so the stock KSampler
-    drives the engine forward on the model's NATIVE schedule (the same the engine's own pipeline uses).
-    No-op (comfy default kept, logged) when the checkpoint declares no flow_shift.
-
-    ROOT CAUSE of the "native worse than the direct-engine path" report: comfy's WAN default shift=8.0
-    vs this distilled checkpoint's flow_shift=5.0 mis-schedules the 4-step denoise (mid-range under-
-    resolved → mangled hands / hair halo). VERIFIED fixed — run 20260808-234500-native-optionc-final-
-    wan-svdq, legA_f0030: the hand resolved to individual fingers vs the pre-fix flesh smear."""
-    ms = getattr(model, "model_sampling", None)
-    shift = _read_flow_shift(model_dir)
-    if shift is None or ms is None or not hasattr(ms, "set_parameters"):
-        logging.warning("[qf_native] flow_shift: no scheduler_config flow_shift under %s — keeping "
-                        "comfy's WAN default shift (schedule may not match the checkpoint)", model_dir)
-        return
-    ms.set_parameters(shift=float(shift))   # multiplier (1000) preserved; recomputes the sigma table
-    print(f"[qf_native] flow_shift: set comfy model_sampling shift={float(shift)} from the checkpoint's "
-          f"scheduler_config (comfy's WAN default 8.0 mis-schedules this distilled ckpt)", flush=True)
-
-
 # Pipeline CACHE: reuse the created engine handle for a repeated config → a re-executed workflow does
 # NOT leak a fresh pipeline. Keyed by the create-determining inputs.
 #  • VRAM residency is scheduled by ComfyUI. Cache selection must not independently
 #    evict other live handles; their resource adapters execute host reclaim requests.
 #  • HOST RAM (bounded by the set of LIVE patchers): `_sweep_dead_pipelines` DESTROYS a handle only
-#    once its QFWanModel has been garbage-collected (comfy dropped the patcher) — a dead model cannot
+#    once its family model has been garbage-collected (comfy dropped the patcher) — a dead model cannot
 #    be use-after-freed, so destroy is safe there. Without this the unload_vram-only design leaks a
 #    multi-GB CPU backup per distinct config forever (a resolution/model sweep). `_PIPELINE_MODELS`
 #    holds weakrefs to ALL live consumers: QFLazyEngine acquisition pins plus family models.
@@ -407,7 +359,7 @@ def _sweep_dead_pipelines(keep_key):
             eng = _PIPELINE_CACHE.get(k)
         # requester=None ⇒ _retire_handle refuses while ANY consumer is live (only-all-dead sweeps)
         if eng is not None and _retire_handle(k, eng, None, reason="host-RAM sweep"):
-            print("[qf_native] host-RAM sweep: destroyed a cached pipeline whose QFWanModel was GC'd "
+            print("[qf_native] host-RAM sweep: destroyed a cached pipeline whose model was GC'd "
                   "(comfy dropped its patcher) — freed its CPU backup", flush=True)
 
 
@@ -522,8 +474,8 @@ def _get_engine(model_dir, create_cfg=None, device_idx=0):
     a PREQUANT svdq package carries its own layout/precision in its metadata; anything
     supplied on top competes with it and loses. The transformer weights live INSIDE the
     package (engine loads model_dir/transformer[_2]/ directly — no path override).
-    create_cfg carries the per-family create keys (e.g. wan text_precision) + the
-    declarative lora stack from chained QuantFuncNativeLoRA nodes."""
+    create_cfg carries the per-family create keys only: never a LoRA set or a session setting, so
+    every setting of one model's weights shares one cached pipeline."""
     # [session-knobs] the session-knob-≠-create-key guard is sealed INSIDE
     # qf_engine.create_pipeline (the real quantfunc_create boundary — construction-enforced,
     # unbypassable by a future direct caller), not duplicated here (one truth source).
@@ -551,7 +503,7 @@ if _IMPORT_OK:
     # detection rule) and exposes exactly three names: FAMILY / matches() / register(deps).
     # Adding a family = write qf_<name>_modelpatcher.py + add it to _FAMILY_MODULES. No edit to the
     # node, the dispatch or the detection lives here, so families cannot bleed into each other.
-    _FAMILY_MODULES = ("qf_wan_modelpatcher", "qf_ltx_modelpatcher", "qf_h3_modelpatcher", "qf_krea2_modelpatcher",
+    _FAMILY_MODULES = ("qf_ltx_modelpatcher", "qf_h3_modelpatcher", "qf_krea2_modelpatcher",
                        "qf_qwenimage21_modelpatcher")
     _FAMILY_BUILDERS = {}     # family key -> build(...)
     _FAMILY_MATCHERS = []     # (family key, matches) in registration order. The FILE-based
@@ -566,8 +518,7 @@ if _IMPORT_OK:
         — one broken family must not take the whole plugin's registration down."""
         import importlib
         deps = {"get_engine": _get_engine, "bind_pipeline_model": _bind_pipeline_model,
-                "retire_handle": _retire_handle,
-                "apply_checkpoint_flow_shift": _apply_checkpoint_flow_shift}
+                "retire_handle": _retire_handle}
         for mod_name in _FAMILY_MODULES:
             try:
                 mod = importlib.import_module("." + mod_name, __name__)
@@ -586,8 +537,7 @@ if _IMPORT_OK:
         validation is preserved verbatim from the original single-node load(); the per-family
         nodes add only (a) a family-filtered preset dropdown and (b) this family guard —
         defense-in-depth against a preset dir whose manifest family drifted after the dropdown
-        rendered. Returns the family builder's result AS-IS (wan: a (model_high, model_low)
-        patcher pair; single-expert families: one patcher)."""
+        rendered. Returns the family builder's result AS-IS (one patcher)."""
         bundle_dir, manifest = _load_model_config(model_config)
         family = str(manifest["family"])
         if family != expect_family:
@@ -874,68 +824,6 @@ if _IMPORT_OK:
         d["attention_backend"] = eng
         return d
 
-    class QuantFuncWanLoader:
-        """Wan 2.x loader — DUAL MODEL outputs (high-noise, low-noise) over ONE shared engine,
-        mirroring the official two-UNETLoader wan2.2 A14B workflow 1:1: wire model_high to the
-        first KSamplerAdvanced stage and model_low to the second, keep CLIP/VAE/latent/video
-        nodes stock. Expert selection is engine-side per-step sigma (boundary_ratio from the
-        preset), so sub-range stages (start/end_at_step) are fully supported — and even a
-        mis-wired stage still computes correctly."""
-
-        @classmethod
-        def INPUT_TYPES(cls):
-            _xfms = _transformer_choices()
-            return {"required": {
-                "transformer1": (_xfms, {"tooltip": "The HIGH-noise expert .safetensors under "
-                                                    "models/diffusion_models."}),
-                "transformer2": (_xfms, {"tooltip": "The LOW-noise expert .safetensors (wan A14B "
-                                                    "ships them as a *-high-* / *-low-* pair)."}),
-                "model_config": (_model_config_choices(family="wan"),
-                                 {"tooltip": "The Wan 2.2 preset that matches the chosen model files."}),
-            }, "optional": {
-                "attention_backend": _attn_backend_input(),
-                "step_cache": _STEP_CACHE_INPUT,
-                "block_cache": _BLOCK_CACHE_INPUT,
-                "act_scale_g32": ("BOOLEAN", {"default": False,
-                    "tooltip": "svdq int4 激活-scale 组宽开关 (#565). OFF=g64 (默认, 与旧版逐字节一致); "
-                               "ON=g32 (更细的激活量化组, 实测 -9.1% 激活量化误差, 前向 +~45%, 仅 SM89/86 是真杠杆; "
-                               "SM120 上 int4 已用更细的 E0M3 g16, 此开关 no-op). 仅对 svdq int4 生效. "
-                               "把 int4 画质往 fp8 靠的实验开关 —— 温和收益, 单靠它通常不足以完全追平 fp8 "
-                               "(根因是 int4 激活精度; 干净对齐 fp8 需 a8w4). "
-                               "切换此项会重新加载模型 (引擎只在创建模型时读取它)."}),
-            }}
-
-        RETURN_TYPES = ("MODEL", "MODEL")
-        RETURN_NAMES = ("model_high", "model_low")
-        FUNCTION = "load"
-        CATEGORY = "loaders"
-        DESCRIPTION = (
-            "QuantFunc Wan loader (svdq, denoise_only): TWO MODEL outputs (high/low-noise expert) "
-            "over ONE shared engine — a drop-in for the official wan2.2 A14B dual-UNETLoader "
-            "workflow (dual KSamplerAdvanced stages + trimmed step ranges fully supported; the "
-            "engine picks the expert per step by sigma). LoRA: chain QuantFuncNativeLoRA on an "
-            "output — the wire IS the target (high output ⇒ high expert, low ⇒ low), no target "
-            "widget; both wires keep sharing the one engine. "
-            + _COMMON_LIMITS)
-
-        def load(self, transformer1, transformer2, model_config,
-                 attention_backend="auto", step_cache=0.0, block_cache=0.0, act_scale_g32=False):
-            # [#659] the sparse dial is a SESSION knob (never a create key — no rebuild
-            # on change); sparse_opts carries CREATE-level keys only.
-            # [runtime dial 2026-08-29] attention_backend is a SESSION knob now — NOT a
-            # create key (widget change no longer re-keys the loader = no rebuild).
-            sparse_opts = {"act_scale_g32": True} if act_scale_g32 else None
-            pair = _run_family_load("wan", transformer1, model_config,
-                                    transformer2,
-                                    sparse_opts=(sparse_opts or None))
-            eng_b = _attn_backend_to_engine(attention_backend)
-            for _p in pair:
-                _mm = getattr(_p, "model", None)   # the session mixin lives on the MODEL
-                if _mm is not None and hasattr(_mm, "set_attn_backend"):
-                    _mm.set_attn_backend(eng_b)
-                _arm_session_caches(_mm, step_cache, block_cache)
-            return pair
-
     class QuantFuncLTXLoader:
         """LTX-2 loader — single MODEL output (single-expert family)."""
 
@@ -1135,20 +1023,17 @@ if _IMPORT_OK:
         """Sidecar LoRA for the QuantFunc native loader — MODEL in, MODEL out (LoraLoaderModelOnly
         shape). Chain several to stack them.
 
-        Single-expert families (LTX-2.5, H3, Krea-2, Qwen-Image-2.1; user rule 2026-09-24 「换 LoRA 也不重建」):
-        the pipeline is created WITHOUT LoRA, so every LoRA set of one model shares it, and the chained set is
-        applied in place before each run (one declarative quantfunc_pipeline_update {"lora": [...]}; QFLazyEngine
-        runtime_lora). Wan still merges its per-expert union at CREATE time (the engine cannot yet route a
-        high/low target at runtime), so a LoRA change there re-creates the pair's pipeline. Either way the create
-        is deferred (QFLazyEngine), so a chain of N nodes still builds ONE pipeline.
+        User rule 2026-09-24 「换 LoRA 也不重建」: the pipeline is created WITHOUT LoRA, so every LoRA set of one
+        model shares it, and the chained set is applied in place before each run (one declarative
+        quantfunc_pipeline_update {"lora": [...]}; QFLazyEngine._apply_runtime_lora). The create is deferred
+        (QFLazyEngine), so a chain of N nodes builds at most ONE pipeline.
         Comfy-level patches applied upstream (ModelSampling*, set_model_* …) are TRANSPLANTED onto
         the rebuilt patcher, so this node may sit anywhere in the chain.
         """
         @classmethod
         def INPUT_TYPES(cls):
-            # NO target widget (user directive 2026-08-22): the target is derived from WIRING —
-            # chaining this node on the wan loader's high output MEANS it acts on the high
-            # expert (low likewise); single-expert families derive "all".
+            # NO target widget (user directive 2026-08-22): every family in this release is single-expert, so the
+            # target is always "all".
             return {"required": {
                 "model": ("MODEL",),
                 "lora_name": (_lora_choices(),),
@@ -1163,7 +1048,7 @@ if _IMPORT_OK:
         CATEGORY = "model/loaders"
         DESCRIPTION = ("Attaches a sidecar LoRA to a QuantFunc native MODEL (wire downstream of a "
                        "QuantFunc loader; chain several to stack). Changing the LoRA keeps the loaded "
-                       "model (no reload). On the Wan loader a LoRA change reloads the model.")
+                       "model (no reload).")
 
         @staticmethod
         def _refuse_foreign_lora_format(path):
@@ -1210,15 +1095,11 @@ if _IMPORT_OK:
                     "QuantFuncNativeLoRA: this MODEL is not a QuantFunc native model — wire it "
                     "downstream of the QuantFunc Native Loader. (For a stock comfy model use the "
                     "built-in LoraLoaderModelOnly instead.)")
-            # [R2-generality fix] the ONE-FORMAT refusal applies only to families the
-            # engine actually restricts (Krea2/LTX2/H3 — mirror of the engine's E1 arm);
-            # Wan keeps native kohya support (WAN_RULES) and marks itself exempt via
-            # _qf_kohya_lora_ok on its model class.
-            if not getattr(model.model, "_qf_kohya_lora_ok", False):
-                self._refuse_foreign_lora_format(_resolve_lora(lora_name))
+            # The ONE-FORMAT refusal (mirror of the engine's E1 arm) applies to every family in this release.
+            self._refuse_foreign_lora_format(_resolve_lora(lora_name))
             stack = qfmp.lora_stack_of(model)
             stack.append({"path": _resolve_lora(lora_name), "scale": float(strength),
-                          "target": qfmp.expert_of(model)})   # [wiring-lora] wire-derived side
+                          "target": "all"})
             rebuilt = rebuild(stack)
             # CR regression fix: carry the UPSTREAM comfy state (ModelSampling* object patches,
             # set_model_* options, callbacks/wrappers/hooks) onto the re-created patcher, so a
@@ -1226,14 +1107,12 @@ if _IMPORT_OK:
             return (rebuilt.adopt_comfy_state_from(model),)
 
     # merge into (not replace) the mappings — matches the real plugin's multi-file NODE_CLASS_MAPPINGS.update
-    NODE_CLASS_MAPPINGS.update({"QuantFuncWanLoader": QuantFuncWanLoader,
-                                "QuantFuncLTXLoader": QuantFuncLTXLoader,
+    NODE_CLASS_MAPPINGS.update({"QuantFuncLTXLoader": QuantFuncLTXLoader,
                                 "QuantFuncH3Loader": QuantFuncH3Loader,
                                 "QuantFuncKrea2Loader": QuantFuncKrea2Loader,
                                 "QuantFuncQwenImage21Loader": QuantFuncQwenImage21Loader,
                                 "QuantFuncNativeLoRA": QuantFuncNativeLoRA})
     NODE_DISPLAY_NAME_MAPPINGS.update({
-        "QuantFuncWanLoader": "QuantFunc Wan Loader (high+low)",
         "QuantFuncLTXLoader": "QuantFunc LTX-2 Loader",
         "QuantFuncH3Loader": "QuantFunc MiniMax-H3 Loader",
         "QuantFuncKrea2Loader": "QuantFunc Krea-2 Loader",
@@ -1259,17 +1138,6 @@ if _IMPORT_OK:
     NODE_DISPLAY_NAME_MAPPINGS.update({"QuantFuncNativeLoRA": "QuantFunc Native LoRA"})
 
 
-# ── QuantFunc Cloud TE encode node (design v11) ──────────────────────────────────
-# Module-level merge (never replace), independent of the family-loader flow, so the
-# cloud-TE node registers even when the family loaders are unavailable. Fully guarded —
-# a failure (e.g. torch missing outside ComfyUI) must never break plugin import.
-try:
-    from . import qf_cloud_te_node as _qf_cloud_te
-    NODE_CLASS_MAPPINGS.update(_qf_cloud_te.NODE_CLASS_MAPPINGS)
-    NODE_DISPLAY_NAME_MAPPINGS.update(_qf_cloud_te.NODE_DISPLAY_NAME_MAPPINGS)
-except Exception as _qf_cloud_te_exc:  # noqa: BLE001
-    import logging as _qf_lg
-    _qf_lg.warning("[qf_native] cloud-TE node not registered: %r", _qf_cloud_te_exc)
 # ── QuantFunc LTX-2.5 AV ancestral-sampler audio fix ─────────────────────────────
 # The engine's STATELESS flow-match forward requires a non-re-noised trajectory; comfy's
 # ancestral samplers (euler_ancestral auto-routes to *_RF for CONST/flow models) re-noise x
@@ -1285,7 +1153,7 @@ except Exception as _qf_ltx_afix_exc:  # noqa: BLE001
 
 
 # ── Engine log detail ─────────────────────────────────────────────────────────
-# One HIDDEN `log_level` input on EVERY QuantFunc loader (family loaders and the cloud-TE loader alike): never
+# One HIDDEN `log_level` input on EVERY QuantFunc loader: never
 # shown, so users do not choose it; a prompt that carries it (the test harness's) still sets it. Default warning
 # (warnings and errors only). The value is handed to qf_engine before the loader runs and applied to the
 # engine library as soon as it is (or once it gets) loaded; asking never loads it. Process-wide. This runs LAST,

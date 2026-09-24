@@ -204,7 +204,6 @@ class HostSchedulerContract(unittest.TestCase):
         # Only the native CUDA library is replaced, as in the other host tests.
         import comfy.supported_models as supported
         cases = (
-            ("qf_wan_modelpatcher", "QFWanModel", "WAN21_I2V", "wan2.1", {"start_image": None}),
             ("qf_h3_modelpatcher", "QFH3Model", "MiniMaxH3", "minimax_h3", {}),
             ("qf_krea2_modelpatcher", "QFKrea2Model", "Krea2", "krea2", {}),
             ("qf_ltx_modelpatcher", "QFLTXModel", "LTXV", "ltxv", {"connector": None}),
@@ -222,7 +221,7 @@ class HostSchedulerContract(unittest.TestCase):
                 patcher = module.QFModelPatcher(model, torch.device("cpu"), torch.device("cpu"))
                 # In a LEAF module: Comfy's load list manages only leaf-module parameters. One set
                 # directly on the root is skipped as "default weights in a non-leaf module" once
-                # the root has a parameterized child - Wan/Krea2 arm the stub's 0-byte concat-shape
+                # the root has a parameterized child - Krea2 arms the stub's 0-byte concat-shape
                 # carrier, so a root-level weight there is never loaded and never reclaimed.
                 model.contract = torch.nn.Module()
                 model.contract.weight = torch.nn.Parameter(torch.ones(8, dtype=torch.float32))

@@ -315,14 +315,14 @@ def cleanup_ref_tempfile(path):
 
 
 class QFSessionModelMixin:
-    """Shared base for every QuantFunc native-session model wrapper (wan / LTX-2 / MiniMax-H3).
+    """Shared base for every QuantFunc native-session model wrapper (LTX-2.5 / MiniMax-H3 / Krea-2 / Qwen-Image-2.1).
 
     These wrappers all drive the SAME engine external-denoise seam (begin → per-sampler-step
     quantfunc_denoise_step → finalize) over comfy's stock KSampler, differing only in the
     MODEL-SPECIFIC parts (context source, latent packing, per-step param wiring, output shape).
     This mixin holds the parts that are IDENTICAL across models so they live once, not once per
     class; each model subclasses it alongside its comfy base
-    (e.g. `class QFWanModel(QFSessionModelMixin, comfy.model_base.WAN21)` in the wan family
+    (e.g. `class QFKrea2Model(QFSessionModelMixin, comfy.model_base.Krea2)` in the Krea-2 family
     module — this substrate is family-AGNOSTIC and defines no model class itself).
 
     INCREMENT 1 (this commit — behavior-PRESERVING, low-risk): the two blocks that are
@@ -454,22 +454,6 @@ class QFSessionModelMixin:
             o["video_enhance"] = bool(getattr(self, "_video_enhance", False))
         return o
 
-    def _assert_wire_lora(self):
-        """[wiring-lora] RUN-START side assert (reviewer-C correctness fix): THIS model's wire
-        is the AUTHORITY for its side — write its own QF_LORA_STACK_ATTR (the wire's stack;
-        [] on a raw loader output) into the shared engine's side registry at every run, so a
-        registry entry can never OUTLIVE the node that authored it. Deleting a LoRA node and
-        rewiring the sampler to the raw output therefore resets that side to [] on the next
-        run (no silent LoRA pollution — the defect reviewer C executed). Idempotent for
-        unchanged wiring; models without a high/low wire tag (single-expert families) no-op."""
-        side = getattr(self, QF_EXPERT_ATTR, "all")
-        if side not in ("high", "low"):
-            return
-        eng = getattr(self, "_qf", None)
-        if eng is None or not hasattr(eng, "set_lora_side"):
-            return
-        eng.set_lora_side(side, list(getattr(self, QF_LORA_STACK_ATTR, []) or []))
-
     # ── comfy's per-model VRAM interface (2026-09-19, user: 「与 comfyui 打通,让它知道我们需要多少显存、当前占了多少」) ──
     # comfy asks a model TWO numbers and does the rest itself: `memory_required(shape)` — how much MORE VRAM one
     # forward of `shape` needs (sampler_helpers.estimate_memory → load_models_gpu(memory_required=…) → free_memory
@@ -484,11 +468,7 @@ class QFSessionModelMixin:
     # → 15 s/prompt inter-stage thrash) — with the side effect that on a card where comfy's idle TE/VAEs FIT, comfy
     # kept them resident through the denoise and the engine shed its own weight pages every step (MEASURED 5090/H3
     # 800x768: 26–50 blocks re-copied per step). H3 additionally stacked a static per-element heuristic on top
-    # (deleted with this change — it would double-count the real number). The 2026-08-22 constraint still holds for
-    # the SHADOW (a second MODEL output over ONE shared engine, wan dual-expert): it reports comfy-side bytes only —
-    # the primary is a separate LoadedModel that is NOT currently_used at the shadow's load, so a real need there
-    # would evict it. Follow-up: declare the primary via get_additional_models() so comfy keeps it, then the shadow
-    # can report the real need too.
+    # (deleted with this change — it would double-count the real number).
     # Comfy-side bytes for this wrapper (D3): the latent in/out copies + cond tensors + conversion scratch — geometry-
     # proportional; K factors: input + noise + output velocity + c_concat tail + ~4x conversion/temporary copies ≈ 8
     # latent-sized tensors; cond tensors counted 2x (borrowed + converted). Floor keeps small runs honest. Signature
@@ -545,7 +525,7 @@ class QFSessionModelMixin:
         """ComfyUI's inference reserve for one forward of `input_shape`: ONLY native numbers (D3, tests-07 ruling
         2026-09-24: "the plan side estimates; the upper layer doesn't invent numbers").
 
-        = comfy-side bytes (the plugin's own tensor copies) + (PRIMARY only) the ENGINE's working set for that shape:
+        = comfy-side bytes (the plugin's own tensor copies) + the ENGINE's working set for that shape:
         quantfunc_vram_need_bytes(latent [B,C,(T,)H,W]) — the primary transformer's working set (MEASURED by an
         earlier forward; else the same spatial shape at another batch scaled; else the model's config estimate) + the
         plan margin − the allocator's cached pool it already holds. The engine is asked through the CACHED real
@@ -655,11 +635,10 @@ class QFSessionModelMixin:
 class QFLazyEngine:
     """A QFEngineHandle that materializes ON FIRST REAL USE.
 
-    WHY (measured): sidecar LoRA is applied at pipeline CREATE time, so a chained
-    QuantFuncNativeLoRA node has to build a pipeline for its accumulated LoRA set. Doing that
-    EAGERLY in the node makes an N-node chain create N+1 pipelines — and comfy's node-output
-    cache pins every intermediate model, so each intermediate ALSO pins a multi-GB CPU backup.
-    Deferring means only the model the sampler actually touches is ever created.
+    WHY: comfy's node-output cache pins every intermediate model of a chain (loader → LoRA → LoRA …). The
+    pipeline is created only when the sampler first touches a model, the create carries the weights only, and
+    every LoRA set of one model shares that one pipeline: ensure() applies THIS consumer's set in place
+    (_apply_runtime_lora; user rule 2026-09-24 「换 LoRA 也不重建」).
 
     The proxy answers the CHEAP part of the handle surface locally while unmaterialized (an
     engine that does not exist holds no VRAM and has no session), and materializes only for
@@ -667,25 +646,14 @@ class QFLazyEngine:
     __getattr__ magic: a typo must fail loud, not silently forward.
     """
 
-    def __init__(self, factory, retire=None, runtime_lora=False):
+    def __init__(self, factory, retire=None):
         self._factory = factory          # () -> (QFEngineHandle, ckey)
-        # runtime_lora (single-expert families, user rule 2026-09-24 「换 LoRA 也不重建」): the create carries the
-        # weights only, so every LoRA set of one model shares ONE cached pipeline, and ensure() applies THIS
-        # consumer's set to it in place (_apply_runtime_lora). False (Wan, until the engine can route a per-expert
-        # target at runtime): the union is a create input and a change re-creates (reconcile_lora).
-        self._runtime_lora = bool(runtime_lora)
         self._real = None
         self._prepared_entry = None
         self._ckey = None                # the materialized handle's cache key (for retire)
-        # [wiring-lora] per-SIDE declarative LoRA registry (dual-expert, ONE shared engine).
-        # Each chained LoRA node REPLACES its wire-side's whole cumulative stack, and EVERY
-        # wire re-writes its own truth at run start via _assert_wire_lora (a raw loader
-        # output writes []) — so re-execution converges by construction and a DELETED node's
-        # side is reset by the raw wire's next run. Loader-cached state is never appended to.
-        # The factory reads lora_union() at CREATE; reconcile_lora() retires a handle whose
-        # created union no longer matches.
+        # This consumer's declarative LoRA set (side 'all'): each chained LoRA node builds a fresh lazy engine with
+        # its whole cumulative stack, so a raw loader output holds [] and deleting a LoRA node needs no cleanup.
         self._lora_sides = {}
-        self._created_lora_sig = None
         # retire(ckey, eng, requester, *, keep_binding=False, reason="") -> bool: the cache
         # layer's SINGLE liveness-gated retire chokepoint (the only .destroy() site in the
         # plugin). None => this wrapper can NEVER destroy (fail-safe: a wrapper that cannot
@@ -708,7 +676,6 @@ class QFLazyEngine:
         Runs every factory, including the custom dual-output factory, through
         the shared _get_engine prepare-only branch. No lazy .lib access here.
         """
-        self.reconcile_lora()
         token = qfe.FACTORY_PREPARE_ONLY.set(True)
         try:
             with _engine_cache_acquisition(self):
@@ -743,7 +710,6 @@ class QFLazyEngine:
         self._real, self._ckey = real, ckey
         self._real.step_count = self.step_count
         self._real.sampler_step_count = self.sampler_step_count
-        self._created_lora_sig = self._lora_sig()
         return self._real
 
     def _materialize_prepared(self, entry):
@@ -764,11 +730,6 @@ class QFLazyEngine:
             # The real handle was DESTROYED under us (a sibling's lifecycle path, or any future
             # one). Never hand a NULL pipeline to denoise_begin — drop it and re-create from disk.
             self._real = None
-        # [wiring-lora] drift-retire lives HERE, at the ONE materialization chokepoint (CR
-        # generality fix): a family cannot forget a per-begin hook that does not exist. Cheap
-        # (a small json sig compare); sides only mutate during node execution (sequential,
-        # pre-sampling), so an open mid-generation session never sees a drift.
-        self.reconcile_lora()
         if self._real is None:
             entry, ckey = self.prepare_resource()
             if isinstance(entry, QFPreparedEntry):
@@ -779,8 +740,9 @@ class QFLazyEngine:
         # Busy/Unknown after the native grant was fenced. Cache hits are not a
         # new host admission and must not resume it implicitly.
         _require_engine_host_grants(self._real)
-        if self._runtime_lora:
-            self._apply_runtime_lora()
+        # The ONE materialization chokepoint also puts this consumer's LoRA set on the shared pipeline, so no family
+        # needs a per-begin hook it could forget.
+        self._apply_runtime_lora()
         return self._real
 
     def _apply_runtime_lora(self):
@@ -817,45 +779,17 @@ class QFLazyEngine:
         entry, _ = self.prepare_resource()
         return None if isinstance(entry, QFPreparedEntry) else entry
 
-    # ---- [wiring-lora] per-side LoRA registry (see __init__ docblock) ----
-    # DUAL-OUTPUT FAMILY ONBOARDING (wan = the reference implementation): a new multi-output
-    # family needs exactly FOUR wirings — (1) tag each output model with QF_EXPERT_ATTR at
-    # build AND tag the raw pair's wire stacks EMPTY (loader-level entries live only in the
-    # "loader" side), (2) construct the shared QFLazyEngine with
-    # retire=deps["retire_handle"] (the single liveness-gated destroy chokepoint),
-    # (3) route its LoRA rebuild through set_lora_side + return a fresh same-side patcher
-    # (see wan _lora_rebuild_dual), (4) call self._assert_wire_lora() at the model's
-    # RUN-START hook (wan: extra_conds) so a side entry can never outlive its author node.
-    # DELETION SEMANTICS (the honest claim, reviewers C+E): deleting a LoRA node on EITHER
-    # wire converges at the next run — both wires re-assert their truth at their run hooks
-    # before the next session opens (reviewer-E measured: under comfy's sequential
-    # single-worker execution the mid-generation drift guard in reconcile_lora is NOT
-    # reachable — it is DEFENSIVE, kept for any future concurrent/out-of-band mutation
-    # path). Never a silent stale-LoRA output.
-    # Single-expert families keep a fresh _build (patcher + lazy engine) per LoRA set, but since
-    # 2026-09-24 (user rule 「换 LoRA 也不重建」) their create carries NO LoRA: every set of one model
-    # shares ONE cached pipeline and ensure() applies each consumer's set in place (runtime_lora,
-    # _apply_runtime_lora). Wan keeps the create-time union below until the engine can route a
-    # per-expert target at runtime. Half-adoption fails LOUD: set_lora_side refuses without a retire chokepoint
-    # (else a superseded handle would silently leak its host backup), and the drift-retire
-    # runs inside ensure() itself (no per-family hook to forget).
+    # ---- LoRA: the consumer's declarative set, applied in place at ensure() ----
+    # A family builds a fresh patcher + lazy engine per LoRA set (tag_lora_rebuild), passes the set here, and
+    # constructs the engine with retire=deps['retire_handle'] (the single liveness-gated destroy chokepoint, used
+    # by comfy's RAM release). The pipeline itself never depends on the set.
     def set_lora_side(self, side, entries):
-        """REPLACE one wire-side's cumulative LoRA stack ('high'/'low'/'all')."""
-        if self._retire is None:
-            raise RuntimeError(
-                "QFLazyEngine.set_lora_side: this engine was constructed WITHOUT retire — "
-                "the per-side LoRA registry would silently orphan superseded handles (host-RAM "
-                "leak). Pass retire=deps['retire_handle'] at the family's QFLazyEngine(...) "
-                "construction (see the onboarding note above).")
+        """REPLACE this consumer's cumulative LoRA stack (every family in this release uses side 'all')."""
         self._lora_sides[str(side)] = [dict(e) for e in (entries or [])]
 
     def lora_union(self):
-        """The engine-create 'lora' list: every side's entries, side-sorted for determinism
-        ('high' < 'loader' < 'low'). The SORT is for signature stability only — sidecar LoRA
-        entries are per-layer ADDITIVE low-rank columns applied per their own target, so the
-        relative order of sides is mathematically inert (within one wire the user's chain
-        order is preserved). A future NON-additive merge semantic would need a real order
-        contract here."""
+        """The declarative 'lora' list pipeline_update carries: every side's entries, side-sorted for a stable
+        signature (within a side the user's chain order is preserved)."""
         out = []
         for side in sorted(self._lora_sides):
             out.extend(dict(e) for e in self._lora_sides[side])
@@ -863,42 +797,6 @@ class QFLazyEngine:
 
     def _lora_sig(self):
         return json.dumps(self.lora_union(), sort_keys=True)
-
-    def reconcile_lora(self):
-        """Session-BEGIN hook: LoRA merges at pipeline CREATE, so a materialized handle whose
-        created union no longer matches the current side registry is RETIRED here (session
-        closed, retired via the retire chokepoint) and the next ensure() re-creates
-        with the current union. Unmaterialized (the common deferred path) or unchanged union
-        => no-op. Returns True when a retire happened (observable for tests/logs).
-        A runtime_lora engine never retires here: its create carries no LoRA (ensure() applies the set in place)."""
-        if self._runtime_lora or self._real is None or self._created_lora_sig == self._lora_sig():
-            return False
-        if getattr(self._real, "current_session", None):
-            # Retention (2026-08-24): a REFUSED end now keeps the pointer, so first try to
-            # close it — a stale/abandoned session ends here and the retire proceeds; only a
-            # session that STILL refuses to end (genuinely running) takes the raise below.
-            self._real.end_session_if_open()
-        if getattr(self._real, "current_session", None):
-            # A wire changed its LoRA truth MID-GENERATION (e.g. the OTHER expert's wire
-            # asserted a different stack at its stage — a LoRA node deleted there). The
-            # running session was created under the old union and cannot be retargeted
-            # mid-run; fail LOUD instead of silently finishing with the wrong weights. The
-            # next queue re-creates with the current wiring (the side registry is already
-            # correct). The stranded session is closed by the run-start end_session_if_open.
-            raise RuntimeError(
-                "qf_native: LoRA wiring changed MID-GENERATION (a wire's LoRA set no longer "
-                "matches the running session's union — e.g. a LoRA node was added/removed on "
-                "the other expert's wire). Re-queue the prompt: the next run re-creates the "
-                "engine with the current wiring.")
-        self.end_session_if_open()
-        old, old_ck = self._real, self._ckey
-        self._real, self._ckey = None, None
-        self._created_lora_sig = None
-        if old is not None and self._retire is not None:
-            # identity-gated single chokepoint: refuses if a FOREIGN wrapper still shares the
-            # entry (the new union creates under a NEW ckey, so both handles coexist then)
-            self._retire(old_ck, old, self, reason="lora reconcile (union drift)")
-        return True
 
     # ---- members that NEED a live pipeline ----
     @property
@@ -1000,22 +898,12 @@ class QFLazyEngine:
 
 
 # ── shared sidecar-LoRA rebuild contract (CR simplicity: ONE definition, not one per family) ──
-# The engine merges sidecar LoRA at pipeline CREATE time, so a downstream QuantFuncNativeLoRA node
-# re-creates the pipeline for the accumulated set. Every family's builder tags its model with these
+# A downstream QuantFuncNativeLoRA node rebuilds the PATCHER for the accumulated set (the pipeline is shared and
+# the set goes on in place, see QFLazyEngine). Every family's builder tags its model with these
 # two attributes through tag_lora_rebuild(); the LoRA node reads them through lora_stack_of()/
 # rebuild_of(). Names live here so the three seams cannot drift apart.
 QF_LORA_STACK_ATTR = "_qf_lora_stack"
 QF_LORA_REBUILD_ATTR = "_qf_rebuild"
-QF_EXPERT_ATTR = "_qf_expert"   # "high"/"low" on the wan dual pair; absent => "all" (single-expert)
-
-
-def expert_of(patcher):
-    """[wiring-lora] WIRING-derived LoRA target: which loader output this MODEL came from
-    ('high'/'low' — the wan builder tags its pair), 'all' for single-expert families. User
-    directive 2026-08-22: the LoRA node carries NO target widget — chaining it on the loader's
-    high output MEANS it acts on the high expert. Reads the MODEL (clones share .model), so a
-    comfy patcher clone keeps its wire identity."""
-    return getattr(getattr(patcher, "model", None), QF_EXPERT_ATTR, "all")
 
 
 def ensure_model_config_attrs(model_config):
@@ -1968,12 +1856,6 @@ class QFModelPatcher(comfy.model_patcher.ModelPatcher):
         self._native_dependencies()
         return super().get_additional_models()
 
-    # Shadow remains relevant to legacy CPU-backup ownership only. Physical GPU
-    # accounting and release belong to canonical dependencies for EVERY output.
-
-    def _is_shadow(self):
-        return bool(getattr(getattr(self, "model", None), "_qf_shadow", False))
-
     @_comfy_facing("no resource read")
     def model_size(self):
         return super().model_size()
@@ -2061,8 +1943,6 @@ class QFModelPatcher(comfy.model_patcher.ModelPatcher):
     def loaded_ram_size(self):
         """HOST-RAM this model is actually responsible for: the engine's CPU backup after a
         co-eviction, else 0 (including for a handle that was never created)."""
-        if self._is_shadow():
-            return 0   # the PRIMARY output reports the shared engine's backup — no double-count
         holds, eng = self._engine_holds_cpu_backup()
         return max(0, int(getattr(eng, "footprint_bytes", 0))) if holds else 0
 

@@ -1293,7 +1293,7 @@ def register(deps):
             # below is LTX-2.5's own engine-side joint AV, which is a different mechanism.
             _lora_cfg = dict(create_extra or {})   # file-mode: {"denoise_only": True}
             # NO "lora" in the create: the cache key is the weights only (user rule 2026-09-24), so every LoRA set of
-            # this model shares one pipeline; the engine below applies THIS build's set in place (runtime_lora).
+            # this model shares one pipeline; the lazy engine below applies THIS build's set in place (QFLazyEngine._apply_runtime_lora).
             device, device_idx = qfmp.current_torch_device()
             # ── LTX-2.5 JOINT-AV auto-detect (c5.8b): the SAME discriminant the engine's own
             # has_audio_ uses — the engine model_dir ships audio_vae/ weights (the video-only
@@ -1334,7 +1334,7 @@ def register(deps):
                 # accumulated LoRA set, so an eager create here would build ONE PIPELINE PER
                 # CHAIN LINK (and comfy's node-output cache would pin every intermediate's
                 # multi-GB CPU backup). Only the model the sampler touches is ever created.
-                engine = qfmp.QFLazyEngine(_factory, retire=retire_handle, runtime_lora=True)
+                engine = qfmp.QFLazyEngine(_factory, retire=retire_handle)
                 engine.set_lora_side("all", lora_entries)
                 offload = comfy.model_management.unet_offload_device()
                 unet_config = {"image_model": "ltxav", "disable_unet_model_creation": True}
@@ -1376,7 +1376,7 @@ def register(deps):
             # accumulated LoRA set, so an eager create here would build ONE PIPELINE PER
             # CHAIN LINK (and comfy's node-output cache would pin every intermediate's
             # multi-GB CPU backup). Only the model the sampler touches is ever created.
-            engine = qfmp.QFLazyEngine(_factory, retire=retire_handle, runtime_lora=True)
+            engine = qfmp.QFLazyEngine(_factory, retire=retire_handle)
             engine.set_lora_side("all", lora_entries)
             # [19B non-gated connector] authoritative head count from the ORIGINAL model dir\'s diffusers
             # LTX2TextConnectors config (the 19B family ships NON-gated connector weights; the head split

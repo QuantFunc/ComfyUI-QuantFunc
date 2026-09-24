@@ -125,12 +125,6 @@ m = _Model(); m._qf = _engine(need_mb=0)
 r, log = _quiet(m.memory_required, SHAPE, cond_shapes=COND)
 check(r == side and "nothing measured yet" in log, "arm2: engine 0 → comfy-side only, logged as covered-or-unmeasured")
 
-# ---- arm 3: every logical output declares the shared engine's inference demand ---------------------------------
-m = _Model(); m._qf = _engine(need_mb=12000); m._qf_shadow = True
-r, _ = _quiet(m.memory_required, SHAPE, cond_shapes=COND)
-check(r == side + 12000 * MB and m._qf.vram_need_bytes.asked == [SHAPE],
-      "arm3: shadow → same canonical engine demand as the primary")
-
 # ---- arm 4: lazy proxy — a CACHED handle is used; an uncreated engine is NEVER created here ---------------------
 # (self-CR P-2: comfy calls memory_required BEFORE its own eviction pass, so a create here would run ahead of the
 #  room being made. The proxy discovers cache hits through the canonical
@@ -178,23 +172,19 @@ else:
 logical = torch.nn.Module()
 logical.weight = torch.nn.Parameter(torch.ones(4, dtype=torch.float32))
 logical._qf = _engine(hold_mb=23000, footprint_mb=14380)
-logical._qf_shadow = False
 p = _patcher(logical)
 check(p.model_size() == 16 and p.loaded_size() == 0,
       "arm6a: logical patcher reports Torch parameters, not native capacity/residency")
 logical.model_loaded_weight_memory = 8
 check(p.model_size() == 16 and p.loaded_size() == 8,
       "arm6b: logical loaded_size follows the official Torch loaded-weight ledger")
-logical._qf_shadow = True
-check(p.model_size() == 16 and p.loaded_size() == 8,
-      "arm6c: shadow flag does not replace the ordinary Torch ledger")
 
 # ---- arm 7: ONE source of truth — no family overrides the ledger interface; H3 (packed AV) gets exactly base ---------
 # (self-CR P-1 on 1d51182 found QFH3Model.memory_required stacking a 2026-08-24 heuristic ON TOP of the base's real
 #  engine need → double-count. A family that needs different accounting must change the base, not shadow it.)
 _LEDGER_METHODS = ("memory_required", "model_size", "loaded_size")
 _families = {}
-for _mod in ("qf_h3_modelpatcher", "qf_krea2_modelpatcher", "qf_wan_modelpatcher", "qf_ltx_modelpatcher"):
+for _mod in ("qf_h3_modelpatcher", "qf_krea2_modelpatcher", "qf_ltx_modelpatcher", "qf_qwenimage21_modelpatcher"):
     try:
         _families[_mod] = __import__(f"{_pkg}.{_mod}", fromlist=["*"])
     except Exception as e:  # noqa: BLE001

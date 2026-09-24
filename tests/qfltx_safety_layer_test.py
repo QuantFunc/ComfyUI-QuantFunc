@@ -42,15 +42,12 @@ def _extract_method(src_text, cls, meth):
     raise AssertionError(f"method {cls}.{meth} not found in {_SRC}")
 
 
-# One module per model family: the WAN seam (its comfy model subclass + _apply_model) lives in
-# qf_wan_modelpatcher.py, while qf_modelpatcher.py is the family-AGNOSTIC substrate that owns the
-# SHARED interrupt helper. Both paths are pinned so this test keeps checking the real split.
-_WAN_SRC = os.path.join(_HERE, "..", "qf_wan_modelpatcher.py")
+# One module per model family (each seam's comfy model subclass + _apply_model), while qf_modelpatcher.py is the
+# family-AGNOSTIC substrate that owns the SHARED interrupt helper. The other families' modules are pinned too, so
+# this test keeps checking the real split for every family (LTX itself is _SRC).
+_OTHER_FAMILY_SRCS = {f: os.path.join(_HERE, "..", f) for f in ("qf_h3_modelpatcher.py", "qf_krea2_modelpatcher.py",
+                                                                 "qf_qwenimage21_modelpatcher.py")}
 _SHARED_SRC = os.path.join(_HERE, "..", "qf_modelpatcher.py")
-
-
-def _wan_src_text():
-    return open(_WAN_SRC, errors="replace").read()
 
 
 def _extract_module_fn(src_text, name):
@@ -65,7 +62,7 @@ def _shared_src_text():
     return open(_SHARED_SRC, errors="replace").read()
 
 
-def _bind_wan_helper(comfy):
+def _bind_shared_helper(comfy):
     """Exec the REAL shared interrupt helper — it lives in the family-AGNOSTIC substrate
     (qf_modelpatcher.py), NOT in a family module; that separation is what this arm pins."""
     ns = {"comfy": comfy}
@@ -301,54 +298,15 @@ def _t_post_connector_seq(src):
     return bad
 
 
-def _t_wan_interrupt(src):
-    """WAN-side analog of _t_interrupt (§6.5 round-3 residual: the shared-helper change made QFWanModel
-    ALSO end its session on interrupt — a WAN behavior change that previously had only the structural
-    grep-arm, no functional coverage). Execs the REAL QFWanModel._apply_model + the REAL shared helper:
-    an interrupt fired at the per-cond-group poll must END the open session (not strand it) and re-raise.
-    `src` (the LTX source) is unused — this arm reads qf_modelpatcher.py; it lives here because this file
-    owns the seam-pair safety-layer harness (_bind/_mock_self/_make_comfy)."""
-    del src
-    wan_src = _wan_src_text()
-    comfy = _make_comfy(interrupt_raises=True)
-    helper = _bind_wan_helper(comfy)
-    ns = {"comfy": comfy, "torch": torch,
-          "_interrupt_poll_end_session_on_raise": helper}
-    exec(_extract_method(wan_src, "QFWanModel", "_apply_model"), ns)  # noqa: S102 — trusted repo source
-    fn = ns["_apply_model"]
-    eng = _MockEngine(open_session=object())   # session OPEN → _begin/_derive_geometry are skipped
-    me = _mock_self(_qf=eng, _max_batch=0, _out=None, _step_i=0,
-                    # the real WAN _apply_model consults these before the interrupt poll;
-                    # stub them so this arm exercises the GUARD, not the surrounding plumbing.
-                    _sigma_step_index=lambda *a, **k: 0,
-                    _derive_geometry=lambda *a, **k: None,
-                    _ctx_key_assigner=types.SimpleNamespace(key_for=lambda *a, **k: 0,
-                                                            reset=lambda: None))
-    x = torch.zeros(1, 16, 2, 2, 2)            # [B,C,T,Hl,Wl] wan latent shape (values irrelevant)
-    bad = 0
-    try:
-        fn(me, x, 0.5, c_crossattn=torch.zeros(1, 3, 4096), transformer_options={})
-        print("  [FAIL] WAN _apply_model did NOT propagate the interrupt"); bad += 1
-    except _InterruptExc:
-        if eng.end_calls < 1:
-            print("  [FAIL] WAN interrupt did not call end_session_if_open (session change unproven)"); bad += 1
-        if eng.current_session is not None:
-            print("  [FAIL] WAN interrupt left current_session non-None (stranded)"); bad += 1
-    except BaseException as e:   # noqa: BLE001
-        print(f"  [FAIL] WAN _apply_model raised the wrong type on interrupt: {type(e).__name__}: {e}"); bad += 1
-    print(f"  wan interrupt guard: {'OK' if bad == 0 else 'FAIL'} (interrupt re-raised + session cleared "
-          "via the shared helper at the REAL WAN call site)")
-    return bad
-
-
 def _t_shared_interrupt_helper(src):
-    """§6.5 simplicity: ONE shared interrupt guard for BOTH model classes. STRUCTURAL: the raw
+    """§6.5 simplicity: ONE shared interrupt guard for EVERY family. STRUCTURAL: the raw
     comfy.model_management.throw_exception_if_processing_interrupted() call appears on exactly ONE
-    non-comment line across qf_modelpatcher.py + qf_ltx_modelpatcher.py — inside the shared helper — and
-    BOTH classes call the helper. FUNCTIONAL: the REAL helper source ends the open session and re-raises on
+    non-comment line across qf_modelpatcher.py + every family module — inside the shared helper — and
+    every family calls the helper. FUNCTIONAL: the REAL helper source ends the open session and re-raises on
     a BaseException-derived interrupt (an `except Exception` rewrite MISSES it → end_calls==0 → FAIL), and
     is a no-op without an interrupt."""
-    wan_src = _wan_src_text()
+    fam_srcs = {"qf_ltx_modelpatcher.py": src}
+    fam_srcs.update({f: open(p, errors="replace").read() for f, p in _OTHER_FAMILY_SRCS.items()})
     bad = 0
     def _code_lines(text):
         return [ln for ln in text.splitlines() if not ln.lstrip().startswith("#")]
@@ -356,23 +314,21 @@ def _t_shared_interrupt_helper(src):
     # ONE raw poll site, and it must be in the family-AGNOSTIC substrate — every FAMILY module
     # routes through the shared helper. (Scanning all three files is what makes a family module
     # re-introducing its own poll a FAILURE rather than an invisible drift.)
-    raws = {"qf_modelpatcher.py (shared)": sum(raw_call in ln for ln in _code_lines(_shared_src_text())),
-            "qf_wan_modelpatcher.py": sum(raw_call in ln for ln in _code_lines(wan_src)),
-            "qf_ltx_modelpatcher.py": sum(raw_call in ln for ln in _code_lines(src))}
+    raws = {"qf_modelpatcher.py (shared)": sum(raw_call in ln for ln in _code_lines(_shared_src_text()))}
+    raws.update({f: sum(raw_call in ln for ln in _code_lines(s)) for f, s in fam_srcs.items()})
     if raws["qf_modelpatcher.py (shared)"] != 1:
         print(f"  [FAIL] the shared substrate has {raws['qf_modelpatcher.py (shared)']} raw interrupt-poll "
               "call lines, expected exactly 1 (inside _interrupt_poll_end_session_on_raise)"); bad += 1
-    for fam_file in ("qf_wan_modelpatcher.py", "qf_ltx_modelpatcher.py"):
+    for fam_file in fam_srcs:
         if raws[fam_file] != 0:
             print(f"  [FAIL] {fam_file} has {raws[fam_file]} raw interrupt-poll call lines, expected 0 "
                   "(a family module must route through the shared helper)"); bad += 1
     helper_call = "_interrupt_poll_end_session_on_raise(self._qf)"
-    if sum(helper_call in ln for ln in _code_lines(wan_src)) < 1:
-        print("  [FAIL] QFWanModel does not call the shared interrupt helper"); bad += 1
-    if sum(helper_call in ln for ln in _code_lines(src)) < 1:
-        print("  [FAIL] QFLTXModel does not call the shared interrupt helper"); bad += 1
+    for fam_file, fam_src in fam_srcs.items():
+        if sum(helper_call in ln for ln in _code_lines(fam_src)) < 1:
+            print(f"  [FAIL] {fam_file} does not call the shared interrupt helper"); bad += 1
     # FUNCTIONAL — the real helper body: interrupt → end + re-raise; no interrupt → no-op.
-    helper = _bind_wan_helper(_make_comfy(interrupt_raises=True))
+    helper = _bind_shared_helper(_make_comfy(interrupt_raises=True))
     eng = _MockEngine(open_session=object())
     try:
         helper(eng)
@@ -383,12 +339,12 @@ def _t_shared_interrupt_helper(src):
                   f"session={eng.current_session} (expected 1 / None)"); bad += 1
     except BaseException as e:   # noqa: BLE001
         print(f"  [FAIL] helper raised the wrong type: {type(e).__name__}"); bad += 1
-    helper2 = _bind_wan_helper(_make_comfy(interrupt_raises=False))
+    helper2 = _bind_shared_helper(_make_comfy(interrupt_raises=False))
     eng2 = _MockEngine(open_session=object())
     helper2(eng2)
     if eng2.end_calls != 0:
         print(f"  [FAIL] helper no-interrupt path called end_session ({eng2.end_calls} times)"); bad += 1
-    print(f"  shared_interrupt_helper: {'OK' if bad == 0 else 'FAIL'} (one raw poll site; both classes via "
+    print(f"  shared_interrupt_helper: {'OK' if bad == 0 else 'FAIL'} (one raw poll site; every family via "
           "helper; ends+re-raises on BaseException interrupt; no-op otherwise)")
     return bad
 
@@ -397,8 +353,7 @@ def _t_scale_latent_inpaint(src):
     """2026-08-22 wan-align pivot: the LTX seam INHERITS comfy's own LTXV.scale_latent_inpaint (model_base.py:
     `return latent_image` — the masked latent is blended OUTSIDE the model by KSamplerX0Inpaint; exact because
     the engine step is stateless in x) — the Inplace i2v route rides it, so the plugin must NOT override it
-    (the old loud-fail override would break i2v). Positive control: the WAN seam, whose session does its own
-    i2v conditioning, still overrides it."""
+    (the old loud-fail override would break i2v). Positive control: the H3 seam still overrides it."""
     def overrides(text, cls):
         try:
             _extract_method(text, cls, "scale_latent_inpaint"); return True
@@ -407,9 +362,9 @@ def _t_scale_latent_inpaint(src):
     for cls in ("QFLTXModel", "QFLTXAVModel"):
         if overrides(src, cls):
             print(f"  [FAIL] {cls} overrides scale_latent_inpaint (must be inherited since the 2026-08-22 pivot)"); return 1
-    if not overrides(open(_WAN_SRC, errors="replace").read(), "QFWanModel"):
-        print("  [FAIL] positive control: QFWanModel no longer overrides scale_latent_inpaint"); return 1
-    print("  scale_latent_inpaint: OK (inherited by LTX/LTXAV, overridden by WAN)"); return 0
+    if not overrides(open(_OTHER_FAMILY_SRCS["qf_h3_modelpatcher.py"], errors="replace").read(), "QFH3Model"):
+        print("  [FAIL] positive control: QFH3Model no longer overrides scale_latent_inpaint"); return 1
+    print("  scale_latent_inpaint: OK (inherited by LTX/LTXAV, overridden by H3)"); return 0
 
 
 def _t_derive_geometry(src):
@@ -477,7 +432,7 @@ def _t_interrupt(src):
     (_interrupt_poll_end_session_on_raise) — so this arm execs the REAL helper source and injects it into
     _apply_model's namespace: it now exercises the real call site AND the real shared guard together."""
     comfy = _make_comfy(interrupt_raises=True)
-    helper = _bind_wan_helper(comfy)
+    helper = _bind_shared_helper(comfy)
     fn, _ = _bind(src, "_apply_model", {"comfy": comfy, "torch": torch,
                                         "_interrupt_poll_end_session_on_raise": helper})
     eng = _MockEngine(open_session=object())   # a session is OPEN when the interrupt fires
@@ -515,7 +470,7 @@ def main():
     print(f"=== QFLTXModel safety-layer behavioral test (src={os.path.relpath(_SRC, _HERE)}) ===")
     bad = 0
     for t in (_t_extra_conds, _t_max_ctx_seq, _t_post_connector_seq, _t_scale_latent_inpaint,
-              _t_derive_geometry, _t_interrupt, _t_wan_interrupt, _t_shared_interrupt_helper):
+              _t_derive_geometry, _t_interrupt, _t_shared_interrupt_helper):
         try:
             bad += t(src)
         except Exception as e:   # noqa: BLE001 — a harness error is a FAIL, not a crash-through

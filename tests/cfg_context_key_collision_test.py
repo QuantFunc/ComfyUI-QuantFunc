@@ -34,9 +34,10 @@ import uuid as _uuidmod
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _PLUGIN = os.path.dirname(_HERE)
 # One module per model family: _CtxKeyAssigner is SHARED substrate (qf_modelpatcher.py) while
-# the call site that uses it lives in the WAN family module — pin both.
+# the call site that uses it lives in each family module; the Krea-2 module's _apply_model carries the
+# cuid/ctx_key derivation this test extracts (the Wan module that used to host it left the release) — pin both.
 _SRC_PATH = os.path.join(_PLUGIN, "qf_modelpatcher.py")
-_WAN_SRC_PATH = os.path.join(_PLUGIN, "qf_wan_modelpatcher.py")
+_CALLSITE_SRC_PATH = os.path.join(_PLUGIN, "qf_krea2_modelpatcher.py")
 
 
 def _read_src():
@@ -313,10 +314,10 @@ def main():
     #          affine i/len keys for the UNCOND role too — exactly as A + B1 + B2 do for cond. That closes the
     #          a250211 NO-GO and its whole AFFINE family (K=a*i+b*len+c per role; non-affine is OUT OF SCOPE
     #          by the M5 reachability argument at the ★ SCOPE note below), not just the literal `else i` spelling.
-    # The CALL SITE lives in the WAN family module (one module per family); the assigner class it
+    # The CALL SITE lives in the Krea-2 family module (one module per family); the assigner class it
     # uses is shared substrate. Read the family module for this arm.
     callsite = _extract_callsite_key_derivation(
-        open(_WAN_SRC_PATH, encoding='utf-8').read())   # loud-fails if the derivation vanished
+        open(_CALLSITE_SRC_PATH, encoding='utf-8').read())   # loud-fails if the derivation vanished
     try:
         import torch
     except ImportError:
@@ -539,11 +540,11 @@ def main():
 
     # (8) WIRING (a cheap SYNTACTIC tripwire — NOT the content-hash coverage; arm (7) covers that by behaviour).
     # One module per model family: the assigner CLASS + its kNoCtxKey constant are shared substrate
-    # (`src`), while the CALL SITE that reads uuids / keys / resets lives in the WAN family module.
+    # (`src`), while the CALL SITE that reads uuids / keys / resets lives in the Krea-2 family module.
     # Each half is checked against the file that actually owns it — checking the wiring against the
     # shared file would silently pass on an EMPTY match once the seam moved out of it.
-    wan_src = open(_WAN_SRC_PATH, encoding="utf-8").read()
-    wired = ('transformer_options.get("uuids")' in wan_src and "self._ctx_key_assigner.key(" in wan_src)
+    callsite_src = open(_CALLSITE_SRC_PATH, encoding="utf-8").read()
+    wired = ('transformer_options.get("uuids")' in callsite_src and "self._ctx_key_assigner.key(" in callsite_src)
     # "no content hash" means no hash feeds a CTX KEY — a hash used for anything else (e.g. the
     # staging helper derives a TEMP-DIR name with hashlib.sha1, wholly unrelated to conditioning
     # identity) must not trip this. So: forbid the old content_ctx_key symbol outright, and forbid
@@ -552,8 +553,8 @@ def main():
         return any(("hashlib" in ln or "sha1" in ln or "sha256" in ln or "md5(" in ln)
                    and ("ctx_key" in ln or "context_key" in ln)
                    for ln in text.splitlines())
-    no_hash = all(("content_ctx_key" not in t) and not _hash_feeds_ctx_key(t) for t in (src, wan_src))
-    reset_wired = "self._ctx_key_assigner.reset()" in wan_src
+    no_hash = all(("content_ctx_key" not in t) and not _hash_feeds_ctx_key(t) for t in (src, callsite_src))
+    reset_wired = "self._ctx_key_assigner.reset()" in callsite_src
     kno_wired = "_KNO_CTX_KEY" in src
     if wired and no_hash and reset_wired and kno_wired:
         print("  [OK ] wiring: _apply_model reads uuids + keys via the assigner; per-gen reset + kNoCtxKey present; no content hash")

@@ -52,14 +52,6 @@ _INFRA_KEYS = {"cross_attn", "noise", "device", "latent_image"}
 #                    model's override if present). concat_cond + encode_adm today (see the docstring SCOPE).
 _Model = collections.namedtuple("_Model", "comfy_class plugin covered_elsewhere callees")
 _AUDITED_MODELS = (
-    # WAN i2v (QFWanModel) — UNCHANGED from the original single-model audit.
-    #  • concat_latent_image + siblings concat_mask/concat_mask_index only reach a run that ALSO wired
-    #    concat_latent_image (WanImageToVideo sets them together) — which QFWanModel.extra_conds loud-fails.
-    #  • denoise_mask reaches the SAMPLER (KSamplerX0Inpaint), NOT extra_conds; the scale_latent_inpaint
-    #    override loud-fails it (the correct hook — fires only when a mask is set).
-    _Model("WAN21", "qf_wan_modelpatcher.py",
-           {"concat_latent_image", "concat_mask", "concat_mask_index", "denoise_mask"},
-           ("concat_cond", "encode_adm")),
     # LTX-2 t2v (QFLTXModel) — the seam the CR generality NO-GO found was NEVER audited. Its reject-list is a
     # defensive superset (mask/keyframe/guide + noise_concat/cross_attn_controlnet/concat_latent_image). Two
     # keys are documented-ACCEPTED (not hook-handled), each with a VERIFIED reason:
@@ -273,7 +265,7 @@ def _derived_roster_defects():
                 f"family genuinely bypasses the extra_conds audit (add its seam + an _AUDITED_MODELS row).")
     if not seen:
         defects.append(
-            "the QF*Model derivation scan matched NO seam in the plugin package (expected e.g. QFWanModel / "
+            "the QF*Model derivation scan matched NO seam in the plugin package (expected e.g. QFKrea2Model / "
             "QFLTXModel). The class pattern or _PLUGIN_DIR drifted — a completeness check that scans nothing "
             "cannot certify completeness.")
     return defects
@@ -408,7 +400,7 @@ def _selftest():
         print("[FAIL] selftest: a bogus comfy root was not detected as absent"); bad += 1
     # MODEL-AGNOSTIC property: the table must carry >1 model and INCLUDE LTXV (the seam that used to escape).
     classes = {m.comfy_class for m in _AUDITED_MODELS}
-    if len(_AUDITED_MODELS) < 2 or "LTXV" not in classes or "WAN21" not in classes:
+    if len(_AUDITED_MODELS) < 2 or "LTXV" not in classes or "Krea2" not in classes:
         print("[FAIL] selftest: audit table is not model-agnostic (classes=%r)" % sorted(classes)); bad += 1
     # Every model row must point at an existing plugin file + a real reject-list tuple in it (catch a typo'd
     # plugin basename that would silently parse-miss forever).
@@ -457,7 +449,7 @@ def _selftest():
     _d3 = tempfile.mkdtemp(prefix="qfrl_sel3_")
     try:
         with open(os.path.join(_d3, "qf_ok_modelpatcher.py"), "w") as _fh:
-            _fh.write("class QFOkModel(comfy.model_base.WAN21):\n    pass\n")
+            _fh.write("class QFOkModel(comfy.model_base.Krea2):\n    pass\n")
         with open(os.path.join(_d3, "qf_bogus_modelpatcher.py"), "w") as _fh:
             _fh.write("FAMILY = 'bogus'\n\nclass BogusSeam:\n    pass\n")   # drifted naming: no QF*Model
         _PLUGIN_DIR = _d3
@@ -471,7 +463,7 @@ def _selftest():
         _PLUGIN_DIR = _real_plugin_dir
         shutil.rmtree(_d3, ignore_errors=True)
     print("REJECT_LIST_SELFTEST:",
-          ("PASS — comfy-absent run is loud ([SKIP]+exit %d); audit model-agnostic (WAN21+LTXV); derived-roster "
+          ("PASS — comfy-absent run is loud ([SKIP]+exit %d); audit model-agnostic (LTXV+Krea2); derived-roster "
            "gate proven both ways (clean real dir → no defect; unaudited seam + vacuous scan + seamless family "
            "module → defect)" % _SKIP_EXIT)
           if bad == 0 else "FAIL (%d wrong)" % bad)

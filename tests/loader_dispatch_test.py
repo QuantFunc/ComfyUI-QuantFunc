@@ -2,12 +2,12 @@
 """Behavioural tests for the FILE-BASED loader node (INT8-Fast-aligned redesign) + the
 liveness/LoRA substrate:
 
-  1. UI surface — transformer1/transformer2 FILE dropdowns + model_config (official presets,
-     data-driven from configs/), nothing else
+  1. UI surface — exactly the four single-expert loaders (no Wan / cloud-TE node), FILE dropdowns +
+     model_config (official presets, data-driven from configs/)
   2. dispatch by the preset MANIFEST's family; ltx2/minimax-h3 FILE-MODE staging shape;
-     traversal/shape-mismatch presets refused
-  3. wan dual-expert STAGING — configs copied from the shipped bundle, weights SYMLINKED,
-     denoise_only in the create cfg; single-file wan refused (A14B is dual-expert)
+     traversal / cross-family presets refused
+  3. single-expert STAGING (Krea-2) — configs copied from the shipped bundle, weight SYMLINKED,
+     denoise_only (and no LoRA) in the create cfg; the shared zero-latent guard; memory_required D3/D4
   4. transformer-name containment (comfy's own get_full_path_or_raise normalization)
   5. adopt_comfy_state_from — an upstream ModelSampling patch must SURVIVE a LoRA rebuild
   6. HOST-RAM accounting honesty — a never-created engine must report 0, not its estimate
@@ -98,8 +98,7 @@ def main():
     tmp = tempfile.mkdtemp(prefix="qf_loader_test_")
     dm = os.path.join(tmp, "diffusion_models")
     os.makedirs(dm)
-    for f in ("fx-t2v-4steps-high-quantfunc-int4.safetensors", "fx-t2v-4steps-low-quantfunc-int4.safetensors", "other.safetensors",
-              "not-a-model.txt"):
+    for f in ("other.safetensors", "not-a-model.txt"):
         with open(os.path.join(dm, f), "wb") as fh:
             fh.write(b"\0" * 16)
     folder_paths.add_model_folder_path("diffusion_models", dm)
@@ -162,10 +161,6 @@ def main():
     # single-expert shape) without shipping fake production presets.
     import shutil
     cfgroot = os.path.join(tmp, "configs")
-    shutil.copytree(os.path.join(_PLUGIN, "configs", "wan2.2-a14b-t2v"),
-                    os.path.join(cfgroot, "wan2.2-a14b-t2v"))
-    shutil.copytree(os.path.join(_PLUGIN, "configs", "wan2.2-a14b-i2v"),
-                    os.path.join(cfgroot, "wan2.2-a14b-i2v"))
     shutil.copytree(os.path.join(_PLUGIN, "configs", "ltx2-2.5-22b"),
                     os.path.join(cfgroot, "ltx2-2.5-22b"))
     shutil.copytree(os.path.join(_PLUGIN, "configs", "minimax-h3-fl2va"),
@@ -174,8 +169,7 @@ def main():
                     os.path.join(cfgroot, "krea2-turbo-int4"))
     for name, mf in (("fx-ltx", {"family": "ltx2"}),
                      ("fx-h3", {"family": "minimax-h3"}),
-                     ("fx-alien", {"family": "no-such-family"}),
-                     ("fx-single", {"family": "wan", "dual_expert": False})):
+                     ("fx-alien", {"family": "no-such-family"})):
         os.makedirs(os.path.join(cfgroot, name))
         json.dump(mf, open(os.path.join(cfgroot, name, "qf_native.json"), "w"))
     qfn._CONFIGS_DIR = cfgroot
@@ -257,7 +251,6 @@ def main():
     qfn._FAMILY_MATCHERS.clear()
     qfn._register_families()
 
-    WanL = qfn.NODE_CLASS_MAPPINGS["QuantFuncWanLoader"]()
     LtxL = qfn.NODE_CLASS_MAPPINGS["QuantFuncLTXLoader"]()
     H3L = qfn.NODE_CLASS_MAPPINGS["QuantFuncH3Loader"]()
     KreaL = qfn.NODE_CLASS_MAPPINGS["QuantFuncKrea2Loader"]()
@@ -274,31 +267,23 @@ def main():
     check("log_level is hidden (never a visible input) on every QuantFunc loader",
           bool(_ll_loaders) and not _ll_bad, f"-> {len(_ll_loaders)} loaders, wrong: {_ll_bad}")
 
-    # ── 1) UI surface (per-family pivot): wan = dual required transformers + DUAL MODEL outputs;
-    #      single-expert nodes = one transformer; preset dropdowns are FAMILY-FILTERED ──
-    it = WanL.INPUT_TYPES()
-    check("wan required = transformer1/transformer2/model_config",
-          list(it["required"].keys()) == ["transformer1", "transformer2", "model_config"],
-          f"-> {list(it['required'].keys())}")
-    check("wan has NO optional block (transformer2 is required)", not it.get("optional"))
-    check("wan RETURN = two MODELs named high/low",
-          WanL.RETURN_TYPES == ("MODEL", "MODEL")
-          and WanL.RETURN_NAMES == ("model_high", "model_low"))
-    cfgs = it["required"]["model_config"][0]
-    check("wan model_config lists ONLY wan presets (family-filtered)",
-          "wan2.2-a14b-t2v" in cfgs and "fx-single" in cfgs and "fx-ltx" not in cfgs
-          and "fx-alien" not in cfgs, f"-> {cfgs}")
-    check("the i2v preset ships and lists in the wan dropdown", "wan2.2-a14b-i2v" in cfgs,
-          f"-> {cfgs}")
+    # ── 1) UI surface: the release ships exactly the four single-expert loaders (user scope 2026-09-24
+    #      「我们的新功能支持好LTX2.5 H3 Krea2 QI就好 还有wan的节点 还有cloud TE节点先干掉吧」); preset dropdowns are
+    #      FAMILY-FILTERED ──
+    _nodes = sorted(qfn.NODE_CLASS_MAPPINGS)
+    check("the Wan loader and the cloud-TE node are not registered",
+          not any("Wan" in k or "CloudTE" in k for k in _nodes)
+          and {"QuantFuncLTXLoader", "QuantFuncH3Loader", "QuantFuncKrea2Loader", "QuantFuncQwenImage21Loader",
+               "QuantFuncNativeLoRA"} <= set(_nodes), f"-> {_nodes}")
     ltx_cfgs = LtxL.INPUT_TYPES()["required"]["model_config"][0]
     check("ltx model_config lists ONLY ltx2 presets",
-          "fx-ltx" in ltx_cfgs and "wan2.2-a14b-t2v" not in ltx_cfgs, f"-> {ltx_cfgs}")
+          "fx-ltx" in ltx_cfgs and "krea2-turbo-int4" not in ltx_cfgs, f"-> {ltx_cfgs}")
     h3_cfgs = H3L.INPUT_TYPES()["required"]["model_config"][0]
     check("h3 model_config lists ONLY minimax-h3 presets",
-          "fx-h3" in h3_cfgs and "wan2.2-a14b-t2v" not in h3_cfgs, f"-> {h3_cfgs}")
-    t1 = it["required"]["transformer1"][0]
-    check("transformer1 lists .safetensors FILES (and only those)",
-          "fx-t2v-4steps-high-quantfunc-int4.safetensors" in t1 and "not-a-model.txt" not in t1)
+          "fx-h3" in h3_cfgs and "krea2-turbo-int4" not in h3_cfgs, f"-> {h3_cfgs}")
+    t1 = KreaL.INPUT_TYPES()["required"]["transformer"][0]
+    check("transformer lists .safetensors FILES (and only those)",
+          "fx-krea2-turbo-quantfunc-int4.safetensors" in t1 and "not-a-model.txt" not in t1)
 
     # ── 2) dispatch: family-node guard + ltx2/minimax-h3 FILE-MODE staging (wired now —
     #      the old not-wired refusal arms flipped into layout-shape arms);
@@ -603,9 +588,6 @@ def main():
     _ltx_mod._load_ltx_video_connector = lambda *_args, **_kwargs: qfn.qfmp.torch.nn.Identity()
     try:
         _device_cases = (
-            ("wan", lambda: WanL.load(
-                "fx-t2v-4steps-high-quantfunc-int4.safetensors",
-                "fx-t2v-4steps-low-quantfunc-int4.safetensors", "wan2.2-a14b-t2v")[0]),
             ("h3", lambda: H3L.load(
                 "fx-minimax-h3-quantfunc-int4.safetensors", "minimax-h3-fl2va")[0]),
             ("krea2", lambda: KreaL.load(
@@ -798,118 +780,54 @@ def main():
           and not os.path.exists(os.path.join(_hmd, "transformer_2")))
     # a preset whose manifest family does not match the NODE's family → the defense-in-depth guard
     try:
-        WanL.load("fx-t2v-4steps-high-quantfunc-int4.safetensors",
-                  "fx-t2v-4steps-low-quantfunc-int4.safetensors", "fx-ltx")
-        check("cross-family preset on the wan node refused", False, "-> no exception")
+        KreaL.load("fx-krea2-turbo-quantfunc-int4.safetensors", "fx-ltx")
+        check("cross-family preset on the Krea-2 node refused", False, "-> no exception")
     except RuntimeError as e:
-        check("cross-family preset on the wan node refused", "declares family" in str(e))
+        check("cross-family preset on the Krea-2 node refused", "declares family" in str(e))
     try:
-        LtxL.load("fx-t2v-4steps-high-quantfunc-int4.safetensors", "fx-alien")
+        LtxL.load("fx-ltx-2.5-quantfunc-4bit.safetensors", "fx-alien")
         check("unknown-family preset refused (family guard)", False, "-> no exception")
     except RuntimeError as e:
         check("unknown-family preset refused (family guard)", "declares family" in str(e))
-    for evil_cfg in ("../wan2.2-a14b-t2v", "a/b", "..", ""):
+    for evil_cfg in ("../krea2-turbo-int4", "a/b", "..", ""):
         try:
-            WanL.load("fx-t2v-4steps-high-quantfunc-int4.safetensors",
-                      "fx-t2v-4steps-low-quantfunc-int4.safetensors", evil_cfg)
+            KreaL.load("fx-krea2-turbo-quantfunc-int4.safetensors", evil_cfg)
             check(f"model_config refuses {evil_cfg!r}", False, "-> loaded!")
         except RuntimeError:
             check(f"model_config refuses {evil_cfg!r}", True)
-    # manifest-driven SHAPE mismatches
+    # ── 3) single-expert staging + denoise_only create cfg + the shared ledger / D3 arms (Krea-2; the Wan dual
+    #      loader these arms used to ride left the release — user scope 2026-09-24) ──
     try:
-        WanL.load("fx-t2v-4steps-high-quantfunc-int4.safetensors",
-                  "fx-t2v-4steps-low-quantfunc-int4.safetensors", "fx-single")
-        check("single-expert preset + transformer2 refused", False, "-> no exception")
-    except RuntimeError as e:
-        check("single-expert preset + transformer2 refused", "single-transformer" in str(e))
-
-    # ── 3) wan dual-expert staging + denoise_only create cfg + DUAL MODEL outputs ──
-    try:
-        pair = WanL.load("fx-t2v-4steps-high-quantfunc-int4.safetensors",
-                         "fx-t2v-4steps-low-quantfunc-int4.safetensors", "wan2.2-a14b-t2v")
-        check("wan loader returns a (high, low) pair", isinstance(pair, tuple) and len(pair) == 2)
-        out, low = pair
-        check("both outputs are QFModelPatcher",
-              type(out).__name__ == "QFModelPatcher" and type(low).__name__ == "QFModelPatcher")
-        check("both outputs SHARE one engine object", low.model._qf is out.model._qf)
-        check("low output is the SHADOW (flag on the MODEL, survives clones)",
-              getattr(low.model, "_qf_shadow", False) is True
-              and not getattr(out.model, "_qf_shadow", False))
+        with open(os.path.join(dm, "st-krea2-turbo-quantfunc-int4.safetensors"), "wb") as fh:
+            fh.write(b"\0" * 16)
+        out = KreaL.load("st-krea2-turbo-quantfunc-int4.safetensors", "krea2-turbo-int4")[0]
+        check("krea2 loader returns one QFModelPatcher", type(out).__name__ == "QFModelPatcher")
         _module_size = qfn.qfmp.comfy.model_management.module_size
         n0 = len(creates)
-        check("both logical outputs use the ordinary Torch ledger; native bytes stay on dependencies",
-              low.model_size() == _module_size(low.model)
-              and out.model_size() == _module_size(out.model)
-              and low.loaded_size() == low.model.model_loaded_weight_memory
+        check("the logical output uses the ordinary Torch ledger; native bytes stay on dependencies",
+              out.model_size() == _module_size(out.model)
               and out.loaded_size() == out.model.model_loaded_weight_memory
-              and len(creates) == n0,
-              f"-> low={low.model_size()} out={out.model_size()}")
-        check("shadow reports 0 host RAM (primary owns the backup line)",
-              low.loaded_ram_size() == 0)
+              and len(creates) == n0, f"-> model_size={out.model_size()}")
         _ = out.model._qf.lib          # first touch materializes
         check("create deferred until first touch", len(creates) == n0 + 1)
         md = out.model._qf._ckey[0]
         cfg = creates[-1]
-        check("create cfg carries denoise_only", cfg.get("denoise_only") is True, f"-> {cfg}")
-        check("staged dir is config-complete",
+        check("create cfg carries denoise_only and no LoRA", cfg.get("denoise_only") is True and "lora" not in cfg,
+              f"-> {cfg}")
+        check("staged dir is config-complete and single-expert",
               all(os.path.isfile(os.path.join(md, p)) for p in
-                  ("model_index.json", "transformer/config.json", "transformer_2/config.json",
-                   "vae/config.json")))
+                  ("model_index.json", "transformer/config.json", "vae/config.json"))
+              and not os.path.exists(os.path.join(md, "transformer_2")))
         r1 = os.path.realpath(os.path.join(md, "transformer", "model.safetensors"))
-        r2 = os.path.realpath(os.path.join(md, "transformer_2", "model.safetensors"))
-        check("expert weight links resolve to the PICKED files",
-              r1.endswith("fx-t2v-4steps-high-quantfunc-int4.safetensors") and r2.endswith("fx-t2v-4steps-low-quantfunc-int4.safetensors"))
-        mi = json.load(open(os.path.join(md, "model_index.json")))
-        check("staged model_index is dual-expert (boundary_ratio>0)",
-              float(mi.get("boundary_ratio", 0)) > 0)
-        vae = json.load(open(os.path.join(md, "vae", "config.json")))
-        check("staged vae config carries the A14B wan2.1 scales (8 spatial / 4 temporal)",
-              vae.get("scale_factor_spatial") == 8 and vae.get("scale_factor_temporal") == 4)
-        # R8 POSITIVE arm — the pair-mate exemption must GRANT, not just the shadow short-circuit:
-        # with the SHADOW STILL ALIVE, the primary's host-RAM release succeeds (same lazy-wrapper
-        # identity => coherent re-create), and the shared engine self-heals on next use.
-        out.detach(unpatch_all=False)       # engine holds its CPU backup now (already materialized)
-        held_pair = out.loaded_ram_size()
-        check("primary reports the backup while the shadow lives", held_pair > 0,
-              f"-> {held_pair}")
-        freed_pair = out.partially_unload_ram(10 ** 12)
-        check("pair-mate exemption GRANTS the primary's release (shadow alive)",
-              freed_pair == held_pair, f"-> freed {freed_pair} vs held {held_pair}")
-        check("released pair engine self-heals on next use",
-              out.model._qf.ensure().pipeline is not None and low.model._qf is out.model._qf)
-        # ZERO-LATENT GUARD arm (user black-video class): _apply_model on an ALL-ZERO latent must
-        # refuse LOUD (naming add_noise) BEFORE any engine call; a noised latent must get PAST the
-        # guard (it then fails at _begin on the fixture's fake lib — proving the guard is the ONLY
-        # thing that fired for zeros, and that it does NOT fire for nonzero input).
-        import torch as _t
-        _sig = _t.tensor([1.0])
-        _topts = {"sample_sigmas": _t.tensor([1.0, 0.5, 0.0])}
-        _zero = _t.zeros(1, 16, 3, 8, 8)
-        _ctx = _t.zeros(1, 8, 4096)   # cond content is irrelevant to this guard
-        try:
-            out.model._apply_model(_zero, _sig, c_crossattn=_ctx, transformer_options=_topts)
-            check("zero-latent guard fires (black-video class)", False, "-> no exception")
-        except RuntimeError as e:
-            check("zero-latent guard fires (black-video class)",
-                  "ALL ZEROS" in str(e) and "add_noise" in str(e), f"-> {str(e)[:80]}")
-        try:
-            out.model._apply_model(_t.randn(1, 16, 3, 8, 8), _sig, c_crossattn=_ctx,
-                                   transformer_options=_topts)
-            check("noised latent passes the guard (reaches _begin)", False, "-> no exception??")
-        except Exception as e:  # noqa: BLE001 — ANY non-guard failure proves it got PAST the
-            # guard (on the fixture the fake lib then fails inside _begin, e.g. AttributeError);
-            # only the guard's own message would mean the guard misfired on nonzero input.
-            check("noised latent passes the guard (reaches _begin)",
-                  "ALL ZEROS" not in str(e), f"-> {type(e).__name__}: {str(e)[:60]}")
+        check("the weight link resolves to the PICKED file", r1.endswith("st-krea2-turbo-quantfunc-int4.safetensors"))
 
-        # N3: the guard is ONE mechanism, N users — wan is exercised through _apply_model above;
-        # LTX2/H3 file-mode is not wired (build() refuses) so their models can't be instantiated
-        # here, but their EXACT call is behavior-tested via the shared helper per family tag, AND
-        # the call-before-engine wiring is asserted structurally for all three modules.
+        # ZERO-LATENT GUARD (user black-video class): ONE shared mechanism, N users — behavior-tested through the
+        # shared helper per family tag, and its call-before-engine wiring asserted structurally for every family
+        # module that calls it (the image families Krea-2 / QI-2.1 do not).
         import torch as _t2, re as _re2
         _zero5 = _t2.zeros(1, 16, 3, 8, 8)
         _noise5 = _t2.randn(1, 16, 3, 8, 8)
-        for _tag in ("LTX", "LTX-AV", "H3", "wan"):
+        for _tag in ("LTX", "LTX-AV", "H3"):
             try:
                 qfn.qfmp.refuse_all_zero_initial_latent(_zero5, _tag)
                 check(f"shared guard fires for {_tag}", False, "-> no exception")
@@ -923,8 +841,7 @@ def main():
                 check(f"shared guard passes a noised latent for {_tag}", False, f"-> {_e!r}")
         # structural: each family module calls the guard BEFORE it opens the session (self._begin).
         import os as _os
-        for _mod, _tags in (("qf_wan_modelpatcher.py", 1), ("qf_ltx_modelpatcher.py", 2),
-                            ("qf_h3_modelpatcher.py", 1)):
+        for _mod, _tags in (("qf_ltx_modelpatcher.py", 2), ("qf_h3_modelpatcher.py", 1)):
             _src = open(_os.path.join(_PLUGIN, _mod)).read()
             _n_guard = _src.count("refuse_all_zero_initial_latent(")
             # every guard call must be followed (in source) by a self._begin( before the next guard
@@ -936,155 +853,52 @@ def main():
             check(f"{_mod}: {_tags} guard call(s), each before self._begin", _ok,
                   f"-> found {_n_guard}")
     except Exception as e:  # noqa: BLE001
-        check("wan dual-expert staging", False, f"-> raised {type(e).__name__}: {e}")
+        check("single-expert staging", False, f"-> raised {type(e).__name__}: {e}")
 
     # a NON-conforming file name for the preset must be refused loud (file_hints mechanism)
     try:
-        WanL.load("other.safetensors", "fx-t2v-4steps-low-quantfunc-int4.safetensors",
-                  "wan2.2-a14b-t2v")
-        check("file_hints refuses a non-conforming transformer1", False, "-> loaded!")
+        KreaL.load("other.safetensors", "krea2-turbo-int4")
+        check("file_hints refuses a non-conforming transformer", False, "-> loaded!")
     except RuntimeError as e:
-        check("file_hints refuses a non-conforming transformer1",
-              "does not look like" in str(e))
+        check("file_hints refuses a non-conforming transformer", "does not look like" in str(e))
 
-    # wan without a low expert must refuse (A14B is dual-expert; "" maps to the none-sentinel)
-    try:
-        WanL.load("fx-t2v-4steps-high-quantfunc-int4.safetensors", "", "wan2.2-a14b-t2v")
-        check("wan single-file refused (dual-expert required)", False, "-> no exception")
-    except RuntimeError as e:
-        check("wan single-file refused (dual-expert required)", "DUAL-expert" in str(e))
-
-    # CROSS-task discrimination: the i2v preset must REFUSE a t2v file (and the t2v preset an
-    # i2v-named file) — file_hints are the only guard between the two same-family presets.
-    for f in ("fx-i2v-4steps-high-quantfunc-int4.safetensors",
-              "fx-i2v-4steps-low-quantfunc-int4.safetensors"):
-        with open(os.path.join(dm, f), "wb") as fh:
-            fh.write(b"\0" * 16)
-    try:
-        WanL.load("fx-t2v-4steps-high-quantfunc-int4.safetensors",
-                  "fx-i2v-4steps-low-quantfunc-int4.safetensors", "wan2.2-a14b-i2v")
-        check("i2v preset refuses a t2v transformer1", False, "-> loaded!")
-    except RuntimeError as e:
-        check("i2v preset refuses a t2v transformer1", "does not look like" in str(e))
-    try:
-        WanL.load("fx-i2v-4steps-high-quantfunc-int4.safetensors",
-                  "fx-t2v-4steps-low-quantfunc-int4.safetensors", "wan2.2-a14b-t2v")
-        check("t2v preset refuses an i2v transformer1", False, "-> loaded!")
-    except RuntimeError as e:
-        check("t2v preset refuses an i2v transformer1", "does not look like" in str(e))
-    pair_i2v = WanL.load("fx-i2v-4steps-high-quantfunc-int4.safetensors",
-                         "fx-i2v-4steps-low-quantfunc-int4.safetensors",
-                         "wan2.2-a14b-i2v")
-    check("i2v preset loads a conforming pair (dual outputs)",
-          isinstance(pair_i2v, tuple) and len(pair_i2v) == 2)
-    mi_i2v = json.load(open(os.path.join(cfgroot, "wan2.2-a14b-i2v", "model_index.json")))
-    check("i2v preset carries the official boundary 0.9",
-          abs(float(mi_i2v.get("boundary_ratio", 0)) - 0.9) < 1e-6)
-    # i2v COND FLOW arm (the E2E-caught wiring gap, both ways): with the stub's shape carrier
-    # armed from the STAGED config, comfy's stock concat machinery must build the [mask|image]
-    # tail (20ch) for the i2v package — and must build NOTHING for a t2v package (in==16).
-    import torch as _t3
-    _kw = dict(noise=_t3.zeros(1, 16, 3, 8, 8), device="cpu",
-               concat_latent_image=_t3.randn(1, 16, 3, 8, 8),
-               concat_mask=_t3.cat([_t3.zeros(1, 1, 1, 8, 8), _t3.ones(1, 1, 2, 8, 8)], dim=2),
-               cross_attn=_t3.randn(1, 8, 4096))
-    _oc = pair_i2v[0].model.extra_conds(**_kw)
-    check("i2v package: extra_conds emits c_concat", "c_concat" in _oc, f"-> {sorted(_oc)}")
-    if "c_concat" in _oc:
-        _cc = _oc["c_concat"].cond
-        check("i2v tail is [mask|image] = 20 channels", int(_cc.shape[1]) == 20,
-              f"-> {tuple(_cc.shape)}")
-        # comfy inverts the mask (1-mask): our concat_mask frame0=0 -> tail mask frame0=1
-        check("i2v tail mask frame0==1 (engine frame0-known semantics)",
-              float(_cc[0, 0, 0].mean()) == 1.0 and float(_cc[0, 0, 1].mean()) == 0.0)
-    _ot = out.model.extra_conds(**_kw)
-    check("t2v package: NO c_concat (in==16, extra_channels 0)", "c_concat" not in _ot,
-          f"-> {sorted(_ot)}")
-    # inter-stage thrash fix (D3/D4-hardened): comfy's eviction decisions call
-    # memory_required THROUGH sampler_helpers.estimate_memory — `memory_required(shape,
-    # cond_shapes=cond_shapes)` (KEYWORD). D4: the old positional-only override TypeError'd
-    # on every real KSampler run while the old positional-only arm stayed green — so this
-    # arm now (a) calls EXACTLY like the real call site, (b) asserts signature
-    # compatibility against comfy's own BaseModel.memory_required so future comfy drift
-    # goes red here, (c) asserts the D3 honesty properties: geometry-proportional,
-    # monotonic, and far below the torch-WAN activation estimate that caused the eviction
-    # thrash.
+    # memory_required (D3/D4): comfy's eviction decisions call it THROUGH sampler_helpers.estimate_memory —
+    # `memory_required(shape, cond_shapes=cond_shapes)` (KEYWORD). This arm (a) calls EXACTLY like the real call
+    # site, (b) asserts signature compatibility against comfy's own BaseModel.memory_required so future comfy drift
+    # goes red here, (c) asserts the D3 honesty properties: geometry-proportional, monotonic, and nowhere near a
+    # torch activation estimate (the inter-stage eviction thrash). Krea-2 rides comfy's [B,C,T=1,H,W] latent.
     import inspect as _insp
     from comfy.model_base import BaseModel as _CB
     _base_params = [q for q in _insp.signature(_CB.memory_required).parameters
                     if q != "self"]
     _ours = _insp.signature(type(out.model).memory_required)
     try:
-        _ours.bind(out.model, [1, 16, 21, 80, 80],
+        _ours.bind(out.model, [1, 16, 1, 128, 128],
                    **{q: {} for q in _base_params[1:]})
         _sig_ok = True
     except TypeError:
         _sig_ok = False
     check("memory_required signature accepts every BaseModel caller form (D4)", _sig_ok,
           f"-> base params {_base_params} vs ours {list(_ours.parameters)}")
-    _shape = [2, 16, 21, 80, 80]      # sampler_helpers doubles batch for cfg
-    _conds = {"c_crossattn": [[1, 512, 4096]], "c_concat": [[1, 20, 21, 80, 80]]}
+    _shape = [2, 16, 1, 128, 128]      # sampler_helpers doubles batch for cfg
+    _conds = {"c_crossattn": [[1, 512, 30720]]}
     _mr = out.model.memory_required(_shape, cond_shapes=_conds)   # the REAL call form
-    _mr_small = out.model.memory_required([1, 16, 3, 8, 8], cond_shapes={})
-    _mr_big = out.model.memory_required([2, 16, 21, 192, 192], cond_shapes=_conds)
+    _mr_small = out.model.memory_required([1, 16, 1, 8, 8], cond_shapes={})
+    _mr_big = out.model.memory_required([2, 16, 1, 256, 256], cond_shapes=_conds)
     check("memory_required geometry-proportional + monotonic (D3)",
           _mr_small < _mr < _mr_big, f"-> {_mr_small} < {_mr} < {_mr_big}")
-    check("memory_required stays far below the torch-WAN estimate (thrash fix preserved)",
+    check("memory_required stays far below a torch activation estimate (thrash fix preserved)",
           _mr <= 1 << 30, f"-> {_mr}")
 
-    # ── B1 (CR-2b): the OLD-.so compat qfa pin is SM-GATED — NEVER on the SM80 fault tier ──
-    # The engine's qfa forward THROWS on SM80 (kQfaForwardFaultsOnSm) even for explicit
-    # requests, so an unconditional plugin pin turned A100/A800 from runs-with-collapse-risk
-    # into first-attention hard crash. The gate lives in _wan_device_sm() + the (86, 89) span;
-    # these arms pin BOTH directions by rebuilding with the SM query monkeypatched.
-    _wan_mod = sys.modules[type(out.model).__module__]
-    _orig_sm = _wan_mod._wan_device_sm
-    try:
-        for _sm_val, _want_pin, _why in ((89, True,  "sm89: consumable tier -> pin qfa"),
-                                         (86, True,  "sm86: consumable tier -> pin qfa"),
-                                         (80, False, "sm80: engine qfa-fwd FAULT tier -> NO pin (AUTO)"),
-                                         (75, False, "sm75: outside compat-pin span -> NO pin"),
-                                         (0,  False, "no CUDA -> NO pin (fail-safe AUTO)")):
-            _wan_mod._wan_device_sm = (lambda v: (lambda _device=None: v))(_sm_val)
-            _pair = WanL.load("fx-t2v-4steps-high-quantfunc-int4.safetensors",
-                              "fx-t2v-4steps-low-quantfunc-int4.safetensors", "wan2.2-a14b-t2v")
-            _p = _pair[0]
-            _n0 = len(creates)
-            _ = _p.model._qf.lib          # touch -> create (or cache-hit on an identical cfg)
-            if len(creates) > _n0:
-                _cfg = creates[-1]
-            else:
-                # cache-hit: cfg identical to an earlier create — decode it from the cache
-                # key. cfg-json is the LAST element of BOTH the real _get_engine ckey (5-tuple)
-                # and the suite's fake ckey (3-tuple), so [-1] is shape-agnostic.
-                _cfg = json.loads(_p.model._qf._ckey[-1])
-            check("B1 " + _why,
-                  (_cfg.get("attention_backend") == "qfa") if _want_pin
-                  else ("attention_backend" not in _cfg),
-                  f"-> cfg={_cfg}")
-    finally:
-        _wan_mod._wan_device_sm = _orig_sm
-
-    # single-expert staging shape (direct helper call — no single-expert family is wired yet,
-    # but the helper's contract must already hold for the one that will be)
-    try:
-        stage = qfn.qfmp.stage_denoise_only_package(
-            os.path.join(_PLUGIN, "configs", "wan2.2-a14b-t2v"),
-            os.path.join(dm, "other.safetensors"), None)
-        check("single-expert staging PRUNES transformer_2",
-              not os.path.exists(os.path.join(stage, "transformer_2")))
-    except Exception as e:  # noqa: BLE001
-        check("single-expert staging", False, f"-> raised {type(e).__name__}: {e}")
-
     # ── 4) containment: traversal/absolute names cannot escape the model roots ──
-    for evil in ("../../../../etc/passwd", "/etc/passwd", "fx-t2v-4steps-high-quantfunc-int4.safetensors/../../x"):
+    for evil in ("../../../../etc/passwd", "/etc/passwd", "fx-krea2-turbo-quantfunc-int4.safetensors/../../x"):
         try:
             qfn._resolve_transformer(evil)
             check(f"containment refuses {evil!r}", False, "-> resolved!")
         except Exception:  # noqa: BLE001 — comfy raises its own error type
             check(f"containment refuses {evil!r}", True)
     try:
-        ok = qfn._resolve_transformer("fx-t2v-4steps-high-quantfunc-int4.safetensors") == os.path.join(dm, "fx-t2v-4steps-high-quantfunc-int4.safetensors")
+        ok = qfn._resolve_transformer("fx-krea2-turbo-quantfunc-int4.safetensors") == os.path.join(dm, "fx-krea2-turbo-quantfunc-int4.safetensors")
         check("containment still resolves a legit file", ok)
     except Exception as e:  # noqa: BLE001
         check("containment still resolves a legit file", False, f"-> {e!r}")
@@ -1096,105 +910,33 @@ def main():
         from comfy_extras.nodes_model_advanced import ModelSamplingSD3
         lora_dir = os.path.join(tmp, "loras")
         os.makedirs(lora_dir, exist_ok=True)
+        import struct as _lst
+        _lh = json.dumps({"blocks.0.attn.to_q.lora_A.weight":
+                          {"dtype": "F16", "shape": [1, 1], "data_offsets": [0, 2]}}).encode()
         for f in ("a.safetensors", "b.safetensors"):
-            open(os.path.join(lora_dir, f), "wb").write(b"\0" * 16)
+            open(os.path.join(lora_dir, f), "wb").write(_lst.pack("<Q", len(_lh)) + _lh + b"\0\0")
         qfn._lora_choices = lambda: ["a.safetensors", "b.safetensors"]
         qfn._resolve_lora = lambda n: os.path.join(lora_dir, n)
         LoraNode = qfn.NODE_CLASS_MAPPINGS["QuantFuncNativeLoRA"]()
 
-        base, base_low = WanL.load("fx-t2v-4steps-high-quantfunc-int4.safetensors",
-                                   "fx-t2v-4steps-low-quantfunc-int4.safetensors",
-                                   "wan2.2-a14b-t2v")
-        shifted = ModelSamplingSD3().patch(base, 11.0)[0]     # upstream comfy patch on the pair's high
-        check("comfy patches still apply to the dual outputs (clone path intact)",
+        base = KreaL.load("fx-krea2-turbo-quantfunc-int4.safetensors", "krea2-turbo-int4")[0]
+        shifted = ModelSamplingSD3().patch(base, 3.0)[0]     # upstream comfy patch on the loader output
+        check("comfy patches still apply to a QuantFunc output (clone path intact)",
               "model_sampling" in shifted.object_patches)
-        # [wiring-lora] v2 (retires the v1 refusal): chaining on the dual outputs WORKS with the
-        # target derived from the WIRE (no widget), over ONE shared engine object.
         from qfn_test_pkg import qf_modelpatcher as _qmp2
-        outH = LoraNode.apply(shifted, "a.safetensors", 0.8)[0]
-        stH = _qmp2.lora_stack_of(outH)
-        check("LoRA on the HIGH wire derives target=high (no widget)",
-              len(stH) == 1 and stH[0]["target"] == "high" and stH[0]["scale"] == 0.8,
-              f"-> {stH}")
-        check("high-wire rebuild keeps the upstream comfy patch (adopt)",
-              "model_sampling" in outH.object_patches)
-        outL = LoraNode.apply(base_low, "b.safetensors", 0.5)[0]
-        stL = _qmp2.lora_stack_of(outL)
-        check("LoRA on the LOW wire derives target=low",
-              len(stL) == 1 and stL[0]["target"] == "low", f"-> {stL}")
-        engH, engL = outH.model._qf, outL.model._qf
-        check("both wires share ONE engine object (no fork), union holds both sides",
-              engH is engL and engH is base.model._qf
-              and [e["target"] for e in engH.lora_union()] == ["high", "low"],
-              f"-> same={engH is engL} union={engH.lora_union()}")
-        outH2 = LoraNode.apply(outH, "b.safetensors", 0.3)[0]
-        stH2 = _qmp2.lora_stack_of(outH2)
-        check("second node on the same wire accumulates FUNCTIONALLY (no loader-cache mutation)",
-              [(e["target"], e["scale"]) for e in stH2] == [("high", 0.8), ("high", 0.3)]
-              and [e["target"] for e in engH.lora_union()] == ["high", "high", "low"]
-              and _qmp2.lora_stack_of(base) == [],
-              f"-> wire={stH2} union={engH.lora_union()} loader_stack={_qmp2.lora_stack_of(base)}")
-        # DEAD-AUTHOR convergence (reviewer-C death rule): a registry side must never outlive
-        # the node that authored it. Simulate "user deleted the LoRA nodes and rewired the
-        # sampler to the RAW loader outputs": the raw models' run-start assert resets their
-        # sides. Both directions: re-asserting the rebuilt wire restores it.
-        base.model._assert_wire_lora()            # raw HIGH wire => high side reset to []
-        _u1 = [e["target"] for e in engH.lora_union()]
-        base_low.model._assert_wire_lora()        # raw LOW wire => low side reset too
-        _u2 = [e["target"] for e in engH.lora_union()]
-        outH2.model._assert_wire_lora()           # rebuilt wire re-asserts its stack
-        _u3 = [e["target"] for e in engH.lora_union()]
-        check("registry side never outlives its author node (raw assert resets; both ways)",
-              _u1 == ["low"] and _u2 == [] and _u3 == ["high", "high"],
-              f"-> after-raw-high={_u1} after-raw-low={_u2} re-asserted={_u3}")
-        # RECONCILE unit, both ways: a materialized engine retires ONLY on a union change —
-        # and the retire fires from inside ensure() itself (the chokepoint; no per-family
-        # begin hook exists to forget).
-        _drops = []
-
-        class _FakeReal(_ContractEngine):
-            """A materialized handle that honours the prepared-resource contract: the host-vram QFLazyEngine.ensure()
-            resolves EVERY factory through prepare_resource(), which refuses a bare object without a retained
-            native resource ("lacks the common prepared-resource contract")."""
-            def __init__(self):
-                super().__init__(_DummyPrepared().resource)
-        _le = _qmp2.QFLazyEngine(lambda: (_FakeReal(), "new-ck"),
-                                 retire=lambda _ck, _e, _req=None, **_kw: _drops.append(_ck) or True)
-        _le.set_lora_side("high", [{"path": "x", "scale": 1.0, "target": "high"}])
-        _le._real, _le._ckey = _FakeReal(), "old-ck"
-        _le._created_lora_sig = _le._lora_sig()
-        _same = _le.reconcile_lora()          # unchanged union -> no retire
-        _le.set_lora_side("low", [{"path": "y", "scale": 1.0, "target": "low"}])
-        _r2 = _le.ensure()                    # ensure() itself must drift-retire + re-create
-        check("ensure() drift-retires ONLY on a union change (both ways) + re-creates",
-              _same is False and _drops == ["old-ck"] and _le._ckey == "new-ck"
-              and _r2 is not None and _le._created_lora_sig == _le._lora_sig(),
-              f"-> same={_same} drops={_drops} ckey={_le._ckey}")
-        # MID-SESSION drift must refuse LOUD (never retarget under a running generation) —
-        # both ways: same union with an open session passes silently.
-        _le._real.current_session = object()
-        _mid_ok = True
-        try:
-            _le.reconcile_lora()              # sig == created sig -> no-op even mid-session
-        except RuntimeError:
-            _mid_ok = False
-        _le.set_lora_side("high", [])         # drift while session open
-        _mid_raised = False
-        try:
-            _le.reconcile_lora()
-        except RuntimeError as _e:
-            _mid_raised = "MID-GENERATION" in str(_e)
-        check("mid-session drift refuses LOUD (both ways)", _mid_ok and _mid_raised,
-              f"-> same-sig-ok={_mid_ok} drift-raised={_mid_raised}")
-        # set_lora_side without retire must refuse LOUD (half-adoption leak guard):
-        _naked = _qmp2.QFLazyEngine(lambda: (None, None))
-        try:
-            _naked.set_lora_side("high", [])
-            check("set_lora_side refuses without retire (half-adoption guard)", False,
-                  "-> accepted!")
-        except RuntimeError as _e:
-            check("set_lora_side refuses without retire (half-adoption guard)",
-                  "retire" in str(_e), f"-> {_e}")
+        outA = LoraNode.apply(shifted, "a.safetensors", 0.8)[0]
+        stA = _qmp2.lora_stack_of(outA)
+        check("a LoRA node stacks target=all with its strength (no target widget)",
+              len(stA) == 1 and stA[0]["target"] == "all" and stA[0]["scale"] == 0.8, f"-> {stA}")
+        check("a LoRA rebuild keeps the upstream comfy patch (adopt)",
+              "model_sampling" in outA.object_patches)
+        outAB = LoraNode.apply(outA, "b.safetensors", 0.3)[0]
+        stAB = _qmp2.lora_stack_of(outAB)
+        check("a second node accumulates FUNCTIONALLY (no loader-cache mutation)",
+              [(os.path.basename(e["path"]), e["scale"]) for e in stAB] == [("a.safetensors", 0.8), ("b.safetensors", 0.3)]
+              and outAB.model._qf.lora_union() == stAB and _qmp2.lora_stack_of(base) == []
+              and base.model._qf.lora_union() == [],
+              f"-> wire={stAB} loader_stack={_qmp2.lora_stack_of(base)}")
         # identity-gated retire: a FOREIGN live consumer on the same ckey must SKIP the destroy.
         class _W:                       # two distinct wrapper identities
             pass
@@ -1301,7 +1043,7 @@ def main():
         check("create guard refuses a session knob in the STRING (JSON) form too",
               _sr and _sok, f"-> str-with-key raised={_sr} str-clean passed={_sok}")
     except Exception as e:  # noqa: BLE001
-        check("wiring-derived dual LoRA arm", False, f"-> raised {type(e).__name__}: {e}")
+        check("LoRA chain + substrate arm", False, f"-> raised {type(e).__name__}: {e}")
 
     # ── 5b) RUNTIME LoRA on a single-expert family (user rule 2026-09-24 「换 LoRA 也不重建」) ──
     # The create carries the weights only, so every LoRA set of one model shares ONE pipeline, and each consumer's
@@ -1381,11 +1123,6 @@ def main():
         check("runtime LoRA: a set change mid-generation refuses LOUD, the same set passes (both ways)",
               _same_ok and "still running" in _mid and len(_rt_updates) == _n0,
               f"-> same-ok={_same_ok} mid={_mid!r} updates-sent={len(_rt_updates) - _n0}")
-        # Wan keeps the create-time union (per-expert targets are create-only in the engine): a set change
-        # there never sends a runtime update.
-        check("runtime LoRA is single-expert only: the Wan engine keeps create-time LoRA",
-              base.model._qf._runtime_lora is False and rt_base.model._qf._runtime_lora is True,
-              f"-> wan={base.model._qf._runtime_lora} krea2={rt_base.model._qf._runtime_lora}")
     except Exception as e:  # noqa: BLE001
         check("runtime LoRA arm", False, f"-> raised {type(e).__name__}: {e}")
     finally:
@@ -1450,11 +1187,8 @@ def main():
 
     # ── 6) HOST-RAM honesty on a DEDICATED file pair (isolated ckey) ──
     try:
-        for f in ("ram-t2v-high-quantfunc-int4.safetensors", "ram-t2v-low-quantfunc-int4.safetensors"):
-            open(os.path.join(dm, f), "wb").write(b"\0" * 16)
-        fresh, fresh_low = WanL.load("ram-t2v-high-quantfunc-int4.safetensors",
-                                     "ram-t2v-low-quantfunc-int4.safetensors",
-                                     "wan2.2-a14b-t2v")
+        open(os.path.join(dm, "ram-krea2-turbo-quantfunc-int4.safetensors"), "wb").write(b"\0" * 16)
+        fresh = KreaL.load("ram-krea2-turbo-quantfunc-int4.safetensors", "krea2-turbo-int4")[0]
         eng = fresh.model._qf
         check("never-created engine reports 0 host RAM", fresh.loaded_ram_size() == 0)
         check("never-created engine frees 0 host RAM", fresh.partially_unload_ram(10 ** 12) == 0)
@@ -1474,29 +1208,26 @@ def main():
     # ── 7) SHARED-handle sibling safety on a DEDICATED pair ──
     try:
         import gc
-        for f in ("sh-t2v-high-quantfunc-int4.safetensors", "sh-t2v-low-quantfunc-int4.safetensors"):
-            open(os.path.join(dm, f), "wb").write(b"\0" * 16)
-        pa, pa_low = WanL.load("sh-t2v-high-quantfunc-int4.safetensors",
-                               "sh-t2v-low-quantfunc-int4.safetensors", "wan2.2-a14b-t2v")
-        pb, pb_low = WanL.load("sh-t2v-high-quantfunc-int4.safetensors",
-                               "sh-t2v-low-quantfunc-int4.safetensors", "wan2.2-a14b-t2v")
+        open(os.path.join(dm, "sh-krea2-turbo-quantfunc-int4.safetensors"), "wb").write(b"\0" * 16)
+        pa = KreaL.load("sh-krea2-turbo-quantfunc-int4.safetensors", "krea2-turbo-int4")[0]
+        pb = KreaL.load("sh-krea2-turbo-quantfunc-int4.safetensors", "krea2-turbo-int4")[0]
         ra = pa.model._qf.ensure()
         rb = pb.model._qf.ensure()
-        check("two loads of one file-pair share the real handle", ra is rb)
+        check("two loads of one file share the real handle", ra is rb)
         pa.detach(unpatch_all=False)
         check("sibling-shared release REFUSES (freed 0, sibling alive)",
               pa.partially_unload_ram(10 ** 12) == 0)
         check("sibling's pipeline SURVIVES the refused release",
               pb.model._qf.pipeline is not None)
         check("sibling still honestly reports its backup", pb.loaded_ram_size() > 0)
-        del pb, pb_low, rb
+        del pb, rb
         gc.collect()
         freed = pa.partially_unload_ram(10 ** 12)
         check("sole-consumer release DOES free once the sibling is gone", freed > 0, f"-> {freed}")
         check("released wrapper reports 0 afterwards", pa.loaded_ram_size() == 0)
         check("released wrapper self-heals on next use",
               pa.model._qf.ensure().pipeline is not None)
-        del pa, pa_low, ra
+        del pa, ra
         gc.collect()
     except Exception as e:  # noqa: BLE001
         check("shared-handle sibling safety", False, f"-> raised {type(e).__name__}: {e}")
