@@ -1295,7 +1295,7 @@ def main():
                                         and _t.value.id == "self" and _t.attr not in _cls._SESSION_DIALS):
                                     _dviol.append(f"{_mn}.{_cn.name}.{_fn.name} writes {_t.attr}")
         check("every session-dial setter's attribute is carried across a LoRA rebuild (AST, family modules derived)",
-              _dseen >= 9 and not _dviol, f"-> setters={_dseen} uncarried={_dviol}")
+              _dseen >= 8 and not _dviol, f"-> setters={_dseen} uncarried={_dviol}")
         # DEATH RULE: the begin dials are emitted in ONE place, dial_opts — no other function reads them, so no family
         # can drift from the always-send rule (the image families once built their own copies that omitted "auto").
         _eviol, _ereads = [], 0

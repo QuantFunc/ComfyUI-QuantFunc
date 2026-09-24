@@ -153,10 +153,14 @@ def _mock_self(**attrs):
     return m
 
 
+# extra_conds prints its run-start note through qf_engine.info (the plugin's own log level): a silent stub here.
+_QFE_STUB = types.SimpleNamespace(info=lambda *a, **k: None)
+
+
 # ── tests ─────────────────────────────────────────────────────────────────────────────────────────────────
 def _t_extra_conds(src):
     comfy = _make_comfy()
-    fn, _ = _bind(src, "extra_conds", {"comfy": comfy})
+    fn, _ = _bind(src, "extra_conds", {"comfy": comfy, "qfe": _QFE_STUB})
     keys = _extract_class_attr(src, "QFLTXModel", "_ENGINE_IGNORED_COND_KEYS")
     assert len(keys) >= 7, f"reject-list shrank unexpectedly: {keys}"
     bad = 0
@@ -206,7 +210,7 @@ def _t_max_ctx_seq(src):
     length semantics (the quantity accumulated) are proven against the REAL comfy connector in
     _t_post_connector_seq."""
     comfy = _make_comfy()
-    fn, _ = _bind(src, "extra_conds", {"comfy": comfy})
+    fn, _ = _bind(src, "extra_conds", {"comfy": comfy, "qfe": _QFE_STUB})
     keys = _extract_class_attr(src, "QFLTXModel", "_ENGINE_IGNORED_COND_KEYS")
     _ident = lambda s: int(s)   # identity probe: isolates the max/order/untouched arithmetic  # noqa: E731
     bad = 0
@@ -285,7 +289,7 @@ def _t_post_connector_seq(src):
     # long neg raw=1200 accumulates its POST length 1280; a later short pos must not shrink it. PRE-FIX
     # (raw accumulation) reads 1200 here → FAIL (the able-to-fail direction of this death rule).
     comfy_stub = _make_comfy()
-    efn, _ = _bind(src, "extra_conds", {"comfy": comfy_stub})
+    efn, _ = _bind(src, "extra_conds", {"comfy": comfy_stub, "qfe": _QFE_STUB})
     keys = _extract_class_attr(src, "QFLTXModel", "_ENGINE_IGNORED_COND_KEYS")
     me2 = _mock_self(_qf=_MockEngine(), _ENGINE_IGNORED_COND_KEYS=keys, _max_ctx_seq=0,
                      _connector=build(128), _post_seq_cache={})
