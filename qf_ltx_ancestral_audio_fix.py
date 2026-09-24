@@ -103,8 +103,8 @@ def _log_once(name, how):
                  "silenced. Video is deterministic here (accepted tradeoff).", name, how)
 
 
-def _wrap(orig, name, sig, params):
-    """Wrap ONE re-noising sampler. sig/params are threaded from install() (computed once)."""
+def _wrap(orig, name, sig, params, guard=None):
+    """Wrap ONE re-noising sampler. sig/params/guard are threaded from install() (computed once)."""
     has_eta = "eta" in params
     has_ns = "noise_sampler" in params
     has_churn = "s_churn" in params
@@ -145,16 +145,18 @@ def _wrap(orig, name, sig, params):
         except Exception as e:  # never break sampling - degrade to the original (unfixed) behavior
             _log.warning("[qf_native] LTX-2.5 AV euler-force setup failed for %s (%r); sampler unchanged.", name, e)
             return orig(model, x, sigmas, *args, **kwargs)
-        return target(*call_args, **call_kwargs)  # outside the try - a sampler-internal error propagates normally
+        # outside the try: a sampler-internal error propagates, through the plugin's boundary (install's guard)
+        return (guard(target) if guard else target)(*call_args, **call_kwargs)
 
     return wrapped
 
 
-def install():
+def install(guard=None):
     """Wrap the USER-SELECTABLE re-noising samplers (comfy.samplers.KSampler.SAMPLERS with an
     eta/s_churn/noise_sampler param). Idempotent; transparent for non-QF-AV models; safe no-op if comfy
     isn't importable. Internal `*_RF` delegates are deliberately NOT wrapped (their parent threads the
-    forced eta down positionally)."""
+    forced eta down positionally). `guard` wraps the sampler a QF-AV run calls (the plugin passes its
+    console-safe boundary, qf_engine.console_safe_errors: this module loads without the package)."""
     global _installed, _ORIG_EULER
     if _installed:
         return
@@ -183,7 +185,7 @@ def install():
         except (TypeError, ValueError):
             continue
         if "eta" in params or "s_churn" in params or "noise_sampler" in params:   # re-noising samplers
-            w = _wrap(fn, fn_name, sig, params)
+            w = _wrap(fn, fn_name, sig, params, guard)
             w._qf_av_wrapped = True
             setattr(S, fn_name, w)
             wrapped_names.append(fn_name)

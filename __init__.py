@@ -795,7 +795,8 @@ if _IMPORT_OK:
         ComfyUI's value for a LINKED input (resolved at run time, where _resolve_quality refuses anything else)."""
         if quality is None or isinstance(quality, bool) or quality in _QUALITY_FAST_OPTIONS:
             return True
-        return f"quality must be one of {', '.join(_QUALITY_FAST_OPTIONS)} (got {quality!r})"
+        # ComfyUI logs it (execution.py): console-safe like every plugin line
+        return qfe.console_safe(f"quality must be one of {', '.join(_QUALITY_FAST_OPTIONS)} (got {quality!r})")
 
     def _resolve_quality(quality=None, quality_enhance=None, device_idx=None, family=None):
         """The node's quality → the mode this run uses. An explicit quality wins; the retired switch (a boolean in quality's
@@ -1223,7 +1224,7 @@ if _IMPORT_OK:
 try:
     from . import qf_ltx_ancestral_audio_fix as _qf_ltx_afix
     qfe.logger(_qf_ltx_afix.__name__)   # its warnings: console-safe
-    _qf_ltx_afix.install()
+    _qf_ltx_afix.install(guard=qfe.console_safe_errors)
 except Exception as _qf_ltx_afix_exc:  # noqa: BLE001
     _log.warning("[qf_native] LTX-2.5 AV audio fix not installed: %s", ascii(_qf_ltx_afix_exc))
 

@@ -931,40 +931,54 @@ def console_safe_errors(fn):
         except Exception as exc:
             if console_safe_exception(exc):
                 raise
-            safe = RuntimeError(console_safe(f"{type(exc).__name__}: {exc!r}"))
+            safe = RuntimeError(console_safe("".join(traceback.format_exception_only(type(exc), exc)).strip()))
             safe.qf_console_original = exc
             raise safe.with_traceback(exc.__traceback__) from None
     wrapper.__qf_console_safe__ = True
+    try:   # what a caller introspects stays fn's, for inspect.getfullargspec too (it ignores __wrapped__): ComfyUI
+        wrapper.__signature__ = inspect.signature(fn)   # passes VALIDATE_INPUTS only the inputs it names (execution.py)
+    except (TypeError, ValueError):   # a callable without one: nothing to keep
+        pass
     return wrapper
 
 
 def _console_safe_attr(cls, name):
-    """Wrap one attribute of `cls` with console_safe_errors, keeping a classmethod / staticmethod what it is."""
+    """Wrap one attribute of `cls` with console_safe_errors; a classmethod / staticmethod / property stays one."""
     raw = inspect.getattr_static(cls, name)
     if isinstance(raw, (classmethod, staticmethod)):
         setattr(cls, name, type(raw)(console_safe_errors(raw.__func__)))
+    elif isinstance(raw, property):
+        fns = (f and console_safe_errors(f) for f in (raw.fget, raw.fset, raw.fdel))
+        setattr(cls, name, property(*fns, raw.__doc__))
     elif isinstance(raw, types.FunctionType):
         setattr(cls, name, console_safe_errors(raw))
 
 
 def console_safe_methods(cls):
-    """Class decorator: every method the class defines (dunders aside) runs under console_safe_errors. It goes on every
+    """Class decorator: every method and property the class defines, and its __init__ (ComfyUI constructs model
+    patchers itself: ModelPatcher.clone), runs under console_safe_errors; other dunders are Python's. It goes on every
     class ComfyUI calls into (a comfy base, a plugin subclass of one, the mixins combined with one), so the sampler and
     model-management paths, present and future, pass the same boundary as the nodes (tests/text_encoding_test.py)."""
     for name in list(vars(cls)):
-        if not (name.startswith("__") and name.endswith("__")):
+        if name == "__init__" or not (name.startswith("__") and name.endswith("__")):
             _console_safe_attr(cls, name)
     return cls
 
 
+# What ComfyUI calls on a node class besides its FUNCTION, each when present (execution.py, server.py).
+_NODE_ENTRY_POINTS = ("INPUT_TYPES", "VALIDATE_INPUTS", "IS_CHANGED", "check_lazy_status")
+
+
 def console_safe_nodes(mapping):
-    """Wrap every registered node's FUNCTION with console_safe_errors. __init__ calls it once, after the last
-    NODE_CLASS_MAPPINGS registration, so no node skips it (tests/text_encoding_test.py, the boundary arm)."""
+    """Wrap every registered node's FUNCTION and its other ComfyUI entry points with console_safe_errors. __init__
+    calls it once, after the last NODE_CLASS_MAPPINGS registration, so no node skips it (tests/text_encoding_test.py,
+    the boundary arm)."""
     for cls in mapping.values():
-        name = getattr(cls, "FUNCTION", None)
-        if isinstance(name, str) and hasattr(cls, name):
-            _console_safe_attr(cls, name)
+        for name in (getattr(cls, "FUNCTION", None), *_NODE_ENTRY_POINTS):
+            if isinstance(name, str) and hasattr(cls, name):
+                _console_safe_attr(cls, name)
     return mapping
+
 
 # ── Engine library install (option C, user 2026-09-24 「在原生加载器里实现」「根据自己的显卡型号下载对应so」) ──────────
 # The plugin installs the engine it needs into bin/<platform>/, SHA-256-verified against the release's published

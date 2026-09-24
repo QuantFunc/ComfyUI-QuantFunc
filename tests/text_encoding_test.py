@@ -38,10 +38,15 @@ cannot hold raises UnicodeEncodeError out of the print() / log call, and out of 
               an ENGINE error (last_err) raised through the plugin's real create_pipeline and logged the way
               ComfyUI's execution.py logs it (the message, then the traceback) never raises a second exception;
               an error naming a user path (a Chinese username, chained from the OSError) raised through a node
-              FUNCTION and through a denoise method never raises a second exception either, keeps its type and
-              its original text (qf_console_original), and is unchanged where the console holds it (cp936, UTF-8).
-  boundary    static: every class ComfyUI calls into carries @qfe.console_safe_methods, and every registered node's
-              FUNCTION is wrapped by qfe.console_safe_nodes after the last registration.
+              FUNCTION, its VALIDATE_INPUTS, a denoise method, a property, a constructor and the ComfyUI sampler the
+              LTX audio fix wraps never raises a second exception either, keeps its type and its original text
+              (qf_console_original), and is unchanged where the console holds it (cp936, UTF-8); one whose text
+              comes from its __str__ becomes a RuntimeError carrying that text escaped; the loaders' VALIDATE_INPUTS
+              message, logged the way execution.py logs it, is never lost.
+  boundary    static: every class ComfyUI calls into (its base named by module path or by a name imported from comfy)
+              carries @qfe.console_safe_methods, every registered node's entry points are wrapped by
+              qfe.console_safe_nodes after the last registration, and no wrapped method is async or a generator.
+              A planted tree proves the check finds each kind of escape.
 
 Run:  python3 tests/text_encoding_test.py       stdlib only: no ComfyUI, no torch, no GPU
       QF_TEXTIO_TEST_ROOT=<plugin tree> points it at another tree (e.g. the unfixed base, to show the arms go RED).
@@ -212,21 +217,45 @@ def _non_ascii_code_lines(tree, path):
             if any(ord(c) > 127 for c in lines[ln - 1])]
 
 
+# ComfyUI's entry points on a node class besides its FUNCTION (execution.py / server.py call each one when present).
+_COMFY_NODE_ENTRY_POINTS = ("INPUT_TYPES", "VALIDATE_INPUTS", "IS_CHANGED", "check_lazy_status")
+
+
+def _suspends(f):
+    """Whether the ast function `f` is async or a generator: its body runs after the call returned, where a call-time
+    wrapper (console_safe_errors) no longer catches what it raises."""
+    if isinstance(f, ast.AsyncFunctionDef):
+        return True
+    stack = list(f.body)
+    while stack:
+        n = stack.pop()
+        if isinstance(n, (ast.Yield, ast.YieldFrom)):
+            return True
+        if not isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+            stack.extend(ast.iter_child_nodes(n))
+    return False
+
+
 def _boundary_sites(root):
     """Where an exception leaves the plugin for ComfyUI, it must pass the console-safe boundary (#738): every class
-    ComfyUI calls into (a comfy.* base, a plugin subclass of one, or a mixin combined with one) carries
-    @qfe.console_safe_methods, and __init__ wraps every registered node's FUNCTION with
-    qfe.console_safe_nodes(NODE_CLASS_MAPPINGS) after the last registration, so a new node cannot skip it."""
-    classes, sites = {}, []
-    trees = {}
+    ComfyUI calls into (a comfy base, named by module path or by a name imported from comfy; a plugin subclass of one;
+    a mixin combined with one) carries @qfe.console_safe_methods; __init__ wraps every registered node's entry points
+    with qfe.console_safe_nodes(NODE_CLASS_MAPPINGS) after the last registration, so a new node cannot skip it; and no
+    wrapped method is async or a generator (it would raise past the wrapper)."""
+    classes, sites, trees, comfy = {}, [], {}, {}
     for fn in sorted(os.listdir(root)):
         if fn.endswith(".py"):
             with open(os.path.join(root, fn), encoding="utf-8") as f:
                 trees[fn] = ast.parse(f.read())
+            comfy[fn] = {"comfy"}   # the names this file binds to a comfy module or to a name imported from one
             for n in ast.walk(trees[fn]):
                 if isinstance(n, ast.ClassDef):
                     classes[n.name] = (fn, n, [ast.unparse(b) for b in n.bases])
-    facing = {c for c, (_, _, bases) in classes.items() if any(b.startswith("comfy.") for b in bases)}
+                elif isinstance(n, ast.ImportFrom) and not n.level and (n.module or "").split(".")[0] == "comfy":
+                    comfy[fn] |= {a.asname or a.name for a in n.names}
+                elif isinstance(n, ast.Import):
+                    comfy[fn] |= {a.asname for a in n.names if a.asname and a.name.split(".")[0] == "comfy"}
+    facing = {c for c, (fn, _, bases) in classes.items() if any(b.split(".")[0] in comfy[fn] for b in bases)}
     grown = True
     while grown:   # plugin subclasses of a comfy-facing class, and the mixins combined with one
         grown = False
@@ -240,6 +269,14 @@ def _boundary_sites(root):
         fn, node, _ = classes[c]
         if not any(ast.unparse(d).endswith("console_safe_methods") for d in node.decorator_list):
             sites.append(f"{fn}:{node.lineno} class {c}: ComfyUI calls into it, but it lacks @qfe.console_safe_methods")
+    for c, (fn, node, _) in sorted(classes.items()):
+        wrapped = {s.value.value for s in node.body if isinstance(s, ast.Assign) and isinstance(s.value, ast.Constant)
+                   and any(getattr(t, "id", None) == "FUNCTION" for t in s.targets)}
+        wrapped |= set(_COMFY_NODE_ENTRY_POINTS) if wrapped else set()
+        for m in node.body:
+            if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef)) and _suspends(m) and (m.name in wrapped or (
+                    c in facing and (m.name == "__init__" or not (m.name.startswith("__") and m.name.endswith("__"))))):
+                sites.append(f"{fn}:{m.lineno} {c}.{m.name}: async or a generator, it raises past console_safe_errors")
     init = trees.get("__init__.py")
     wraps = [n.lineno for n in ast.walk(init) if isinstance(n, ast.Call)
              and ast.unparse(n.func).endswith("console_safe_nodes") and "NODE_CLASS_MAPPINGS" in ast.unparse(n)]
@@ -256,6 +293,78 @@ def _boundary_sites(root):
     return sites
 
 
+def _introspection_arm(root):
+    """The boundary is invisible to introspection: ComfyUI passes VALIDATE_INPUTS only the inputs that
+    inspect.getfullargspec names, and skips its own list check for those (execution.py:891-893, 1082-1086), and
+    getfullargspec ignores __wrapped__. So every entry point console_safe_nodes / console_safe_methods wraps keeps
+    its argspec."""
+    import importlib.util
+    import inspect
+    spec = importlib.util.spec_from_file_location("qf_textio_engine", os.path.join(root, "qf_engine.py"))
+    qfe = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(qfe)
+    row = ("static", "boundary introspection", "getfullargspec of every wrapped entry point unchanged")
+    if not (hasattr(qfe, "console_safe_nodes") and hasattr(qfe, "console_safe_methods")):
+        return row + ("no console_safe_nodes / console_safe_methods", False)
+
+    class Node:
+        FUNCTION = "load"
+
+        @classmethod
+        def INPUT_TYPES(cls):
+            return {}
+
+        @classmethod
+        def VALIDATE_INPUTS(cls, quality=None):
+            return True
+
+        @classmethod
+        def IS_CHANGED(cls, model, quality=None):
+            return ""
+
+        def load(self, model, quality=None):
+            return (model,)
+
+    class Model:
+        def __init__(self, model, device=None):
+            self.model = model
+
+        def apply_model(self, x, t, **kwargs):
+            return x
+
+    def specs():
+        return {n: inspect.getfullargspec(getattr(c, a)) for n, c, a in (
+            ("INPUT_TYPES", Node, "INPUT_TYPES"), ("VALIDATE_INPUTS", Node, "VALIDATE_INPUTS"),
+            ("IS_CHANGED", Node, "IS_CHANGED"), ("FUNCTION", Node, "load"), ("__init__", Model, "__init__"),
+            ("method", Model, "apply_model"))}
+    before = specs()
+    qfe.console_safe_nodes({"QuantFuncTextioNode": Node})
+    qfe.console_safe_methods(Model)
+    changed = [n for n, s in specs().items() if s != before[n]]
+    return row + (f"changed: {', '.join(changed)}" if changed else "unchanged", not changed)
+
+
+def _boundary_selftest():
+    """_boundary_sites on a planted tree finds exactly its three escapes: a class on a comfy base imported under an
+    alias, without the decorator; an async method of a decorated class on a comfy module alias; a generator FUNCTION."""
+    planted = {
+        "facing.py": "from comfy.model_base import BaseModel as Aliased\nimport comfy.model_patcher as mp\n\n\n"
+                     "class Plain(Aliased):\n    pass\n\n\n@qfe.console_safe_methods\nclass Patcher(mp.ModelPatcher):\n"
+                     "    async def load(self):\n        pass\n",
+        "__init__.py": "class Node:\n    FUNCTION = 'run'\n\n    def run(self):\n        yield 1\n\n\n"
+                       "NODE_CLASS_MAPPINGS = {'Node': Node}\nqfe.console_safe_nodes(NODE_CLASS_MAPPINGS)\n",
+    }
+    with tempfile.TemporaryDirectory(prefix="qf-boundary-") as d:
+        for name, src in planted.items():
+            with open(os.path.join(d, name), "w", encoding="utf-8") as f:
+                f.write(src)
+        got = _boundary_sites(d)
+    want = ("class Plain:", "Patcher.load:", "Node.run:")
+    found = [w for w in want if any(w in s for s in got)]
+    return ("static", "boundary selftest", "the 3 planted escapes, nothing else",
+            f"{len(got)} site(s), planted found: {', '.join(found) or 'none'}", len(got) == 3 and found == list(want))
+
+
 # The plugin's own non-ASCII punctuation (— – →), CJK, Hangul, Latin-1 and an emoji: no single code page holds them all.
 _CONSOLE_TEXT = "— – → 中文 한국어 日本語 éü \U0001f600"
 _CONSOLE_PAGES = ("cp932", "cp949", "cp1252", "cp936", "utf-8")   # redirected Windows consoles, and a UTF-8 one
@@ -263,6 +372,8 @@ _CONSOLE_PAGES = ("cp932", "cp949", "cp1252", "cp936", "utf-8")   # redirected W
 _CONSOLE_PATH = "C:\\Users\\\u5f20\u4e09\\\u4e2d\u6587\u76ee\u5f55\\model.safetensors"
 _BOUNDARY_MSG = "qf_native: cannot stage the weights: " + _CONSOLE_PATH
 _LOG_ERROR = b"--- Logging error ---"
+_LOST = []   # the records the console child's logging could not print (its handler's handleError): each a lost line
+_LOST_ROW = ["error", "LoggingError", "logging lost a line: '--- Logging error ---'"]
 
 
 def _console_child(job):
@@ -274,10 +385,32 @@ def _console_child(job):
     for name in ("stdout", "stderr"):
         s = getattr(sys, name)
         setattr(sys, name, io.TextIOWrapper(s.buffer, encoding=s.encoding, line_buffering=True))
-    handler = logging.StreamHandler(sys.stderr)
+    class Handler(logging.StreamHandler):   # ComfyUI's root handler, noting each line logging could not print
+        def handleError(self, record):
+            _LOST.append(record)
+            super().handleError(record)
+    handler = Handler(sys.stderr)
     handler.setFormatter(logging.Formatter("%(message)s"))
     logging.getLogger().addHandler(handler)
     logging.getLogger().setLevel(logging.DEBUG)
+
+    def fail():   # a plugin error naming a user path, chained from the OSError that named it first
+        try:
+            raise OSError(2, "No such file or directory", _CONSOLE_PATH)
+        except OSError as e:
+            raise RuntimeError(_BOUNDARY_MSG) from e
+
+    def opaque():
+        raise _Opaque()
+    import types
+    sampling = types.ModuleType("comfy.k_diffusion.sampling")   # a ComfyUI sampler, for the audio fix to wrap
+
+    def sample_euler_ancestral(model, x, sigmas, extra_args=None, callback=None, disable=None, eta=1.0, s_noise=1.0,
+                               noise_sampler=None):
+        fail()
+    sampling.sample_euler_ancestral = sample_euler_ancestral
+    sys.modules.update({"comfy.k_diffusion": types.ModuleType("comfy.k_diffusion"),
+                        "comfy.k_diffusion.sampling": sampling})
     out = {}
     try:
         mod = _import_plugin(job["root"])   # the guarded comfy import fails here (torch blocked): its warning prints
@@ -324,30 +457,62 @@ def _console_child(job):
                 logging.getLogger().error(f"!!! Exception during processing !!! {ex}")
                 logging.getLogger().error(traceback.format_exc())
         out["console engine error"] = _outcome(comfy_logs_an_engine_error)
-    def fail():   # a plugin error naming a user path, chained from the OSError that named it first
-        try:
-            raise OSError(2, "No such file or directory", _CONSOLE_PATH)
-        except OSError as e:
-            raise RuntimeError(_BOUNDARY_MSG) from e
+    arms = ("console node error", "console validate error", "console denoise error", "console init error",
+            "console property error")
     if qfe is not None and hasattr(qfe, "console_safe_nodes") and hasattr(qfe, "console_safe_methods"):
         class Node:   # stands in for a QuantFunc node class, wrapped the way __init__ wraps every registered node
             FUNCTION = "load"
 
+            @classmethod
+            def VALIDATE_INPUTS(cls, quality=None):
+                fail()
+
             def load(self):
                 fail()
-        qfe.console_safe_nodes({"QuantFuncTextioNode": Node})
+
+        class OpaqueNode:
+            FUNCTION = "load"
+
+            def load(self):
+                opaque()
+        qfe.console_safe_nodes({"QuantFuncTextioNode": Node, "QuantFuncTextioOpaque": OpaqueNode})
 
         @qfe.console_safe_methods
         class Model:   # stands in for a class ComfyUI calls into while it samples
             def _apply_model(self):
                 fail()
-        out["console node error"] = _boundary_outcome(qfe, lambda: Node().load())
-        out["console denoise error"] = _boundary_outcome(qfe, lambda: Model()._apply_model())
+
+            @property
+            def patcher(self):
+                fail()
+
+        @qfe.console_safe_methods
+        class Patcher:   # stands in for a class ComfyUI constructs (ModelPatcher.clone calls self.__class__)
+            def __init__(self):
+                fail()
+        calls = (lambda: Node().load(), lambda: Node.VALIDATE_INPUTS(), lambda: Model()._apply_model(), Patcher,
+                 lambda: Model().patcher)
+        out.update({arm: _boundary_outcome(qfe, call) for arm, call in zip(arms, calls)})
+        out["console fallback error"] = _fallback_outcome(qfe, lambda: OpaqueNode().load())
     else:   # no boundary: the same error reaches ComfyUI's logging as it is
-        out["console node error"] = out["console denoise error"] = _boundary_outcome(qfe, fail)
+        out.update({arm: _boundary_outcome(qfe, fail) for arm in arms})
+        out["console fallback error"] = _fallback_outcome(qfe, opaque)
+    validate = _extract(os.path.join(job["root"], "__init__.py"), "_validate_quality", {"qfe": qfe},
+                        consts=("_QUALITY_FAST_OPTIONS",))
+
+    def comfy_logs_a_validation_failure():   # ComfyUI execution.py:1098 + :1227 around the loaders' VALIDATE_INPUTS
+        logging.getLogger().error(f"  - Custom validation failed for node: quality - {validate(_CONSOLE_TEXT)}")
+    out["console validate message"] = (_outcome(comfy_logs_a_validation_failure) if validate
+                                       else ["error", "Missing", "no _validate_quality in __init__.py"])
     afix = sys.modules.get("qfn_textio_pkg.qf_ltx_ancestral_audio_fix")
     out["console audio-fix"] = (_outcome(afix._log_once, "sampler " + _CONSOLE_TEXT, "euler") if afix
                                 else ["error", "Missing", "the audio-fix module was not imported"])
+    if afix is not None and getattr(sampling.sample_euler_ancestral, "_qf_av_wrapped", False):
+        afix._resolve_qf_av = lambda model: model   # every model stands in for a QF LTX-2.5 AV one
+        out["console sampler error"] = _boundary_outcome(
+            qfe, lambda: sampling.sample_euler_ancestral(object(), None, None))
+    else:
+        out["console sampler error"] = ["error", "Missing", "the audio fix did not wrap ComfyUI's sampler"]
     import logging as _lg
     bare = sorted(n for n, lg in _lg.Logger.manager.loggerDict.items()
                   if n.startswith("qfn_textio_pkg") and isinstance(lg, _lg.Logger)
@@ -373,11 +538,19 @@ def _broken_engine_copy(root, tmp):
     return dst
 
 
-def _boundary_outcome(qfe, call):
-    """ComfyUI's execution.py:637-638 around one plugin call. The logging must not raise a second exception; the
-    exception keeps its type, its original message is recoverable, and it is unchanged where the console holds it."""
+class _Opaque(Exception):
+    """An exception whose text comes from other state (its __str__), not its args: no rewrite in place reaches it."""
+
+    def __str__(self):
+        return _BOUNDARY_MSG
+
+
+def _comfy_logs(call):
+    """ComfyUI's execution.py:637-638 around one plugin call: (the exception it logged, None), or (None, an error row)
+    when the call did not raise or the logging raised a second exception."""
     import logging
     import traceback
+    lost = len(_LOST)
     try:
         try:
             call()
@@ -386,9 +559,34 @@ def _boundary_outcome(qfe, call):
             logging.getLogger().error(traceback.format_exc())
             caught = ex
         else:
-            return ["error", "NoRaise", "the call did not raise"]
+            return None, ["error", "NoRaise", "the call did not raise"]
     except Exception as second:  # noqa: BLE001 - the secondary exception this guards against
-        return ["error", type(second).__name__, str(second)]
+        return None, ["error", type(second).__name__, str(second)]
+    return (caught, None) if len(_LOST) == lost else (None, _LOST_ROW)
+
+
+def _fallback_outcome(qfe, call):
+    """For an _Opaque exception: logged without a second exception; where the console holds its text it passes as it
+    is, elsewhere it becomes a RuntimeError carrying that text escaped, the original object kept
+    (qf_console_original)."""
+    caught, err = _comfy_logs(call)
+    if err:
+        return err
+    safe = qfe.console_safe(_BOUNDARY_MSG) if hasattr(qfe, "console_safe") else _BOUNDARY_MSG
+    if safe == _BOUNDARY_MSG and type(caught) is _Opaque:
+        return ["ok", "unchanged"]
+    if (type(caught) is RuntimeError and safe in str(caught)
+            and type(getattr(caught, "qf_console_original", None)) is _Opaque):
+        return ["ok", "replaced: its text escaped, the original kept"]
+    return ["error", "Lost", f"type={type(caught).__name__} now={str(caught)[:60]!r}"]
+
+
+def _boundary_outcome(qfe, call):
+    """ComfyUI's execution.py:637-638 around one plugin call. The logging must not raise a second exception; the
+    exception keeps its type, its original message is recoverable, and it is unchanged where the console holds it."""
+    caught, err = _comfy_logs(call)
+    if err:
+        return err
     fits = qfe.console_safe(_BOUNDARY_MSG) == _BOUNDARY_MSG if hasattr(qfe, "console_safe") else True
     original = getattr(caught, "qf_console_original", str(caught))
     kept = type(caught) is RuntimeError and original == _BOUNDARY_MSG and isinstance(caught.__cause__, OSError)
@@ -417,8 +615,9 @@ def _console_arms(root, tmp):
                 "console logger": ("stderr", "[log] "), "console exception": ("stderr", "[exc] "),
                 "console engine error": ("stderr", "[engine] ")}
         for arm in ("console import", "console say", "console info", "console logger", "console exception",
-                    "console engine error", "console node error", "console denoise error", "console audio-fix",
-                    "console loggers"):
+                    "console engine error", "console node error", "console validate error", "console denoise error",
+                    "console init error", "console property error", "console fallback error",
+                    "console validate message", "console sampler error", "console audio-fix", "console loggers"):
             g = got.get(arm, ["error", "Missing", "the child did not run this arm"])
             ok, act = g[0] == "ok", _show(g)
             if ok and arm in want:   # the line reached the console, with what the code page cannot hold escaped
@@ -492,10 +691,12 @@ def _extract(path, name, ns, consts=()):
 
 
 def _outcome(fn, *args):
+    lost = len(_LOST)
     try:
-        return ["ok", fn(*args)]
+        got = fn(*args)
     except Exception as exc:  # noqa: BLE001 — every failure is data for the parent's verdict
         return ["error", type(exc).__name__, str(exc)]
+    return ["ok", got] if len(_LOST) == lost else _LOST_ROW
 
 
 def _child(job):
@@ -669,6 +870,8 @@ def main():
     rows.append(("static", "boundary", "every node and comfy-facing class wrapped", f"{len(bsites)} site(s)", not bsites))
     for s in bsites:
         print(f"  boundary: {s}")
+    rows.append(_boundary_selftest())
+    rows.append(_introspection_arm(_ROOT))
     tmp = tempfile.mkdtemp(prefix="qf-textio-")
     try:
         mal_job, mal_expect = _malformed(tmp)
