@@ -1833,7 +1833,8 @@ class QFModelPatcher(comfy.model_patcher.ModelPatcher):
         """Return a patcher that has THIS patcher's model but SRC's comfy-level state.
 
         WHY (CR regression, measured class): a downstream QuantFuncNativeLoRA re-creates the
-        pipeline, so it hands back a DIFFERENT patcher+model. Anything an upstream node had
+        PATCHER and MODEL (the pipeline is shared: its set goes on in place), so it hands back a
+        DIFFERENT patcher+model. Anything an upstream node had
         applied with add_object_patch — most importantly ModelSamplingSD3 /
         ModelSamplingMiniMaxH3's shift patch — lives on the OLD patcher and would be silently
         dropped, leaving the checkpoint default with no error (the exact silent-shift class the
