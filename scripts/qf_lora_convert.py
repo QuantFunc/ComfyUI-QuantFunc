@@ -12,13 +12,18 @@ What it accepts (auto-detected):
   * diffusers / PEFT  — already canonical; normalized (down/up -> A/B) + copied
   * kohya sd-scripts / ai-toolkit — ``lora_unet_``/``lora_transformer_`` keys,
     underscored module path, ``.lora_down/up.weight`` + ``.alpha``
-  * LyCORIS (LoHa/LoKr) — REFUSED loud (needs math reconstruction, not a rename)
+  * LyCORIS (LoHa/LoKr) — NOT SUPPORTED: refused loud (a factored decomposition,
+    not a rename; the native loaders do not load it either)
+  * Krea-2 BFL / ai-toolkit module names (the community Krea-2 LoRAs: ``blocks.N``,
+    ``txtfusion.*``, ``first``/``tmlp.0``/…) — renamed to the engine's diffusers
+    names (ComfyUI comfy/utils.py krea2_to_diffusers: MAP_BASIC + the block map).
+    Recognized by a Krea-2-only name (``txtfusion.``, ``tmlp.``, ``txtmlp.``, ``tproj.``).
 
 Raw-safetensors byte-copy: tensor DTYPE is preserved exactly (bf16/fp16/fp32),
 no torch, no numpy, no model load, no GPU. Text-encoder LoRA keys (``lora_te*``)
 are dropped — the native loaders drive the transformer only.
 """
-import json, struct, sys, argparse, os
+import json, struct, sys, argparse, os, re
 
 # ---- multi-token diffusers MODULE names (union across Krea-2 / LTX-2 / H3) ----
 # ONLY names whose INTERNAL underscore must survive kohya's dot->underscore
@@ -165,6 +170,35 @@ def strip_root(path):
     return path
 
 
+# Krea-2 BFL / ai-toolkit names -> the engine's (diffusers) names: ComfyUI comfy/utils.py krea2_to_diffusers
+# (MAP_BASIC + the block map). Applied only to a file that carries a Krea-2-only name (_KREA2_MARK): "blocks." and
+# "first" also occur in other families.
+_KREA2_ROOT = {
+    "first": "img_in", "last.linear": "final_layer.linear",
+    "tmlp.0": "time_embed.linear_1", "tmlp.2": "time_embed.linear_2", "tproj.1": "time_mod_proj",
+    "txtmlp.1": "txt_in.linear_1", "txtmlp.3": "txt_in.linear_2", "txtfusion.projector": "text_fusion.projector",
+}
+_KREA2_TAIL = {
+    "attn.wq": "attn.to_q", "attn.wk": "attn.to_k", "attn.wv": "attn.to_v", "attn.wo": "attn.to_out.0",
+    "attn.gate": "attn.to_gate", "mlp.gate": "ff.gate", "mlp.up": "ff.up", "mlp.down": "ff.down",
+}
+_KREA2_MARK = ("txtfusion.", "tmlp.", "txtmlp.", "tproj.")
+_KREA2_BLOCK = re.compile(r"(blocks|txtfusion\.(?:layerwise|refiner)_blocks)\.(\d+)\.(.+)$")
+
+
+def krea2_engine_body(body):
+    """Krea-2 BFL module path -> the engine's module path (the root prefix, if any, is kept)."""
+    rest = strip_root(body)
+    root = body[:len(body) - len(rest)]
+    if rest in _KREA2_ROOT:
+        return root + _KREA2_ROOT[rest]
+    m = _KREA2_BLOCK.match(rest)
+    if not m:
+        return body
+    grp = "transformer_blocks" if m.group(1) == "blocks" else "text_fusion." + m.group(1)[len("txtfusion."):]
+    return "%s%s.%s.%s" % (root, grp, m.group(2), _KREA2_TAIL.get(m.group(3), m.group(3)))
+
+
 def detect_format(keys):
     ky = list(keys)
     if any(".hada_" in k or ".lokr_" in k for k in ky):
@@ -189,6 +223,9 @@ def _canon_leaf(role):
     return None
 
 
+_PEFT_ADAPTER = re.compile(r"(.+)\.(lora_A|lora_B|lora_down|lora_up)\.(?!weight$)[^.]+\.weight$")
+
+
 def _split_role(key):
     """Return (module_body, role) or (None, None). role in
     {lora_down,lora_up,lora_A,lora_B,alpha,lora_linear_layer.down/up}."""
@@ -201,6 +238,11 @@ def _split_role(key):
                       (".alpha", "alpha")):
         if key.endswith(suf):
             return key[:-len(suf)], role
+    # PEFT adapter-name form `<module>.lora_A.<adapter>.weight` (peft saves with its adapter name, commonly "default"
+    # — e.g. DiffSynth-Studio LoRAs): the same rule as the engine's DiffusersAdapter (one identifier, no dots).
+    m = _PEFT_ADAPTER.match(key)
+    if m:
+        return m.group(1), m.group(2)
     return None, None
 
 
@@ -237,6 +279,21 @@ def convert_key(orig, src_fmt, model_inv=None):
     return dotted + "." + leaf + ".weight"
 
 
+def convert_keys(keys, fmt, model_inv=None):
+    """[(orig, canonical key or None to DROP)] for a whole file, and whether the Krea-2 rename applied: convert_key
+    per key, then — for a file that carries a Krea-2-only name — the Krea-2 BFL -> engine rename of every module."""
+    conv = [(k, convert_key(k, fmt, model_inv)) for k in keys]
+    if not any(nk and strip_root(_split_role(nk)[0]).startswith(_KREA2_MARK) for _, nk in conv):
+        return conv, False
+    out = []
+    for k, nk in conv:
+        if nk is not None:
+            body = _split_role(nk)[0]
+            nk = krea2_engine_body(body) + nk[len(body):]
+        out.append((k, nk))
+    return out, True
+
+
 def convert_file(in_path, out_path, verbose=True, model_path=None):
     model_inv = build_model_inverse(model_path) if model_path else None
     hdr, blob = _read_st(in_path)
@@ -245,10 +302,11 @@ def convert_file(in_path, out_path, verbose=True, model_path=None):
     fmt = detect_format(keys)
     if fmt == "lycoris":
         raise SystemExit(
-            "qf_lora_convert: this is a LyCORIS (LoHa/LoKr) file — it is a "
-            "factored decomposition, not a plain (A,B) LoRA, so a key-rename "
-            "cannot convert it. Re-export/merge it to a standard LoRA first, "
-            "or load it through the ctypes engine path which reconstructs it.")
+            "qf_lora_convert: this is a LyCORIS (LoHa/LoKr) file, which is not "
+            "supported — it is a factored decomposition, not a plain (A,B) LoRA, "
+            "so a key rename cannot convert it, and the QuantFunc native loaders "
+            "do not load it either. Re-export or merge it to a plain (A,B) LoRA "
+            "with your training tool first.")
     if fmt == "unknown":
         raise SystemExit(
             "qf_lora_convert: could not detect the LoRA format (no kohya "
@@ -262,8 +320,8 @@ def convert_file(in_path, out_path, verbose=True, model_path=None):
     out_tensors = []
     dropped = 0
     seen = {}
-    for k in keys:
-        nk = convert_key(k, fmt, model_inv)
+    conv, krea2 = convert_keys(keys, fmt, model_inv)
+    for k, nk in conv:
         if nk is None:
             dropped += 1
             continue
@@ -275,11 +333,13 @@ def convert_file(in_path, out_path, verbose=True, model_path=None):
         out_tensors.append((nk, hdr[k]))
     if not out_tensors:
         raise SystemExit("qf_lora_convert: nothing to write (all keys dropped).")
-    new_meta = {"qf_lora_convert": "from %s (%s)" % (os.path.basename(in_path), fmt)}
+    new_meta = {"qf_lora_convert": "from %s (%s%s)" % (os.path.basename(in_path), fmt,
+                                                        ", Krea-2 BFL names renamed" if krea2 else "")}
     _write_st(out_path, out_tensors, blob, new_meta)
     if verbose:
-        print("[qf_lora_convert] %s: source=%s  wrote %d tensors, dropped %d  -> %s"
-              % (os.path.basename(in_path), fmt, len(out_tensors), dropped, out_path))
+        print("[qf_lora_convert] %s: source=%s%s  wrote %d tensors, dropped %d  -> %s"
+              % (os.path.basename(in_path), fmt, " (Krea-2 BFL names -> engine names)" if krea2 else "",
+                 len(out_tensors), dropped, out_path))
     return fmt, len(out_tensors), dropped
 
 
@@ -347,13 +407,54 @@ def self_test(diffusers_path):
     return ok
 
 
+def key_names_self_test():
+    """The key-name rules on synthetic keys (no file): the Krea-2 rename of a raw community file and of a kohya file,
+    files it must not touch, and the PEFT adapter-name form."""
+    def run(keys, fmt):
+        return [nk for _, nk in convert_keys(keys, fmt)[0]]
+    raw = ["diffusion_model.blocks.3.attn.wq.lora_A.weight", "diffusion_model.blocks.3.attn.wo.lora_B.weight",
+           "diffusion_model.blocks.3.mlp.gate.lora_A.weight",
+           "diffusion_model.txtfusion.layerwise_blocks.0.attn.gate.lora_A.weight",
+           "diffusion_model.txtfusion.refiner_blocks.1.mlp.down.lora_B.weight"]
+    want = ["diffusion_model.transformer_blocks.3.attn.to_q.lora_A.weight",
+            "diffusion_model.transformer_blocks.3.attn.to_out.0.lora_B.weight",
+            "diffusion_model.transformer_blocks.3.ff.gate.lora_A.weight",
+            "diffusion_model.text_fusion.layerwise_blocks.0.attn.to_gate.lora_A.weight",
+            "diffusion_model.text_fusion.refiner_blocks.1.ff.down.lora_B.weight"]
+    kohya = ["lora_unet_first.lora_down.weight", "lora_unet_last_linear.lora_up.weight", "lora_unet_tmlp_0.alpha",
+             "lora_unet_tmlp_2.lora_down.weight", "lora_unet_tproj_1.lora_down.weight",
+             "lora_unet_txtmlp_1.lora_down.weight", "lora_unet_txtmlp_3.lora_up.weight",
+             "lora_unet_txtfusion_projector.lora_down.weight", "lora_unet_blocks_0_attn_wv.lora_down.weight"]
+    kwant = ["img_in.lora_A.weight", "final_layer.linear.lora_B.weight", "time_embed.linear_1.alpha",
+             "time_embed.linear_2.lora_A.weight", "time_mod_proj.lora_A.weight", "txt_in.linear_1.lora_A.weight",
+             "txt_in.linear_2.lora_B.weight", "text_fusion.projector.lora_A.weight",
+             "transformer_blocks.0.attn.to_v.lora_A.weight"]
+    native = ["transformer.transformer_blocks.0.attn.to_q.lora_A.weight", "transformer.img_in.lora_B.weight"]
+    peft = ["transformer_blocks.0.attn.to_k.lora_A.default.weight", "blocks.25.attn.out_proj.lora_B.default.weight"]
+    pwant = ["transformer_blocks.0.attn.to_k.lora_A.weight", "blocks.25.attn.out_proj.lora_B.weight"]
+    other = ["diffusion_model.blocks.0.self_attn.q.lora_A.weight", "diffusion_model.first.lora_A.weight"]   # no marker
+    ok = True
+    for name, got, exp in (("raw BFL", run(raw, "diffusers"), want), ("kohya", run(kohya, "kohya"), kwant),
+                           ("diffusers", run(native, "diffusers"), native), ("no marker", run(other, "diffusers"), other),
+                           ("peft adapter", run(peft, "diffusers"), pwant)):
+        good = got == exp
+        ok &= good
+        print("  %-9s %s" % (name, "ok" if good else "FAIL %s" % [g for g, e in zip(got, exp) if g != e]))
+    print("KEY-NAME SELF-TEST:", "PASS" if ok else "FAIL")
+    return ok
+
+
 def main():
     ap = argparse.ArgumentParser(description="Convert a LoRA to QuantFunc diffusers/PEFT canonical form.")
     ap.add_argument("--in", dest="inp", help="input LoRA .safetensors")
     ap.add_argument("--out", dest="out", help="output .safetensors (diffusers canonical)")
     ap.add_argument("--model", dest="model", help="target checkpoint .safetensors — derives the EXACT module-name inverse (any family, zero vocabulary)")
     ap.add_argument("--self-test", dest="selftest", help="round-trip a diffusers LoRA through a synthesized kohya twin")
+    ap.add_argument("--self-test-names", dest="selftest_names", action="store_true",
+                    help="check the key-name rules (Krea-2 BFL -> engine rename, PEFT adapter form) on synthetic keys")
     a = ap.parse_args()
+    if a.selftest_names:
+        sys.exit(0 if key_names_self_test() else 1)
     if a.selftest:
         sys.exit(0 if self_test(a.selftest) else 1)
     if not a.inp or not a.out:
