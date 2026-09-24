@@ -421,13 +421,16 @@ class CanonicalIntegration(unittest.TestCase):
                 unsupported.model_patches_models()
         create.assert_not_called()
 
-    def test_official_prepare_sampling_uses_cold_host_floor_then_admits_without_early_create(self):
+    def test_official_prepare_sampling_cold_request_is_native_only_then_admits_without_early_create(self):
+        """D3 (tests-07 ruling 2026-09-24): the cold reserve carries NATIVE numbers only. With no pipeline yet it is
+        the comfy side alone: never ComfyUI's torch BaseModel estimate (the inter-stage-thrash floor c71c315 had
+        re-added), and never the weights (the Owner adapter carries the Prepared capacity)."""
         import comfy.sampler_helpers as sampler_helpers
         import comfy.supported_models as supported_models
         from qf_loader_contract import qf_krea2_modelpatcher as krea2
 
-        # Make persistent backing decisively larger than either request-shaped
-        # cold floor. Capacity belongs to the Owner ledger, never peak demand.
+        # Make persistent backing decisively larger than either request. Capacity belongs to the Owner
+        # ledger, never peak demand.
         self.lib.capacity_bytes = 32 << 30
         noise_shape = (1, 16, 8, 8)
         cfg = supported_models.Krea2({"image_model": "krea2",
@@ -438,14 +441,12 @@ class CanonicalIntegration(unittest.TestCase):
         patcher = qfm.QFModelPatcher(model, torch.device("cuda:0"), torch.device("cpu"))
         full_shape = [noise_shape[0] * 2, *noise_shape[1:]]
         minimum_shape = list(noise_shape)
-        expected_memory = max(
-            model._qf_comfy_side_bytes(full_shape, {}),
-            int(super(qfm.QFSessionModelMixin, model).memory_required(
-                full_shape, cond_shapes={})))
-        expected_minimum = max(
-            model._qf_comfy_side_bytes(minimum_shape, {}),
-            int(super(qfm.QFSessionModelMixin, model).memory_required(
-                minimum_shape, cond_shapes={})))
+        expected_memory = model._qf_comfy_side_bytes(full_shape, {})
+        expected_minimum = model._qf_comfy_side_bytes(minimum_shape, {})
+        torch_estimate = int(super(qfm.QFSessionModelMixin, model).memory_required(full_shape, cond_shapes={}))
+        # Discriminating fixture: ComfyUI's torch estimate must exceed the native answer, or this arm could not
+        # tell "no floor" from "floor".
+        self.assertGreater(torch_estimate, expected_memory)
         self.assertGreater(self.lib.capacity_bytes,
                            max(expected_memory, expected_minimum))
         observed = {}
@@ -480,6 +481,7 @@ class CanonicalIntegration(unittest.TestCase):
         self.assertEqual(conds, {})
         self.assertEqual(observed["memory_required"], expected_memory)
         self.assertEqual(observed["minimum_memory_required"], expected_minimum)
+        self.assertLess(observed["memory_required"], torch_estimate)   # the torch floor is gone (D3)
         self.assertLess(observed["memory_required"], self.lib.capacity_bytes)
         self.assertLess(observed["minimum_memory_required"], self.lib.capacity_bytes)
         self.assertEqual(observed["actual_delta"], self.lib.capacity_bytes)
