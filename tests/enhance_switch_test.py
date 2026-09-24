@@ -55,6 +55,22 @@ for root, _dirs, files in os.walk(_PLUGIN):
 # (a docstring/comment that merely MENTIONS a key is not an exact-match Constant, so prose never trips this)
 check(not hits, "arm1: no raw enhance knob reachable from the plugin path (%s)" % (hits or "clean"))
 
+# ---- arm 1b: the Qwen-Image-2.1 example workflows state the family's MEASURED quality behaviour -------------------------
+# (tests-07 re-CR round 4, A): on QI-2.1, balance / fast / super_fast change details (PSNR 23-27 dB vs best_quality,
+# __init__.py's QI-2.1 note: no "closer" / "nearly the same" claims), and a GPU without the fast mode shows no choice and
+# always runs best_quality. A note claiming "almost the same result" or only "balance (default)" misstates both.
+import glob as _glob
+import json as _json
+_qi_notes = []
+for _wf in sorted(_glob.glob(os.path.join(_PLUGIN, "example_workflows", "QuantFunc-QwenImage21-*.json"))):
+    _txt = " ".join(str(v) for n in _json.load(open(_wf, encoding="utf-8")).get("nodes", [])
+                    for v in (n.get("widgets_values") or []) if isinstance(v, str) and "`quality`" in v)
+    _qi_notes.append((os.path.basename(_wf), _txt))
+_bad = [(w, t[:80]) for w, t in _qi_notes if not t or "almost the same" in t or "nearly the same" in t
+        or "details such as poses, faces or small objects can differ" not in t or "always uses the highest quality" not in t]
+check(len(_qi_notes) == 5 and not _bad, "arm1b: the 5 QI-2.1 workflow notes carry the measured quality wording (%s)"
+      % (_bad or "clean"))
+
 try:
     # Fake-engine test: run ComfyUI in its own --cpu mode (the contract tests' idiom), so a box with no visible GPU
     # (the CPU suite hides CUDA) imports comfy instead of skipping every arm. Must precede the first comfy import.
