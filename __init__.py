@@ -765,14 +765,16 @@ if _IMPORT_OK:
     # dot), so the node's widget layout is the same on every GPU: widget values are stored by POSITION, and a workflow saved on
     # one kind of GPU opens on the other with every value in its place (including any widget added after quality later).
     # Whatever value a saved workflow carries there is ignored on such a GPU.
-    # Measured on SM89 (RTX 4090 D 24 GB, QI-2.1 int4, 1024², same seed; timing study with repeated blocks, steady-state medians
-    # against best_quality): super_fast +15..+20 %, fast +10..+12 %, balance +0..+2 % when a 22 GB budget makes the 27 GB pack
-    # stream hard and +20 % with the whole card (its gain depends on memory headroom). All three keep the scene but change
-    # details — a subject's pose or expression, which people stand where, small objects — about equally (PSNR 23-27 dB vs
-    # best_quality); no "closer" / "nearly the same" claims for this family.
-    _QI21_QUALITY_TOOLTIP = ("Speed or quality. super_fast: the fastest. fast: faster. balance (default): can be a little faster "
-                             "than best_quality. With these three the picture stays the same, but details such as poses, faces "
-                             "or small objects can differ from best_quality. best_quality: the highest quality.")
+    # Measured on SM89 (RTX 4090 D 24 GB, QI-2.1 int4, 1024², same seed; two timing runs x 25/40 steps, each mode's steady-state
+    # median against best_quality's in the same run, a 22 GB budget so the 27 GB pack streams): super_fast +13..+15 % and fast
+    # +7..+9 % in the quiet run; in the noisy run (best_quality itself varying up to 58 %) fast was once 11 % slower and super_fast
+    # once behind fast and balance — hence "usually". balance -3..+3 % there, +11..+20 % with the whole card (its gain depends on memory
+    # headroom). All three keep the scene but change details — a subject's pose or expression, which people stand where, small
+    # objects — about equally (PSNR 23-27 dB vs best_quality); no "closer" / "nearly the same" claims for this family.
+    _QI21_QUALITY_TOOLTIP = ("Speed or quality. super_fast: usually the fastest. fast: usually faster than best_quality. balance "
+                             "(default): can be a little faster than best_quality. With these three the picture stays the same, "
+                             "but details such as poses, faces or small objects can differ from best_quality. best_quality: the "
+                             "highest quality.")
     _QI21_QUALITY_TOOLTIP_FIXED = "On this GPU Qwen-Image-2.1 always uses the highest quality; this setting has no effect here."
 
     def _qi21_resolve_quality(quality=None, quality_enhance=None, transformer=None, model_config=None, device_idx=None):
