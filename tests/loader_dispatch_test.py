@@ -365,6 +365,7 @@ def main():
     #     quality change never rebuilds — the engine arms its fast mode in place); the session sends the name, never video_enhance
     #     with it; every loader declares the legacy names.
     _FOUR = ("QuantFuncLTXLoader", "QuantFuncH3Loader", "QuantFuncKrea2Loader", "QuantFuncQwenImage21Loader")
+    _QI21 = "QuantFuncQwenImage21Loader"
     _Q4, _Q2 = ["super_fast", "fast", "balance", "best_quality"], ["balance", "best_quality"]
 
     class _FakeQLib:
@@ -386,10 +387,46 @@ def main():
                                        ("library fails to load", _boom, _Q2)):
             qfn._quality_engine_cache.clear()
             qfn.qfe.load_lib = loader_fn
-            _opts = {n: qfn.NODE_CLASS_MAPPINGS[n].INPUT_TYPES()["optional"]["quality"] for n in _FOUR}
-            check(f"quality options follow the engine ({label}) on all four loaders, default balance",
+            _opts = {n: qfn.NODE_CLASS_MAPPINGS[n].INPUT_TYPES()["optional"]["quality"] for n in _FOUR if n != _QI21}
+            check(f"quality options follow the engine ({label}) on the H3 / LTX / Krea2 loaders, default balance",
                   all(o[0] == want and o[1]["default"] == "balance" for o in _opts.values()),
                   f"-> {[(n, o[0], o[1]['default']) for n, o in _opts.items()]}")
+            # QI-2.1 (user 「sm120不要展示这个选项就好」): four options where the engine offers them; elsewhere the input stays in
+            # its slot (widget values are positional) but hidden, socketless, defaulting to best_quality.
+            _it = qfn.NODE_CLASS_MAPPINGS[_QI21].INPUT_TYPES()["optional"]
+            _qo = _it["quality"]
+            _shown = (_qo[0] == _Q4 and _qo[1]["default"] == "balance" and not _qo[1].get("hidden") and not _qo[1].get("socketless"))
+            _hidden = (_qo[1].get("hidden") is True and _qo[1].get("socketless") is True and _qo[1]["default"] == "best_quality"
+                       and _qo[0] == _Q4)
+            check(f"QI-2.1 quality ({label}): shown with four options on a fast GPU, else hidden in its slot, best_quality",
+                  (_shown if want == _Q4 else _hidden) and list(_it.keys())[:2] == ["attention_backend", "quality"],
+                  f"-> {_qo[0]} {_qo[1]} keys={list(_it.keys())}")
+            _QR = qfn._qi21_resolve_quality
+            _runs = [_QR(x) for x in _Q4 + [True, False, None]] + [_QR(None, quality_enhance=True), _QR(None, quality_enhance=False)]
+            check(f"QI-2.1 run quality ({label}): a fast GPU resolves as the others do; elsewhere every saved value runs best_quality",
+                  _runs == ([qfn._resolve_quality(x) for x in _Q4 + [True, False, None]]
+                            + [qfn._resolve_quality(None, quality_enhance=True), qfn._resolve_quality(None, quality_enhance=False)]
+                            if want == _Q4 else ["best_quality"] * 9),
+                  f"-> {_runs}")
+        # QI-2.1's rule is asked of the LOAD's device (the one device capture of a load, _loaded_device_index), never ComfyUI's
+        # current device: an engine whose fast mode exists on device 1 only.
+        class _FakeQLibDev(_FakeQLib):
+            def quantfunc_quality_fast_available(self, idx):
+                return 1 if idx == 1 else 0
+        qfn._quality_engine_cache.clear()
+        qfn.qfe.load_lib = lambda: _FakeQLibDev(None)
+        import contextlib as _qctl
+        import io as _qio
+        _dv = []
+        for q, d in (("fast", 1), ("fast", 0), ("balance", 1), (None, 0), ("balance", 0), ("super_fast", 0)):
+            _qb = _qio.StringIO()
+            with _qctl.redirect_stdout(_qb):
+                _r = qfn._qi21_resolve_quality(q, device_idx=d)
+            _dv.append((_r, _qb.getvalue().count(f"'{q}' is not available here; using best_quality.")))
+        check("QI-2.1 run quality follows the load's device: fast on the device that has the fast mode, best_quality on one "
+              "without — one console line only when a fast option was dropped",
+              _dv == [("fast", 0), ("best_quality", 1), ("balance", 0), ("best_quality", 0), ("best_quality", 0),
+                      ("best_quality", 1)], f"-> {_dv}")
         qfn._quality_engine_cache.clear()
         qfn.qfe.load_lib = lambda: _FakeQLib(1)
         R = qfn._resolve_quality

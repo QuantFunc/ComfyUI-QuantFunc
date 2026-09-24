@@ -671,6 +671,41 @@ if _IMPORT_OK:
         return (list(_QUALITY_FAST_OPTIONS if fast else _QUALITY_BASE_OPTIONS),
                 {"default": _QUALITY_DEFAULT, "tooltip": _QUALITY_TOOLTIP_FAST if fast else _QUALITY_TOOLTIP_BASE})
 
+    # [quality — Qwen-Image-2.1, user 2026-09-24 「balance改为只快慢路径 fast 以及supper改为剪枝 0.9」「sm120不要展示这个选项就好」]
+    # QI-2.1 keeps the four names (what each does for this family is the engine's table), but where the engine offers only the
+    # two-way choice (no fast mode on this GPU) QI-2.1 shows NO quality choice and always runs best_quality. The input stays
+    # DECLARED there, hidden (ComfyUI's input option `hidden` keeps the widget, invisible, in its slot; `socketless` = no input
+    # dot), so the node's widget layout is the same on every GPU: widget values are stored by POSITION, and a workflow saved on
+    # one kind of GPU opens on the other with every value in its place (including any widget added after quality later).
+    # Whatever value a saved workflow carries there is ignored on such a GPU.
+    # Measured on SM89 (RTX 4090 D 24 GB, QI-2.1 int4, 1024², same seed; two timing runs x 25/40 steps, each mode's steady-state
+    # median against best_quality's in the same run, a 22 GB budget so the 27 GB pack streams): super_fast +13..+15 % and fast
+    # +7..+9 % in the quiet run; in the noisy run (best_quality itself varying up to 58 %) fast was once 11 % slower and super_fast
+    # once behind fast and balance — hence "usually". balance -3..+3 % there, +11..+20 % with the whole card (its gain depends on memory
+    # headroom). All three keep the scene but change details — a subject's pose or expression, which people stand where, small
+    # objects — about equally (PSNR 23-27 dB vs best_quality); no "closer" / "nearly the same" claims for this family.
+    _QI21_QUALITY_TOOLTIP = ("Speed or quality. super_fast: usually the fastest. fast: usually faster than best_quality. balance "
+                             "(default): can be a little faster than best_quality. With these three the picture stays the same, "
+                             "but details such as poses, faces or small objects can differ from best_quality. best_quality: the "
+                             "highest quality.")
+    _QI21_QUALITY_TOOLTIP_FIXED = "On this GPU Qwen-Image-2.1 always uses the highest quality; this setting has no effect here."
+
+    def _qi21_resolve_quality(quality=None, quality_enhance=None, transformer=None, model_config=None, device_idx=None):
+        """QI-2.1's quality for this run on the load's device: _resolve_quality where the fast mode exists; elsewhere
+        best_quality, whatever a saved workflow carries (the input is hidden there) — with one console line when that value
+        was a fast option (a workflow saved on another GPU, or a multi-GPU box whose form device differs from the load's)."""
+        if _quality_fast_tier(device_idx):
+            return _resolve_quality(quality, quality_enhance, transformer, model_config, device_idx)
+        if quality in ("super_fast", "fast"):
+            print(f"[QuantFunc] '{quality}' is not available here; using best_quality.", flush=True)
+        return "best_quality"
+
+    def _qi21_quality_input():
+        if _quality_fast_tier():
+            return (list(_QUALITY_FAST_OPTIONS), {"default": _QUALITY_DEFAULT, "tooltip": _QI21_QUALITY_TOOLTIP})
+        return (list(_QUALITY_FAST_OPTIONS), {"default": "best_quality", "hidden": True, "socketless": True,
+                                              "tooltip": _QI21_QUALITY_TOOLTIP_FIXED})
+
     def _validate_quality(quality):
         """The loaders' VALIDATE_INPUTS body (it replaces ComfyUI's own list check for `quality`): any of the four names on every
         GPU (a workflow saved on a GPU with the fast options still opens), a boolean (the retired switch, positional), or None —
@@ -886,7 +921,7 @@ if _IMPORT_OK:
                                  {"tooltip": "The Qwen-Image-2.1 preset that matches the chosen model file."}),
             }, "optional": {
                 "attention_backend": _attn_backend_input(),
-                "quality": _quality_input(),
+                "quality": _qi21_quality_input(),
             }, "hidden": dict(_QUALITY_LEGACY_HIDDEN)}
 
         @classmethod
@@ -905,7 +940,7 @@ if _IMPORT_OK:
             # no rebuild), exactly like the Krea2 node.
             _p = _run_family_load("qwenimage21", transformer, model_config)
             _dev = _loaded_device_index(_p)
-            q = _resolve_quality(quality, quality_enhance, transformer, model_config, _dev)
+            q = _qi21_resolve_quality(quality, quality_enhance, transformer, model_config, _dev)
             _mm = getattr(_p, "model", None)
             if _mm is not None and hasattr(_mm, "set_attn_backend"):
                 _mm.set_attn_backend(_attn_backend_to_engine(attention_backend))
