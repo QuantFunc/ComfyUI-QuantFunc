@@ -831,6 +831,7 @@ _ENGINE_HOSTS = {13: "libquantfunc.so", 12: "libquantfunc-12.so"}   # Linux host
 _ENGINE_KERNEL_RE = re.compile(r"libquantfunc_kernels[-A-Za-z0-9_.]*\.so")   # the host's DT_NEEDED names its kernel
 _ENGINE_VERSION_RE = re.compile(r"\d+\.\d+\.\d+")    # a release version: a URL path segment and part of a folder name
 _ENGINE_SET_RE = re.compile(r"[a-z][a-z0-9_]{0,31}")  # a GPU class from sets.json: a URL path segment, part of a name
+_ENGINE_SETS_SCHEMA = 2  # sets.json: one kernel library per GPU architecture ({"sm89": [89], ...}); 1 was consumer/server
 _ENGINE_SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _ENGINE_PAIR_ID_RE = re.compile(r"[0-9a-f]{32}")      # .qf_pair_id: one id per release and CUDA major, in every file
 _ENGINE_MARKER_RE = re.compile(r"\.engine-([a-z][a-z0-9_]{0,31})-cu(\d+)\.json")
@@ -1101,7 +1102,11 @@ def _engine_sets(version, hashes):
     if hashlib.sha256(raw).hexdigest() != hashes["sets.json"]:
         raise RuntimeError(f"the {version} sets.json does not match its published SHA-256")
     doc = json.loads(raw)
-    sets = doc.get("sets") if isinstance(doc, dict) else None
+    schema = doc.get("schema") if isinstance(doc, dict) else None
+    if not (type(schema) is int and schema == _ENGINE_SETS_SCHEMA):   # schema 1 = the old consumer/server classes
+        raise RuntimeError(f"the {version} sets.json has schema {schema!r}, and this plugin reads schema "
+                           f"{_ENGINE_SETS_SCHEMA} (one kernel library per GPU architecture); no engine was installed")
+    sets = doc.get("sets")
     if not (isinstance(sets, dict) and sets and all(
             isinstance(k, str) and _ENGINE_SET_RE.fullmatch(k) and isinstance(v, list) and v
             and all(type(s) is int for s in v) for k, v in sets.items())):
@@ -1182,9 +1187,11 @@ def _install_pair(bin_dir, device_idx):
         raise RuntimeError(f"the {version} verify.json is not a manifest this plugin understands")
     hashes = manifest["linux"]
     sets = _engine_sets(version, hashes)
-    gpu_set = next((k for k, sms in sets.items() if sm in sms), None)
+    gpu_set = next((k for k, sms in sets.items() if sm in sms), None)   # EXACT architecture: never a nearest match
     if gpu_set is None:
-        raise EngineNotInstallable(f"no QuantFunc engine is published for this GPU (SM {sm}); published classes: {sets}")
+        published = ", ".join(f"{s // 10}.{s % 10}" for s in sorted({s for v in sets.values() for s in v}))
+        raise EngineNotInstallable(f"no QuantFunc engine is published for this GPU's architecture (SM {sm // 10}.{sm % 10}); "
+                                   f"the {version} release has kernels for SM {published}; no engine was installed")
     host = _ENGINE_HOSTS[major]
     marker = os.path.join(bin_dir, f".engine-{gpu_set}-cu{major}.json")
     have = _read_marker(marker)
@@ -1801,9 +1808,10 @@ def _refuse_second_arch(device_idx):
     sm, m = _gpu_sm(device_idx), _installed_pair()[1]
     if sm is None or m is None or sm in m["sms"]:
         return
-    raise RuntimeError(f"qf_native: GPU {device_idx} is SM {sm}, but this ComfyUI runs the QuantFunc engine built for SM "
-                       f"{'/'.join(map(str, m['sms']))} (GPU {_ENGINE_DEVICE}). One engine serves one GPU architecture: run "
-                       f"one ComfyUI per GPU architecture (start each with CUDA_VISIBLE_DEVICES set to its GPU).")
+    raise RuntimeError(f"qf_native: GPU {device_idx} is SM {sm // 10}.{sm % 10}, but this ComfyUI runs the QuantFunc engine "
+                       f"built for SM {' / '.join(f'{s // 10}.{s % 10}' for s in m['sms'])} (GPU {_ENGINE_DEVICE}). One "
+                       f"engine serves one GPU architecture: run one ComfyUI per GPU architecture (start each with "
+                       f"CUDA_VISIBLE_DEVICES set to its GPU).")
 
 
 def make_create_params(*, model_dir, transformer_path=None, model_backend="svdq",

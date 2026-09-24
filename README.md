@@ -180,13 +180,16 @@ background, it:
 1. reads the release list on [ModelScope `QuantFunc/Plugin`](https://www.modelscope.cn/models/QuantFunc/Plugin) (HTTPS
    only) and picks the newest engine compatible with this plugin;
 2. picks the engine for your setup: the host library for torch's CUDA version (12 or 13), and the kernel library for your
-   GPU class, from the release's `sets.json`;
+   GPU's architecture (the GPU ComfyUI runs on), from the release's `sets.json`. A kernel library holds exactly one
+   architecture; an architecture the release does not publish is refused with its SM number, never given another's;
 3. downloads both, checks each file's SHA-256 against the release's `verify.json` and that both come from one build, and
-   installs them into `bin/linux/<version>-<class>-cu<major>/` — all or nothing.
+   installs them into `bin/linux/<version>-<architecture>-cu<major>/` — all or nothing.
 
 Before every load the plugin hashes the installed files again: a file that changed on disk is not loaded, and it is
 downloaded again. Offline, the installed engine stays in use. Several ComfyUI instances with different GPUs can share one
-plugin folder; each uses the engine for its own GPU.
+plugin folder; each uses the engine for its own GPU. One ComfyUI serves one GPU architecture: a pipeline on a GPU of
+another architecture is refused. To use both, run one ComfyUI per GPU architecture, each started with
+`CUDA_VISIBLE_DEVICES` set to its GPU.
 
 `verify.json` proves the files are the ones published in that same ModelScope repository. It is an integrity check, not a
 signature: it does not protect against the repository itself being changed.

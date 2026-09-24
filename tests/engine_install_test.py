@@ -7,7 +7,7 @@ torch's CUDA major, the driver's CUDA major, the GPU's SM, the CPU and the ELF D
 plugin's bin/ is a temp dir. The fake release has the layout the engine ships:
   version.json                    {"linux": {"<key>": {"comfy", "comfy-12", "lib", "lib-12", "kernel_so"}}}
   <ver>/verify.json               {"schema", "linux": {"<host>": sha256, "<set>/<kernel>": sha256, "sets.json": sha256}}
-  <ver>/linux/sets.json           {"schema": 1, "sets": {"<set>": [sm, ...]}}   the ONLY source of the GPU classes
+  <ver>/linux/sets.json           {"schema": 2, "sets": {"<set>": [sm, ...]}}   the ONLY source of the GPU classes
   <ver>/linux/<host>              one host per CUDA major (every file of a release's major carries one .qf_pair_id)
   <ver>/linux/<set>/<kernel>      one kernel per (GPU class, CUDA major)
 Installed: bin/linux/<ver>-<set>-cu<major>/{host, kernel}, then (LAST) the marker bin/linux/.engine-<set>-cu<major>.json.
@@ -73,7 +73,7 @@ class Release:
                 body[f"{gset}/{KERNELS[major]}"] = sha(k)
         self.manifest = {"schema": 1, "linux": body}      # verify_manifest.py's shape: no version key (it is the path)
         if sets is not None:
-            self.set_sets(json.dumps({"schema": 1, "sets": sets}).encode())
+            self.set_sets(json.dumps({"schema": 2, "sets": sets}).encode())
         self.publish()
         self.entries = {
             "0.0.12": {"comfy": "0.0.06", "comfy-12": "0.0.06", "lib": "0.0.12", "lib-12": "0.0.12"},   # monolithic
@@ -99,6 +99,22 @@ class Release:
         if rel not in self.files:
             raise OSError(f"404 {rel}")
         return _Resp(self.files[rel], "https://cdn.example/" + rel)
+
+
+PER_ARCH = {"sm75": [75], "sm80": [80], "sm86": [86], "sm89": [89], "sm90a": [90], "sm100a": [100], "sm103a": [103],
+            "sm120a": [120]}   # the per-arch ship's sets.json schema 2 (ship-deps-e PLUGIN-PERARCH-CHANGES.md)
+
+
+def per_arch_release(version="0.0.14"):
+    """The layout the per-arch ship publishes: sets.json schema 2, one kernel .so per architecture and CUDA major."""
+    rel = Release(version, sets=None)
+    for major in (13, 12):
+        for gset in PER_ARCH:
+            k = f"KERNEL-{version}-{gset}-cu{major}".encode()
+            rel.files[f"{version}/linux/{gset}/{KERNELS[major]}"] = k
+            rel.manifest["linux"][f"{gset}/{KERNELS[major]}"] = sha(k)
+    rel.set_sets(json.dumps({"schema": 2, "sets": PER_ARCH}).encode())
+    return rel
 
 
 def fake_needed(path):
@@ -236,7 +252,7 @@ def main():
             qfe.install_engine()
             check("an SM outside every class installs nothing", False, "installed!")
         except qfe.EngineNotInstallable as e:
-            check("an SM outside every class installs nothing, and says why", "SM 61" in str(e) and not env.pairs()
+            check("an SM outside every class installs nothing, and says why", "SM 6.1" in str(e) and not env.pairs()
                   and not any(f.startswith("0.0.13/linux/") and not f.endswith("sets.json") for f in rel.fetched), str(e)[:80])
     rel = Release()
     with Env(rel, torch_major=13, driver_major=12) as env:
@@ -277,7 +293,7 @@ def main():
             check("a release without sets.json installs nothing, and says so", "publishes no sets.json" in str(e)
                   and not env.pairs() and env.marker() is None, str(e)[:80])
     rel = Release()
-    rel.set_sets(json.dumps({"schema": 1, "sets": {"../x": [89]}}).encode())
+    rel.set_sets(json.dumps({"schema": 2, "sets": {"../x": [89]}}).encode())
     with Env(rel) as env:
         try:
             qfe.install_engine()
@@ -286,7 +302,7 @@ def main():
             check("a sets.json class that is not a plain name is refused (it would name a folder and a URL segment)",
                   "GPU-class map" in str(e) and not env.pairs(), str(e)[:80])
     rel = Release()
-    rel.set_sets(json.dumps({"schema": 1, "sets": {"consumer": [75, 86, 120], "server": [80, 89, 90]}}).encode())
+    rel.set_sets(json.dumps({"schema": 2, "sets": {"consumer": [75, 86, 120], "server": [80, 89, 90]}}).encode())
     with Env(rel, sm=89) as env:
         qfe.install_engine()
         check("a published sets.json decides the class (SM 89 moved to server here)",
@@ -752,7 +768,7 @@ def main():
         qfe.install_engine()
         first = qfe.resolve_so_path()
         new = Release("0.0.14")
-        new.set_sets(json.dumps({"schema": 1, "sets": {"consumer": [75, 86, 120],
+        new.set_sets(json.dumps({"schema": 2, "sets": {"consumer": [75, 86, 120],
                                                         "server": [80, 89, 90, 100, 103]}}).encode())
         qfe._engine_http_open = new.open
         qfe.install_engine()
@@ -786,7 +802,7 @@ def main():
     with Env(old, sm=89) as env:
         qfe.install_engine()
         new = Release("0.0.14")
-        new.set_sets(json.dumps({"schema": 1, "sets": {"consumer": [75, 86, 120],
+        new.set_sets(json.dumps({"schema": 2, "sets": {"consumer": [75, 86, 120],
                                                         "server": [80, 89, 90, 100, 103]}}).encode())
         qfe._engine_http_open = new.open
         qfe.install_engine()
@@ -811,7 +827,7 @@ def main():
         older, newer = Release("0.0.13"), Release("0.0.14")
         for rel, gset, extra in ((older, older_set, [75]), (newer, newer_set, [])):
             other = "consumer" if gset == "server" else "server"   # the older class keeps SM 75, so its marker stays
-            rel.set_sets(json.dumps({"schema": 1, "sets": {gset: [89, 120] + extra,
+            rel.set_sets(json.dumps({"schema": 2, "sets": {gset: [89, 120] + extra,
                                                            other: [s for s in (75, 80, 86, 90) if s not in extra]}}).encode())
         with Env(older, sm=89) as env:
             qfe.install_engine()
@@ -856,7 +872,7 @@ def main():
     with Env(old, sm=89) as env:
         qfe.install_engine()
         new = Release("0.0.14")
-        new.set_sets(json.dumps({"schema": 1, "sets": {"consumer": [75, 86, 120],
+        new.set_sets(json.dumps({"schema": 2, "sets": {"consumer": [75, 86, 120],
                                                         "server": [80, 89, 90, 100, 103]}}).encode())
         qfe._engine_http_open = new.open
         real_write = qfe._engine_write_file
@@ -907,7 +923,7 @@ def main():
         k = f"KERNEL-0.0.14-desktop-cu{major}".encode()
         renamed.files[f"0.0.14/linux/desktop/{KERNELS[major]}"] = k
         renamed.manifest["linux"][f"desktop/{KERNELS[major]}"] = sha(k)
-    renamed.set_sets(json.dumps({"schema": 1, "sets": {"desktop": [75, 86, 89, 120], "server": [80, 90, 100, 103]}}).encode())
+    renamed.set_sets(json.dumps({"schema": 2, "sets": {"desktop": [75, 86, 89, 120], "server": [80, 90, 100, 103]}}).encode())
     with Env(old, sm=89) as env:
         qfe.install_engine()
         qfe._engine_http_open = renamed.open
@@ -987,15 +1003,8 @@ def main():
     # 32) one engine pair per process = one GPU architecture (per-arch kernel sets; tests-07 2026-09-24): ComfyUI's device
     #     (GPU 0, SM 89) installs the sm89 pair; a pipeline on GPU 1 (SM 86) refuses loudly with the hint, GPU 0 is fine.
     #     A class covering both SMs (a multi-arch release) still admits GPU 1: the rule is coverage, not "a second device".
-    per_arch = Release("0.0.14")
-    for major in (13, 12):
-        for gset in ("sm86", "sm89"):
-            k = f"KERNEL-0.0.14-{gset}-cu{major}".encode()
-            per_arch.files[f"0.0.14/linux/{gset}/{KERNELS[major]}"] = k
-            per_arch.manifest["linux"][f"{gset}/{KERNELS[major]}"] = sha(k)
-    per_arch.set_sets(json.dumps({"schema": 1, "sets": {"sm86": [86], "sm89": [89]}}).encode())
     got = {}
-    for rel, label in ((per_arch, "per-arch"), (Release("0.0.13"), "multi-arch")):
+    for rel, label in ((per_arch_release(), "per-arch"), (Release("0.0.13"), "multi-arch")):
         with Env(rel, sm={0: 89, 1: 86}) as env:
             qfe.install_engine()
             for dev in (0, 1):
@@ -1004,10 +1013,45 @@ def main():
                     got[f"{label}/gpu{dev}"] = "ok"
                 except RuntimeError as e:
                     got[f"{label}/gpu{dev}"] = ("refused" if "one ComfyUI per GPU architecture" in str(e)
-                                                else f"other: {str(e)[:60]}")
+                                                and "GPU 1 is SM 8.6" in str(e) else f"other: {str(e)[:60]}")
     check("a second GPU architecture in one process is refused loudly with the hint; a GPU the installed class covers "
           "is fine", got == {"per-arch/gpu0": "ok", "per-arch/gpu1": "refused", "multi-arch/gpu0": "ok",
                              "multi-arch/gpu1": "ok"}, got)
+    # 33) the per-arch release as published (sets.json schema 2, one kernel .so per architecture): each GPU installs and
+    #     loads EXACTLY its architecture's set, in its own folder, and its marker claims only that SM.
+    want = {75: "sm75", 80: "sm80", 86: "sm86", 89: "sm89", 90: "sm90a", 100: "sm100a", 103: "sm103a", 120: "sm120a"}
+    got = {}
+    for sm, gset in want.items():
+        with Env(per_arch_release(), sm=sm) as env:
+            m = qfe.install_engine() or {}
+            got[sm] = (m.get("set"), m.get("sms"), os.path.relpath(qfe.resolve_so_path(), env.dir))
+    check("per-arch release: every GPU installs and loads exactly its own architecture's set",
+          all(got[sm] == (gset, [sm], f"0.0.14-{gset}-cu13/{HOSTS[13]}") for sm, gset in want.items()), got)
+    # 34) an architecture the per-arch release does not publish (SM 8.7 / 11.0 / 12.1 are aarch64 parts): refused by name,
+    #     nothing installed; never the nearest architecture's kernel.
+    refused = {}
+    for sm in (87, 110, 121):
+        with Env(per_arch_release(), sm=sm) as env:
+            try:
+                qfe.install_engine()
+                refused[sm] = "installed!"
+            except qfe.EngineNotInstallable as e:
+                refused[sm] = f"SM {sm // 10}.{sm % 10}" in str(e) and not env.pairs()
+    check("an unpublished architecture is refused by name (SM 8.7 / 11.0 / 12.1), never given the nearest kernel",
+          refused == {87: True, 110: True, 121: True}, refused)
+    # 35) sets.json must be schema 2, an int: the old consumer/server schema 1 and a float 2.0 are refused loudly.
+    res = {}
+    for label, schema in (("schema 1", 1), ("float 2.0", 2.0)):
+        rel = Release()
+        rel.set_sets(json.dumps({"schema": schema, "sets": SETS}).encode())
+        with Env(rel, sm=89) as env:
+            try:
+                qfe.install_engine()
+                res[label] = "installed!"
+            except RuntimeError as e:
+                res[label] = "schema" in str(e) and not env.pairs()
+    check("a sets.json that is not schema 2 (the old schema 1, or a float 2.0) is refused loudly, nothing installed",
+          res == {"schema 1": True, "float 2.0": True}, res)
     print("ENGINE_INSTALL:", "PASS" if bad == 0 else f"FAIL ({bad} wrong)")
     return 1 if bad else 0
 
