@@ -138,12 +138,21 @@ def _find_comfy_root():
     return None
 
 
+def _comfy_cpu_args():
+    """comfy parses its CLI args once, at its first import; with CUDA hidden (the CPU suite) the import then raises
+    "No CUDA GPUs are available" unless --cpu is set. Force that parse, as the other contract tests do."""
+    import comfy.options
+    sys.argv = [sys.argv[0], "--cpu"]
+    comfy.options.enable_args_parsing()
+
+
 def _conditioning_combine_reachability():
     comfy_root = _find_comfy_root()
     if not comfy_root:
         return None
     sys.path.insert(0, comfy_root)
     try:
+        _comfy_cpu_args()
         import torch
         from nodes import ConditioningCombine
     except Exception:      # noqa: BLE001 — missing/ABI-broken comfy → SKIP
@@ -181,6 +190,7 @@ def _cou_ge2_reachability():
         return None
     sys.path.insert(0, comfy_root)
     try:
+        _comfy_cpu_args()
         import inspect
         import comfy.samplers as _cs
         import comfy_extras.nodes_custom_sampler as _ncs

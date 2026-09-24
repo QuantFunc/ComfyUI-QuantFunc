@@ -41,7 +41,6 @@ import hashlib
 import json
 import logging
 import os
-import tempfile
 import threading
 import time
 import weakref
@@ -412,9 +411,9 @@ class QFSessionModelMixin:
     # forward of `shape` needs (sampler_helpers.estimate_memory → load_models_gpu(memory_required=…) → free_memory
     # unloads comfy's IDLE models, largest first, keeping the sampler's declared set; samplers.calc_cond_batch →
     # `need × 1.5 < free` decides cond batching) — and `loaded_size()`/`model_size()` — what it holds (the patcher,
-    # below). A cold request (no pipeline yet) reserves the comfy-side bytes only — no native pre-create working-set
-    # estimate exists (D3: no torch-estimate floor); a hot pipeline adds quantfunc_vram_need_bytes, while actual
-    # residency comes from quantfunc_resident_vram_bytes. Comfy's own
+    # below). A cold request (no pipeline yet) takes comfy's own estimate as the floor (#716: no native pre-create
+    # working-set estimate exists yet); a hot pipeline asks native numbers only (D3: comfy-side + quantfunc_vram_need_bytes),
+    # while actual residency comes from quantfunc_resident_vram_bytes. Comfy's own
     # allocator makes the room before the denoise starts; nothing here reaches into comfy's state (user: 「不要 hack」).
     # What this REPLACES (git: 52ec260 / 9b6f7d3 / a6ec609): this function returned the comfy-side bytes ONLY — a
     # deliberate under-report so comfy would never evict the engine for a stage-2 shadow load (2026-08-22: the
@@ -804,8 +803,8 @@ class QFLazyEngine:
     def vram_need_bytes(self, latent_shape):
         entry = self._real or self.ensure_if_cached()
         if entry is None:
-            # A cold/unestimable result is zero: QFSessionModelMixin.memory_required then reserves the
-            # comfy-side bytes only (D3 — never ComfyUI's torch estimate as a floor).
+            # A cold/unestimable result is zero: QFSessionModelMixin.memory_required then takes comfy's own
+            # estimate as the floor (#716) until a pipeline exists; hot requests never do (D3).
             return 0
         return entry.vram_need_bytes(latent_shape)
 
@@ -955,6 +954,8 @@ def tag_lora_rebuild(patcher, lora_entries, rebuild):
     """Mark a freshly built patcher's model with its LoRA set + how to re-create with a new one, and hand that set to
     its lazy engine (applied in place at ensure()). Every family's build ends here, so this is the ONE wiring point."""
     m = patcher.model
+    if not isinstance(m._qf, QFLazyEngine):   # the set lives on the lazy engine; any other holder would drop it silently
+        raise TypeError(f"tag_lora_rebuild: {type(m).__name__}._qf must be a QFLazyEngine, not {type(m._qf).__name__}")
     m._qf._lora = [dict(e) for e in lora_entries]
     setattr(m, QF_LORA_STACK_ATTR, list(lora_entries))
     setattr(m, QF_LORA_REBUILD_ATTR, rebuild)

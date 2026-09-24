@@ -28,6 +28,15 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _SRC = os.environ.get("QF_LTXSAFETY_TEST_SRC") or os.path.join(_HERE, "..", "qf_ltx_modelpatcher.py")
 
 
+
+def _comfy_cpu_args():
+    """comfy parses its CLI args once, at its first import; with CUDA hidden (the CPU suite) the import then raises
+    "No CUDA GPUs are available" unless --cpu is set. Force that parse, as the other contract tests do."""
+    import comfy.options
+    sys.argv = [sys.argv[0], "--cpu"]
+    comfy.options.enable_args_parsing()
+
+
 def _src_text():
     return open(_SRC, errors="replace").read()
 
@@ -240,6 +249,7 @@ def _t_post_connector_seq(src):
     try:
         if comfy_path not in sys.path:
             sys.path.insert(0, comfy_path)
+        _comfy_cpu_args()
         from comfy.ldm.lightricks.embeddings_connector import Embeddings1DConnector
     except Exception as e:   # noqa: BLE001 — env-gated arm, suite [SKIP] convention
         print(f"  [SKIP] post_connector_seq real-connector arms (comfy unimportable from {comfy_path}: "

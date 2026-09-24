@@ -1196,6 +1196,13 @@ def main():
             qfn.qfmp.time = _real_time
             del _rt_real.end_session_if_open
             _rt_real.current_session = None
+        try:
+            qfn.qfmp.tag_lora_rebuild(_types.SimpleNamespace(model=_types.SimpleNamespace(_qf=_rt_real)), [_pa], lambda s: None)
+            _typed = ""
+        except TypeError as _e:
+            _typed = str(_e)
+        check("runtime LoRA: tag_lora_rebuild refuses a model whose engine is not a QFLazyEngine (no silent drop)",
+              "must be a QFLazyEngine" in _typed, f"-> {_typed!r}")
         check("runtime LoRA: after an interrupted run's refused end, ONE 2 s retry, then the set change goes through",
               not _late and len(_ends) == 2 and _slept == [2.0] and _rt_updates[-1] == {"lora": [_pb1]},
               f"-> refused={_late!r} ends={len(_ends)} slept={_slept} last={_rt_updates[-1]}")

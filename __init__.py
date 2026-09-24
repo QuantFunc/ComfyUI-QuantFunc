@@ -94,7 +94,6 @@ def _load_model_config(name):
 
 
 _NO_XFM_HINT = "(no .safetensors in models/diffusion_models)"
-_XFM_NONE = "(none)"
 
 
 def _transformer_choices():
@@ -136,7 +135,7 @@ def _resolve_transformer(name):
     """Resolve a listed transformer filename to its full path via comfy's own containment
     (get_full_path_or_raise confines it to the diffusion_models roots — the untrusted-widget
     #vuln guard, same as _resolve_lora)."""
-    if _folder_paths is None or name in ("", _NO_XFM_HINT, _XFM_NONE):
+    if _folder_paths is None or name in ("", _NO_XFM_HINT):
         raise RuntimeError("qf_native: no transformer weight selected — put the svdq .safetensors "
                            "under ComfyUI/models/diffusion_models/ and pick it in transformer1.")
     return _folder_paths.get_full_path_or_raise("diffusion_models", name)
