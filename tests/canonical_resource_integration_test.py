@@ -514,6 +514,24 @@ class CanonicalIntegration(unittest.TestCase):
         self.assertEqual(observed["actual_delta"], self.lib.capacity_bytes)
         self.assertTrue(lazy.materialized)
 
+    def test_model_config_attrs_are_ensured_without_comfys_missing_attribute_warning(self):
+        # comfy's BASE answers a missing attribute through a warning __getattr__ (0.37 dropped scaled_fp8): the ensure
+        # step looks up statically -- no warning, the missing default is SET so later reads stay quiet, and a present
+        # attribute keeps its value. hasattr() warned here and left the attribute unset (every read warned again).
+        import comfy.supported_models as supported_models
+        cfg = supported_models.Krea2({"image_model": "krea2", "disable_unet_model_creation": True})
+        cfg.optimizations = {"fp8": True}
+        with self.assertNoLogs(level="WARNING"):
+            self.assertIs(qfm.ensure_model_config_attrs(cfg), cfg)
+            self.assertIsNone(cfg.scaled_fp8)
+        self.assertEqual(cfg.optimizations, {"fp8": True})
+
+        class Bare:   # a config with none of them and no __getattr__: every default is set
+            pass
+        bare = qfm.ensure_model_config_attrs(Bare())
+        self.assertIsNone(bare.scaled_fp8)
+        self.assertEqual(bare.optimizations, {})
+
     def test_cold_request_asks_comfy_for_the_engines_create_time_need_not_its_floor(self):
         """#738 (G3 landed): with an engine that reports its cold create-time need (quantfunc_resource_vram_need_bytes),
         the cold reserve is comfy side + that need — comfy's torch estimate is no longer the floor — so ComfyUI evicts its

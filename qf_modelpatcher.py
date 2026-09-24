@@ -38,6 +38,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 import functools
 import hashlib
+import inspect
 import json
 import os
 import threading
@@ -1001,12 +1002,20 @@ QF_LORA_STACK_ATTR = "_qf_lora_stack"
 QF_LORA_REBUILD_ATTR = "_qf_rebuild"
 
 
+_ABSENT = object()
+
+
 def ensure_model_config_attrs(model_config):
     """comfy's model_config classes grow attributes over releases; a seam that builds one directly
-    must tolerate an older/newer comfy. ONE definition (was copy-pasted in every family builder)."""
+    must tolerate an older/newer comfy. ONE definition (was copy-pasted in every family builder).
+
+    Looked up STATICALLY: comfy's BASE answers any missing attribute through a __getattr__ that logs
+    "you accessed scaled_fp8 from the model config object which doesn't exist. Please fix your code"
+    and returns None (0.37 dropped scaled_fp8). hasattr() therefore warned on every load AND saw the
+    attribute as present, so it was never set and every later read warned again."""
     for attr, default in (("manual_cast_dtype", None), ("custom_operations", None),
                           ("optimizations", {}), ("scaled_fp8", None)):
-        if not hasattr(model_config, attr):
+        if inspect.getattr_static(model_config, attr, _ABSENT) is _ABSENT:
             setattr(model_config, attr, default)
     return model_config
 
