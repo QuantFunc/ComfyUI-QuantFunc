@@ -768,7 +768,7 @@ def _bind(lib):
 
 
 _LIB = None
-_LIB_PATH = None             # the engine library load_lib loaded — constant for the process (loaded_so_path)
+_LIB_PATH = None             # the engine library load_lib loaded - constant for the process (loaded_so_path)
 _FINGERPRINT_PENDING = None  # (lib, path, file identity at load) whose fingerprint waits for the first info-level loader
 _LIB_LOCK = threading.Lock()  # one first load per process: two could resolve two different pairs (a marker switched between)
 _LOG_LEVEL = None   # the level a loader asked for (qf_log_level); applied when/after the library loads
@@ -1304,7 +1304,7 @@ def _install_pair(bin_dir, device_idx):
             _claim(bin_dir, marker, sets[gpu_set])
             _engine_status("installed", f"engine {version} ({gpu_set}, CUDA {major})")
             return have
-        os.remove(marker)    # KNOWN mismatch: the release no longer publishes these bytes — never loaded again
+        os.remove(marker)    # KNOWN mismatch: the release no longer publishes these bytes - never loaded again
         known_bad, have = version, None
     pair = os.path.join(bin_dir, f"{version}-{gpu_set}-cu{major}")
     os.makedirs(pair, exist_ok=True)
@@ -1403,7 +1403,7 @@ def start_engine_install(device_idx=None):
         except EngineNotInstallable as e:
             _engine_status("unavailable", str(e))
             say(f"[qf_native] QuantFunc engine not installed: {e}", flush=True)
-        except Exception as e:  # noqa: BLE001 — offline / manifest / hash: a verified installed pair stays in use
+        except Exception as e:  # noqa: BLE001 - offline / manifest / hash: a verified installed pair stays in use
             kept = _installed_pair()[1]
             _engine_status("offline" if kept else "failed", f"{type(e).__name__}: {e}")
             say(f"[qf_native] QuantFunc engine update failed ({type(e).__name__}: {e}); "
@@ -1513,7 +1513,7 @@ def _elf_map(path, read):
     try:
         with open(path, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as data:
             return read(data)
-    except Exception:  # noqa: BLE001 — any unreadable / malformed ELF → "undeterminable", the caller fails closed
+    except Exception:  # noqa: BLE001 - any unreadable / malformed ELF -> "undeterminable", the caller fails closed
         return None
 
 
@@ -1884,7 +1884,7 @@ def _log_lib_fingerprint(lib, so_path, ident):
             fn.restype = ctypes.c_char_p
             fn.argtypes = []
             ver = (fn() or b"?").decode("utf-8", "replace")
-        except Exception:  # noqa: BLE001 — an old .so without the symbol still gets the file fingerprint
+        except Exception:  # noqa: BLE001 - an old .so without the symbol still gets the file fingerprint
             pass
         info("[qf_native] engine lib: %s  size=%d  mtime=%s  md5=%s  quantfunc_version=%s"
               % (so_path, st.st_size, time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st.st_mtime)),
@@ -1894,8 +1894,11 @@ def _log_lib_fingerprint(lib, so_path, ident):
 
 
 def last_err(lib):
+    """The engine's last error text, console-safe. Every plugin raise of an engine error goes through here, and ComfyUI
+    logs an uncaught node exception to its strict console (execution.py); a character the code page cannot hold made
+    that logging raise (#738)."""
     e = lib.quantfunc_last_error()
-    return e.decode("utf-8", "replace") if e else "(none)"
+    return console_safe(e.decode("utf-8", "replace")) if e else "(none)"
 
 
 def _enc(s):
@@ -1915,7 +1918,7 @@ def _refuse_session_knobs_in_create(config_json):
     if isinstance(cfg, (str, bytes, bytearray)):
         try:
             cfg = json.loads(cfg)
-        except Exception:  # noqa: BLE001 — unparseable JSON: the engine's own create refuses it loudly
+        except Exception:  # noqa: BLE001 - unparseable JSON: the engine's own create refuses it loudly
             return
 
     def _scan(obj):
@@ -1970,7 +1973,7 @@ def make_create_params(*, model_dir, transformer_path=None, model_backend="svdq"
     if not 0 <= device_idx < (1 << 31):
         raise ValueError("resource device must fit nonnegative int32")
     _refuse_second_arch(device_idx)                # one engine pair per process: one GPU architecture
-    _refuse_session_knobs_in_create(config_json)   # [session-knobs] session knob ≠ create key
+    _refuse_session_knobs_in_create(config_json)   # [session-knobs] session knob != create key
     if isinstance(config_json, dict):
         config_json = dict(config_json)
     # [metadata-KV disk cache — user 2026-09-01 "为啥metadata每次都重新请求后端 不是有缓存吗"]
@@ -1991,7 +1994,7 @@ def make_create_params(*, model_dir, transformer_path=None, model_backend="svdq"
             if isinstance(_cj, dict) and "_cache_dir" not in _cj:
                 _cj["_cache_dir"] = _cdir; config_json = json.dumps(_cj)
     except Exception:
-        pass  # cache dir is an optimization — never block create on it
+        pass  # cache dir is an optimization - never block create on it
     p = InitParams()
     p._keep = [_enc(model_dir), _enc(transformer_path), _enc(model_backend)]
     p.model_dir = p._keep[0]
@@ -2157,7 +2160,7 @@ class QFEngineHandle:
                         f"{last_err(self.lib)}", flush=True)
                 except Exception:  # noqa: BLE001
                     pass
-        except Exception as _end_exc:  # noqa: BLE001 — end is best-effort on teardown
+        except Exception as _end_exc:  # noqa: BLE001 - end is best-effort on teardown
             ok = False
             try:  # R7 observability: this branch previously left no trail (leg-1 was
                 #   diagnosed FROM logs — a silent branch here would blind the next diagnosis)

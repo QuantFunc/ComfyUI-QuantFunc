@@ -64,8 +64,8 @@ _FORCE_EULER = {
     # (i) eta=0 gives SILENT/DEGENERATE audio through the engine's stateless forward — 2nd-order/ancestral
     #     samplers whose interior-sigma eval lands off-schedule and the engine's nearest-by-value
     #     step_index duplicates a step:
-    "sample_dpm_2_ancestral",              # eta=0 → 27 KB no-audio output (measured)
-    "sample_res_multistep_ancestral",      # eta=0 → -13.6 dB clipping + over-saturated video, diverges
+    "sample_dpm_2_ancestral",              # eta=0 -> 27 KB no-audio output (measured)
+    "sample_res_multistep_ancestral",      # eta=0 -> -13.6 dB clipping + over-saturated video, diverges
     # (ii) cfg++ samplers whose OWN body view/reshapes the latent to a SINGLE-lane shape that is invalid
     #      for the 2x (video+audio) AV latent → they RuntimeError ("shape [1,128,16,9,16] invalid for
     #      input of size 589824") regardless of this fix; euler-sub runs plain euler instead, bypassing
@@ -142,10 +142,10 @@ def _wrap(orig, name, sig, params):
                 target, call_args, call_kwargs = orig, ba.args, ba.kwargs
                 how = "s_churn=0 (keeps its own deterministic body)"
             _log_once(name, how)
-        except Exception as e:  # never break sampling — degrade to the original (unfixed) behavior
+        except Exception as e:  # never break sampling - degrade to the original (unfixed) behavior
             _log.warning("[qf_native] LTX-2.5 AV euler-force setup failed for %s (%r); sampler unchanged.", name, e)
             return orig(model, x, sigmas, *args, **kwargs)
-        return target(*call_args, **call_kwargs)  # outside the try — a sampler-internal error propagates normally
+        return target(*call_args, **call_kwargs)  # outside the try - a sampler-internal error propagates normally
 
     return wrapped
 

@@ -208,7 +208,7 @@ class _CtxKeyAssigner:
             return _KNO_CTX_KEY                       # no trustworthy identity -> engine disables caches (safe)
         k = self._uuid_to_key.get(cond_uuid)
         if k is None:
-            k = len(self._uuid_to_key) + 1            # first-seen order -> {1,2,…}; non-zero (caching ON)
+            k = len(self._uuid_to_key) + 1            # first-seen order -> {1,2,...}; non-zero (caching ON)
             self._uuid_to_key[cond_uuid] = k
         return k
 
@@ -593,7 +593,7 @@ class QFImageSessionModel(QFSessionModelMixin):
     def __init__(self, model_config, engine, device=None):
         super().__init__(model_config, device=device)
         self.diffusion_model = _QFStub()
-        self.diffusion_model.arm_concat_shape(self._LATENT_CHANNELS)   # in == latent channels → extra 0 → no concat
+        self.diffusion_model.arm_concat_shape(self._LATENT_CHANNELS)   # in == latent channels -> extra 0 -> no concat
         self._qf = engine
         self._num_steps = 0
         self._step_i = 0
@@ -1026,7 +1026,7 @@ def stage_denoise_only_package(bundle_dir, transformer1_path, extra_links=None):
             shutil.rmtree(stage)
         else:
             os.remove(stage)
-    shutil.copytree(bundle_dir, stage)   # tiny config JSONs only — no weights
+    shutil.copytree(bundle_dir, stage)   # tiny config JSONs only - no weights
     def _link_expert(sub, target):
         d = os.path.join(stage, sub)
         os.makedirs(d, exist_ok=True)

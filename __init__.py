@@ -32,7 +32,7 @@ try:
     from . import qf_modelpatcher as qfmp
     from .qf_modelpatcher import QFModelPatcher
     _IMPORT_OK = True
-except Exception as _exc:  # noqa: BLE001 — never break registration; report loudly
+except Exception as _exc:  # noqa: BLE001 - never break registration; report loudly
     _log.warning("[qf_native] disabled - a required import failed (ComfyUI API drift?): %s", ascii(_exc))
     _IMPORT_OK = False
 
@@ -40,7 +40,7 @@ except Exception as _exc:  # noqa: BLE001 — never break registration; report l
 # folder_paths gives the model-file listing surface (INT8-Fast-aligned: FILES, not dirs).
 try:
     import folder_paths as _folder_paths
-except Exception as _fp_exc:  # noqa: BLE001 — never break registration
+except Exception as _fp_exc:  # noqa: BLE001 - never break registration
     _folder_paths = None
     _log.warning("[qf_native] folder_paths unavailable: %s", ascii(_fp_exc))
 
@@ -76,7 +76,7 @@ def _model_config_choices(family=None):
                     with open(mp, "r", encoding="utf-8") as fh:
                         if str(json.load(fh).get("family")) != family:
                             continue
-                except Exception:  # noqa: BLE001 — unreadable manifest: hide from filtered lists
+                except Exception:  # noqa: BLE001 - unreadable manifest: hide from filtered lists
                     continue
             out.append(d)
         return out or [_NO_CFG_HINT]
@@ -118,9 +118,11 @@ def _load_model_config(name):
         with open(mf, encoding="utf-8") as fh:   # never the OS code page: Windows would read it as cp936 (#738)
             manifest = json.load(fh)
     except Exception as exc:  # noqa: BLE001
-        raise RuntimeError(f"qf_native: model_config {name!r} manifest unreadable: {exc}") from exc
+        raise RuntimeError(f"qf_native: model_config {name!r} manifest unreadable ({mf}): {exc}. "
+                           f"It ships with the plugin: reinstall or update the QuantFunc plugin.") from exc
     if not isinstance(manifest, dict) or not manifest.get("family"):
-        raise RuntimeError(f"qf_native: model_config {name!r} manifest must declare a family.")
+        raise RuntimeError(f"qf_native: model_config {name!r} manifest ({mf}) must declare a family. "
+                           f"It ships with the plugin: reinstall or update the QuantFunc plugin.")
     return bundle, manifest
 
 
@@ -234,9 +236,11 @@ def _read_auth():
             with open(keyfile, encoding="utf-8") as fh:
                 c = json.load(fh)
         except (OSError, ValueError) as exc:
-            raise RuntimeError(f"qf_native: the keyfile {keyfile} is unreadable: {exc}") from exc
+            raise RuntimeError(f"qf_native: the keyfile {keyfile} is unreadable: {exc}. Set QUANTFUNC_API_KEY (the file "
+                               f"is then not read), or restore the file: reinstall or update the QuantFunc plugin.") from exc
         if not isinstance(c, dict):
-            raise RuntimeError(f"qf_native: the keyfile {keyfile} must hold a JSON object.")
+            raise RuntimeError(f"qf_native: the keyfile {keyfile} must hold a JSON object. Set QUANTFUNC_API_KEY (the file "
+                               f"is then not read), or restore the file: reinstall or update the QuantFunc plugin.")
         key, surl = c.get("api_key", ""), c.get("server_url", surl)
     return key, surl
 
@@ -262,7 +266,7 @@ def _comfy_device_index():
 _PIPELINE_CACHE = {}     # ckey -> QFEngineHandle
 _PREPARED_CACHE = weakref.WeakValueDictionary()  # cold identities retained by lazy consumers
 _ENGINE_IDENTITY_LOCK = threading.RLock()
-_PIPELINE_MODELS = {}    # ckey -> [weakref.ref(consumer), ...] — ALL live consumers of that config's
+_PIPELINE_MODELS = {}    # ckey -> [weakref.ref(consumer), ...] - ALL live consumers of that config's
 #                          handle. A LIST, not one ref: two loader nodes on the same package share
 #                          ONE handle, and a single last-load-wins ref made the FIRST model invisible
 #                          to liveness (measured: a sibling's release/sweep could destroy the shared
@@ -387,8 +391,8 @@ def _retire_handle(ckey, eng, requester=None, *, keep_binding=False, reason=""):
         retired_entry.retire_materialized()
     # Native teardown may be slow and must never run under the cache lock.
     try:
-        eng.destroy()   # idempotent (pipeline→None); closes any session first
-    except Exception:  # noqa: BLE001 — retire must never mask the caller's continuation
+        eng.destroy()   # idempotent (pipeline->None); closes any session first
+    except Exception:  # noqa: BLE001 - retire must never mask the caller's continuation
         pass
     return True
 
@@ -404,7 +408,7 @@ def _sweep_dead_pipelines(keep_key):
             continue
         with _ENGINE_IDENTITY_LOCK:
             if not _PIPELINE_MODELS.get(k):
-                continue   # UNBOUND (load may be in flight) → never touch; only ever-bound entries sweep
+                continue   # UNBOUND (load may be in flight) -> never touch; only ever-bound entries sweep
             eng = _PIPELINE_CACHE.get(k)
         # requester=None ⇒ _retire_handle refuses while ANY consumer is live (only-all-dead sweeps)
         if eng is not None and _retire_handle(k, eng, None, reason="host-RAM sweep"):
@@ -573,7 +577,7 @@ if _IMPORT_OK:
                 mod = importlib.import_module("." + mod_name, __name__)
                 _FAMILY_BUILDERS[mod.FAMILY] = mod.register(deps)
                 _FAMILY_MATCHERS.append((mod.FAMILY, mod.matches))
-            except Exception as exc:  # noqa: BLE001 — never break plugin import
+            except Exception as exc:  # noqa: BLE001 - never break plugin import
                 _log.warning("[qf_native] family module %s not registered: %s", mod_name, ascii(exc))
 
     _register_families()
@@ -675,7 +679,8 @@ if _IMPORT_OK:
     # User-facing text states only the speed / quality trade (user 「介绍上不要透露技术细节」).
     _QUALITY_FAST_OPTIONS = ["super_fast", "fast", "balance", "best_quality"]
     _QUALITY_BASE_OPTIONS = ["balance", "best_quality"]
-    _QUALITY_DEFAULT = "balance"   # every GPU; the fast options are opt-in (user 「默认balance」)
+    # every GPU; the fast options are opt-in (user 「默认balance」)
+    _QUALITY_DEFAULT = "balance"
     # What each option does, ONE clause per tier, on every family and every text (tooltips, README, workflow notes), from
     # the measurements vs best_quality: Qwen-Image-2.1 PSNR 23-27 dB (the note below), Krea-2 balance 20.7-22 dB / SSIM ~0.78
     # (a pose / composition shift), LTX-2.5 balance 15.8 dB (a different pose / motion); H3's 3-step turbo balance is
@@ -876,7 +881,7 @@ if _IMPORT_OK:
                 maj, _min = torch.cuda.get_device_capability(0)
                 if maj < 8:  # SM75 Turing (sm_7x): no sage int8-QK, no flash_attn
                     choices = _ATTN_BACKEND_SM75
-        except Exception:  # noqa: BLE001 — no torch/CUDA at import → assume modern; engine validates
+        except Exception:  # noqa: BLE001 - no torch/CUDA at import -> assume modern; engine validates
             pass
         return choices
 
@@ -1058,7 +1063,7 @@ if _IMPORT_OK:
 
         def load(self, transformer, model_config=None,
                  attention_backend="flash", sol_tau=1.0, quality=None, audio_enhance=False,
-                 step_cache=0.0, block_cache=0.0, allow_partial_denoise=False, quality_enhance=None):  # H3: flash default (auto→sage is broken)
+                 step_cache=0.0, block_cache=0.0, allow_partial_denoise=False, quality_enhance=None):  # H3: flash default (auto->sage is broken)
             _p = _run_family_load("minimax-h3", transformer, model_config)
             _dev = _loaded_device_index(_p)
             q = _resolve_quality(quality, quality_enhance, _dev, "minimax-h3")
@@ -1189,7 +1194,7 @@ if _IMPORT_OK:
         _rc = _ilu.module_from_spec(_spec)
         _spec.loader.exec_module(_rc)
         _rc.warn_if_stale(comfy_root=os.path.dirname(os.path.dirname(comfy.model_management.__file__)))
-    except Exception as _rc_exc:  # noqa: BLE001 — the self-check must never break plugin import
+    except Exception as _rc_exc:  # noqa: BLE001 - the self-check must never break plugin import
         _log.debug("[qf_native] reject-list self-check skipped: %s", ascii(_rc_exc))
     # (R7: the old single-node "QuantFuncNativeLoader" display entry is GONE with the class —
     # a display mapping for an unregistered class is dead weight; the three per-family loaders
@@ -1205,7 +1210,7 @@ if _IMPORT_OK:
         _qf_srv = getattr(_qf_sys.modules.get("server"), "PromptServer", None)
         if getattr(_qf_srv, "instance", None) is not None:
             qfe.start_engine_install(_comfy_device_index())
-    except Exception as _qf_install_exc:  # noqa: BLE001 — installing must never break plugin import
+    except Exception as _qf_install_exc:  # noqa: BLE001 - installing must never break plugin import
         _log.warning("[qf_native] engine install not started: %s", ascii(_qf_install_exc))
 
 

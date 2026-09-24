@@ -57,7 +57,7 @@ from .qf_modelpatcher import (_qf_dtype, _QFStub,
 # ── LTX-2.3-22B connector config (av_model.py video connector; dossier seq-234) ─────────────────────
 # inner_dim = 32*128 = 4096 (NOT the Embeddings1DConnector default 30*128=3840); 2 layers; the video
 # slice of the dual TE output is [:, :, :_LTX_VIDEO_DIM].
-_LTX_VIDEO_DIM = 4096          # cross_attention_dim (video) — the connector inner_dim + the video slice width
+_LTX_VIDEO_DIM = 4096          # cross_attention_dim (video) - the connector inner_dim + the video slice width
 # The connector ARCH (num_layers / num_heads / head_dim / num_registers / inner_dim) is DERIVED from the
 # checkpoint by _derive_connector_arch (Finding #1) -- nothing below is a hardcoded arch dim.
 # ★ SECURITY BOUNDS (vuln-CR + self-CR Reviewer A): EVERY value derived from the untrusted `connector_ckpt`
@@ -172,15 +172,17 @@ def _connector_config_heads(model_dir):
             with open(cand, encoding="utf-8") as f:
                 cfg = json.load(f)
         except (OSError, ValueError) as exc:
-            raise RuntimeError(f"QuantFuncNativeLoader: {cand} is unreadable: {exc}") from exc
+            raise RuntimeError(f"QuantFuncNativeLoader: {cand} is unreadable: {exc}. It is the model's diffusers "
+                               f"LTX2TextConnectors config: restore it from the model's download.") from exc
         if not isinstance(cfg, dict):
-            raise RuntimeError(f"QuantFuncNativeLoader: {cand} must hold a JSON object.")
+            raise RuntimeError(f"QuantFuncNativeLoader: {cand} must hold a JSON object. It is the model's diffusers "
+                               f"LTX2TextConnectors config: restore it from the model's download.")
         heads = cfg.get("video_connector_num_attention_heads")
         if heads is None:
             continue
         if type(heads) is not int or not 1 <= heads <= _MAX_CONNECTOR_HEADS:
             raise RuntimeError(f"QuantFuncNativeLoader: {cand} declares video_connector_num_attention_heads={heads!r}; "
-                               f"expected an integer in 1..{_MAX_CONNECTOR_HEADS}.")
+                               f"expected an integer in 1..{_MAX_CONNECTOR_HEADS}. Restore the file from the model's download.")
         return heads
     return None
 
@@ -612,7 +614,7 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
         self._num_steps = len(sigmas) - 1
         try:
             s_first, s_last = float(sigmas[0]), float(sigmas[-1])
-        except Exception:  # noqa: BLE001 — non-tensor sigmas: keep the count, skip the range check
+        except Exception:  # noqa: BLE001 - non-tensor sigmas: keep the count, skip the range check
             return
         if s_first <= s_last:
             raise RuntimeError(
@@ -708,7 +710,7 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
         lib = self._qf.lib   # MATERIALIZE FIRST (see qf_h3_modelpatcher._begin: a deferred wrapper
         # no-ops the close while the cached engine still holds an interrupted run's open session)
         self._qf.end_session_if_open()
-        self._ctx_key_assigner.reset()   # per-generation uuid→key numbering (no cross-gen leak)
+        self._ctx_key_assigner.reset()   # per-generation uuid->key numbering (no cross-gen leak)
         bpx = qfe.DenoiseBeginParams()
         ctypes.memset(ctypes.byref(bpx), 0, ctypes.sizeof(bpx))
         bpx.struct_size = ctypes.sizeof(bpx)
@@ -1168,7 +1170,7 @@ def _file_has_prefix(path, prefix):
                 return False
             hdr = json.loads(fh.read(n))
         return any(k.startswith(prefix) for k in hdr)
-    except Exception:  # noqa: BLE001 — unreadable = no keys
+    except Exception:  # noqa: BLE001 - unreadable = no keys
         return False
 
 

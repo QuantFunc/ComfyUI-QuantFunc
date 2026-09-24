@@ -64,11 +64,11 @@ def _h3_frames_from_latent_t(latent_t):
             fc += 17
         if _h3n.video_latent_t(fc) == lt:
             return fc
-    except Exception:  # noqa: BLE001 — fall through to the closed form
+    except Exception:  # noqa: BLE001 - fall through to the closed form
         pass
     return 5 if lt <= 2 else (lt - 2) // 5 * 17 + 5
 _H3_VIDEO_CHANNELS = 24   # video latent channels
-_H3_AUDIO_CHANNELS = 32   # audio_latents_dim (AutoencoderKLMiniMaxH3Audio) — kMmh3AudioLatentDim
+_H3_AUDIO_CHANNELS = 32   # audio_latents_dim (AutoencoderKLMiniMaxH3Audio) - kMmh3AudioLatentDim
 _H3_AUDIO_STEREO = 2      # K (stereo)
 
 # The official audio pack/unpack + video patchify/unpatchify — import from comfy so a ComfyUI upgrade
@@ -256,7 +256,7 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
         # before materializing was a no-op on that wrapper -> begin hit "pipeline busy" until the
         # 5-min engine watchdog (measured 2026-08-24). Post-materialize, the close is real.
         self._qf.end_session_if_open()
-        self._ctx_key_assigner.reset()   # per-generation uuid→key numbering (no cross-gen leak)
+        self._ctx_key_assigner.reset()   # per-generation uuid->key numbering (no cross-gen leak)
         bpx = qfe.DenoiseBeginParams()
         ctypes.memset(ctypes.byref(bpx), 0, ctypes.sizeof(bpx))
         bpx.struct_size = ctypes.sizeof(bpx)

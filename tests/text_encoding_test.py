@@ -28,12 +28,15 @@ CONSOLE ARMS (the plugin's own OUTPUT must never raise on the console's code pag
 stdout/stderr with errors='strict' (its LogInterceptor), so on a redirected Windows console one character the code page
 cannot hold raises UnicodeEncodeError out of the print() / log call, and out of the loader:
   static      no print() outside qf_engine.say, no root-logger call, no bare getLogger where qfe.logger() exists, and
-              no non-ASCII string literal: a raised exception reaches the console through ComfyUI's own
-              logging.error, where logging swallows an unencodable message and the line is lost
+              no non-ASCII on any line a traceback can print (a code line: its literals and its trailing comment).
+              ComfyUI logs an uncaught node exception and its traceback; on cp932/cp949 one unencodable character
+              there makes that logging raise
   runtime     per code page cp932 / cp949 / cp1252 / cp936 (PYTHONIOENCODING, streams wrapped like ComfyUI's): importing
               the plugin, qf_engine.say / info / logger, and the LTX audio-fix warning never raise and never lose a line
               ("--- Logging error ---"); every plugin logger carries the console-safe filter; the bytes on stdout/stderr
-              are valid in the code page, with what it cannot hold backslash-escaped; qf_lora_convert --help runs.
+              are valid in the code page, with what it cannot hold backslash-escaped; qf_lora_convert --help runs;
+              an ENGINE error (last_err) raised through the plugin's real create_pipeline and logged the way
+              ComfyUI's execution.py logs it (the message, then the traceback) never raises a second exception.
 
 Run:  python3 tests/text_encoding_test.py       stdlib only: no ComfyUI, no torch, no GPU
       QF_TEXTIO_TEST_ROOT=<plugin tree> points it at another tree (e.g. the unfixed base, to show the arms go RED).
@@ -172,16 +175,18 @@ def _console_sites(root):
             elif (has_qfe and isinstance(f, ast.Attribute) and f.attr == "getLogger" and isinstance(f.value, ast.Name)
                   and f.value.id in aliases and id(n) not in fallback):
                 sites.append(f"{fn}:{n.lineno} logging.getLogger(...) where qfe.logger(...) exists")
-        sites += [f"{fn}:{row} non-ASCII string literal ({', '.join(f'U+{ord(c):04X}' for c in chars)})"
-                  for row, chars in _non_ascii_literals(tree, path)]
+        sites += [f"{fn}:{row} non-ASCII on a traceback-visible line ({', '.join(f'U+{ord(c):04X}' for c in chars)})"
+                  for row, chars in _non_ascii_code_lines(tree, path)]
     return sites
 
 
-def _non_ascii_literals(tree, path):
-    """(line, chars) for each string literal outside a docstring that carries a non-ASCII character. An exception the
-    plugin raises reaches ComfyUI's console through ComfyUI's own logging.error (execution.py: "!!! Exception during
-    processing !!! {ex}"), which the plugin cannot make console-safe. On a code page that lacks the character, logging
-    swallows the error and the line is lost, so the plugin's own text stays ASCII (#738)."""
+def _non_ascii_code_lines(tree, path):
+    """(line, chars) for each CODE line (outside a docstring, not comment-only) carrying a non-ASCII character: its
+    string literals and its trailing comment alike. ComfyUI logs an uncaught node exception AND its traceback, which
+    prints the source line of every frame (execution.py: logging.error(traceback.format_exc())). On a code page that
+    lacks one character there, logging's handleError re-prints the exception chain to the same strict stream and raises
+    (cp932/cp949, measured), so every line a traceback can print stays ASCII (#738). Comment-only lines and docstrings
+    never appear in a traceback."""
     import io
     import tokenize
     doc = set()
@@ -190,11 +195,16 @@ def _non_ascii_literals(tree, path):
                 and isinstance(n.body[0], ast.Expr) and isinstance(n.body[0].value, ast.Constant)
                 and isinstance(n.body[0].value.value, str)):
             doc.update(range(n.body[0].lineno, n.body[0].end_lineno + 1))
-    kinds = {tokenize.STRING, getattr(tokenize, "FSTRING_MIDDLE", tokenize.STRING)}
     with open(path, encoding="utf-8") as f:
-        toks = list(tokenize.generate_tokens(io.StringIO(f.read()).readline))
-    return [(t.start[0], sorted({c for c in t.string if ord(c) > 127})) for t in toks
-            if t.type in kinds and t.start[0] not in doc and any(ord(c) > 127 for c in t.string)]
+        src = f.read()
+    skip = {tokenize.COMMENT, tokenize.NL, tokenize.NEWLINE, tokenize.INDENT, tokenize.DEDENT, tokenize.ENDMARKER}
+    code = set()
+    for t in tokenize.generate_tokens(io.StringIO(src).readline):
+        if t.type not in skip:
+            code.update(range(t.start[0], t.end[0] + 1))
+    lines = src.split("\n")
+    return [(ln, sorted({c for c in lines[ln - 1] if ord(c) > 127})) for ln in sorted(code - doc)
+            if any(ord(c) > 127 for c in lines[ln - 1])]
 
 
 # The plugin's own non-ASCII punctuation (— – →), CJK, Hangul, Latin-1 and an emoji: no single code page holds them all.
@@ -248,6 +258,20 @@ def _console_child(job):
         qfe._LOG_LEVEL = qfe._LOG_INFO
         out["console say"] = out["console logger"] = out["console exception"] = missing
         out["console info"] = _outcome(qfe.info, "[info] " + _CONSOLE_TEXT)
+    if qfe is not None and hasattr(qfe, "create_pipeline"):
+        import types
+        engine = types.SimpleNamespace(   # an engine whose create fails, with an error text the code page may not hold
+            quantfunc_create=lambda params, handle: 3,
+            quantfunc_last_error=lambda: ("[engine] " + _CONSOLE_TEXT).encode("utf-8"))
+
+        def comfy_logs_an_engine_error():   # ComfyUI execution.py:637-638, around the plugin's real raise of engine text
+            import traceback
+            try:
+                qfe.create_pipeline(engine, create_params=qfe.InitParams())
+            except Exception as ex:  # noqa: BLE001
+                logging.getLogger().error(f"!!! Exception during processing !!! {ex}")
+                logging.getLogger().error(traceback.format_exc())
+        out["console engine error"] = _outcome(comfy_logs_an_engine_error)
     afix = sys.modules.get("qfn_textio_pkg.qf_ltx_ancestral_audio_fix")
     out["console audio-fix"] = (_outcome(afix._log_once, "sampler " + _CONSOLE_TEXT, "euler") if afix
                                 else ["error", "Missing", "the audio-fix module was not imported"])
@@ -293,9 +317,10 @@ def _console_arms(root, tmp):
             rows.append((cp, "console child", "a result", f"rc={r.returncode}: {tail}", False))
             continue
         want = {"console say": ("stdout", "[say] "), "console info": ("stdout", "[info] "),
-                "console logger": ("stderr", "[log] "), "console exception": ("stderr", "[exc] ")}
+                "console logger": ("stderr", "[log] "), "console exception": ("stderr", "[exc] "),
+                "console engine error": ("stderr", "[engine] ")}
         for arm in ("console import", "console say", "console info", "console logger", "console exception",
-                    "console audio-fix", "console loggers"):
+                    "console engine error", "console audio-fix", "console loggers"):
             g = got.get(arm, ["error", "Missing", "the child did not run this arm"])
             ok, act = g[0] == "ok", _show(g)
             if ok and arm in want:   # the line reached the console, with what the code page cannot hold escaped
@@ -453,16 +478,16 @@ def _malformed(tmp):
     for name, data in _BROKEN.items():
         _write(os.path.join(mal_configs, name, "qf_native.json"), data)
         job["mal_presets"].append(name)
-        expect[f"malformed-manifest {name}"] = ("raises", name)
+        expect[f"malformed-manifest {name}"] = ("raises", (name, "reinstall"))   # names it and says how to fix it
         _write(os.path.join(keys, f"{name}.json"), data)
         job["mal_keyfiles"].append(os.path.join(keys, f"{name}.json"))
-        expect[f"malformed-keyfile {name}.json"] = ("raises", f"{name}.json")
+        expect[f"malformed-keyfile {name}.json"] = ("raises", (f"{name}.json", "QUANTFUNC_API_KEY", "reinstall"))
         _write(os.path.join(conn, name, "connectors", "config.json"), data)
     for name, data in _BROKEN_HEADS.items():
         _write(os.path.join(conn, name, "connectors", "config.json"), data)
     for name in list(_BROKEN) + list(_BROKEN_HEADS):
         job["connectors"].append([f"conn/{name}", os.path.join(conn, name)])
-        expect[f"connectors conn/{name}"] = ("raises", os.path.join(name, "connectors", "config.json"))
+        expect[f"connectors conn/{name}"] = ("raises", (os.path.join(name, "connectors", "config.json"), "download"))
     _write(os.path.join(conn, "keyless", "connectors", "config.json"), b"{}")   # gated checkpoints declare no heads
     os.makedirs(os.path.join(conn, "absent"))                                    # no connectors/ at all
     for name in ("keyless", "absent"):
@@ -470,8 +495,9 @@ def _malformed(tmp):
         expect[f"connectors conn/{name}"] = ("ok", None)
     # a family whose manifest is broken: the refusal names EVERY broken manifest (it cannot tell whose each one was)
     # and the family it was resolving - never "no model config shipped"
-    expect["malformed-family ltx2"] = ("raises", ("ltx2", "'badjson'", "'notutf8'", "'notobject'"))
-    expect["malformed-saved-workflow ltx2"] = ("raises", ("ltx2", "'badjson'", "'notutf8'", "'notobject'"))
+    expect["malformed-family ltx2"] = ("raises", ("ltx2", "'badjson'", "'notutf8'", "'notobject'", "reinstall"))
+    expect["malformed-saved-workflow ltx2"] = ("raises", ("ltx2", "'badjson'", "'notutf8'", "'notobject'",
+                                                        "reinstall"))
     return job, expect
 
 

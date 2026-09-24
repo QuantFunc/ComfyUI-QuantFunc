@@ -60,7 +60,7 @@ class QFQwenImage21Model(qfmp.QFImageSessionModel, comfy.model_base.QwenImage21)
         self._current_patcher = patcher
 
     def get_dynamic_vram__units(self):
-        return [], []   # no torch blocks to page — the engine holds the weights
+        return [], []   # no torch blocks to page - the engine holds the weights
 
     def _check_conds(self, kwargs):
         # probe the loaded library, NOT self._qf.lib (that materializes the lazy engine = creates the pipeline early)
