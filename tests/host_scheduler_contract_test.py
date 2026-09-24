@@ -218,7 +218,8 @@ class HostSchedulerContract(unittest.TestCase):
                 })
                 qfm.ensure_model_config_attrs(cfg)
                 model = getattr(module, class_name)(cfg, self.engine, device=torch.device("cpu"), **kwargs)
-                patcher = module.QFModelPatcher(model, torch.device("cpu"), torch.device("cpu"))
+                # the substrate's patcher (every family builds its patcher through qf_modelpatcher.family_build)
+                patcher = qfm.QFModelPatcher(model, torch.device("cpu"), torch.device("cpu"))
                 # In a LEAF module: Comfy's load list manages only leaf-module parameters. One set
                 # directly on the root is skipped as "default weights in a non-leaf module" once
                 # the root has a parameterized child - Krea2 arms the stub's 0-byte concat-shape
