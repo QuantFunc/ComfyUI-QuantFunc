@@ -757,6 +757,30 @@ if _IMPORT_OK:
         return (list(_QUALITY_FAST_OPTIONS if fast else _QUALITY_BASE_OPTIONS),
                 {"default": _QUALITY_DEFAULT, "tooltip": _QUALITY_TOOLTIP_FAST if fast else _QUALITY_TOOLTIP_BASE})
 
+    # [quality — Qwen-Image-2.1, user 2026-09-24 「balance改为只快慢路径 fast 以及supper改为剪枝 0.9」「sm120不要展示这个选项就好」]
+    # QI-2.1 keeps the four names (what each does for this family is the engine's table), but where the engine offers only the
+    # two-way choice (no fast mode on this GPU) QI-2.1 shows NO quality choice and always runs best_quality. The input stays
+    # DECLARED there, hidden (ComfyUI's input option `hidden` keeps the widget, invisible, in its slot; `socketless` = no input
+    # dot), so the node's widget layout is the same on every GPU: widget values are stored by POSITION, and a workflow saved on
+    # one kind of GPU opens on the other with every value in its place (including any widget added after quality later).
+    # Whatever value a saved workflow carries there is ignored on such a GPU.
+    _QI21_QUALITY_TOOLTIP = ("Speed or quality. super_fast: the fastest; fine details can differ from best_quality. fast: faster, "
+                             "and closer to best_quality. balance (default): faster than best_quality, with nearly the same "
+                             "result. best_quality: the highest quality, and the slowest.")
+    _QI21_QUALITY_TOOLTIP_FIXED = "On this GPU Qwen-Image-2.1 always uses the highest quality; this setting has no effect here."
+
+    def _qi21_resolve_quality(quality=None, quality_enhance=None, transformer=None, model_config=None, device_idx=None):
+        """QI-2.1's quality for this run on the load's device: _resolve_quality where the fast mode exists; elsewhere
+        best_quality, whatever a saved workflow carries (the input is hidden there)."""
+        return (_resolve_quality(quality, quality_enhance, transformer, model_config, device_idx)
+                if _quality_fast_tier(device_idx) else "best_quality")
+
+    def _qi21_quality_input():
+        if _quality_fast_tier():
+            return (list(_QUALITY_FAST_OPTIONS), {"default": _QUALITY_DEFAULT, "tooltip": _QI21_QUALITY_TOOLTIP})
+        return (list(_QUALITY_FAST_OPTIONS), {"default": "best_quality", "hidden": True, "socketless": True,
+                                              "tooltip": _QI21_QUALITY_TOOLTIP_FIXED})
+
     def _validate_quality(quality):
         """The loaders' VALIDATE_INPUTS body (it replaces ComfyUI's own list check for `quality`): any of the four names on every
         GPU (a workflow saved on a GPU with the fast options still opens), a boolean (the retired switch, positional), or None —
@@ -1051,7 +1075,7 @@ if _IMPORT_OK:
                                  {"tooltip": "The Qwen-Image-2.1 preset that matches the chosen model file."}),
             }, "optional": {
                 "attention_backend": _attn_backend_input(),
-                "quality": _quality_input(),
+                "quality": _qi21_quality_input(),
             }, "hidden": dict(_QUALITY_LEGACY_HIDDEN)}
 
         @classmethod
@@ -1072,7 +1096,7 @@ if _IMPORT_OK:
                                   None,
                                   sparse_opts=None)
             _dev = _loaded_device_index(_p)
-            q = _resolve_quality(quality, quality_enhance, transformer, model_config, _dev)
+            q = _qi21_resolve_quality(quality, quality_enhance, transformer, model_config, _dev)
             _mm = getattr(_p, "model", None)
             if _mm is not None and hasattr(_mm, "set_attn_backend"):
                 _mm.set_attn_backend(_attn_backend_to_engine(attention_backend))
