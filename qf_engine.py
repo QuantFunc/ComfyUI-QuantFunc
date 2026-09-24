@@ -744,6 +744,11 @@ def _bind(lib):
         lib.quantfunc_denoise_step_refs.argtypes = [v, ctypes.POINTER(DenoiseStepRefsParams)]
     # i2v cond-latent begin (cond-ABI builds only; hasattr-gated like step_multi — an old .so
     # simply lacks the symbol and the wan i2v sampling path then refuses with guidance).
+    if hasattr(lib, "quantfunc_quality_fast_available"):
+        # [quality] can the loaders' super_fast / fast take effect on CUDA device N — the ENGINE's own arming rule for
+        # that GPU (the plugin keeps no GPU list): 1 yes, 0 no (balance / best_quality only), -1 bad device.
+        lib.quantfunc_quality_fast_available.restype = ctypes.c_int
+        lib.quantfunc_quality_fast_available.argtypes = [ctypes.c_int]
     if hasattr(lib, "quantfunc_denoise_cond_tail_supported"):
         # CR A-1 capability query (per-pipeline): 1 = this pipeline consumes a
         # begin_edit_cond cond-latent. Probe THIS (presence + answer), not the wan-era
@@ -1125,7 +1130,7 @@ def _refuse_session_knobs_in_create(config_json):
             # create-side leak would rebuild the pipeline per widget change).
             if any(k in obj for k in ("cache_mode", "cache_thresh",
                                       "step_cache", "block_cache", "step_cache_thresh",
-                                      "block_cache_thresh", "sparse", "sparse_cdf")):
+                                      "block_cache_thresh", "sparse", "sparse_cdf", "quality")):
                 return True
             return any(_scan(v) for v in obj.values())
         if isinstance(obj, list):
@@ -1254,6 +1259,22 @@ def estimate_resident_bytes(lib, model_dir, device_idx=0, transformer_path=None,
     if st != QUANTFUNC_OK:
         raise RuntimeError(f"QuantFunc capacity estimate failed (status {st}): {last_err(lib)}")
     return int(out.value)
+
+
+def quality_fast_available_file(lib, model_dir, transformer_path=None, device_idx=0, server_url=None, api_key=None):
+    """[quality] Can super_fast / fast take effect for THIS checkpoint on this GPU (quantfunc_quality_fast_available_file:
+    the GPU's tier AND the file — a layer the fast mode speeds up, none stored in a form it cannot use)? 1 yes, 0 no, -1
+    error; None = the engine predates the query (the caller keeps the GPU-level answer)."""
+    fn = getattr(lib, "quantfunc_quality_fast_available_file", None)
+    if fn is None:
+        return None
+    fn.restype = ctypes.c_int
+    fn.argtypes = [ctypes.POINTER(ResidentEstimateParams)]
+    p = ResidentEstimateParams(model_dir=_enc(model_dir) if model_dir else None,
+                               transformer_weights=_enc(transformer_path) if transformer_path else None,
+                               server_url=_enc(server_url) if server_url else None,
+                               api_key=_enc(api_key) if api_key else None, device_idx=int(device_idx))
+    return int(fn(ctypes.byref(p)))
 
 
 class QFEngineHandle:
