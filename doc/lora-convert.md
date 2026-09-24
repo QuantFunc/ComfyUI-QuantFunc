@@ -3,9 +3,11 @@
 QuantFunc 原生 loader(Krea-2 / LTX-2 / MiniMax-H3)的 LoRA 路径**只适配一种最主流格式**:
 **diffusers / PEFT 规范形**(`<模块路径>.lora_A.weight` / `<模块路径>.lora_B.weight`,可带 `.alpha`)。
 其它训练器产出的格式(kohya sd-scripts、ai-toolkit 等下划线命名)用本工具**一次性转换**成规范形即可加载。
+**LyCORIS(LoHa/LoKr)不支持**:改名转不了因子分解,原生 loader 也不加载;请先重导出为标准 (A,B) LoRA。
 
 The native loaders adapt ONE mainstream LoRA format — diffusers/PEFT canonical. Convert
-anything else once with this tool.
+anything else once with this tool. LyCORIS (LoHa/LoKr) is not supported: re-export it to a
+plain (A,B) LoRA first.
 
 ## 为什么这么设计 / Why
 
@@ -49,7 +51,7 @@ python3 qf_lora_convert.py --self-test-krea2
 | Krea-2 的 BFL / ai-toolkit 模块名(社区 Krea-2 LoRA 常见:`blocks.N.attn.wq`、`txtfusion.*`、`first`/`tmlp.0`/`tproj.1`/`txtmlp.1`/`last.linear`) | 改成引擎的 diffusers 模块名(对照 ComfyUI `comfy/utils.py` 的 krea2_to_diffusers:MAP_BASIC + 块映射);仅当文件含 Krea-2 专有名(`txtfusion.`/`tmlp.`/`txtmlp.`/`tproj.`)时启用。引擎原样加载这类文件会**响亮拒绝**并提示本工具 |
 | kohya / ai-toolkit(`lora_unet_*` 下划线键) | 键名重建为点分模块路径;`--model` 时用目标 checkpoint 的真实模块表做精确逆映射;**不带 `--model` 时退化为内置词表(按真实语料拟合、新家族可能漏词,工具会打警告)——强烈建议总是带 `--model`** |
 | 文本编码器 LoRA(`lora_te*`) | 丢弃(原生 loader 只驱动 transformer) |
-| LyCORIS(LoHa/LoKr) | **响亮拒绝**——它是因子分解不是 (A,B) 低秩对,改名转不动;请先合并/重导出为标准 LoRA |
+| LyCORIS(LoHa/LoKr) | **不支持**(本工具与 QuantFunc 原生 loader 都不支持),响亮拒绝——它是因子分解不是 (A,B) 低秩对,改名转不动;请先用训练工具合并/重导出为标准 (A,B) LoRA |
 | 两个源键映射到同一目标键 | 拒绝(绝不猜) |
 
 插件端的 **QuantFunc Native LoRA** 节点会嗅探文件头:遇到外来格式会直接报错并打印上面这条转换命令,

@@ -12,7 +12,8 @@ What it accepts (auto-detected):
   * diffusers / PEFT  — already canonical; normalized (down/up -> A/B) + copied
   * kohya sd-scripts / ai-toolkit — ``lora_unet_``/``lora_transformer_`` keys,
     underscored module path, ``.lora_down/up.weight`` + ``.alpha``
-  * LyCORIS (LoHa/LoKr) — REFUSED loud (needs math reconstruction, not a rename)
+  * LyCORIS (LoHa/LoKr) — NOT SUPPORTED: refused loud (a factored decomposition,
+    not a rename; the native loaders do not load it either)
   * Krea-2 BFL / ai-toolkit module names (the community Krea-2 LoRAs: ``blocks.N``,
     ``txtfusion.*``, ``first``/``tmlp.0``/…) — renamed to the engine's diffusers
     names (ComfyUI comfy/utils.py krea2_to_diffusers: MAP_BASIC + the block map).
@@ -293,10 +294,11 @@ def convert_file(in_path, out_path, verbose=True, model_path=None):
     fmt = detect_format(keys)
     if fmt == "lycoris":
         raise SystemExit(
-            "qf_lora_convert: this is a LyCORIS (LoHa/LoKr) file — it is a "
-            "factored decomposition, not a plain (A,B) LoRA, so a key-rename "
-            "cannot convert it. Re-export/merge it to a standard LoRA first, "
-            "or load it through the ctypes engine path which reconstructs it.")
+            "qf_lora_convert: this is a LyCORIS (LoHa/LoKr) file, which is not "
+            "supported — it is a factored decomposition, not a plain (A,B) LoRA, "
+            "so a key rename cannot convert it, and the QuantFunc native loaders "
+            "do not load it either. Re-export or merge it to a plain (A,B) LoRA "
+            "with your training tool first.")
     if fmt == "unknown":
         raise SystemExit(
             "qf_lora_convert: could not detect the LoRA format (no kohya "
