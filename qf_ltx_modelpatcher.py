@@ -156,6 +156,35 @@ _LTX_DEFAULT_FPS = 25.0   # informational default; the sampler/graph owns real t
 _LTX_CHANNELS = 128
 
 
+def _connector_config_heads(model_dir):
+    """The authoritative video-connector head count from the model dir's diffusers LTX2TextConnectors config
+    (connectors/config.json, video_connector_num_attention_heads), or None when no config declares one: gated checkpoints
+    need none, and a non-gated one then fail-louds in _derive_connector_arch. The staged video-only dir may symlink or
+    omit connectors/, so the transformer's real parent is probed too. A config that is there but unreadable, or that
+    declares an unusable count, RAISES: swallowing it hid a Windows cp936 decode failure (#738) behind "no
+    authoritative head count", and a dropped count also skips the gate-weight cross-check."""
+    for cand in (os.path.join(model_dir, "connectors", "config.json"),
+                 os.path.join(os.path.dirname(os.path.realpath(os.path.join(model_dir, "transformer"))),
+                              "connectors", "config.json")):
+        if not os.path.isfile(cand):
+            continue
+        try:
+            with open(cand, encoding="utf-8") as f:
+                cfg = json.load(f)
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(f"QuantFuncNativeLoader: {cand} is unreadable: {exc}") from exc
+        if not isinstance(cfg, dict):
+            raise RuntimeError(f"QuantFuncNativeLoader: {cand} must hold a JSON object.")
+        heads = cfg.get("video_connector_num_attention_heads")
+        if heads is None:
+            continue
+        if type(heads) is not int or not 1 <= heads <= _MAX_CONNECTOR_HEADS:
+            raise RuntimeError(f"QuantFuncNativeLoader: {cand} declares video_connector_num_attention_heads={heads!r}; "
+                               f"expected an integer in 1..{_MAX_CONNECTOR_HEADS}.")
+        return heads
+    return None
+
+
 def _derive_connector_arch(sd, desc, authoritative_heads=None):
     """Derive the FULL Embeddings1DConnector arch from the checkpoint state_dict -- EVERY dim is a checkpoint
     property, NOT a constant (dossier seq-250/252 + Finding #1). Returns (n_layers, num_heads, head_dim,
@@ -1326,22 +1355,8 @@ def register(deps):
         # No fix now (adding keys back defeats minimal=True's purpose); this note is the tripwire.
         # [19B non-gated connector] authoritative head count from the ORIGINAL model dir's diffusers
         # LTX2TextConnectors config (the 19B family ships NON-gated connector weights; the head split
-        # lives ONLY here). Absent/malformed -> None (gated checkpoints need nothing; a non-gated one
-        # then fail-louds in _derive_connector_arch). The staged video-only dir may symlink or omit
-        # connectors/ -- we also probe the transformer_path's parent for the original layout.
-        auth_heads = None
-        for _cand in (os.path.join(model_dir, "connectors", "config.json"),
-                      os.path.join(os.path.dirname(os.path.realpath(os.path.join(model_dir, "transformer"))),
-                                   "connectors", "config.json")):
-            try:
-                with open(_cand) as _cf:
-                    _cc = json.load(_cf)
-                _v = _cc.get("video_connector_num_attention_heads")
-                if isinstance(_v, int) and 1 <= _v <= _MAX_CONNECTOR_HEADS:
-                    auth_heads = _v
-                    break
-            except (OSError, ValueError):
-                continue
+        # lives ONLY here). Absent -> None; unreadable -> raises (_connector_config_heads).
+        auth_heads = _connector_config_heads(model_dir)
 
         def _video_model(model_config, engine, device):
             # ★ PER-BUILD combined-footprint running total: the video connector AND (when the future a2v split lands)

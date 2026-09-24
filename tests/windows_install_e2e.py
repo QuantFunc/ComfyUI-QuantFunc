@@ -166,8 +166,9 @@ def make_tls(d):
     if not exe:
         sys.exit("need the `cryptography` package or an openssl executable to make the throwaway certificate")
     ca_key, csr, ext = (os.path.join(d, n) for n in ("ca.key", "server.csr", "server.ext"))
-    open(ext, "w").write("subjectAltName=IP:127.0.0.1\nbasicConstraints=critical,CA:FALSE\nextendedKeyUsage=serverAuth\n"
-                         "subjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid\n")
+    with open(ext, "w", encoding="utf-8") as f:
+        f.write("subjectAltName=IP:127.0.0.1\nbasicConstraints=critical,CA:FALSE\nextendedKeyUsage=serverAuth\n"
+                "subjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid\n")
     run = functools.partial(subprocess.run, check=True, capture_output=True)
     run([exe, "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes", "-keyout", ca_key,
          "-out", ca_pem, "-days", "1", "-subj", "/CN=qf-e2e throwaway CA",
@@ -275,8 +276,9 @@ def step_b(py, comfy, out, port, xfm, env):
         for ln in open(log.name, encoding="utf-8", errors="replace"):
             if "[qf_native]" in ln or "[QuantFunc]" in ln:
                 print("   log:", ln.rstrip()[:220])
+        # tasklist writes the console code page; only its ASCII module names matter here, so never fail on the rest
         mods = subprocess.run(["tasklist", "/m", "quantfunc*", "/fi", f"PID eq {proc.pid}", "/fo", "list"],
-                              capture_output=True, text=True).stdout
+                              capture_output=True, encoding="utf-8", errors="replace").stdout
         print(f"engine modules loaded by ComfyUI (pid {proc.pid}):", " ".join(mods.split())[:500])
     finally:
         proc.terminate()
@@ -312,7 +314,8 @@ def main():
         print(f"   serving {base} (throwaway CA via {how}); the CA is trusted only by the install process below")
         trusted = dict(env, SSL_CERT_FILE=ca)       # urllib's default context honours it (measured just below)
         for label, e in (("with SSL_CERT_FILE", trusted), ("without (control)", env)):
-            r = subprocess.run([sys.executable, "-c", FETCH, base + "/version.json"], env=e, capture_output=True, text=True)
+            r = subprocess.run([sys.executable, "-c", FETCH, base + "/version.json"], env=dict(e, PYTHONIOENCODING="utf-8"),
+                               capture_output=True, encoding="utf-8", errors="replace")
             print(f"   urllib default context {label}: {r.stdout.strip()}")
         print("== A: the plugin's installer against the local stage")
         r = subprocess.run([sys.executable, "-c", STEP_A, PLUGIN, base, "1" if a.dry_run else "0"], env=trusted)

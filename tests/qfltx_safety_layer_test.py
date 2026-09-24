@@ -38,7 +38,7 @@ def _comfy_cpu_args():
 
 
 def _src_text():
-    return open(_SRC, errors="replace").read()
+    return open(_SRC, encoding="utf-8", errors="replace").read()
 
 
 def _extract_method(src_text, cls, meth):
@@ -68,7 +68,7 @@ def _extract_module_fn(src_text, name):
 
 
 def _shared_src_text():
-    return open(_SHARED_SRC, errors="replace").read()
+    return open(_SHARED_SRC, encoding="utf-8", errors="replace").read()
 
 
 def _bind_shared_helper(comfy):
@@ -320,7 +320,7 @@ def _t_shared_interrupt_helper(src):
     a BaseException-derived interrupt (an `except Exception` rewrite MISSES it → end_calls==0 → FAIL), and
     is a no-op without an interrupt."""
     fam_srcs = {"qf_ltx_modelpatcher.py": src}
-    fam_srcs.update({f: open(p, errors="replace").read() for f, p in _OTHER_FAMILY_SRCS.items()})
+    fam_srcs.update({f: open(p, encoding="utf-8", errors="replace").read() for f, p in _OTHER_FAMILY_SRCS.items()})
     bad = 0
     def _code_lines(text):
         return [ln for ln in text.splitlines() if not ln.lstrip().startswith("#")]
@@ -387,7 +387,7 @@ def _t_scale_latent_inpaint(src):
     for cls in ("QFLTXModel", "QFLTXAVModel"):
         if overrides(src, cls):
             print(f"  [FAIL] {cls} overrides scale_latent_inpaint (must be inherited since the 2026-08-22 pivot)"); return 1
-    if not overrides(open(_OTHER_FAMILY_SRCS["qf_h3_modelpatcher.py"], errors="replace").read(), "QFH3Model"):
+    if not overrides(open(_OTHER_FAMILY_SRCS["qf_h3_modelpatcher.py"], encoding="utf-8", errors="replace").read(), "QFH3Model"):
         print("  [FAIL] positive control: QFH3Model no longer overrides scale_latent_inpaint"); return 1
     print("  scale_latent_inpaint: OK (inherited by LTX/LTXAV, overridden by H3)"); return 0
 

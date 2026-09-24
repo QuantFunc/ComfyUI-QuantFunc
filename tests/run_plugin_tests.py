@@ -46,7 +46,9 @@ def _discover(root):
 
 
 def _run_one(path):
-    r = subprocess.run([_PY, path], cwd=os.path.dirname(path), capture_output=True, text=True)
+    # the child writes UTF-8 and the parent reads UTF-8, whatever the OS code page (#738)
+    r = subprocess.run([_PY, path], cwd=os.path.dirname(path), capture_output=True, encoding="utf-8", errors="replace",
+                       env=dict(os.environ, PYTHONIOENCODING="utf-8"))
     text = (r.stdout or "") + (r.stderr or "")
     return r.returncode, text, text.count("[SKIP]")
 
@@ -97,11 +99,12 @@ def _selftest():
     bad = 0
 
     def _mk(d, name, body):
-        open(os.path.join(d, name), "w").write(body)
+        with open(os.path.join(d, name), "w", encoding="utf-8") as f:
+            f.write(body)
 
     def _invoke(root):
         env = dict(os.environ, QF_NATIVE_TEST_ROOT=root)
-        return subprocess.run([_PY, os.path.abspath(__file__)], env=env, capture_output=True, text=True).returncode
+        return subprocess.run([_PY, os.path.abspath(__file__)], env=env, capture_output=True).returncode
 
     # (A) RED: a known-red test file must drive the runner to non-zero.
     with tempfile.TemporaryDirectory() as d:
@@ -125,8 +128,8 @@ def _selftest():
     with tempfile.TemporaryDirectory() as d:
         _mk(d, "known_skip_test.py", "import sys\nprint('[SKIP] env-gated')\nsys.exit(77)\n")
         env = dict(os.environ, QF_NATIVE_TEST_ROOT=d)
-        rc_default = subprocess.run([_PY, os.path.abspath(__file__)], env=env, capture_output=True, text=True).returncode
-        rc_strict = subprocess.run([_PY, os.path.abspath(__file__), "--strict"], env=env, capture_output=True, text=True).returncode
+        rc_default = subprocess.run([_PY, os.path.abspath(__file__)], env=env, capture_output=True).returncode
+        rc_strict = subprocess.run([_PY, os.path.abspath(__file__), "--strict"], env=env, capture_output=True).returncode
         ok = rc_default == 0 and rc_strict != 0
         print(f"[{'OK ' if ok else 'FAIL'}] selftest STRICT: skip-only tree -> default rc={rc_default} (0), "
               f"--strict rc={rc_strict} (non-zero)")

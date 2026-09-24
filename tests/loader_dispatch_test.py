@@ -176,7 +176,7 @@ def main():
                      ("fx-h3", {"family": "minimax-h3"}),
                      ("fx-alien", {"family": "no-such-family"})):
         os.makedirs(os.path.join(cfgroot, name))
-        json.dump(mf, open(os.path.join(cfgroot, name, "qf_native.json"), "w"))
+        json.dump(mf, open(os.path.join(cfgroot, name, "qf_native.json"), "w", encoding="utf-8"))
     qfn._CONFIGS_DIR = cfgroot
 
     creates = []
@@ -1061,7 +1061,7 @@ def main():
         # structural: each family module calls the guard BEFORE it opens the session (self._begin).
         import os as _os
         for _mod, _tags in (("qf_ltx_modelpatcher.py", 2), ("qf_h3_modelpatcher.py", 1)):
-            _src = open(_os.path.join(_PLUGIN, _mod)).read()
+            _src = open(_os.path.join(_PLUGIN, _mod), encoding="utf-8").read()
             _n_guard = _src.count("refuse_all_zero_initial_latent(")
             # every guard call must be followed (in source) by a self._begin( before the next guard
             _ok = _n_guard == _tags
@@ -1226,7 +1226,7 @@ def main():
             if not _os.path.exists(_p):
                 _viol.append(f"{_fn}:MISSING")
                 continue
-            _src = open(_p).read()
+            _src = open(_p, encoding="utf-8").read()
             _tree = _ast.parse(_src)
             _allowed = set()
             for _n in _ast.walk(_tree):
@@ -1442,7 +1442,7 @@ def main():
             _dmods[_mn] = sys.modules[f"qfn_test_pkg.{_mn}"]
         _dviol, _dseen = [], 0
         for _mn, _mod in _dmods.items():
-            for _cn in _dast.parse(open(_mod.__file__).read()).body:
+            for _cn in _dast.parse(open(_mod.__file__, encoding="utf-8").read()).body:
                 if not isinstance(_cn, _dast.ClassDef):
                     continue
                 _cls = getattr(_mod, _cn.name, None)
@@ -1464,7 +1464,7 @@ def main():
         # can drift from the always-send rule (the image families once built their own copies that omitted "auto").
         _eviol, _ereads = [], 0
         for _mn, _mod in _dmods.items():
-            for _fn in _dast.walk(_dast.parse(open(_mod.__file__).read())):
+            for _fn in _dast.walk(_dast.parse(open(_mod.__file__, encoding="utf-8").read())):
                 if not isinstance(_fn, _dast.FunctionDef):
                     continue
                 for _n in _dast.walk(_fn):
@@ -1592,7 +1592,7 @@ def main():
                    if os.path.isfile(os.path.join(real_cfg, d, "qf_native.json"))]
         check("at least one shipped preset exists", bool(presets), f"-> {presets}")
         for d in presets:
-            mf = json.load(open(os.path.join(real_cfg, d, "qf_native.json")))
+            mf = json.load(open(os.path.join(real_cfg, d, "qf_native.json"), encoding="utf-8"))
             hints = mf.get("file_hints")
             need = ["transformer1"]
             check(f"preset {d} declares file_hints for {need}",

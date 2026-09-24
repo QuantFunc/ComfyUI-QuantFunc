@@ -86,6 +86,7 @@ def _family_preset(family):
     if len(presets) == 1:
         return presets[0]
     if not presets:
+        _raise_if_a_manifest_is_unreadable()
         raise RuntimeError(f"qf_native: this plugin ships no model config for {family} (configs/ has no preset for it).")
     raise RuntimeError(f"qf_native: this plugin ships {len(presets)} model configs for {family} ({', '.join(presets)}) "
                        f"and the loader cannot choose between them.")
@@ -103,12 +104,21 @@ def _load_model_config(name):
         raise RuntimeError(f"qf_native: model_config {name!r} has no qf_native.json manifest "
                            f"(shipped presets: {_model_config_choices()}).")
     try:
-        manifest = json.load(open(mf))
+        with open(mf, encoding="utf-8") as fh:   # never the OS code page: Windows would read it as cp936 (#738)
+            manifest = json.load(fh)
     except Exception as exc:  # noqa: BLE001
         raise RuntimeError(f"qf_native: model_config {name!r} manifest unreadable: {exc}") from exc
     if not isinstance(manifest, dict) or not manifest.get("family"):
         raise RuntimeError(f"qf_native: model_config {name!r} manifest must declare a family.")
     return bundle, manifest
+
+
+def _raise_if_a_manifest_is_unreadable():
+    """The family listings HIDE a preset whose manifest cannot be read, because a broken file must not take down node
+    registration. A load that then finds no preset for its family would report the preset as not shipped: read every
+    shipped manifest first, so a broken one raises its own error (_load_model_config) naming it."""
+    for name in _shipped_presets(None):
+        _load_model_config(name)
 
 
 _NO_XFM_HINT = "(no .safetensors in models/diffusion_models)"
@@ -200,11 +210,16 @@ def _read_auth():
     surl = os.environ.get("QF_SERVER_URL", "https://service.quantfunc.com")
     keyfile = _resolve_keyfile()
     if not key and keyfile and os.path.exists(keyfile):
+        # A keyfile that is there but unreadable is an error, never "no key": swallowing it hid a Windows cp936 decode
+        # failure (#738) behind a later auth failure.
         try:
-            c = json.load(open(keyfile))
-            key, surl = c.get("api_key", ""), c.get("server_url", surl)
-        except Exception:  # noqa: BLE001
-            pass
+            with open(keyfile, encoding="utf-8") as fh:
+                c = json.load(fh)
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(f"qf_native: the keyfile {keyfile} is unreadable: {exc}") from exc
+        if not isinstance(c, dict):
+            raise RuntimeError(f"qf_native: the keyfile {keyfile} must hold a JSON object.")
+        key, surl = c.get("api_key", ""), c.get("server_url", surl)
     return key, surl
 
 
@@ -558,6 +573,7 @@ if _IMPORT_OK:
         else:
             shipped = _shipped_presets(expect_family)
             if model_config not in shipped:
+                _raise_if_a_manifest_is_unreadable()
                 raise RuntimeError(
                     f"qf_native: this workflow was saved with model_config {model_config!r}, which is not a "
                     f"{expect_family} model config of this plugin (it ships: {', '.join(shipped) or 'none'}). Omit "

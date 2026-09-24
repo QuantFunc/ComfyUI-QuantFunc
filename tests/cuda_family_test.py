@@ -226,7 +226,7 @@ def arm_real_linker(tmp):
     bad += _check("(L) a soname nothing loaded -> None", qfe._linker_path("libqf-never-loaded.so.99") is None)
     # a real library next to libc that this process has not loaded: the probe must neither report nor LOAD it
     libdir = os.path.dirname(os.path.realpath(libc))
-    with open("/proc/self/maps") as f:
+    with open("/proc/self/maps", encoding="utf-8", errors="replace") as f:
         maps = f.read()
     idle = next((n for n in ("libBrokenLocale.so.1", "libanl.so.1", "libutil.so.1")
                  if os.path.exists(os.path.join(libdir, n)) and n not in maps), None)
@@ -234,7 +234,7 @@ def arm_real_linker(tmp):
         print("  [SKIP] (L) no unloaded glibc companion library to probe")
         return bad
     got = qfe._linker_path(idle)
-    with open("/proc/self/maps") as f:
+    with open("/proc/self/maps", encoding="utf-8", errors="replace") as f:
         loaded_now = idle in f.read()
     bad += _check(f"(L) probing {idle} (present, not loaded) neither reports nor loads it",
                   got is None and not loaded_now, f"got={got!r} loaded_now={loaded_now}")
@@ -247,7 +247,7 @@ def arm_real_linker(tmp):
             out.write(src.read())
     qfe.ctypes.CDLL(first, mode=qfe.ctypes.RTLD_LOCAL)
     qfe.ctypes.CDLL(twin, mode=qfe.ctypes.RTLD_LOCAL)
-    with open("/proc/self/maps") as f:
+    with open("/proc/self/maps", encoding="utf-8", errors="replace") as f:
         maps_now = f.read()
     both_mapped = first in maps_now and twin in maps_now
     got = qfe._linker_path(idle)

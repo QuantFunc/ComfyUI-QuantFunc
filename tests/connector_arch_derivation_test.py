@@ -63,7 +63,7 @@ def _blocks(n, heads=32, inner=4096, gated=True, regs=128):
 
 
 def main():
-    src = open(_SRC).read()
+    src = open(_SRC, encoding="utf-8").read()
     consts = {c: _extract_const(src, c) for c in _CEILINGS}
     max_layers = consts["_MAX_CONNECTOR_LAYERS"]
     ns = dict(consts)  # the functions reference these module globals

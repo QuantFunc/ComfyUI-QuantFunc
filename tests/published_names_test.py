@@ -37,10 +37,10 @@ def check(name, ok, detail=""):
 
 
 def main():
-    presets = {os.path.basename(os.path.dirname(f)): json.load(open(f)).get("file_hints") or {}
+    presets = {os.path.basename(os.path.dirname(f)): json.load(open(f, encoding="utf-8")).get("file_hints") or {}
                for f in glob.glob(os.path.join(PLUGIN, "configs", "*", "qf_native.json"))}
     slots = [(p, a, pats) for p, h in presets.items() for a, pats in h.items()]
-    listing = json.load(open(os.path.join(HERE, "published_names.json")))
+    listing = json.load(open(os.path.join(HERE, "published_names.json"), encoding="utf-8"))
     check("frozen list has repos", bool(listing.get("repos")))
     n_native = 0
     for repo, r in sorted(listing["repos"].items()):

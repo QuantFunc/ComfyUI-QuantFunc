@@ -116,7 +116,7 @@ check("T4b refused partial reclaim retains the session pointer", h.current_sessi
 
 # T5: static death-rule for the needs-begin flag (silent session-REUSE hole)
 for fam in ("qf_h3_modelpatcher.py", "qf_ltx_modelpatcher.py"):
-    src = open(os.path.join(_HERE, "..", fam), errors="replace").read()
+    src = open(os.path.join(_HERE, "..", fam), encoding="utf-8", errors="replace").read()
     check(f"T5 {fam} arms _qf_needs_begin at run start", "self._qf_needs_begin = True" in src)
     check(f"T5 {fam} lazy-begin gate consumes the flag",
           'or getattr(self, "_qf_needs_begin", False)' in src)

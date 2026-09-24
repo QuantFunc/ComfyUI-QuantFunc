@@ -174,7 +174,7 @@ def _compute(comfy_root, model):
     """Pure scan for ONE model. Returns (consumed, guarded, covered_present, uncovered) as sorted lists, or
     None on a parse miss (comfy layout changed / plugin reject-list not found). No printing — the callers
     decide how to surface it."""
-    src = open(_comfy_model_base(comfy_root), errors="replace").read()
+    src = open(_comfy_model_base(comfy_root), encoding="utf-8", errors="replace").read()
     own = _method_body(src, model.comfy_class, "extra_conds")
     base = _method_body(src, "BaseModel", "extra_conds")
     if not own or not base:
@@ -191,7 +191,7 @@ def _compute(comfy_root, model):
     plugin_path = _resolve_plugin_path(model)
     if not os.path.isfile(plugin_path):
         return None  # plugin file not found — parse miss, not a false PASS
-    pm = open(plugin_path, errors="replace").read()
+    pm = open(plugin_path, encoding="utf-8", errors="replace").read()
     m = re.search(r"_ENGINE_IGNORED_COND_KEYS\s*=\s*\(([^)]*)\)", pm, re.S)
     guarded = set(re.findall(r'["\']([a-z_]+)["\']', m.group(1))) if m else set()
     uncovered = consumed - guarded - model.covered_elsewhere
@@ -205,7 +205,7 @@ def _row_defect(model):
     pp = _resolve_plugin_path(model)
     if not os.path.isfile(pp):
         return f"{model.comfy_class}: plugin file not found: {pp}"
-    if "_ENGINE_IGNORED_COND_KEYS" not in open(pp, errors="replace").read():
+    if "_ENGINE_IGNORED_COND_KEYS" not in open(pp, encoding="utf-8", errors="replace").read():
         return f"{model.comfy_class}: plugin {model.plugin} has no _ENGINE_IGNORED_COND_KEYS"
     return None
 
@@ -229,7 +229,7 @@ def _derived_roster_defects():
         if not fn.endswith(".py"):
             continue
         try:
-            src = open(os.path.join(_PLUGIN_DIR, fn), errors="replace").read()
+            src = open(os.path.join(_PLUGIN_DIR, fn), encoding="utf-8", errors="replace").read()
         except OSError:
             continue
         # `class QF<Name>Model(comfy.model_base.<Base>):` — the native-seam pattern. <Base> (WAN21/LTXV/…) is
@@ -408,7 +408,7 @@ def _selftest():
         pp = _resolve_plugin_path(m)
         if not os.path.isfile(pp):
             print("[FAIL] selftest: %s plugin file missing: %s" % (m.comfy_class, pp)); bad += 1
-        elif "_ENGINE_IGNORED_COND_KEYS" not in open(pp, errors="replace").read():
+        elif "_ENGINE_IGNORED_COND_KEYS" not in open(pp, encoding="utf-8", errors="replace").read():
             print("[FAIL] selftest: %s plugin %s has no _ENGINE_IGNORED_COND_KEYS" % (m.comfy_class, m.plugin)); bad += 1
     # DERIVED-ROSTER gate (_derived_roster_defects — the generality fix), proven BOTH directions here because it
     # is env-INDEPENDENT (scans the plugin package, needs no comfy) whereas check()'s call to it is comfy-gated
@@ -423,7 +423,7 @@ def _selftest():
     # (neg-1) a synthetic UNAUDITED seam MUST be reported (the silent-new-seam class this generality fix closes).
     _d1 = tempfile.mkdtemp(prefix="qfrl_sel1_")
     try:
-        with open(os.path.join(_d1, "qf_foo_modelpatcher.py"), "w") as _fh:
+        with open(os.path.join(_d1, "qf_foo_modelpatcher.py"), "w", encoding="utf-8") as _fh:
             _fh.write("class QFFooModel(comfy.model_base.FooBaseXYZ):\n    pass\n")
         _PLUGIN_DIR = _d1
         _defs1 = _derived_roster_defects()
@@ -448,9 +448,9 @@ def _selftest():
     # carries one VALID seam so the vacuous-scan defect (neg-2) cannot mask this arm's message.
     _d3 = tempfile.mkdtemp(prefix="qfrl_sel3_")
     try:
-        with open(os.path.join(_d3, "qf_ok_modelpatcher.py"), "w") as _fh:
+        with open(os.path.join(_d3, "qf_ok_modelpatcher.py"), "w", encoding="utf-8") as _fh:
             _fh.write("class QFOkModel(comfy.model_base.Krea2):\n    pass\n")
-        with open(os.path.join(_d3, "qf_bogus_modelpatcher.py"), "w") as _fh:
+        with open(os.path.join(_d3, "qf_bogus_modelpatcher.py"), "w", encoding="utf-8") as _fh:
             _fh.write("FAMILY = 'bogus'\n\nclass BogusSeam:\n    pass\n")   # drifted naming: no QF*Model
         _PLUGIN_DIR = _d3
         _defs3 = _derived_roster_defects()

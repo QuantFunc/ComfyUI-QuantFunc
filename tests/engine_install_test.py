@@ -234,7 +234,7 @@ class Env:
     def __init__(self, release, torch_major=13, driver_major=13, sm=89, plugin_version="0.0.07", machine="x86_64"):
         self.release = release
         self.dir = tempfile.mkdtemp(prefix="qf_engine_install_")
-        with open(os.path.join(self.dir, "version.json"), "w") as f:
+        with open(os.path.join(self.dir, "version.json"), "w", encoding="utf-8") as f:
             json.dump({"comfy": plugin_version}, f)
         self._saved = {n: getattr(qfe, n) for n in _STUBBED}
         self._machine = qfe.platform.machine
@@ -500,11 +500,11 @@ def main():
         }
         followed = []
         for field, m in tampered.items():
-            with open(mpath, "w") as f:
+            with open(mpath, "w", encoding="utf-8") as f:
                 json.dump(m, f)
             if qfe._read_marker(mpath) is not None or qfe._installed_pair() != (None, None):
                 followed.append(field)
-        with open(mpath, "w") as f:
+        with open(mpath, "w", encoding="utf-8") as f:
             json.dump(good, f)
         check("a tampered marker (any field) is ignored; the intact one is used", not followed
               and qfe._installed_pair() == (mpath, good), f"followed={followed}")
@@ -678,7 +678,7 @@ def main():
     with Env(rel) as env:
         with open(env.path(HOSTS[13]), "wb") as f:
             f.write(b"LOCAL-BUILD")
-        open(env.path(qfe._ENGINE_LOCAL_BUILD_LOCK), "w").close()
+        open(env.path(qfe._ENGINE_LOCAL_BUILD_LOCK), "w", encoding="utf-8").close()
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             _join_install(qfe.start_engine_install())
@@ -898,7 +898,7 @@ def main():
             qfe.install_engine()
             stale = env.marker(older_set)                   # an older plugin's folder: its marker still claims 89
             stale["sms"] = sorted(set(stale["sms"]) | {89})
-            open(env.path(f".engine-{older_set}-cu13.json"), "w").write(json.dumps(stale))
+            open(env.path(f".engine-{older_set}-cu13.json"), "w", encoding="utf-8").write(json.dumps(stale))
             got = os.path.relpath(qfe.resolve_so_path(), env.dir)
         check(f"two markers claim the SM (legacy folder, newer release in '{newer_set}'): the newest release loads",
               got == f"0.0.14-{newer_set}-cu13/{HOSTS[13]}", got)
@@ -954,7 +954,7 @@ def main():
         finally:
             qfe._engine_write_file = real_write
         claimants = [n for n in os.listdir(env.dir) if qfe._ENGINE_MARKER_RE.fullmatch(n)
-                     and 89 in (json.loads(open(os.path.join(env.dir, n)).read()).get("sms") or [])]
+                     and 89 in (json.loads(open(os.path.join(env.dir, n), encoding="utf-8").read()).get("sms") or [])]
         saved_start = qfe.start_engine_install
         qfe.start_engine_install = lambda *a, **k: None
         try:
@@ -974,7 +974,7 @@ def main():
         qfe.install_engine()
         mk = env.marker("consumer", 13)
         mk["cuda"] = 13.0
-        open(env.path(".engine-consumer-cu13.json"), "w").write(json.dumps(mk))
+        open(env.path(".engine-consumer-cu13.json"), "w", encoding="utf-8").write(json.dumps(mk))
         check("a marker whose cuda is a float (13.0) is not a marker", qfe._read_marker(env.path(".engine-consumer-cu13.json"))
               is None)
     # 29) a class RENAMED, then the release PULLED (self-CR round 8, A, rules 1+2): 0.0.14 calls the consumer class
@@ -1207,7 +1207,7 @@ def main():
     rel = WinRelease("0.0.13")
     with windows(), Env(rel, torch_major=12, sm=89, machine="AMD64") as env:
         open(env.path("quantfunc.dll"), "wb").write(b"LOCAL-BUILD")
-        open(env.path(qfe._ENGINE_LOCAL_BUILD_LOCK), "w").close()
+        open(env.path(qfe._ENGINE_LOCAL_BUILD_LOCK), "w", encoding="utf-8").close()
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             skipped = qfe.install_engine()
@@ -1237,7 +1237,7 @@ def main():
         followed = {}
         for label, bad_m in (("kernel named", dict(m, kernel="quantfunc_kernels.dll")),   # only the kernel field
                              ("second sha256", dict(m, sha256=dict(m["sha256"], **{"x.dll": "0" * 64})))):
-            open(mp, "w").write(json.dumps(bad_m))
+            open(mp, "w", encoding="utf-8").write(json.dumps(bad_m))
             followed[label] = qfe._read_marker(mp) is not None
         try:
             qfe.resolve_so_path()

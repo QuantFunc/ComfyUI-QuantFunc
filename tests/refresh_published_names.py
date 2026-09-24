@@ -42,7 +42,7 @@ def _safetensors(repo):
 
 
 def main():
-    old = json.load(open(OUT)) if os.path.exists(OUT) else {"repos": {}}
+    old = json.load(open(OUT, encoding="utf-8")) if os.path.exists(OUT) else {"repos": {}}
     new = {"_about": old.get("_about", ""), "fetched": datetime.date.today().isoformat(), "repos": {}}
     for repo in _repos():
         prev = old["repos"].get(repo, {"loader": "UNCLASSIFIED", "files": {}})
@@ -54,7 +54,7 @@ def main():
     print("\n".join(changed) or "no change in published files")
     if "--check" in sys.argv:
         return 1 if changed else 0
-    with open(OUT, "w") as f:
+    with open(OUT, "w", encoding="utf-8") as f:
         json.dump(new, f, indent=1, ensure_ascii=False)
         f.write("\n")
     return 0

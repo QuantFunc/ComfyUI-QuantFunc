@@ -42,11 +42,11 @@ class HostLoaderContract(unittest.TestCase):
     def test_every_family_has_exited_the_legacy_capacity_estimator_path(self):
         self.assertNotIn("estimate_footprint", plugin._register_families.__code__.co_consts)
         for name in plugin._FAMILY_MODULES:
-            source = (plugin_root / f"{name}.py").read_text()
+            source = (plugin_root / f"{name}.py").read_text(encoding="utf-8")
             self.assertNotIn('deps["estimate_footprint"]', source, name)
             self.assertNotIn("estimate_footprint(model_dir)", source, name)
             self.assertNotIn("footprint~", source, name)
-        substrate = (plugin_root / "qf_modelpatcher.py").read_text()
+        substrate = (plugin_root / "qf_modelpatcher.py").read_text(encoding="utf-8")
         self.assertNotIn("._resource.set_grant(", substrate)
         self.assertNotIn("._resource.set_device_grant(", substrate)
 

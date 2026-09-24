@@ -66,8 +66,8 @@ def main():
     # RED control: the exact defect class (a family calling a deleted substrate helper) must be reported.
     with tempfile.TemporaryDirectory(prefix="qf_subref_") as d:
         for f in _ALIASES.values():
-            open(os.path.join(d, f), "w").write("def kept():\n    pass\n")
-        open(os.path.join(d, "qf_fam_modelpatcher.py"), "w").write(
+            open(os.path.join(d, f), "w", encoding="utf-8").write("def kept():\n    pass\n")
+        open(os.path.join(d, "qf_fam_modelpatcher.py"), "w", encoding="utf-8").write(
             "from . import qf_modelpatcher as qfmp\nfrom .qf_engine import gone\n"
             "def _begin(self):\n    qfmp.kept()\n    qfmp._deleted_helper(self)\n")
         seen = dangling(d)
