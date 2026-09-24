@@ -508,7 +508,7 @@ _loader_namespace = {
     "_model_config_input": lambda _family: (["config"], {"default": "config", "hidden": True, "socketless": True}),
     "_attn_backend_input": lambda default: ([default], {"default": default}),
     "_SOL_TAU_INPUT": ("FLOAT", {"default": 1.0}),
-    "_quality_input": lambda: (["balance", "best_quality"], {"default": "balance"}),
+    "_quality_input": lambda _family: (["balance", "best_quality"], {"default": "balance"}),
     "_QUALITY_LEGACY_HIDDEN": {"quality_enhance": ("BOOLEAN", {})},
     "_loaded_device_index": lambda _patcher: 0,
     "_resolve_quality": lambda *_args: "balance",

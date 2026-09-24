@@ -658,10 +658,13 @@ if _IMPORT_OK:
                         + ([f"{' and '.join(fast)} {_QUALITY_FAST_CLAUSE}."] if fast else [])
                         + [f"balance (default): can be a little faster than best_quality; {_QUALITY_BALANCE_CLAUSE}.",
                            "best_quality: the highest quality."])
-    # [user 2026-09-24 「LTX-2.5 不提供 super_fast」] On LTX-2.5 super_fast visibly smears fast-moving faces and hands; H3 /
-    # Krea-2 / QI-2.1 stay sharp. The ONE place a family drops options: its loader never offers them, and a saved workflow's
-    # value runs the substitute with one console line (never an error, so old workflows still open and run).
-    _QUALITY_DROPPED = {"ltx2": {"super_fast": "fast"}}
+    # [user 2026-09-24 「LTX-2.5 不提供 super_fast」] On LTX-2.5 super_fast visibly smears fast-moving faces and hands.
+    # [user 2026-09-24 「H3 去掉 super_fast，降到 fast」, #736] On MiniMax-H3 super_fast put a one-frame block patch in a video
+    # (SM89); fast / balance / best_quality were clean. Krea-2 / QI-2.1 stay sharp. The ONE place a family drops options (the
+    # LTX-2.5 and MiniMax-H3 loaders pass their family key): its loader never offers them, and a saved workflow's value runs
+    # the substitute with one console line (never an error, so old workflows still open and run). Where the GPU has no fast
+    # mode the substitute runs balance, and the line still names the dropped option (_resolve_quality).
+    _QUALITY_DROPPED = {"ltx2": {"super_fast": "fast"}, "minimax-h3": {"super_fast": "fast"}}
     # Saved workflows (migration): they carry the retired quality_enhance switch — API-format prompts under its NAME (declared
     # hidden, in ComfyUI's (type, options) input form, so ComfyUI hands it to load() and can validate it when it is linked; an
     # undeclared key would be dropped silently), UI workflows as a boolean in this widget's POSITION (widget values are stored by
@@ -994,7 +997,7 @@ if _IMPORT_OK:
                 # auto/sage/native. (Wan/LTX → auto is fine → they keep 'auto'.)
                 "attention_backend": _attn_backend_input("flash"),
                 "sol_tau": _SOL_TAU_INPUT,
-                "quality": _quality_input(),
+                "quality": _quality_input("minimax-h3"),
                 "audio_enhance": _AUDIO_ENHANCE_INPUT,
                 "step_cache": _STEP_CACHE_INPUT,
                 "block_cache": _BLOCK_CACHE_INPUT,
@@ -1019,7 +1022,7 @@ if _IMPORT_OK:
                  step_cache=0.0, block_cache=0.0, allow_partial_denoise=False, quality_enhance=None):  # H3: flash default (auto→sage is broken)
             _p = _run_family_load("minimax-h3", transformer, model_config)
             _dev = _loaded_device_index(_p)
-            q = _resolve_quality(quality, quality_enhance, _dev)
+            q = _resolve_quality(quality, quality_enhance, _dev, "minimax-h3")
             _mm = getattr(_p, "model", None)
             if _mm is not None and hasattr(_mm, "set_attn_backend"):
                 _mm.set_attn_backend(_attn_backend_to_engine(attention_backend))

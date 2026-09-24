@@ -429,11 +429,14 @@ def main():
             qfn._quality_fast_cache.clear()
             qfn.qfe.load_lib = loader_fn
             _opts = {n: qfn.NODE_CLASS_MAPPINGS[n].INPUT_TYPES()["optional"]["quality"] for n in _FOUR if n != _QI21}
-            _want = {n: [o for o in want if not (n == "QuantFuncLTXLoader" and o == "super_fast")] for n in _opts}
+            _drops = ("QuantFuncLTXLoader", "QuantFuncH3Loader")   # _QUALITY_DROPPED: these never offer super_fast
+            _want = {n: [o for o in want if not (n in _drops and o == "super_fast")] for n in _opts}
             check(f"quality options follow the engine ({label}) on the H3 / LTX / Krea2 loaders, default balance; the LTX "
-                  f"loader never offers super_fast (user 「LTX-2.5 不提供 super_fast」)",
+                  f"and H3 loaders never offer super_fast (user 「LTX-2.5 不提供 super_fast」「H3 去掉 super_fast，降到 fast」); "
+                  f"Krea-2 keeps it wherever the engine offers the fast options",
                   all(o[0] == _want[n] and o[1]["default"] == "balance" for n, o in _opts.items())
-                  and "super_fast" not in _opts["QuantFuncLTXLoader"][1]["tooltip"],
+                  and not any("super_fast" in _opts[n][1]["tooltip"] for n in _drops)
+                  and ("super_fast" in _opts["QuantFuncKrea2Loader"][1]["tooltip"]) == (want == _Q4),
                   f"-> {[(n, o[0], o[1]['default']) for n, o in _opts.items()]}")
             # QI-2.1 (user 「sm120不要展示这个选项就好」): four options where the engine offers them; elsewhere the input stays in
             # its slot (widget values are positional) but hidden, socketless, defaulting to best_quality.
@@ -489,22 +492,30 @@ def main():
         qfn.qfe.load_lib = lambda: _FakeQLib(0)
         check("a two-way GPU runs a saved fast option as balance",
               [R(x) for x in _Q4] == ["balance", "balance", "balance", "best_quality"], f"-> {[R(x) for x in _Q4]}")
-        _ltx_saved = []
-        for _ans in (1, 0):
-            qfn._quality_fast_cache.clear()
-            qfn.qfe.load_lib = (lambda a=_ans: _FakeQLib(a))
-            for _x in _Q4:
-                _qb = _qio.StringIO()
-                with _qctl.redirect_stdout(_qb):
-                    _r = R(_x, family="ltx2")
-                _ltx_saved.append((_x, _r, _qb.getvalue().count("[QuantFunc]"),
-                                   _qb.getvalue().count("'super_fast' is not offered for this model")))
-        check("LTX: a saved super_fast runs fast on a fast GPU and balance on a two-way GPU — one console line, never an error; "
-              "the other options resolve as on every loader",
-              _ltx_saved == [("super_fast", "fast", 1, 1), ("fast", "fast", 0, 0), ("balance", "balance", 0, 0),
-                             ("best_quality", "best_quality", 0, 0),
-                             ("super_fast", "balance", 1, 1), ("fast", "balance", 1, 0), ("balance", "balance", 0, 0),
-                             ("best_quality", "best_quality", 0, 0)], f"-> {_ltx_saved}")
+        # A dropped option on each family that drops it (LTX-2.5, MiniMax-H3), on a fast GPU and on a two-way GPU (SM120),
+        # with the EXACT console line (the release gates match it). Order in _resolve_quality: the family's substitute first
+        # (super_fast -> fast), then the GPU rule (fast -> balance where there is no fast mode); the line keeps the drop's
+        # reason, so a two-way GPU prints "... not offered for this model; using balance." and never "'fast' is not
+        # available here".
+        _L = "[QuantFunc] 'super_fast' is not offered for this model; using {}.\n"
+        _want_rows = [("super_fast", "fast", _L.format("fast")), ("fast", "fast", ""), ("balance", "balance", ""),
+                      ("best_quality", "best_quality", ""),
+                      ("super_fast", "balance", _L.format("balance")),
+                      ("fast", "balance", "[QuantFunc] 'fast' is not available here; using balance.\n"),
+                      ("balance", "balance", ""), ("best_quality", "best_quality", "")]
+        for _fam in ("ltx2", "minimax-h3"):
+            _rows = []
+            for _ans in (1, 0):
+                qfn._quality_fast_cache.clear()
+                qfn.qfe.load_lib = (lambda a=_ans: _FakeQLib(a))
+                for _x in _Q4:
+                    _qb = _qio.StringIO()
+                    with _qctl.redirect_stdout(_qb):
+                        _r = R(_x, family=_fam)
+                    _rows.append((_x, _r, _qb.getvalue()))
+            check(f"{_fam}: a saved super_fast runs fast on a fast GPU and balance on a two-way GPU — one console line naming "
+                  f"the dropped option, never an error; the other options resolve as on every loader",
+                  _rows == _want_rows, f"-> {_rows}")
     finally:
         qfn.qfe.load_lib = _orig_load_lib
         qfn._quality_fast_cache.clear()
@@ -870,6 +881,41 @@ def main():
         qfn._quality_fast_cache.clear()
     check("h3 load(): retired key applies when quality is absent, default balance, explicit quality wins",
           _hqs == ["best_quality", "balance", "balance", "best_quality"], f"-> {_hqs}")
+    # #736 (user 「H3 去掉 super_fast，降到 fast」) through the REAL load(): a saved super_fast runs fast on a fast GPU and balance
+    # on a two-way GPU (SM120), with the exact console line; fast is untouched. Krea-2 drops nothing: its real load() keeps
+    # super_fast and prints no quality line.
+    import contextlib as _dctl
+    import io as _dio
+    _qlines = lambda s: [ln for ln in s.splitlines() if "is not offered for this model" in ln or "is not available here" in ln]
+    _orig_load_lib6 = qfn.qfe.load_lib
+    _h3drop = []
+    try:
+        for _ans in (1, 0):
+            qfn._quality_fast_cache.clear()
+            qfn.qfe.load_lib = (lambda a=_ans: _FakeQLib(a))
+            for _x in ("super_fast", "fast"):
+                _db = _dio.StringIO()
+                with _dctl.redirect_stdout(_db):
+                    _r = _hq(quality=_x)
+                _h3drop.append((_x, _r, _qlines(_db.getvalue())))
+        qfn._quality_fast_cache.clear()
+        qfn.qfe.load_lib = lambda: _FakeQLib(1)
+        _db = _dio.StringIO()
+        with _dctl.redirect_stdout(_db):
+            _k2 = getattr(KreaL.load("fx-krea2-turbo-quantfunc-int4.safetensors", "krea2-turbo-int4",
+                                     quality="super_fast")[0].model, "_quality", "MISSING")
+        _k2_lines = _qlines(_db.getvalue())
+    finally:
+        qfn.qfe.load_lib = _orig_load_lib6
+        qfn._quality_fast_cache.clear()
+    check("h3 load(): a saved super_fast runs fast on a fast GPU and balance on a two-way GPU, one exact console line; fast "
+          "is untouched",
+          _h3drop == [("super_fast", "fast", ["[QuantFunc] 'super_fast' is not offered for this model; using fast."]),
+                      ("fast", "fast", []),
+                      ("super_fast", "balance", ["[QuantFunc] 'super_fast' is not offered for this model; using balance."]),
+                      ("fast", "balance", ["[QuantFunc] 'fast' is not available here; using balance."])], f"-> {_h3drop}")
+    check("krea2 load(): super_fast is kept on a fast GPU (Krea-2 drops nothing), no quality line",
+          _k2 == "super_fast" and _k2_lines == [], f"-> {_k2} {_k2_lines}")
     # (tests-07 ruling) picking a fast option never reads the model FILE before the create: the pre-load file query
     # (quantfunc_quality_fast_available_file) read the checkpoint's scales first — up to 66 s cold for LTX-2.5. The engine
     # decides a file's fast form after the load. An engine that still exports the query must never be asked it.
