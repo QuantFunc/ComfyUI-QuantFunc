@@ -257,11 +257,11 @@ Import from [`workflow_sample/`](workflow_sample/):
 Qwen-Image-2.1 native-loader workflows are in [`example_workflows/`](example_workflows/) — ComfyUI lists them under
 **Templates → ComfyUI-QuantFunc**. They use the stock `CLIPLoader` (type `qwen_image`), `TextEncodeQwenImage21`, VAE and
 `KSampler`; only the transformer loader is QuantFunc's. The VAE is RGBA, so `VAE Decode` + `Save Image` keep transparency.
-The loader's `quality_enhance` switch (default OFF, like the Krea2 node): OFF = token-prune 0.8 on every
-CFG-1, batch-1 run without reference images — text-to-image, img2img and `SetLatentNoiseMask` inpainting. Measured
-against full compute (same seed): text-to-image about 16% faster sampling, PSNR 25.6–31.3 dB / SSIM 0.92–0.97 (same
-composition, no artifacts); img2img (denoise 0.6) PSNR 39.5 dB / SSIM 0.97; mask inpainting PSNR 28.9 dB inside the
-mask (33.5 dB / SSIM 0.98 over the whole image). ON = full compute. Image edit, CFG > 1 and batch > 1 always run full.
+The loader's `quality` choice (default `balance`, the same on the MiniMax-H3, LTX-2, Krea-2 and Qwen-Image-2.1 loaders): `balance` can be a little faster than
+`best_quality`, with almost the same result; `best_quality` gives the highest quality. On GPUs that offer them, `fast` and
+`super_fast` are faster still, and their details can differ more (on turbo models they can give a different variation of
+the same seed). On the MiniMax-H3, LTX-2 and Krea-2 loaders, `balance` runs like `best_quality` for image edit, CFG above 1
+and batches.
 
 | File | Use Case |
 |------|----------|

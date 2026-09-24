@@ -383,6 +383,13 @@ class QFSessionModelMixin:
         # plugin carries no number for it. Same rides-residency_opts class as set_sol_tau.
         self._video_enhance = bool(on)
 
+    def set_quality(self, q):
+        # [quality 2026-09-24] the loaders' speed/quality choice (super_fast / fast / balance / best_quality), already resolved
+        # for this GPU and file by the node. The ENGINE owns what it means per run (its per-family law: prune + fast steps from
+        # that run's own step count), so a session sends the name, never the numbers — and never with video_enhance (the engine
+        # refuses both). Same rides-residency_opts class as set_video_enhance, which stays for an engine that predates `quality`.
+        self._quality = str(q) if q else None
+
     def residency_opts(self):
         """The begin-options fragment EVERY family merges into its options_json — the ONE
         injection point for ALL runtime session knobs (residency + the two cache
@@ -427,7 +434,11 @@ class QFSessionModelMixin:
         # engine that ships with this plugin (an older .so refuses unknown begin keys LOUD — by design, never
         # silently ignored). The raw token_prune_keep_ratio key is the harness/expert surface and is never
         # built here; the engine refuses a begin that carries both.
-        o["video_enhance"] = bool(getattr(self, "_video_enhance", False))
+        q = getattr(self, "_quality", None)
+        if q:
+            o["quality"] = q   # [quality] the engine resolves it (it decides the prune too — video_enhance is not sent with it)
+        else:
+            o["video_enhance"] = bool(getattr(self, "_video_enhance", False))
         return o
 
     def _assert_wire_lora(self):

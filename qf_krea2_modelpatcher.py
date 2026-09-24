@@ -104,7 +104,11 @@ class QFKrea2Model(QFSessionModelMixin, comfy.model_base.Krea2):
         # engine-REFUSED here), so the mixin's generic emission never runs — emit the switch HERE
         # or the widget is silently dropped (the field 2026-09-01 lesson). Always sent, boolean;
         # the number behind it is engine law (never the raw token_prune_keep_ratio key).
-        _o["video_enhance"] = bool(getattr(self, "_video_enhance", False))
+        _q = getattr(self, "_quality", None)
+        if _q:
+            _o["quality"] = _q   # [quality] the loader's choice; the engine resolves it (never sent with video_enhance)
+        else:
+            _o["video_enhance"] = bool(getattr(self, "_video_enhance", False))
         bpx._opts = json.dumps(_o).encode()
         bpx.options_json = bpx._opts
         session = ctypes.c_void_p()
