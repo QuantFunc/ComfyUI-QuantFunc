@@ -47,6 +47,9 @@ clean audio + full generality + safety (decoupling the lanes is unsafe: video<->
 import inspect
 import logging
 
+# The plugin makes this logger console-safe (qf_engine.logger) when it imports the module (#738).
+_log = logging.getLogger(__name__)
+
 
 _installed = False
 _logged_samplers = set()
@@ -95,7 +98,7 @@ def _log_once(name, how):
     if name in _logged_samplers:
         return
     _logged_samplers.add(name)
-    logging.warning("[qf_native] LTX-2.5 AV: sampler '%s' -> %s for the QF AV model — the engine's stateless "
+    _log.warning("[qf_native] LTX-2.5 AV: sampler '%s' -> %s for the QF AV model — the engine's stateless "
                  "flow-match forward needs a non-re-noised (deterministic) trajectory or the audio lane is "
                  "silenced. Video is deterministic here (accepted tradeoff).", name, how)
 
@@ -140,7 +143,7 @@ def _wrap(orig, name, sig, params):
                 how = "s_churn=0 (keeps its own deterministic body)"
             _log_once(name, how)
         except Exception as e:  # never break sampling — degrade to the original (unfixed) behavior
-            logging.warning("[qf_native] LTX-2.5 AV euler-force setup failed for %s (%r); sampler unchanged.", name, e)
+            _log.warning("[qf_native] LTX-2.5 AV euler-force setup failed for %s (%r); sampler unchanged.", name, e)
             return orig(model, x, sigmas, *args, **kwargs)
         return target(*call_args, **call_kwargs)  # outside the try — a sampler-internal error propagates normally
 
@@ -158,7 +161,7 @@ def install():
     try:
         import comfy.k_diffusion.sampling as S
     except Exception as e:
-        logging.warning("[qf_native] LTX-2.5 AV audio-fix: comfy sampling import failed (%r); not installed.", e)
+        _log.warning("[qf_native] LTX-2.5 AV audio-fix: comfy sampling import failed (%r); not installed.", e)
         return
     _ORIG_EULER = getattr(S, "sample_euler", None)   # capture BEFORE wrapping (substitution target)
     try:
@@ -192,10 +195,10 @@ def install():
             skipped_renoising.append(sname)
     _installed = True
     if wrapped_names:
-        logging.debug("[qf_native] LTX-2.5 AV euler-force audio-fix installed (%d user-selectable re-noising "
-                     "samplers wrapped: %s). QF-AV models run these on a deterministic trajectory so the "
-                     "audio lane is not silenced; non-QF-AV models are unaffected.%s",
-                     len(wrapped_names), ", ".join(sorted(wrapped_names)),
-                     ("" if not skipped_renoising else
-                      " NOTE: %d UI sampler(s) have no sample_<name> module attr (not wrapped, verified "
-                      "deterministic/aliased today): %s" % (len(skipped_renoising), ", ".join(sorted(skipped_renoising)))))
+        _log.debug("[qf_native] LTX-2.5 AV euler-force audio-fix installed (%d user-selectable re-noising "
+                   "samplers wrapped: %s). QF-AV models run these on a deterministic trajectory so the "
+                   "audio lane is not silenced; non-QF-AV models are unaffected.%s",
+                   len(wrapped_names), ", ".join(sorted(wrapped_names)),
+                   ("" if not skipped_renoising else
+                    " NOTE: %d UI sampler(s) have no sample_<name> module attr (not wrapped, verified "
+                    "deterministic/aliased today): %s" % (len(skipped_renoising), ", ".join(sorted(skipped_renoising)))))

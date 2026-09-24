@@ -754,7 +754,7 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
             self._qf.end_session_if_open()
             st = lib.quantfunc_denoise_begin(self._qf.pipeline, ctypes.byref(bpx), ctypes.byref(session))
         if _prof:
-            print(f"[qf_prof] begin_call {(_time.perf_counter()-_t0)*1000:.0f} ms", flush=True)
+            qfe.say(f"[qf_prof] begin_call {(_time.perf_counter()-_t0)*1000:.0f} ms", flush=True)
         self._begin_keep = bpx
         if st != qfe.QUANTFUNC_OK:
             raise RuntimeError(f"denoise_begin (LTX) failed: {qfe.last_err(lib)}")
@@ -834,9 +834,9 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
             cuid = cuuids[i] if (cuuids is not None and i < len(cuuids)) else None
             p.cfg_context_key = self._ctx_key_assigner.key(cuid)
             if os.environ.get("QF_NATIVE_DEBUG_CTXKEY"):   # off by default; probes the uuid path
-                print(f"[qf_native] LTX CTXKEY step={step_index} grp={i} cuuids_none={cuuids is None} "
-                      f"len={0 if cuuids is None else len(cuuids)} cuid={str(cuid)[:8]} key={p.cfg_context_key}",
-                      flush=True)
+                qfe.say(f"[qf_native] LTX CTXKEY step={step_index} grp={i} cuuids_none={cuuids is None} "
+                        f"len={0 if cuuids is None else len(cuuids)} cuid={str(cuid)[:8]} key={p.cfg_context_key}",
+                        flush=True)
             self._call_denoise_step(
                 p, f"LTX denoise_step[step={step_index},group={i},key={p.cfg_context_key}]")  # QFSessionModelMixin
             # UNPACK velocity [1,N,128] -> [1,128,F,H,W] (exact inverse of the pack)
@@ -978,7 +978,7 @@ class QFLTXAVModel(QFLTXModel):
                                            control=control, transformer_options=transformer_options,
                                            **kwargs)
         finally:
-            print(f"[qf_prof] step wall {(_time.perf_counter()-_t0)*1000:.0f} ms", flush=True)
+            qfe.say(f"[qf_prof] step wall {(_time.perf_counter()-_t0)*1000:.0f} ms", flush=True)
 
     def _apply_model_timed(self, x, t, c_concat=None, c_crossattn=None, control=None,
                      transformer_options={}, **kwargs):
@@ -1070,9 +1070,9 @@ class QFLTXAVModel(QFLTXModel):
             cuid = cuuids[i] if (cuuids is not None and i < len(cuuids)) else None
             p.cfg_context_key = self._ctx_key_assigner.key(cuid)
             if os.environ.get("QF_NATIVE_DEBUG_CTXKEY"):
-                print(f"[qf_native] LTX-AV CTXKEY step={step_index} grp={i} "
-                      f"cuuids_none={cuuids is None} cuid={str(cuid)[:8]} key={p.cfg_context_key}",
-                      flush=True)
+                qfe.say(f"[qf_native] LTX-AV CTXKEY step={step_index} grp={i} "
+                        f"cuuids_none={cuuids is None} cuid={str(cuid)[:8]} key={p.cfg_context_key}",
+                        flush=True)
             mp = qfe.DenoiseStepMultiParams()
             ctypes.memset(ctypes.byref(mp), 0, ctypes.sizeof(mp))
             mp.struct_size = ctypes.sizeof(mp)

@@ -24,6 +24,15 @@ MODES (the forced preferred encoding):
               whatever the bytes (so an ASCII-only file cannot hide the defect)
 A mode this OS cannot force is a disclosed [SKIP] (run_plugin_tests.py counts it; --strict fails it), never a pass.
 
+CONSOLE ARMS (the plugin's own OUTPUT must never raise on the console's code page). ComfyUI keeps the OS encoding on
+stdout/stderr with errors='strict' (its LogInterceptor), so on a redirected Windows console one character the code page
+cannot hold raises UnicodeEncodeError out of the print() / log call, and out of the loader:
+  static      no print() outside qf_engine.say, no root-logger call, no bare getLogger where qfe.logger() exists
+  runtime     per code page cp932 / cp949 / cp1252 / cp936 (PYTHONIOENCODING, streams wrapped like ComfyUI's): importing
+              the plugin, qf_engine.say / info / logger, and the LTX audio-fix warning never raise and never lose a line
+              ("--- Logging error ---"); every plugin logger carries the console-safe filter; the bytes on stdout/stderr
+              are valid in the code page, with what it cannot hold backslash-escaped; qf_lora_convert --help runs.
+
 Run:  python3 tests/text_encoding_test.py       stdlib only: no ComfyUI, no torch, no GPU
       QF_TEXTIO_TEST_ROOT=<plugin tree> points it at another tree (e.g. the unfixed base, to show the arms go RED).
 """
@@ -57,12 +66,13 @@ def _mode_literal(node):
 
 
 def _dotted(func):
+    """`a.b.c` for a call's target. A chain rooted in an expression (`Path(x).open`) gets a `?` root, so it is never
+    mistaken for the builtin of the same name."""
     parts = []
     while isinstance(func, ast.Attribute):
         parts.append(func.attr)
         func = func.value
-    if isinstance(func, ast.Name):
-        parts.append(func.id)
+    parts.append(func.id if isinstance(func, ast.Name) else "?")
     return ".".join(reversed(parts))
 
 
@@ -122,6 +132,138 @@ def _static_sites(root):
     return sorted(sites)
 
 
+_LOG_LEVELS = {"debug", "info", "warning", "error", "exception", "critical", "log"}
+
+
+def _console_sites(root):
+    """Console-output paths in the plugin's RUNTIME modules (the .py files at its root) that can raise on a code page:
+    a print() outside qf_engine.say; a call on the ROOT logger (logging.<level>, whatever `logging` is imported as);
+    logging.getLogger() in a module that has qf_engine (qfe.logger() gives the console-safe one there)."""
+    sites = []
+    for fn in sorted(os.listdir(root)):
+        if not fn.endswith(".py"):
+            continue
+        path = os.path.join(root, fn)
+        with open(path, encoding="utf-8") as f:
+            tree = ast.parse(f.read(), path)
+        aliases = {a.asname or a.name for n in ast.walk(tree) if isinstance(n, ast.Import)
+                   for a in n.names if a.name == "logging"}
+        has_qfe = any(isinstance(n, ast.ImportFrom) and any(a.name == "qf_engine" for a in n.names)
+                      for n in ast.walk(tree))
+        say_body = set()
+        for n in ast.walk(tree):
+            if fn == "qf_engine.py" and isinstance(n, ast.FunctionDef) and n.name == "say":
+                say_body = {id(x) for x in ast.walk(n)}
+        for n in ast.walk(tree):
+            if not isinstance(n, ast.Call):
+                continue
+            f = n.func
+            if isinstance(f, ast.Name) and f.id == "print" and id(n) not in say_body:
+                sites.append(f"{fn}:{n.lineno} print(...)")
+            elif (isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name) and f.value.id in aliases
+                  and f.attr in _LOG_LEVELS):
+                sites.append(f"{fn}:{n.lineno} {f.value.id}.{f.attr}(...) on the root logger")
+            elif (has_qfe and isinstance(f, ast.Attribute) and f.attr == "getLogger" and isinstance(f.value, ast.Name)
+                  and f.value.id in aliases):
+                sites.append(f"{fn}:{n.lineno} logging.getLogger(...) where qfe.logger(...) exists")
+    return sites
+
+
+# The plugin's own non-ASCII punctuation (— – →), CJK, Hangul, Latin-1 and an emoji: no single code page holds them all.
+_CONSOLE_TEXT = "— – → 中文 한국어 日本語 éü \U0001f600"
+_CONSOLE_PAGES = ("cp932", "cp949", "cp1252", "cp936")   # redirected Windows consoles: Japanese, Korean, Western, Chinese
+_LOG_ERROR = b"--- Logging error ---"
+
+
+def _console_child(job):
+    """Runs under PYTHONIOENCODING=<code page>. Wraps stdout/stderr the way ComfyUI's LogInterceptor does (the stream's
+    own encoding, errors='strict') and logs to stderr through a root StreamHandler like ComfyUI's, then drives the
+    plugin's output paths. Results go to a file: stdout/stderr ARE the thing under test."""
+    import io
+    import logging
+    for name in ("stdout", "stderr"):
+        s = getattr(sys, name)
+        setattr(sys, name, io.TextIOWrapper(s.buffer, encoding=s.encoding, line_buffering=True))
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    logging.getLogger().addHandler(handler)
+    logging.getLogger().setLevel(logging.DEBUG)
+    out = {}
+    try:
+        mod = _import_plugin(job["root"])   # the guarded comfy import fails here (torch blocked): its warning prints
+        out["console import"] = ["ok", None]
+    except BaseException as exc:  # noqa: BLE001 — a crashed import is the result
+        out["console import"] = ["error", type(exc).__name__, str(exc)]
+        mod = None
+    qfe = getattr(mod, "qfe", None)
+    missing = ["error", "Missing", "qf_engine has no console-safe output"]
+    if qfe is not None and hasattr(qfe, "say") and hasattr(qfe, "logger"):
+        out["console say"] = _outcome(qfe.say, "[say] " + _CONSOLE_TEXT)
+        qfe._LOG_LEVEL = qfe._LOG_INFO
+        out["console info"] = _outcome(qfe.info, "[info] " + _CONSOLE_TEXT)
+        out["console logger"] = _outcome(qfe.logger("qf_textio").warning, "%s", "[log] " + _CONSOLE_TEXT)
+    elif qfe is not None:   # the unfixed plugin: its info() line is the output path that exists
+        qfe._LOG_LEVEL = qfe._LOG_INFO
+        out["console say"] = out["console logger"] = missing
+        out["console info"] = _outcome(qfe.info, "[info] " + _CONSOLE_TEXT)
+    afix = sys.modules.get("qfn_textio_pkg.qf_ltx_ancestral_audio_fix")
+    out["console audio-fix"] = (_outcome(afix._log_once, "sampler " + _CONSOLE_TEXT, "euler") if afix
+                                else ["error", "Missing", "the audio-fix module was not imported"])
+    import logging as _lg
+    bare = sorted(n for n, lg in _lg.Logger.manager.loggerDict.items()
+                  if n.startswith("qfn_textio_pkg") and isinstance(lg, _lg.Logger)
+                  and not any(type(f).__name__ == "_ConsoleSafe" for f in lg.filters))
+    out["console loggers"] = ["ok", None] if not bare else ["error", "Unsafe", ", ".join(bare)]
+    with open(job["result"], "w", encoding="utf-8") as f:
+        json.dump(out, f)
+
+
+def _console_arms(root, tmp):
+    """rows for every code page: each output path, and the bytes the child wrote to stdout/stderr."""
+    rows = []
+    for cp in _CONSOLE_PAGES:
+        env = {k: v for k, v in os.environ.items() if k not in _KEY_ENVS + _LOCALE_ENVS}
+        env.update(PYTHONIOENCODING=cp, PYTHONUTF8="0")
+        res = os.path.join(tmp, f"console-{cp}.json")
+        r = subprocess.run([sys.executable, os.path.abspath(__file__), "--console-child",
+                            json.dumps({"root": root, "result": res})], env=env, capture_output=True)
+        try:
+            with open(res, encoding="utf-8") as f:
+                got = json.load(f)
+        except (OSError, ValueError):
+            tail = r.stderr.decode("ascii", "backslashreplace")[-400:]
+            rows.append((cp, "console child", "a result", f"rc={r.returncode}: {tail}", False))
+            continue
+        want = {"console say": ("stdout", "[say] "), "console info": ("stdout", "[info] "),
+                "console logger": ("stderr", "[log] ")}
+        for arm in ("console import", "console say", "console info", "console logger", "console audio-fix",
+                    "console loggers"):
+            g = got.get(arm, ["error", "Missing", "the child did not run this arm"])
+            ok, act = g[0] == "ok", _show(g)
+            if ok and arm in want:   # the line reached the console, with what the code page cannot hold escaped
+                stream, tag = want[arm]
+                line = (tag + _CONSOLE_TEXT).encode(cp, "backslashreplace")
+                ok = line in (r.stdout if stream == "stdout" else r.stderr)
+                act = f"written as {line[:60]!r}..." if ok else f"not found on {stream}"
+            rows.append((cp, arm, "ok, never raises", act, ok))
+        for stream in ("stdout", "stderr"):
+            data = getattr(r, stream)
+            try:
+                data.decode(cp)
+                clean = _LOG_ERROR not in data
+                act = "decodes, no logging error" if clean else "a '--- Logging error ---' (a message was lost)"
+            except UnicodeDecodeError as exc:
+                clean, act = False, f"undecodable: {exc}"
+            rows.append((cp, f"console {stream} bytes", f"valid {cp}", act, clean))
+        h = subprocess.run([sys.executable, os.path.join(root, "scripts", "qf_lora_convert.py"), "--help"],
+                           env=env, capture_output=True)
+        help_ok = h.returncode == 0 and b"--model" in h.stdout
+        rows.append((cp, "console qf_lora_convert --help", "rc 0 + the help text",
+                     "ok" if help_ok else f"rc={h.returncode}: {h.stderr.decode('ascii', 'backslashreplace')[-200:]}",
+                     help_ok))
+    return rows
+
+
 # ----------------------------------------------------------------------------------------------------- the child --
 def _import_plugin(root):
     """The plugin package the way ComfyUI imports it (by file path), with torch BLOCKED and comfy stubbed: the readers
@@ -174,7 +316,7 @@ def _child(job):
     for fam in job["families"]:
         out[f"family {fam}"] = _outcome(mod._family_preset, fam)
     for rel in job["keyfiles"]:
-        os.environ["QF_NATIVE_KEYFILE"] = os.path.join(job["root"], rel)
+        os.environ[mod.qfe._ENV_KEYFILE_OVERRIDE] = os.path.join(job["root"], rel)
         out[f"keyfile {rel}"] = _outcome(lambda: bool(mod._read_auth()[0]))   # the key itself never leaves the child
     heads = _extract(os.path.join(job["root"], "qf_ltx_modelpatcher.py"), "_connector_config_heads",
                      {"os": os, "json": json}, consts=("_MAX_CONNECTOR_HEADS",))
@@ -189,7 +331,7 @@ def _child(job):
     run_load = _extract(os.path.join(job["root"], "__init__.py"), "_run_family_load", dict(vars(mod)))
     out["malformed-saved-workflow ltx2"] = _outcome(run_load, "ltx2", "x.safetensors", "notutf8")
     for path in job["mal_keyfiles"]:
-        os.environ["QF_NATIVE_KEYFILE"] = path
+        os.environ[mod.qfe._ENV_KEYFILE_OVERRIDE] = path
         out[f"malformed-keyfile {os.path.basename(path)}"] = _outcome(lambda: bool(mod._read_auth()[0]))
     print(json.dumps(out))   # ASCII (ensure_ascii): printable under any forced stdout encoding
 
@@ -256,9 +398,10 @@ def _malformed(tmp):
     for name in ("keyless", "absent"):
         job["connectors"].append([f"conn/{name}", os.path.join(conn, name)])
         expect[f"connectors conn/{name}"] = ("ok", None)
-    # a family whose ONLY manifest is broken: the refusal names the broken file, not "no model config shipped"
-    expect["malformed-family ltx2"] = ("raises", "manifest unreadable")
-    expect["malformed-saved-workflow ltx2"] = ("raises", "manifest unreadable")
+    # a family whose manifest is broken: the refusal names EVERY broken manifest (it cannot tell whose each one was)
+    # and the family it was resolving - never "no model config shipped"
+    expect["malformed-family ltx2"] = ("raises", ("ltx2", "'badjson'", "'notutf8'", "'notobject'"))
+    expect["malformed-saved-workflow ltx2"] = ("raises", ("ltx2", "'badjson'", "'notutf8'", "'notobject'"))
     return job, expect
 
 
@@ -308,7 +451,8 @@ def _modes(tmp):
 def _verdict(expect, got):
     if expect[0] == "ok":
         return got[0] == "ok" and got[1] == expect[1]
-    return got[0] == "error" and got[1] == "RuntimeError" and expect[1] in got[2]
+    need = expect[1] if isinstance(expect[1], tuple) else (expect[1],)
+    return got[0] == "error" and got[1] == "RuntimeError" and all(s in got[2] for s in need)
 
 
 def _show(got):
@@ -323,6 +467,10 @@ def main():
     rows.append(("static", "-", "0 encoding-less text-I/O sites", f"{len(sites)} site(s)", not sites))
     for s in sites:
         print(f"  encoding-less: {s}")
+    csites = _console_sites(_ROOT)
+    rows.append(("static", "console", "0 unsafe console-output sites", f"{len(csites)} site(s)", not csites))
+    for s in csites:
+        print(f"  console-unsafe: {s}")
     tmp = tempfile.mkdtemp(prefix="qf-textio-")
     try:
         mal_job, mal_expect = _malformed(tmp)
@@ -352,6 +500,7 @@ def main():
             for arm, exp in expect.items():
                 g = got.get(arm, ["error", "Missing", "the child did not run this arm"])
                 rows.append((label, arm, f"{exp[0]} {exp[1]}", _show(g), _verdict(exp, g)))
+        rows += _console_arms(_ROOT, tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print(f"{'mode':<14} {'PASS':<5} {'arm':<44} expected -> actual")
@@ -369,5 +518,8 @@ def main():
 if __name__ == "__main__":
     if len(sys.argv) >= 3 and sys.argv[1] == "--child":
         _child(json.loads(sys.argv[2]))
+        sys.exit(0)
+    if len(sys.argv) >= 3 and sys.argv[1] == "--console-child":
+        _console_child(json.loads(sys.argv[2]))
         sys.exit(0)
     sys.exit(main())

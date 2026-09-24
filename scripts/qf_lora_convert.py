@@ -519,6 +519,9 @@ def key_names_self_test():
 
 
 def main():
+    # A standalone command: its own console never raises on the code page (#738); --help alone carries a dash.
+    for stream in (sys.stdout, sys.stderr):
+        stream.reconfigure(errors="backslashreplace")
     ap = argparse.ArgumentParser(description="Convert a LoRA to QuantFunc diffusers/PEFT canonical form.")
     ap.add_argument("--in", dest="inp", help="input LoRA .safetensors")
     ap.add_argument("--out", dest="out", help="output .safetensors (diffusers canonical)")

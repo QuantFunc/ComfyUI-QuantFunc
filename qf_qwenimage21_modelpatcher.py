@@ -78,9 +78,9 @@ class QFQwenImage21Model(qfmp.QFImageSessionModel, comfy.model_base.QwenImage21)
         if isinstance(transformer_options, dict) and transformer_options.get("qwen_image21_cache") \
                 and not getattr(self, "_qi21_cache_noted", False):
             self._qi21_cache_noted = True
-            print("[qf_native] qwenimage21: QwenImage21Cache settings do not apply to the QuantFunc engine "
-                  "(its prefix K/V cache is an engine option, off by default) — sampling is unaffected",
-                  flush=True)
+            qfe.say("[qf_native] qwenimage21: QwenImage21Cache settings do not apply to the QuantFunc engine "
+                    "(its prefix K/V cache is an engine option, off by default) — sampling is unaffected",
+                    flush=True)
         return super()._apply_model(x, t, c_concat, c_crossattn, control, transformer_options, **kwargs)
 
     def _denoise_group(self, p, i, xi, ci, kwargs, step_index, ctx_key):

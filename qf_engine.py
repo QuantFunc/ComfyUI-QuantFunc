@@ -7,6 +7,7 @@ import ctypes
 from contextvars import ContextVar
 import glob
 import json
+import logging
 import mmap
 import os
 import time
@@ -52,7 +53,7 @@ def _dbg_prof(msg):
     """QF_NATIVE_PROF-gated diagnostic line (the [qf_prof] channel the perf probes use)."""
     import os as _os
     if _os.environ.get("QF_NATIVE_PROF") == "1":
-        print(f"[qf_prof] {msg}", flush=True)
+        say(f"[qf_prof] {msg}", flush=True)
 
 # Platform dispatch — the bundled native library lives in bin/<subdir>/<basename>, so a Windows install
 # finds bin/windows/quantfunc.dll and a Linux install finds bin/linux/libquantfunc.so. The Windows/Linux
@@ -811,7 +812,50 @@ def info(msg, *args, flush=True):
     loader ran it is warning too; the harness sends info). A warning or an error never goes through here: it always
     prints. `args` %-format `msg` (the logging idiom the converted lines used)."""
     if _LOG_LEVEL is not None and _LOG_LEVEL <= _LOG_INFO:
-        print(msg % args if args else msg, flush=flush)
+        say(msg % args if args else msg, flush=flush)
+
+
+def console_safe(text):
+    """`text` with each character the console cannot encode written as a backslash escape (#738). ComfyUI keeps the OS
+    encoding on stdout/stderr with errors='strict' (a redirected Windows console: cp932 / cp949 / cp1252 / cp936 ...),
+    so one character the code page cannot hold raises UnicodeEncodeError out of whatever printed it, the loader
+    included. Only such characters change, so a code page that holds CJK keeps it readable. The streams themselves are
+    never reconfigured: they are ComfyUI's."""
+    for stream in (sys.stdout, sys.stderr):
+        enc = getattr(stream, "encoding", None)
+        if enc:
+            try:
+                text = text.encode(enc, "backslashreplace").decode(enc)
+            except LookupError:   # a codec name Python does not know: plain ASCII is safe on every console
+                text = text.encode("ascii", "backslashreplace").decode("ascii")
+    return text
+
+
+def say(msg, flush=True):
+    """print() for the plugin's own lines: never raises on the console's code page (console_safe)."""
+    print(console_safe(msg), flush=flush)
+
+
+class _ConsoleSafe(logging.Filter):
+    """Makes each record of a plugin logger printable on the console's code page (console_safe). A malformed %-format
+    is left to the handler, which reports it as logging always has."""
+
+    def filter(self, record):
+        try:
+            text = record.getMessage()
+        except (TypeError, ValueError):
+            return True
+        record.msg, record.args = console_safe(text), None
+        return True
+
+
+def logger(name):
+    """logging.getLogger(name) with _ConsoleSafe on it: every plugin logger comes from here. A filter works on the
+    logger it is attached to, so ComfyUI's own loggers, handlers and streams are untouched."""
+    log = logging.getLogger(name)
+    if not any(isinstance(f, _ConsoleSafe) for f in log.filters):
+        log.addFilter(_ConsoleSafe())
+    return log
 
 # ── Engine library install (option C, user 2026-09-24 「在原生加载器里实现」「根据自己的显卡型号下载对应so」) ──────────
 # The plugin installs the engine it needs into bin/<platform>/, SHA-256-verified against the release's published
@@ -1165,7 +1209,7 @@ def install_engine(device_idx=None):
     why = _engine_local_choice()
     if why:
         _engine_status("local", why)
-        print(f"[qf_native] QuantFunc engine install skipped: {why}", flush=True)
+        say(f"[qf_native] QuantFunc engine install skipped: {why}", flush=True)
         return None
     plat = _engine_platform()
     if plat is None:
@@ -1300,7 +1344,7 @@ def _install_pair(bin_dir, device_idx):
         if p and p.group(2) == gpu_set and int(p.group(3)) == major and d not in keep:
             shutil.rmtree(os.path.join(bin_dir, d), ignore_errors=True)
     _engine_status("installed", f"engine {version} ({gpu_set}, CUDA {major})")
-    print(f"[qf_native] installed QuantFunc engine {version} for {gpu_set} GPUs, CUDA {major}", flush=True)
+    say(f"[qf_native] installed QuantFunc engine {version} for {gpu_set} GPUs, CUDA {major}", flush=True)
     return m
 
 
@@ -1350,13 +1394,13 @@ def start_engine_install(device_idx=None):
             install_engine()
         except EngineNotInstallable as e:
             _engine_status("unavailable", str(e))
-            print(f"[qf_native] QuantFunc engine not installed: {e}", flush=True)
+            say(f"[qf_native] QuantFunc engine not installed: {e}", flush=True)
         except Exception as e:  # noqa: BLE001 — offline / manifest / hash: a verified installed pair stays in use
             kept = _installed_pair()[1]
             _engine_status("offline" if kept else "failed", f"{type(e).__name__}: {e}")
-            print(f"[qf_native] QuantFunc engine update failed ({type(e).__name__}: {e}); "
-                  f"{'the installed engine ' + kept['version'] + ' stays in use' if kept else 'no engine is installed'}",
-                  flush=True)
+            say(f"[qf_native] QuantFunc engine update failed ({type(e).__name__}: {e}); "
+                f"{'the installed engine ' + kept['version'] + ' stays in use' if kept else 'no engine is installed'}",
+                flush=True)
 
     t = threading.Thread(target=_run, name="qf-engine-install", daemon=True)
     t.start()
@@ -2101,15 +2145,15 @@ class QFEngineHandle:
             if st != QUANTFUNC_OK:
                 ok = False
                 try:
-                    print(f"[qf_native] WARNING quantfunc_denoise_end returned status={st}: "
-                          f"{last_err(self.lib)}", flush=True)
+                    say(f"[qf_native] WARNING quantfunc_denoise_end returned status={st}: "
+                        f"{last_err(self.lib)}", flush=True)
                 except Exception:  # noqa: BLE001
                     pass
         except Exception as _end_exc:  # noqa: BLE001 — end is best-effort on teardown
             ok = False
             try:  # R7 observability: this branch previously left no trail (leg-1 was
                 #   diagnosed FROM logs — a silent branch here would blind the next diagnosis)
-                print(f"[qf_native] WARNING quantfunc_denoise_end raised: {_end_exc!r}", flush=True)
+                say(f"[qf_native] WARNING quantfunc_denoise_end raised: {_end_exc!r}", flush=True)
             except Exception:  # noqa: BLE001
                 pass
         # RETAIN the pointer on a refused end (2026-08-24 busy incident, leg 2). The old
@@ -2215,7 +2259,7 @@ class QFEngineHandle:
             frames = _tb.extract_stack(limit=5)[:-1]
             chain = " <- ".join(f"{_os.path.basename(f.filename)}:{f.lineno}:{f.name}"
                                 for f in reversed(frames))
-            print(f"[qf_prof] unload_vram CALLER: {chain}", flush=True)
+            say(f"[qf_prof] unload_vram CALLER: {chain}", flush=True)
         self.end_session_if_open()          # a live session on unloaded VRAM would be a UAF on reuse
         if self.current_session is not None:
             raise RuntimeError("QuantFunc cannot unload VRAM while a session is still active")

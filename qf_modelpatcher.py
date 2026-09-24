@@ -39,7 +39,6 @@ from contextvars import ContextVar
 import functools
 import hashlib
 import json
-import logging
 import os
 import threading
 import time
@@ -570,7 +569,7 @@ class QFSessionModelMixin:
             self._qf.end_session_if_open()
             raise
         if _prof:
-            print(f"[qf_prof] engine_call {(_time.perf_counter()-_t0)*1000:.0f} ms", flush=True)
+            qfe.say(f"[qf_prof] engine_call {(_time.perf_counter()-_t0)*1000:.0f} ms", flush=True)
         if st != qfe.QUANTFUNC_OK:
             err = qfe.last_err(lib)
             self._qf.end_session_if_open()
@@ -1135,7 +1134,7 @@ class _CanonicalResourceDomain:
         self.transaction_lock = threading.RLock()
 
 
-_log = logging.getLogger(__name__)
+_log = qfe.logger(__name__)   # console-safe (#738)
 
 # Native queries never wait (quantfunc.h). The engine answers QUANTFUNC_RESOURCE_BUSY whenever another thread holds
 # the allocator's or the target's lock at that instant, which is ordinary while native work runs. MEASURED (issue
@@ -1902,8 +1901,8 @@ class QFNativeResourcePatcher(comfy.model_patcher.ModelPatcher):
                     # floor never reaches zero. Everything eligible is already released; growth was revoked
                     # above and is revoked again below, so nothing regrows before the next formal admission,
                     # which re-reads native residency. What remains is physically visible to Comfy.
-                    print(f"[qf_native] full eviction left native backing (state={result.state}); "
-                          "growth stays fenced until the next formal admission", flush=True)
+                    qfe.say(f"[qf_native] full eviction left native backing (state={result.state}); "
+                            "growth stays fenced until the next formal admission", flush=True)
                 if self._host_managed and not closed:
                     _revoke_domain_growth(self)
         # Keep the view and canonical object alive across host deregistration.

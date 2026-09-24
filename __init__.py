@@ -6,9 +6,14 @@ comfy nodes (maximize comfy-ecosystem compatibility).
 """
 import os
 import json
-import logging
 import weakref
 import threading
+
+# qf_engine is stdlib only (nothing from comfy), so a ComfyUI upgrade cannot break it; every warning below prints
+# through its console-safe logger (#738: one character the console's code page cannot hold must never raise).
+from . import qf_engine as qfe
+
+_log = qfe.logger(__name__)
 
 # GUARDED imports (mirror the real plugin __init__.py) — a broken comfy-internals import must NOT
 # take down node registration on a ComfyUI upgrade; degrade to zero nodes + a loud warning.
@@ -17,12 +22,11 @@ NODE_DISPLAY_NAME_MAPPINGS = {}
 try:
     import comfy.model_management
     import comfy.supported_models
-    from . import qf_engine as qfe
     from . import qf_modelpatcher as qfmp
     from .qf_modelpatcher import QFModelPatcher
     _IMPORT_OK = True
 except Exception as _exc:  # noqa: BLE001 — never break registration; report loudly
-    logging.warning("[qf_native] disabled — a required import failed (ComfyUI API drift?): %r", _exc)
+    _log.warning("[qf_native] disabled — a required import failed (ComfyUI API drift?): %r", _exc)
     _IMPORT_OK = False
 
 
@@ -31,7 +35,7 @@ try:
     import folder_paths as _folder_paths
 except Exception as _fp_exc:  # noqa: BLE001 — never break registration
     _folder_paths = None
-    logging.warning("[qf_native] folder_paths unavailable: %r", _fp_exc)
+    _log.warning("[qf_native] folder_paths unavailable: %r", _fp_exc)
 
 _NO_LORA_HINT = "(no LoRA in models/loras)"
 
@@ -86,7 +90,7 @@ def _family_preset(family):
     if len(presets) == 1:
         return presets[0]
     if not presets:
-        _raise_if_a_manifest_is_unreadable()
+        _raise_if_a_manifest_is_unreadable(family)
         raise RuntimeError(f"qf_native: this plugin ships no model config for {family} (configs/ has no preset for it).")
     raise RuntimeError(f"qf_native: this plugin ships {len(presets)} model configs for {family} ({', '.join(presets)}) "
                        f"and the loader cannot choose between them.")
@@ -113,12 +117,19 @@ def _load_model_config(name):
     return bundle, manifest
 
 
-def _raise_if_a_manifest_is_unreadable():
+def _raise_if_a_manifest_is_unreadable(family):
     """The family listings HIDE a preset whose manifest cannot be read, because a broken file must not take down node
-    registration. A load that then finds no preset for its family would report the preset as not shipped: read every
-    shipped manifest first, so a broken one raises its own error (_load_model_config) naming it."""
+    registration. A load that then finds no preset for its family would report the preset as not shipped. So every
+    shipped manifest is read here, and a broken one is reported instead: all of them, since a broken manifest's family
+    cannot be read either."""
+    broken = []
     for name in _shipped_presets(None):
-        _load_model_config(name)
+        try:
+            _load_model_config(name)
+        except RuntimeError as exc:
+            broken.append(str(exc))
+    if broken:
+        raise RuntimeError(f"qf_native: no readable model config for {family}: " + " | ".join(broken))
 
 
 _NO_XFM_HINT = "(no .safetensors in models/diffusion_models)"
@@ -556,7 +567,7 @@ if _IMPORT_OK:
                 _FAMILY_BUILDERS[mod.FAMILY] = mod.register(deps)
                 _FAMILY_MATCHERS.append((mod.FAMILY, mod.matches))
             except Exception as exc:  # noqa: BLE001 — never break plugin import
-                logging.warning("[qf_native] family module %s not registered: %r", mod_name, exc)
+                _log.warning("[qf_native] family module %s not registered: %r", mod_name, exc)
 
     _register_families()
 
@@ -573,7 +584,7 @@ if _IMPORT_OK:
         else:
             shipped = _shipped_presets(expect_family)
             if model_config not in shipped:
-                _raise_if_a_manifest_is_unreadable()
+                _raise_if_a_manifest_is_unreadable(expect_family)
                 raise RuntimeError(
                     f"qf_native: this workflow was saved with model_config {model_config!r}, which is not a "
                     f"{expect_family} model config of this plugin (it ships: {', '.join(shipped) or 'none'}). Omit "
@@ -757,7 +768,7 @@ if _IMPORT_OK:
         if _quality_fast_tier(device_idx):
             return _resolve_quality(quality, quality_enhance, device_idx)
         if quality in ("super_fast", "fast"):
-            print(f"[QuantFunc] '{quality}' is not available here; using best_quality.", flush=True)
+            qfe.say(f"[QuantFunc] '{quality}' is not available here; using best_quality.", flush=True)
         return "best_quality"
 
     def _qi21_quality_input():
@@ -797,7 +808,7 @@ if _IMPORT_OK:
         if q in ("super_fast", "fast") and not _quality_fast_tier(device_idx):
             note, q = note or f"'{q}' is not available here", "balance"   # this GPU, or an older engine
         if note:
-            print(f"[QuantFunc] {note}; using {q}.", flush=True)
+            qfe.say(f"[QuantFunc] {note}; using {q}.", flush=True)
         return q
 
 
@@ -1172,7 +1183,7 @@ if _IMPORT_OK:
         _spec.loader.exec_module(_rc)
         _rc.warn_if_stale(comfy_root=os.path.dirname(os.path.dirname(comfy.model_management.__file__)))
     except Exception as _rc_exc:  # noqa: BLE001 — the self-check must never break plugin import
-        logging.debug("[qf_native] reject-list self-check skipped: %r", _rc_exc)
+        _log.debug("[qf_native] reject-list self-check skipped: %r", _rc_exc)
     # (R7: the old single-node "QuantFuncNativeLoader" display entry is GONE with the class —
     # a display mapping for an unregistered class is dead weight; the three per-family loaders
     # register their display names beside their class mappings above.)
@@ -1188,7 +1199,7 @@ if _IMPORT_OK:
         if getattr(_qf_srv, "instance", None) is not None:
             qfe.start_engine_install(_comfy_device_index())
     except Exception as _qf_install_exc:  # noqa: BLE001 — installing must never break plugin import
-        logging.warning("[qf_native] engine install not started: %r", _qf_install_exc)
+        _log.warning("[qf_native] engine install not started: %r", _qf_install_exc)
 
 
 # ── QuantFunc LTX-2.5 AV ancestral-sampler audio fix ─────────────────────────────
@@ -1199,10 +1210,10 @@ if _IMPORT_OK:
 # guarded — a failure must never break plugin import.
 try:
     from . import qf_ltx_ancestral_audio_fix as _qf_ltx_afix
+    qfe.logger(_qf_ltx_afix.__name__)   # its warnings: console-safe
     _qf_ltx_afix.install()
 except Exception as _qf_ltx_afix_exc:  # noqa: BLE001
-    import logging as _qf_lg2
-    _qf_lg2.warning("[qf_native] LTX-2.5 AV audio fix not installed: %r", _qf_ltx_afix_exc)
+    _log.warning("[qf_native] LTX-2.5 AV audio fix not installed: %r", _qf_ltx_afix_exc)
 
 
 # ── Engine log detail ─────────────────────────────────────────────────────────
@@ -1219,5 +1230,4 @@ try:
         if _qf_name.startswith("QuantFunc") and _qf_name.endswith("Loader"):
             _qf_add_log_level(_qf_cls, _qf_ll_engine.set_log_level)
 except Exception as _qf_ll_exc:  # noqa: BLE001
-    import logging as _qf_ll_lg
-    _qf_ll_lg.warning("[qf_native] log-level input not attached: %r", _qf_ll_exc)
+    _log.warning("[qf_native] log-level input not attached: %r", _qf_ll_exc)
