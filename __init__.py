@@ -1050,11 +1050,16 @@ if _IMPORT_OK:
                     f"QuantFuncNativeLoRA: cannot read '{path}' as safetensors ({e!r})")
             conv = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 "scripts", "qf_lora_convert.py")
-            if any(".hada_" in k or ".lokr_" in k for k in keys):
-                raise RuntimeError(
-                    "QuantFuncNativeLoRA: this is a LyCORIS (LoHa/LoKr) file — a factored "
-                    "decomposition the native path does not consume. Merge/re-export it to a "
-                    "standard LoRA first.")
+            # the kinds no key rename turns into a plain (A,B) LoRA: refused here with the same words as the engine and
+            # scripts/qf_lora_convert.py (never sent to the converter, which refuses them too)
+            for kind, marks in (("LyCORIS (LoHa/LoKr)", (".hada_", ".lokr_")),
+                                ("DoRA", (".dora_scale", "lora_magnitude_vector")),
+                                ("OFT/BOFT", (".oft_", ".boft_"))):
+                if any(m in k for k in keys for m in marks):
+                    raise RuntimeError(
+                        f"QuantFuncNativeLoRA: this is {'an' if kind[0] in 'AEIOU' else 'a'} {kind} file, which is not supported — the native "
+                        "path does not load it and converting it does not help. Merge/re-export it to a "
+                        "standard (A,B) LoRA first.")
             if any(k.startswith(("lora_unet_", "lora_transformer_", "lora_te_",
                                  "lora_te1_", "lora_te2_")) for k in keys):
                 raise RuntimeError(
