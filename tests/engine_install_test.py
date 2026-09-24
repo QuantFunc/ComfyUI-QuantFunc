@@ -238,10 +238,12 @@ def main():
     with Env(rel) as env:
         try:
             qfe.install_engine()
-            check("a traversal version is refused", False, "installed!")
-        except qfe.EngineNotInstallable:
-            check("a traversal version is never picked (nothing fetched below the release root)",
-                  not any(".." in f for f in rel.fetched) and env.read(HOSTS[13]) is None)
+            outcome = "installed!"
+        except Exception as e:  # noqa: BLE001 — the property below is what matters, not the exception type
+            outcome = f"{type(e).__name__}: {e}"
+        check("a traversal version is never picked (nothing fetched below the release root)",
+              not any(".." in f for f in rel.fetched) and env.read(HOSTS[13]) is None
+              and outcome.startswith("EngineNotInstallable"), f"{outcome[:60]} fetched={rel.fetched}")
     rel = Release()
     with Env(rel) as env:
         qfe._elf_needed = lambda p: ["libevil.so", "libcudart.so.13"]
