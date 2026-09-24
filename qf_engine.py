@@ -1681,6 +1681,21 @@ def _refuse_session_knobs_in_create(config_json):
             "the whole pipeline on every widget change.")
 
 
+def _refuse_second_arch(device_idx):
+    """A kernel library is ONE GPU architecture's code (SASS, no PTX), and a process loads ONE engine pair: the one
+    installed for ComfyUI's device. A pipeline on a device whose SM that pair does not cover would fail inside a kernel
+    launch ("no kernel image is available"), so it is refused here, before anything is created. A local build or the dev
+    override is not an installed pair (its architectures are unknown), and neither is an unreadable SM: not checked."""
+    if device_idx == _ENGINE_DEVICE or _BIN_SUBDIR != "linux" or _engine_local_choice():
+        return
+    sm, m = _gpu_sm(device_idx), _installed_pair()[1]
+    if sm is None or m is None or sm in m["sms"]:
+        return
+    raise RuntimeError(f"qf_native: GPU {device_idx} is SM {sm}, but this ComfyUI runs the QuantFunc engine built for SM "
+                       f"{'/'.join(map(str, m['sms']))} (GPU {_ENGINE_DEVICE}). One engine serves one GPU architecture: run "
+                       f"one ComfyUI per GPU architecture (start each with CUDA_VISIBLE_DEVICES set to its GPU).")
+
+
 def make_create_params(*, model_dir, transformer_path=None, model_backend="svdq",
                        device_idx=0, config_json=None):
     """Normalize one retained recipe for both configuration and creation.
@@ -1692,6 +1707,7 @@ def make_create_params(*, model_dir, transformer_path=None, model_backend="svdq"
     device_idx = operator.index(device_idx)
     if not 0 <= device_idx < (1 << 31):
         raise ValueError("resource device must fit nonnegative int32")
+    _refuse_second_arch(device_idx)                # one engine pair per process: one GPU architecture
     _refuse_session_knobs_in_create(config_json)   # [session-knobs] session knob ≠ create key
     if isinstance(config_json, dict):
         config_json = dict(config_json)

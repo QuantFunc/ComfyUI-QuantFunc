@@ -984,6 +984,30 @@ def main():
               "prompt resolves again and loads the chosen pair", first.startswith("refused") and first_loaded == []
               and lib_after_refusal is None and second == f"0.0.14-desktop-cu13/{HOSTS[13]}",
               f"first={first} first_loaded={first_loaded} second={second}")
+    # 32) one engine pair per process = one GPU architecture (per-arch kernel sets; tests-07 2026-09-24): ComfyUI's device
+    #     (GPU 0, SM 89) installs the sm89 pair; a pipeline on GPU 1 (SM 86) refuses loudly with the hint, GPU 0 is fine.
+    #     A class covering both SMs (a multi-arch release) still admits GPU 1: the rule is coverage, not "a second device".
+    per_arch = Release("0.0.14")
+    for major in (13, 12):
+        for gset in ("sm86", "sm89"):
+            k = f"KERNEL-0.0.14-{gset}-cu{major}".encode()
+            per_arch.files[f"0.0.14/linux/{gset}/{KERNELS[major]}"] = k
+            per_arch.manifest["linux"][f"{gset}/{KERNELS[major]}"] = sha(k)
+    per_arch.set_sets(json.dumps({"schema": 1, "sets": {"sm86": [86], "sm89": [89]}}).encode())
+    got = {}
+    for rel, label in ((per_arch, "per-arch"), (Release("0.0.13"), "multi-arch")):
+        with Env(rel, sm={0: 89, 1: 86}) as env:
+            qfe.install_engine()
+            for dev in (0, 1):
+                try:
+                    qfe.make_create_params(model_dir=env.dir, device_idx=dev)
+                    got[f"{label}/gpu{dev}"] = "ok"
+                except RuntimeError as e:
+                    got[f"{label}/gpu{dev}"] = ("refused" if "one ComfyUI per GPU architecture" in str(e)
+                                                else f"other: {str(e)[:60]}")
+    check("a second GPU architecture in one process is refused loudly with the hint; a GPU the installed class covers "
+          "is fine", got == {"per-arch/gpu0": "ok", "per-arch/gpu1": "refused", "multi-arch/gpu0": "ok",
+                             "multi-arch/gpu1": "ok"}, got)
     print("ENGINE_INSTALL:", "PASS" if bad == 0 else f"FAIL ({bad} wrong)")
     return 1 if bad else 0
 
