@@ -68,7 +68,7 @@ class QFQwenImage21Model(qfmp.QFImageSessionModel, comfy.model_base.QwenImage21)
                 not hasattr(qfe.load_lib(), "quantfunc_denoise_step_refs"):
             raise RuntimeError(
                 "qf_native qwenimage21: reference images are wired (TextEncodeQwenImage21 images + vae), but "
-                "the loaded QuantFunc engine has no quantfunc_denoise_step_refs — update the QuantFunc engine "
+                "the loaded QuantFunc engine has no quantfunc_denoise_step_refs - update the QuantFunc engine "
                 "to a build with Qwen-Image-2.1 edit support.")
 
     def _apply_model(self, x, t, c_concat=None, c_crossattn=None, control=None,
@@ -79,7 +79,7 @@ class QFQwenImage21Model(qfmp.QFImageSessionModel, comfy.model_base.QwenImage21)
                 and not getattr(self, "_qi21_cache_noted", False):
             self._qi21_cache_noted = True
             qfe.say("[qf_native] qwenimage21: QwenImage21Cache settings do not apply to the QuantFunc engine "
-                    "(its prefix K/V cache is an engine option, off by default) — sampling is unaffected",
+                    "(its prefix K/V cache is an engine option, off by default) - sampling is unaffected",
                     flush=True)
         return super()._apply_model(x, t, c_concat, c_crossattn, control, transformer_options, **kwargs)
 
@@ -96,7 +96,7 @@ class QFQwenImage21Model(qfmp.QFImageSessionModel, comfy.model_base.QwenImage21)
         if any(t.dim() != 4 for t in ref_i):             # the ABI packs exactly [1, C, h, w] per reference
             self._qf.end_session_if_open()               # never strand the session begun above
             raise RuntimeError("qf_native qwenimage21: reference latents must be 4-D image latents [1, C, h, w]; got "
-                               f"{[tuple(t.shape) for t in ref_i]} — feed Qwen-Image-2.1 references (TextEncodeQwenImage21 + its VAE)")
+                               f"{[tuple(t.shape) for t in ref_i]} - feed Qwen-Image-2.1 references (TextEncodeQwenImage21 + its VAE)")
         rp = qfe.DenoiseStepRefsParams()
         ctypes.memset(ctypes.byref(rp), 0, ctypes.sizeof(rp))
         rp.struct_size = ctypes.sizeof(rp)

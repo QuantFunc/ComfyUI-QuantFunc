@@ -27,7 +27,9 @@ A mode this OS cannot force is a disclosed [SKIP] (run_plugin_tests.py counts it
 CONSOLE ARMS (the plugin's own OUTPUT must never raise on the console's code page). ComfyUI keeps the OS encoding on
 stdout/stderr with errors='strict' (its LogInterceptor), so on a redirected Windows console one character the code page
 cannot hold raises UnicodeEncodeError out of the print() / log call, and out of the loader:
-  static      no print() outside qf_engine.say, no root-logger call, no bare getLogger where qfe.logger() exists
+  static      no print() outside qf_engine.say, no root-logger call, no bare getLogger where qfe.logger() exists, and
+              no non-ASCII string literal: a raised exception reaches the console through ComfyUI's own
+              logging.error, where logging swallows an unencodable message and the line is lost
   runtime     per code page cp932 / cp949 / cp1252 / cp936 (PYTHONIOENCODING, streams wrapped like ComfyUI's): importing
               the plugin, qf_engine.say / info / logger, and the LTX audio-fix warning never raise and never lose a line
               ("--- Logging error ---"); every plugin logger carries the console-safe filter; the bytes on stdout/stderr
@@ -150,10 +152,14 @@ def _console_sites(root):
                    for a in n.names if a.name == "logging"}
         has_qfe = any(isinstance(n, ast.ImportFrom) and any(a.name == "qf_engine" for a in n.names)
                       for n in ast.walk(tree))
-        say_body = set()
+        say_body, fallback = set(), set()
         for n in ast.walk(tree):
             if fn == "qf_engine.py" and isinstance(n, ast.FunctionDef) and n.name == "say":
                 say_body = {id(x) for x in ast.walk(n)}
+            # the handler of a failed `from . import qf_engine`: no qfe.logger() exists there, by construction
+            if isinstance(n, ast.Try) and any(isinstance(b, ast.ImportFrom) and any(a.name == "qf_engine" for a in b.names)
+                                              for b in n.body):
+                fallback |= {id(x) for h in n.handlers for x in ast.walk(h)}
         for n in ast.walk(tree):
             if not isinstance(n, ast.Call):
                 continue
@@ -164,9 +170,31 @@ def _console_sites(root):
                   and f.attr in _LOG_LEVELS):
                 sites.append(f"{fn}:{n.lineno} {f.value.id}.{f.attr}(...) on the root logger")
             elif (has_qfe and isinstance(f, ast.Attribute) and f.attr == "getLogger" and isinstance(f.value, ast.Name)
-                  and f.value.id in aliases):
+                  and f.value.id in aliases and id(n) not in fallback):
                 sites.append(f"{fn}:{n.lineno} logging.getLogger(...) where qfe.logger(...) exists")
+        sites += [f"{fn}:{row} non-ASCII string literal ({', '.join(f'U+{ord(c):04X}' for c in chars)})"
+                  for row, chars in _non_ascii_literals(tree, path)]
     return sites
+
+
+def _non_ascii_literals(tree, path):
+    """(line, chars) for each string literal outside a docstring that carries a non-ASCII character. An exception the
+    plugin raises reaches ComfyUI's console through ComfyUI's own logging.error (execution.py: "!!! Exception during
+    processing !!! {ex}"), which the plugin cannot make console-safe. On a code page that lacks the character, logging
+    swallows the error and the line is lost, so the plugin's own text stays ASCII (#738)."""
+    import io
+    import tokenize
+    doc = set()
+    for n in ast.walk(tree):
+        if (isinstance(n, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and n.body
+                and isinstance(n.body[0], ast.Expr) and isinstance(n.body[0].value, ast.Constant)
+                and isinstance(n.body[0].value.value, str)):
+            doc.update(range(n.body[0].lineno, n.body[0].end_lineno + 1))
+    kinds = {tokenize.STRING, getattr(tokenize, "FSTRING_MIDDLE", tokenize.STRING)}
+    with open(path, encoding="utf-8") as f:
+        toks = list(tokenize.generate_tokens(io.StringIO(f.read()).readline))
+    return [(t.start[0], sorted({c for c in t.string if ord(c) > 127})) for t in toks
+            if t.type in kinds and t.start[0] not in doc and any(ord(c) > 127 for c in t.string)]
 
 
 # The plugin's own non-ASCII punctuation (— – →), CJK, Hangul, Latin-1 and an emoji: no single code page holds them all.
@@ -195,6 +223,13 @@ def _console_child(job):
     except BaseException as exc:  # noqa: BLE001 — a crashed import is the result
         out["console import"] = ["error", type(exc).__name__, str(exc)]
         mod = None
+    if job.get("mode") == "broken-engine":   # qf_engine itself raises on import: the plugin must still degrade
+        degraded = mod is not None and mod.qfe is None and not mod._IMPORT_OK and not mod.NODE_CLASS_MAPPINGS
+        out["console broken qf_engine"] = (["ok", None] if degraded else
+                                           out["console import"] if mod is None else ["error", "NotDegraded", "-"])
+        with open(job["result"], "w", encoding="utf-8") as f:
+            json.dump(out, f)
+        return
     qfe = getattr(mod, "qfe", None)
     missing = ["error", "Missing", "qf_engine has no console-safe output"]
     if qfe is not None and hasattr(qfe, "say") and hasattr(qfe, "logger"):
@@ -202,9 +237,16 @@ def _console_child(job):
         qfe._LOG_LEVEL = qfe._LOG_INFO
         out["console info"] = _outcome(qfe.info, "[info] " + _CONSOLE_TEXT)
         out["console logger"] = _outcome(qfe.logger("qf_textio").warning, "%s", "[log] " + _CONSOLE_TEXT)
+
+        def logged_exception(log):   # a traceback (exc_info) carrying text the code page cannot hold
+            try:
+                raise RuntimeError("[exc] " + _CONSOLE_TEXT)
+            except RuntimeError:
+                log.exception("[exception] logged")
+        out["console exception"] = _outcome(logged_exception, qfe.logger("qf_textio"))
     elif qfe is not None:   # the unfixed plugin: its info() line is the output path that exists
         qfe._LOG_LEVEL = qfe._LOG_INFO
-        out["console say"] = out["console logger"] = missing
+        out["console say"] = out["console logger"] = out["console exception"] = missing
         out["console info"] = _outcome(qfe.info, "[info] " + _CONSOLE_TEXT)
     afix = sys.modules.get("qfn_textio_pkg.qf_ltx_ancestral_audio_fix")
     out["console audio-fix"] = (_outcome(afix._log_once, "sampler " + _CONSOLE_TEXT, "euler") if afix
@@ -216,6 +258,22 @@ def _console_child(job):
     out["console loggers"] = ["ok", None] if not bare else ["error", "Unsafe", ", ".join(bare)]
     with open(job["result"], "w", encoding="utf-8") as f:
         json.dump(out, f)
+
+
+def _broken_engine_copy(root, tmp):
+    """The plugin's runtime modules, with a qf_engine.py that raises on import (once per run)."""
+    dst = os.path.join(tmp, "broken-engine")
+    if not os.path.isdir(dst):
+        os.makedirs(dst)
+        for fn in os.listdir(root):
+            if fn.endswith(".py"):
+                shutil.copy(os.path.join(root, fn), dst)
+        path = os.path.join(dst, "qf_engine.py")
+        with open(path, encoding="utf-8") as f:
+            src = f.read()
+        with open(path, "w", encoding="utf-8") as f:
+            f.write('raise RuntimeError("qf_engine is broken \\u2014 on purpose")\n' + src)
+    return dst
 
 
 def _console_arms(root, tmp):
@@ -235,9 +293,9 @@ def _console_arms(root, tmp):
             rows.append((cp, "console child", "a result", f"rc={r.returncode}: {tail}", False))
             continue
         want = {"console say": ("stdout", "[say] "), "console info": ("stdout", "[info] "),
-                "console logger": ("stderr", "[log] ")}
-        for arm in ("console import", "console say", "console info", "console logger", "console audio-fix",
-                    "console loggers"):
+                "console logger": ("stderr", "[log] "), "console exception": ("stderr", "[exc] ")}
+        for arm in ("console import", "console say", "console info", "console logger", "console exception",
+                    "console audio-fix", "console loggers"):
             g = got.get(arm, ["error", "Missing", "the child did not run this arm"])
             ok, act = g[0] == "ok", _show(g)
             if ok and arm in want:   # the line reached the console, with what the code page cannot hold escaped
@@ -255,6 +313,18 @@ def _console_arms(root, tmp):
             except UnicodeDecodeError as exc:
                 clean, act = False, f"undecodable: {exc}"
             rows.append((cp, f"console {stream} bytes", f"valid {cp}", act, clean))
+        res = os.path.join(tmp, f"console-broken-{cp}.json")
+        b = subprocess.run([sys.executable, os.path.abspath(__file__), "--console-child",
+                            json.dumps({"root": _broken_engine_copy(root, tmp), "result": res, "mode": "broken-engine"})],
+                           env=env, capture_output=True)
+        try:
+            with open(res, encoding="utf-8") as f:
+                g = json.load(f)["console broken qf_engine"]
+        except (OSError, ValueError, KeyError):
+            g = ["error", "Crashed", f"rc={b.returncode}: {b.stderr.decode('ascii', 'backslashreplace')[-200:]}"]
+        warned = b"[qf_native] disabled - qf_engine failed to import" in b.stderr and _LOG_ERROR not in b.stderr
+        rows.append((cp, "console broken qf_engine", "degrades: zero nodes + a warning",
+                     _show(g) if g[0] != "ok" else ("ok" if warned else "no warning line"), g[0] == "ok" and warned))
         h = subprocess.run([sys.executable, os.path.join(root, "scripts", "qf_lora_convert.py"), "--help"],
                            env=env, capture_output=True)
         help_ok = h.returncode == 0 and b"--model" in h.stdout

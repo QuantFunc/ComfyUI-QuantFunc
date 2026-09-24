@@ -166,7 +166,7 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
                 if lat is None or getattr(lat, "ndim", 0) != 5:
                     raise RuntimeError(
                         "qf_native H3: minimax_keyframes entry lacks a 5-D pre-encoded latent "
-                        f"(got {type(lat).__name__}{getattr(lat, 'shape', '')}) — wire the vae into "
+                        f"(got {type(lat).__name__}{getattr(lat, 'shape', '')}) - wire the vae into "
                         "MiniMaxH3ImageToVideo so the keyframe is VAE-encoded.")
             payload["keyframes"] = kf
         refs = kwargs.get("minimax_refs")
@@ -200,7 +200,7 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
             if kwargs.get(_k) is not None:
                 raise RuntimeError(
                     f"qf_native H3: '{_k}' conditioning is wired, but the QuantFunc H3 native session runs "
-                    f"its OWN joint-AV denoise from the loader widgets + the prompt hidden states — it cannot "
+                    f"its OWN joint-AV denoise from the loader widgets + the prompt hidden states - it cannot "
                     f"consume comfy's '{_k}', which would be silently ignored. Remove the node feeding it.")
         out = {}
         cross_attn = kwargs.get("cross_attn", None)
@@ -227,7 +227,7 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
         if sigmas is None or len(sigmas) < 2:
             raise RuntimeError(
                 "qf_native H3: the sampler did not publish a sigma schedule "
-                "(transformer_options['sample_sigmas']) — the engine session needs the step count. "
+                "(transformer_options['sample_sigmas']) - the engine session needs the step count. "
                 "Use a stock KSampler / SamplerCustom on this model.")
         self._num_steps = len(sigmas) - 1
         try:
@@ -240,12 +240,12 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
         if partial and not self._allow_partial_denoise:
             raise RuntimeError(
                 f"qf_native H3: partial / trimmed denoise is disabled (sigmas run "
-                f"{s_first:.4f}→{s_last:.4f}, full range would be {s_max:.4f}→0). Enable "
+                f"{s_first:.4f}->{s_last:.4f}, full range would be {s_max:.4f}->0). Enable "
                 f"'allow_partial_denoise' on QuantFuncH3Loader only for an intentional split-sigma "
                 f"or double-sampling workflow; otherwise use one full-range sampler.")
         if partial:
             qfe.info(f"[qf_native] H3: partial denoise explicitly enabled: "
-                  f"{s_first:.4f}→{s_last:.4f}, stage_steps={self._num_steps}", flush=True)
+                  f"{s_first:.4f}->{s_last:.4f}, stage_steps={self._num_steps}", flush=True)
 
     def _begin(self, x_video, x_audio, vemb, av_payload=None):
         """Open the joint-AV external denoise session. x_video=[1,24,T,H,W], x_audio=[1,32,2,audio_t],
@@ -281,7 +281,7 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
         if not hasattr(ms, "shift") or not hasattr(ms, "audio_shift"):
             raise RuntimeError(
                 f"qf_native H3: the model_sampling object is {type(ms).__name__}, which carries no "
-                f"audio_shift — a GENERIC model-sampling node (ModelSamplingSD3 / ModelSamplingFlux / "
+                f"audio_shift - a GENERIC model-sampling node (ModelSamplingSD3 / ModelSamplingFlux / "
                 f"similar) replaced MiniMax-H3's ModelSamplingAV and dropped the AUDIO schedule. Use "
                 f"the stock ModelSamplingMiniMaxH3 node (shift_video + shift_audio) for H3, or wire no "
                 f"sampling node at all to keep the checkpoint defaults.")
@@ -392,11 +392,11 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
                      transformer_options={}, **kwargs):
         sigma = t
         if c_crossattn is None:
-            raise RuntimeError("qf_native H3: no c_crossattn cond — wire the H3 CLIP (MiniMaxH3ImageToVideo "
+            raise RuntimeError("qf_native H3: no c_crossattn cond - wire the H3 CLIP (MiniMaxH3ImageToVideo "
                                "prompt) into positive/negative.")
         if control is not None:
             raise RuntimeError("qf_native H3: a ControlNet is wired but this seam does not consume comfy "
-                               "control hints — remove it.")
+                               "control hints - remove it.")
         # The AV latent reaches _apply_model in ONE OF TWO forms (comfy.model_base.MiniMaxH3
         # ._scale_audio_slice handles both): (a) a nested view (comfy.nested_tensor.NestedTensor /
         # torch nested, .is_nested + .unbind()), or (b) a FLAT PACKED plain tensor [B,1,N] where
@@ -410,7 +410,7 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
             ls = getattr(self, "latent_shapes", None)
             if not ls or len(ls) < 2:
                 raise RuntimeError(f"qf_native H3: packed latent (type={type(x).__name__} "
-                                   f"shape={tuple(x.shape)}) but model.latent_shapes is unset — cannot unpack.")
+                                   f"shape={tuple(x.shape)}) but model.latent_shapes is unset - cannot unpack.")
             n = int(math.prod(ls[0][1:]))
             xf = x.reshape(int(x.shape[0]), -1)              # [B, N]
             x_video = xf[:, :n].reshape(list(ls[0]))         # [B,24,T,H,W]
@@ -422,7 +422,7 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
         cuuids = transformer_options.get("uuids") if isinstance(transformer_options, dict) else None
         if B > 1 and (cou is None or len(cou) != B):
             raise RuntimeError(f"qf_native H3: engine forward is B==1 per cond group but got batch={B} "
-                               f"with cond_or_uncond={cou} — batch_size>1 latents are not supported")
+                               f"with cond_or_uncond={cou} - batch_size>1 latents are not supported")
         vemb = c_crossattn.to(dev, dtype=torch.bfloat16).contiguous()
         if self._qf.current_session is None or getattr(self, "_qf_needs_begin", False):
             self._qf_needs_begin = False
@@ -443,7 +443,7 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
             raise RuntimeError(
                 f"qf_native H3: this cond group carries (keyframes, refs)={_now_counts} but the "
                 f"session was begin-bound from the first-invoked group with {self._bound_av_counts} "
-                "— av_conds bind session-wide. Make every cond group carry the same reference/"
+                "- av_conds bind session-wide. Make every cond group carry the same reference/"
                 "keyframe set (attach them on the positive and derive the negative via "
                 "ConditioningZeroOut), or run without CFG.")
 

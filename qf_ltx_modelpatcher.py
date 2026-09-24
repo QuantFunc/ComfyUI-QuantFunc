@@ -297,7 +297,7 @@ def _load_ltx_video_connector(connector_ckpt, device, dtype=torch.bfloat16, _bud
     sd = {k[len(prefix):]: v for k, v in sd_full.items() if k.startswith(prefix)}
     if not sd:
         raise RuntimeError(
-            f"QuantFuncNativeLoader: no '{prefix}*' weights in {connector_ckpt} — this must be the "
+            f"QuantFuncNativeLoader: no '{prefix}*' weights in {connector_ckpt} - this must be the "
             "comfy LTX-2.3 checkpoint that carries the video_embeddings_connector (the engine svdq "
             "model_dir does NOT; see dossier seq-234).")
     # DERIVE + BOUND the connector ARCH from the checkpoint (num_layers / num_heads / head_dim / n_registers,
@@ -360,7 +360,7 @@ def _load_ltx_audio_connector(connector_ckpt, device, dtype=torch.bfloat16, _bud
     sd = {k[len(prefix):]: v for k, v in sd_full.items() if k.startswith(prefix)}
     if not sd:
         raise RuntimeError(
-            f"QuantFuncNativeLoader: no '{prefix}*' weights in {connector_ckpt} — the comfy LTX-2.3 "
+            f"QuantFuncNativeLoader: no '{prefix}*' weights in {connector_ckpt} - the comfy LTX-2.3 "
             "checkpoint must carry the audio_embeddings_connector (dossier seq-241).")
     # DERIVE + BOUND the connector ARCH from the checkpoint (shared _derive_connector_arch: num_layers /
     # num_heads / head_dim / n_registers, each magnitude-bounded at the derivation site; non-gated refused).
@@ -497,7 +497,7 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
             if kwargs.get(_k) is not None:
                 raise RuntimeError(
                     f"qf_native LTX: '{_k}' conditioning is wired, but the QuantFunc LTX native session "
-                    f"consumes only latents + the connector video_embeds — it cannot consume comfy's "
+                    f"consumes only latents + the connector video_embeds - it cannot consume comfy's "
                     f"'{_k}', which would be silently ignored. Remove the node feeding it. For "
                     f"image-to-video use LTXVImgToVideoInplace on the LATENT path (its noise_mask is "
                     f"applied by comfy's sampler and IS supported); LTXVAddGuide / keyframe nodes are not.")
@@ -549,17 +549,17 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
             if not ls or len(ls) < 1:
                 raise RuntimeError(
                     "qf_native LTX: flat denoise_mask but the model carries no "
-                    "latent_shapes to split it — unsupported mask source.")
+                    "latent_shapes to split it - unsupported mask source.")
             n_video = int(_m.prod(ls[0][1:]))
             flat = m.reshape(-1)
             if int(flat.shape[0]) < n_video:
                 raise RuntimeError(
                     f"qf_native LTX: flat denoise_mask has {int(flat.shape[0])} elements "
-                    f"but the video latent needs {n_video} — geometry mismatch.")
+                    f"but the video latent needs {n_video} - geometry mismatch.")
             audio_part = flat[n_video:]
             if audio_part.numel() and float(audio_part.min()) < 0.9999:
                 raise RuntimeError(
-                    "qf_native LTX: the denoise_mask masks the AUDIO lane — audio "
+                    "qf_native LTX: the denoise_mask masks the AUDIO lane - audio "
                     "conditioning is not supported on this seam (video Inplace only).")
             m = flat[:n_video].reshape(list(ls[0]))[0]      # [C,F,H,W]
             m = m.movedim(1, 0)                             # [F,C,H,W]
@@ -568,7 +568,7 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
         else:
             raise RuntimeError(
                 f"qf_native LTX: denoise_mask with shape {tuple(dm.shape)} is not a "
-                f"[B,C,F,H,W] latent mask nor the packed AV flat form — unsupported "
+                f"[B,C,F,H,W] latent mask nor the packed AV flat form - unsupported "
                 f"mask source.")
         per_frame = []
         for f in range(int(m.shape[0])):
@@ -576,7 +576,7 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
             lo, hi = float(mf.min()), float(mf.max())
             if hi - lo > 1e-4:
                 raise RuntimeError(
-                    "qf_native LTX: denoise_mask varies WITHIN a latent frame — the "
+                    "qf_native LTX: denoise_mask varies WITHIN a latent frame - the "
                     "engine session scales the timestep per FRAME (Inplace-style masks "
                     "only); spatial inpaint masks are not supported on this seam.")
             per_frame.append(max(0.0, min(1.0, hi)))
@@ -607,7 +607,7 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
         if sigmas is None or len(sigmas) < 2:
             raise RuntimeError(
                 "qf_native LTX: the sampler did not publish a sigma schedule "
-                "(transformer_options['sample_sigmas']) — the engine session needs the step count. "
+                "(transformer_options['sample_sigmas']) - the engine session needs the step count. "
                 "Use a stock KSampler / SamplerCustom on this model.")
         self._num_steps = len(sigmas) - 1
         try:
@@ -617,7 +617,7 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
         if s_first <= s_last:
             raise RuntimeError(
                 f"qf_native LTX: sigma schedule must be strictly DECREASING (got "
-                f"{s_first:.4f}->{s_last:.4f}) — a non-decreasing schedule would drive the "
+                f"{s_first:.4f}->{s_last:.4f}) - a non-decreasing schedule would drive the "
                 f"session backwards.")
 
     # ── connector bridge: comfy pre-connector dual TE [B,S,6144] -> POST-connector [B,S,6144 | 4096] ──
@@ -676,7 +676,7 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
         need = vid_dim + (_LTX_AUDIO_DIM if self._audio_connector is not None else 0)
         if ctx.shape[-1] < need:
             raise RuntimeError(
-                f"qf_native LTX: c_crossattn last dim {ctx.shape[-1]} < {need} — expected the LTX-2.3 dual "
+                f"qf_native LTX: c_crossattn last dim {ctx.shape[-1]} < {need} - expected the LTX-2.3 dual "
                 "TE output [*,S,6144] (video 4096 | audio 2048). Wire a stock LTX-2.3 dual_linear CLIP "
                 "(DualCLIPLoader gemma_3_12B_it + ltx-2.3_text_projection_bf16, type=ltxv).")
         dev = next(self._connector.parameters()).device
@@ -769,11 +769,11 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
                      transformer_options={}, **kwargs):
         sigma = t
         if c_crossattn is None:
-            raise RuntimeError("qf_native LTX: no c_crossattn cond — wire a stock LTX-2.3 CLIPTextEncode")
+            raise RuntimeError("qf_native LTX: no c_crossattn cond - wire a stock LTX-2.3 CLIPTextEncode")
         if control is not None:
             raise RuntimeError(
                 "qf_native LTX: a ControlNet is wired, but this seam does not consume comfy control "
-                "hints — remove it (native LTX ControlNet is not supported through this loader).")
+                "hints - remove it (native LTX ControlNet is not supported through this loader).")
         dev = x.device
         xin = x.to(torch.bfloat16).contiguous()          # [B, 128, F, H, W]
         B = int(xin.shape[0])
@@ -783,7 +783,7 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
         cuuids = transformer_options.get("uuids") if isinstance(transformer_options, dict) else None
         if B > 1 and (cou is None or len(cou) != B):
             raise RuntimeError(f"qf_native LTX: engine forward is B==1 per cond group but got batch={B} "
-                               f"with cond_or_uncond={cou} — batch_size>1 latents are not supported")
+                               f"with cond_or_uncond={cou} - batch_size>1 latents are not supported")
         # ★ loader-widget vs graph-latent geometry cross-check (CR conformance) — before any engine work.
         self._derive_geometry(xin, transformer_options)
         # CONNECTOR BRIDGE: comfy pre-connector [B,S,6144] -> POST-connector video_embeds [B,S,4096].
@@ -952,12 +952,12 @@ class QFLTXAVModel(QFLTXModel):
         if not self._ctx_unprocessed:
             raise RuntimeError(
                 "qf_native LTX-AV: the wired text encoder did not mark its output "
-                "unprocessed_ltxav_embeds — this loader needs the LTX-2.5 'with-proj' TE "
+                "unprocessed_ltxav_embeds - this loader needs the LTX-2.5 'with-proj' TE "
                 "(gemma4-12b-with-proj-*.safetensors through the comfy LTXAV clip), whose "
                 "connector runs ENGINE-side. A 19B/2.3 connector-file TE chain belongs on "
                 "the video-only QuantFuncNativeLoader path.")
         if self._audio_rows <= 0:
-            raise RuntimeError("qf_native LTX-AV: audio latent rows unset at begin — wiring error")
+            raise RuntimeError("qf_native LTX-AV: audio latent rows unset at begin - wiring error")
         return {"audio_dims": [1, int(self._audio_rows), _LTXAV_AUDIO_PACK],
                 "av_unprocessed_ctx": True}
 
@@ -984,11 +984,11 @@ class QFLTXAVModel(QFLTXModel):
                      transformer_options={}, **kwargs):
         sigma = t
         if c_crossattn is None:
-            raise RuntimeError("qf_native LTX-AV: no c_crossattn cond — wire the LTX-2.5 "
-                               "gemma4 'with-proj' TE (CLIPTextEncode → LTXVConditioning)")
+            raise RuntimeError("qf_native LTX-AV: no c_crossattn cond - wire the LTX-2.5 "
+                               "gemma4 'with-proj' TE (CLIPTextEncode -> LTXVConditioning)")
         if control is not None:
             raise RuntimeError("qf_native LTX-AV: a ControlNet is wired, but this seam does "
-                               "not consume comfy control hints — remove it.")
+                               "not consume comfy control hints - remove it.")
         # AV latent arrives nested OR sampler-packed flat (the H3-measured dual form).
         _nested = getattr(x, "is_nested", False)
         if _nested:
@@ -999,14 +999,14 @@ class QFLTXAVModel(QFLTXModel):
             if not ls or len(ls) < 2:
                 raise RuntimeError(f"qf_native LTX-AV: packed latent (type={type(x).__name__} "
                                    f"shape={tuple(getattr(x, 'shape', ()))}) but model.latent_shapes "
-                                   "is unset — cannot unpack the AV pair.")
+                                   "is unset - cannot unpack the AV pair.")
             n = int(math.prod(ls[0][1:]))
             xf = x.reshape(int(x.shape[0]), -1)
             x_video = xf[:, :n].reshape(list(ls[0]))
             x_audio = xf[:, n:].reshape(list(ls[1]))
         if x_audio.ndim != 4 or int(x_audio.shape[1]) != _LTXAV_AUDIO_CH \
                 or int(x_audio.shape[3]) != _LTXAV_AUDIO_MEL:
-            raise RuntimeError(f"qf_native LTX-AV: audio latent shape {tuple(x_audio.shape)} — "
+            raise RuntimeError(f"qf_native LTX-AV: audio latent shape {tuple(x_audio.shape)} - "
                                f"expected [B,{_LTXAV_AUDIO_CH},L,{_LTXAV_AUDIO_MEL}] "
                                "(LTXVEmptyLatentAudio / LTXVConcatAVLatent)")
         dev = x_video.device
@@ -1121,7 +1121,7 @@ class QFLTXAVModel(QFLTXModel):
                     if not ls or len(ls) < 2:
                         raise RuntimeError(f"qf_native LTX-AV: finalize got a non-nested ndim="
                                            f"{latent.ndim} latent and model.latent_shapes is "
-                                           "unset — cannot extract the video half")
+                                           "unset - cannot extract the video half")
                     n = int(math.prod(ls[0][1:]))
                     lv = latent.reshape(int(latent.shape[0]), -1)[:, :n].reshape(list(ls[0]))
                 if lv.ndim != 5:
@@ -1258,8 +1258,8 @@ def register(deps):
                           f"{', '.join(os.path.basename(p) for p in _qualified[1:])})",
                           flush=True)
             if conn_src is None:
-                _why = ("packs the video_embeddings_connector but NOT the audio one — "
-                        "LTX-2.5 file-mode is joint-AV and needs BOTH — "
+                _why = ("packs the video_embeddings_connector but NOT the audio one - "
+                        "LTX-2.5 file-mode is joint-AV and needs BOTH - "
                         if _file_has_prefix(transformer1_path, _CONN_VID)
                         else "is a transformer-only export ")
                 raise RuntimeError(
@@ -1271,7 +1271,7 @@ def register(deps):
                     f"itself (official comfy contract: TE output is unprocessed_ltxav_embeds), "
                     f"so a source is required. Fix: place the shared ltx-2.5-connectors file "
                     f"in the same folder, or use an ALL-IN export (*-allin-*.safetensors).")
-            qfe.info(f"[qf_native] ltx2: transformer-only export — connectors completion file: "
+            qfe.info(f"[qf_native] ltx2: transformer-only export - connectors completion file: "
                   f"{os.path.basename(conn_src)}", flush=True)
         extra = {"connectors": conn_src}
         model_dir = qfmp.stage_denoise_only_package(bundle_dir, transformer1_path, extra_links=extra)

@@ -9,24 +9,31 @@ import json
 import weakref
 import threading
 
-# qf_engine is stdlib only (nothing from comfy), so a ComfyUI upgrade cannot break it; every warning below prints
-# through its console-safe logger (#738: one character the console's code page cannot hold must never raise).
-from . import qf_engine as qfe
-
-_log = qfe.logger(__name__)
+# qf_engine is stdlib only (nothing from comfy); every warning below prints through its console-safe logger (#738: one
+# character the console's code page cannot hold must never raise). Its import is guarded like the rest: a broken
+# plugin file still degrades to zero nodes + a warning.
+try:
+    from . import qf_engine as qfe
+    _log = qfe.logger(__name__)
+except Exception as _qfe_exc:  # noqa: BLE001 - never break registration
+    import logging
+    qfe, _log = None, logging.getLogger(__name__)
+    _log.warning("[qf_native] disabled - qf_engine failed to import: %s", ascii(_qfe_exc))
 
 # GUARDED imports (mirror the real plugin __init__.py) — a broken comfy-internals import must NOT
 # take down node registration on a ComfyUI upgrade; degrade to zero nodes + a loud warning.
 NODE_CLASS_MAPPINGS = {}
 NODE_DISPLAY_NAME_MAPPINGS = {}
 try:
+    if qfe is None:
+        raise ImportError("qf_engine did not import (see the warning above)")
     import comfy.model_management
     import comfy.supported_models
     from . import qf_modelpatcher as qfmp
     from .qf_modelpatcher import QFModelPatcher
     _IMPORT_OK = True
 except Exception as _exc:  # noqa: BLE001 — never break registration; report loudly
-    _log.warning("[qf_native] disabled — a required import failed (ComfyUI API drift?): %r", _exc)
+    _log.warning("[qf_native] disabled - a required import failed (ComfyUI API drift?): %s", ascii(_exc))
     _IMPORT_OK = False
 
 
@@ -35,7 +42,7 @@ try:
     import folder_paths as _folder_paths
 except Exception as _fp_exc:  # noqa: BLE001 — never break registration
     _folder_paths = None
-    _log.warning("[qf_native] folder_paths unavailable: %r", _fp_exc)
+    _log.warning("[qf_native] folder_paths unavailable: %s", ascii(_fp_exc))
 
 _NO_LORA_HINT = "(no LoRA in models/loras)"
 
@@ -100,7 +107,7 @@ def _load_model_config(name):
     """Resolve + read a preset's manifest. The name comes from a saved workflow (workflow-serializable =
     untrusted): it must be exactly one of the listed preset dirs — no separators, no traversal."""
     if name == _NO_CFG_HINT or os.sep in name or "/" in name or "\\" in name or name in ("", ".", ".."):
-        raise RuntimeError(f"qf_native: invalid model_config {name!r} — pick one of the shipped "
+        raise RuntimeError(f"qf_native: invalid model_config {name!r} - pick one of the shipped "
                            f"presets ({_model_config_choices()}).")
     bundle = os.path.join(_CONFIGS_DIR, name)
     mf = os.path.join(bundle, "qf_native.json")
@@ -175,7 +182,7 @@ def _resolve_transformer(name):
     (get_full_path_or_raise confines it to the diffusion_models roots — the untrusted-widget
     #vuln guard, same as _resolve_lora)."""
     if _folder_paths is None or name in ("", _NO_XFM_HINT):
-        raise RuntimeError("qf_native: no transformer weight selected — put the svdq .safetensors "
+        raise RuntimeError("qf_native: no transformer weight selected - put the svdq .safetensors "
                            "under ComfyUI/models/diffusion_models/ and pick it in transformer1.")
     return _folder_paths.get_full_path_or_raise("diffusion_models", name)
 
@@ -197,7 +204,7 @@ def _lora_choices():
 
 def _resolve_lora(name):
     if _folder_paths is None or name == _NO_LORA_HINT:
-        raise RuntimeError("qf_native: no LoRA available — put .safetensors files in models/loras/")
+        raise RuntimeError("qf_native: no LoRA available - put .safetensors files in models/loras/")
     return _folder_paths.get_full_path_or_raise("loras", name)
 
 
@@ -402,7 +409,7 @@ def _sweep_dead_pipelines(keep_key):
         # requester=None ⇒ _retire_handle refuses while ANY consumer is live (only-all-dead sweeps)
         if eng is not None and _retire_handle(k, eng, None, reason="host-RAM sweep"):
             qfe.info("[qf_native] host-RAM sweep: destroyed a cached pipeline whose model was GC'd "
-                  "(comfy dropped its patcher) — freed its CPU backup", flush=True)
+                  "(comfy dropped its patcher) - freed its CPU backup", flush=True)
 
 
 def _engine_recipe(model_dir, create_cfg=None, device_idx=0):
@@ -567,7 +574,7 @@ if _IMPORT_OK:
                 _FAMILY_BUILDERS[mod.FAMILY] = mod.register(deps)
                 _FAMILY_MATCHERS.append((mod.FAMILY, mod.matches))
             except Exception as exc:  # noqa: BLE001 — never break plugin import
-                _log.warning("[qf_native] family module %s not registered: %r", mod_name, exc)
+                _log.warning("[qf_native] family module %s not registered: %s", mod_name, ascii(exc))
 
     _register_families()
 
@@ -602,7 +609,7 @@ if _IMPORT_OK:
                 f"qf_native: model_config '{model_config}' routes to family '{family}', which "
                 f"has no registered native seam in this install (available: "
                 f"{sorted(_FAMILY_BUILDERS)}). An import of the seam module probably failed "
-                f"at startup — check the log for a [qf_native] warning.")
+                f"at startup - check the log for a [qf_native] warning.")
         xfm1 = _resolve_transformer(transformer1)
         # file_hints validation (DATA-driven; the manifest names what its transformers look
         # like). DESIGN BOUNDARY, recorded deliberately: comfy combo values must be the REAL
@@ -652,10 +659,10 @@ if _IMPORT_OK:
     _STEP_CACHE_INPUT = ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.005,
                          "tooltip": "Speed-up that reuses earlier work while the result is barely changing. 0 (default) = off. "
                                     "Higher values are faster but can move the result away from the full render; "
-                                    "0.02–0.05 is typical. Takes effect on the next run."})
+                                    "0.02-0.05 is typical. Takes effect on the next run."})
     _BLOCK_CACHE_INPUT = ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.005,
                           "tooltip": "A second speed-up that reuses work inside each pass when little changes. 0 (default) = "
-                                     "off. 0.05–0.12 is typical; higher is faster but can lose detail. Can be combined "
+                                     "off. 0.05-0.12 is typical; higher is faster but can lose detail. Can be combined "
                                      "with step_cache. Takes effect on the next run."})
     # [quality — user 2026-09-24] ONE speed/quality choice on the four QuantFunc loaders (H3, LTX-2.5, Krea2, Qwen-Image-2.1). It
     # replaces the quality_enhance switch (the engine's video_enhance). The option names are the user's; what each one does is
@@ -830,7 +837,7 @@ if _IMPORT_OK:
     # omitted (older engines refuse unknown keys loud) and the engine resets an absent key to 1.0.
     _SOL_TAU_INPUT = ("FLOAT", {"default": 1.0, "min": 0.02, "max": 1.0, "step": 0.01,
                      "tooltip": "Attention speed-up. 1.0 (default) turns it off. Lower values are faster and give up "
-                                "some quality: 0.15–0.2 is a good start, below 0.1 check the result carefully, 0.3–0.5 "
+                                "some quality: 0.15-0.2 is a good start, below 0.1 check the result carefully, 0.3-0.5 "
                                 "keeps more quality. Takes effect on the next run."})
 
     def _arm_session_caches(_mm, step_cache, block_cache):
@@ -910,7 +917,7 @@ if _IMPORT_OK:
         RETURN_TYPES = ("MODEL",)
         FUNCTION = "load"
         CATEGORY = "loaders"
-        DESCRIPTION = ("Loads a QuantFunc LTX-2 model (video with sound) for ComfyUI's standard samplers — use it in place "
+        DESCRIPTION = ("Loads a QuantFunc LTX-2 model (video with sound) for ComfyUI's standard samplers - use it in place "
                        "of the usual diffusion-model loader. For image-to-video, add the official LTXVImgToVideoInplace node on "
                        "the latent input. " + _COMMON_LIMITS)
 
@@ -954,7 +961,7 @@ if _IMPORT_OK:
         RETURN_TYPES = ("MODEL",)
         FUNCTION = "load"
         CATEGORY = "loaders"
-        DESCRIPTION = ("Loads a QuantFunc Krea-2 Turbo model (text-to-image) for ComfyUI's standard samplers — use it in "
+        DESCRIPTION = ("Loads a QuantFunc Krea-2 Turbo model (text-to-image) for ComfyUI's standard samplers - use it in "
                        "place of the usual diffusion-model loader. " + _COMMON_LIMITS)
 
         def load(self, transformer, model_config=None, attention_backend="auto",
@@ -1046,7 +1053,7 @@ if _IMPORT_OK:
         RETURN_TYPES = ("MODEL",)
         FUNCTION = "load"
         CATEGORY = "loaders"
-        DESCRIPTION = ("Loads a QuantFunc MiniMax-H3 model (video with sound) for ComfyUI's standard samplers — use it in "
+        DESCRIPTION = ("Loads a QuantFunc MiniMax-H3 model (video with sound) for ComfyUI's standard samplers - use it in "
                        "place of the usual diffusion-model loader. " + _COMMON_LIMITS)
 
         def load(self, transformer, model_config=None,
@@ -1123,28 +1130,28 @@ if _IMPORT_OK:
                                 ("OFT/BOFT", (".oft_", ".boft_"))):
                 if any(m in k for k in keys for m in marks):
                     raise RuntimeError(
-                        f"QuantFuncNativeLoRA: this is {'an' if kind[0] in 'AEIOU' else 'a'} {kind} file, which is not supported — the native "
+                        f"QuantFuncNativeLoRA: this is {'an' if kind[0] in 'AEIOU' else 'a'} {kind} file, which is not supported - the native "
                         "path does not load it and converting it does not help. Merge/re-export it to a "
                         "standard (A,B) LoRA first.")
             if any(k.startswith(("lora_unet_", "lora_transformer_", "lora_te_",
                                  "lora_te1_", "lora_te2_")) for k in keys):
                 raise RuntimeError(
                     "QuantFuncNativeLoRA: kohya/ai-toolkit-format LoRA detected. The native "
-                    "path adapts ONE format (diffusers/PEFT canonical) — convert once with:\n"
+                    "path adapts ONE format (diffusers/PEFT canonical) - convert once with:\n"
                     f"  python3 {conv} --in '{path}' --out '<same-dir>/<name>-diff.safetensors'\n"
                     "then pick the converted file in this node.")
             if not any(".lora_A." in k or ".lora_B." in k or ".lora_down." in k
                        or ".lora_up." in k for k in keys):
                 raise RuntimeError(
                     "QuantFuncNativeLoRA: no recognizable LoRA keys (lora_A/lora_B/"
-                    "lora_down/lora_up) in this file — not a LoRA, or an unsupported "
+                    "lora_down/lora_up) in this file - not a LoRA, or an unsupported "
                     f"format. If it is a LoRA, convert it: python3 {conv} --in ... --out ...")
 
         def apply(self, model, lora_name, strength):
             rebuild = qfmp.rebuild_of(model)
             if rebuild is None:
                 raise RuntimeError(
-                    "QuantFuncNativeLoRA: this MODEL is not a QuantFunc native model — wire it "
+                    "QuantFuncNativeLoRA: this MODEL is not a QuantFunc native model - wire it "
                     "downstream of the QuantFunc Native Loader. (For a stock comfy model use the "
                     "built-in LoraLoaderModelOnly instead.)")
             # The ONE-FORMAT refusal (mirror of the engine's E1 arm) applies to every family in this release.
@@ -1183,7 +1190,7 @@ if _IMPORT_OK:
         _spec.loader.exec_module(_rc)
         _rc.warn_if_stale(comfy_root=os.path.dirname(os.path.dirname(comfy.model_management.__file__)))
     except Exception as _rc_exc:  # noqa: BLE001 — the self-check must never break plugin import
-        _log.debug("[qf_native] reject-list self-check skipped: %r", _rc_exc)
+        _log.debug("[qf_native] reject-list self-check skipped: %s", ascii(_rc_exc))
     # (R7: the old single-node "QuantFuncNativeLoader" display entry is GONE with the class —
     # a display mapping for an unregistered class is dead weight; the three per-family loaders
     # register their display names beside their class mappings above.)
@@ -1199,7 +1206,7 @@ if _IMPORT_OK:
         if getattr(_qf_srv, "instance", None) is not None:
             qfe.start_engine_install(_comfy_device_index())
     except Exception as _qf_install_exc:  # noqa: BLE001 — installing must never break plugin import
-        _log.warning("[qf_native] engine install not started: %r", _qf_install_exc)
+        _log.warning("[qf_native] engine install not started: %s", ascii(_qf_install_exc))
 
 
 # ── QuantFunc LTX-2.5 AV ancestral-sampler audio fix ─────────────────────────────
@@ -1213,7 +1220,7 @@ try:
     qfe.logger(_qf_ltx_afix.__name__)   # its warnings: console-safe
     _qf_ltx_afix.install()
 except Exception as _qf_ltx_afix_exc:  # noqa: BLE001
-    _log.warning("[qf_native] LTX-2.5 AV audio fix not installed: %r", _qf_ltx_afix_exc)
+    _log.warning("[qf_native] LTX-2.5 AV audio fix not installed: %s", ascii(_qf_ltx_afix_exc))
 
 
 # ── Engine log detail ─────────────────────────────────────────────────────────
@@ -1230,4 +1237,4 @@ try:
         if _qf_name.startswith("QuantFunc") and _qf_name.endswith("Loader"):
             _qf_add_log_level(_qf_cls, _qf_ll_engine.set_log_level)
 except Exception as _qf_ll_exc:  # noqa: BLE001
-    _log.warning("[qf_native] log-level input not attached: %r", _qf_ll_exc)
+    _log.warning("[qf_native] log-level input not attached: %s", ascii(_qf_ll_exc))

@@ -237,7 +237,7 @@ class _QFStub(torch.nn.Module):
         self.patch_embedding = pe
 
     def forward(self, *a, **k):
-        raise RuntimeError("QF stub diffusion_model must never be called — _apply_model is overridden; "
+        raise RuntimeError("QF stub diffusion_model must never be called - _apply_model is overridden; "
                            "a ComfyUI upgrade may have changed the apply-model dispatch")
 
 
@@ -556,7 +556,7 @@ class QFSessionModelMixin:
         if not hasattr(lib, "quantfunc_denoise_step_multi"):
             self._qf.end_session_if_open()
             raise RuntimeError(f"{fail_prefix}: the loaded engine .so has no "
-                               "quantfunc_denoise_step_multi (D-class AV step) — rebuild/point "
+                               "quantfunc_denoise_step_multi (D-class AV step) - rebuild/point "
                                "the engine lib at an AV-capable build.")
         import os as _os
         _prof = _os.environ.get("QF_NATIVE_PROF") == "1"
@@ -616,7 +616,7 @@ class QFImageSessionModel(QFSessionModelMixin):
             if kwargs.get(_k) is not None:
                 raise RuntimeError(
                     f"qf_native {self._TAG}: '{_k}' conditioning is wired, but the native session "
-                    f"cannot consume it — it would be silently ignored, so it is refused. "
+                    f"cannot consume it - it would be silently ignored, so it is refused. "
                     f"Remove the node feeding '{_k}'{self._REFUSED_HINT}.")
         self._check_conds(kwargs)
         out = super().extra_conds(**kwargs)
@@ -661,14 +661,14 @@ class QFImageSessionModel(QFSessionModelMixin):
         sigma = t
         ctx = c_crossattn
         if ctx is None:
-            raise RuntimeError(f"qf_native {self._TAG}: no c_crossattn cond — {self._NO_COND_HINT}")
+            raise RuntimeError(f"qf_native {self._TAG}: no c_crossattn cond - {self._NO_COND_HINT}")
         if control is not None:
             raise RuntimeError(
                 f"qf_native {self._TAG}: a ControlNet is wired, but the native session consumes no "
-                "control input — it would be silently ignored, so it is refused.")
+                "control input - it would be silently ignored, so it is refused.")
         if c_concat is not None:
             raise RuntimeError(
-                f"qf_native {self._TAG}: c_concat conditioning is not part of the {self._TAG} seam — remove "
+                f"qf_native {self._TAG}: c_concat conditioning is not part of the {self._TAG} seam - remove "
                 "the node feeding it.")
         # BF16-latent/BF16-cond families (the engine's activation dtype); comfy may hand FP32 and may keep the cond
         # host-side (measured on cu12/3090, 2026-08-30: a CPU cond data_ptr reached the engine's cond copy as cudaMemcpy
@@ -1006,7 +1006,7 @@ def stage_denoise_only_package(bundle_dir, transformer1_path, extra_links=None):
     import folder_paths
     if not os.path.isdir(bundle_dir):
         raise RuntimeError(
-            f"qf_native: config bundle missing: {bundle_dir} — this family's arch/VAE configs are "
+            f"qf_native: config bundle missing: {bundle_dir} - this family's arch/VAE configs are "
             f"not shipped in the plugin (configs/<family>/). Cannot stage a denoise_only package.")
     real1 = os.path.realpath(transformer1_path)
     # extra_links: {subdir: target_path} — single-expert AV families link MORE weight files
@@ -1042,7 +1042,7 @@ def stage_denoise_only_package(bundle_dir, transformer1_path, extra_links=None):
                 os.link(target, link)
             except OSError as exc:
                 raise RuntimeError(
-                    f"qf_native: cannot link {target} into the staging dir ({exc}) — enable "
+                    f"qf_native: cannot link {target} into the staging dir ({exc}) - enable "
                     f"symlinks (Windows: Developer Mode) or keep the weights on the same volume "
                     f"as ComfyUI's temp directory.") from exc
     _link_expert("transformer", real1)
@@ -1063,11 +1063,11 @@ def refuse_all_zero_initial_latent(xin, tag):
     latent-input flow is nonzero and never trips this."""
     if float(xin.abs().max()) == 0.0:
         raise RuntimeError(
-            f"qf_native {tag}: the initial latent is ALL ZEROS — denoising pure zeros "
+            f"qf_native {tag}: the initial latent is ALL ZEROS - denoising pure zeros "
             f"produces NaN through int4 quantization (amax=0) and renders a BLACK video. "
             f"Almost always this means the FIRST sampler stage has add_noise=disable on an "
             f"Empty latent: set add_noise=enable on the first stage (official templates ship "
-            f"it enabled; later stages keep disable — they receive the leftover-noise latent).")
+            f"it enabled; later stages keep disable - they receive the leftover-noise latent).")
 
 
 def tag_lora_rebuild(patcher, lora_entries, rebuild):

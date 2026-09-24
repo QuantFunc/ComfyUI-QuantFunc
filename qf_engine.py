@@ -18,6 +18,7 @@ import struct
 import sys
 import operator
 import threading
+import traceback
 import weakref
 from typing import NamedTuple, Optional
 
@@ -837,14 +838,21 @@ def say(msg, flush=True):
 
 
 class _ConsoleSafe(logging.Filter):
-    """Makes each record of a plugin logger printable on the console's code page (console_safe). A malformed %-format
-    is left to the handler, which reports it as logging always has."""
+    """Makes each record of a plugin logger printable on the console's code page (console_safe). A traceback
+    (exc_info, stack_info) is folded into the message first: the handler would format it unescaped. A malformed
+    %-format is left to the handler, which reports it as logging always has."""
 
     def filter(self, record):
         try:
             text = record.getMessage()
         except (TypeError, ValueError):
             return True
+        if record.exc_info:
+            text += "\n" + "".join(traceback.format_exception(*record.exc_info)).rstrip("\n")
+            record.exc_info = record.exc_text = None
+        if record.stack_info:
+            text += "\n" + record.stack_info
+            record.stack_info = None
         record.msg, record.args = console_safe(text), None
         return True
 
@@ -1636,7 +1644,7 @@ def assert_toolchain_compatible(so_path):
     if not _is_elf(so_path) and not _is_pe(so_path):
         import platform as _pf
         raise RuntimeError(
-            f"qf_native: REFUSING to load — the CUDA-toolchain compatibility check reads Linux (ELF) and "
+            f"qf_native: REFUSING to load - the CUDA-toolchain compatibility check reads Linux (ELF) and "
             f"Windows (PE) engine libraries only, and the engine binary ({so_path}) is a "
             f"{_pf.system() or 'non-Linux'} binary whose CUDA version cannot be read here. torch is built for "
             f"CUDA {torch_major or 'none / CPU-only'}. Ensure your torch and the engine binary use the SAME CUDA "
@@ -1644,7 +1652,7 @@ def assert_toolchain_compatible(so_path):
     so_major = _so_cuda_major(so_path)
     if torch_major is None or so_major is None:
         raise RuntimeError(
-            f"qf_native: REFUSING to load — cannot verify the engine's CUDA toolchain matches torch's "
+            f"qf_native: REFUSING to load - cannot verify the engine's CUDA toolchain matches torch's "
             f"(torch CUDA={torch_major or 'none / CPU-only'}, engine library CUDA major="
             f"{so_major if so_major is not None else 'undeterminable'}). The engine loads in-process and "
             f"shares torch's CUDA context; an unverified toolchain combination can silently corrupt "
@@ -1652,7 +1660,7 @@ def assert_toolchain_compatible(so_path):
             f"or set {_ENV_ALLOW_UNVERIFIED_TOOLCHAIN}=1 if you KNOW this combination is safe.")
     if torch_major != so_major:
         raise RuntimeError(
-            f"qf_native: REFUSING to load — CUDA toolchain MISMATCH. torch is built for CUDA {torch_major} "
+            f"qf_native: REFUSING to load - CUDA toolchain MISMATCH. torch is built for CUDA {torch_major} "
             f"but the engine library ({so_path}) links CUDA {so_major}. Running "
             f"a CUDA-{so_major} engine in-process with a CUDA-{torch_major} torch is an unverified "
             f"combination that can SILENTLY corrupt generated images/video (no crash). Use an engine library "
@@ -1770,7 +1778,7 @@ def _assert_torch_cuda_family(provided, dirs, linker):
         bound = linker(soname)
         if bound and os.path.dirname(os.path.realpath(bound)) not in dirs:
             raise RuntimeError(
-                f"qf_native: REFUSING the engine — it links {soname}, and this process resolves it to "
+                f"qf_native: REFUSING the engine - it links {soname}, and this process resolves it to "
                 f"{os.path.realpath(bound)}, which is not torch's copy (torch's CUDA libraries are in "
                 f"{', '.join(sorted(dirs))}). One process must use one cuBLAS/cuSOLVER set: two of them fail to load or "
                 f"compute wrong. Find what loads that file (another custom node, LD_PRELOAD, LD_LIBRARY_PATH) and "
@@ -1928,9 +1936,9 @@ def _refuse_session_knobs_in_create(config_json):
     if _scan(cfg):
         raise RuntimeError(
             "qf_native: a runtime SESSION knob (cache_mode / cache_thresh / "
-            "step_cache — they ride every denoise_begin via "
+            "step_cache - they ride every denoise_begin via "
             "QFSessionModelMixin.residency_opts) must never appear anywhere in a create "
-            "config — that would bake it into the pipeline cache identity and rebuild "
+            "config - that would bake it into the pipeline cache identity and rebuild "
             "the whole pipeline on every widget change.")
 
 

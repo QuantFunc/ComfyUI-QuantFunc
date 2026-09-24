@@ -98,7 +98,7 @@ def _log_once(name, how):
     if name in _logged_samplers:
         return
     _logged_samplers.add(name)
-    _log.warning("[qf_native] LTX-2.5 AV: sampler '%s' -> %s for the QF AV model — the engine's stateless "
+    _log.warning("[qf_native] LTX-2.5 AV: sampler '%s' -> %s for the QF AV model - the engine's stateless "
                  "flow-match forward needs a non-re-noised (deterministic) trajectory or the audio lane is "
                  "silenced. Video is deterministic here (accepted tradeoff).", name, how)
 
