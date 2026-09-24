@@ -517,7 +517,7 @@ def main():
     for _tier_ans in (1, 0):   # both quality forms
         qfn._quality_fast_cache.clear()
         qfn.qfe.load_lib = (lambda a=_tier_ans: _FakeQLib(a))
-        for _n in _FOUR:
+        for _n in _FOUR + ("QuantFuncNativeLoRA",):   # the LoRA node's text is user-visible too (A, round 2)
             _c = qfn.NODE_CLASS_MAPPINGS[_n]
             _texts.append((f"{_n}.DESCRIPTION", getattr(_c, "DESCRIPTION", "")))
             for _sec in ("required", "optional"):

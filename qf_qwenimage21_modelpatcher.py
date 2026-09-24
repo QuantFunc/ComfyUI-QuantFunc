@@ -68,8 +68,8 @@ class QFQwenImage21Model(qfmp.QFImageSessionModel, comfy.model_base.QwenImage21)
                 not hasattr(qfe.load_lib(), "quantfunc_denoise_step_refs"):
             raise RuntimeError(
                 "qf_native qwenimage21: reference images are wired (TextEncodeQwenImage21 images + vae), but "
-                "the loaded QuantFunc engine has no quantfunc_denoise_step_refs — update the engine library "
-                "(bin/linux/libquantfunc.so) to a build with Qwen-Image-2.1 edit support.")
+                "the loaded QuantFunc engine has no quantfunc_denoise_step_refs — update the QuantFunc engine "
+                "to a build with Qwen-Image-2.1 edit support.")
 
     def _apply_model(self, x, t, c_concat=None, c_crossattn=None, control=None,
                      transformer_options={}, **kwargs):

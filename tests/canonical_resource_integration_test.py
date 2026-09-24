@@ -200,7 +200,9 @@ class CanonicalIntegration(unittest.TestCase):
             mock.patch.dict(plugin._PIPELINE_MODELS, {}, clear=True),
             mock.patch.dict(plugin._PREPARED_CACHE, {}, clear=True),
             mock.patch.object(qfe, "load_lib", return_value=self.lib),
-            mock.patch.object(qfe, "resolve_so_path", return_value="contract.so"),
+            # the pipeline cache keys on the library THIS process loaded (qf_engine.loaded_so_path), never on
+            # the resolver's current answer: resolve_so_path is reached only by load_lib (mocked here)
+            mock.patch.object(qfe, "loaded_so_path", return_value="contract.so"),
             mock.patch.object(plugin, "_read_auth", return_value=("", "")),
             mock.patch.object(mm, "get_total_memory", return_value=64 << 30),
             # No free memory unless a test says otherwise: growth is then exactly Comfy's allowance, so
@@ -386,6 +388,22 @@ class CanonicalIntegration(unittest.TestCase):
                 self.exercise_shared_full_detach_state(state)
         # A mutation that never ran proves nothing about the oracle.
         self.assertEqual(len(restored), 1, "mutation never reached the failing release")
+
+    def test_cache_key_is_the_loaded_library_not_the_resolvers_current_answer(self):
+        """G-1 (tests-07 re-CR round 2, both reviewers): a newer pair marked while ComfyUI runs moves resolve_so_path's
+        answer. The pipeline cache key must stay the library THIS process loaded (else the same weights miss the cache
+        and build a second pipeline), and no lookup may re-resolve the pair (each resolve re-hashes host + kernel)."""
+        calls = []
+        with mock.patch.object(qfe, "resolve_so_path",
+                               side_effect=lambda: calls.append(1) or f"/bin/linux/0.0.1{len(calls)}-consumer-cu13/x.so"):
+            before = plugin._engine_recipe("pkg-a")
+            after = plugin._engine_recipe("pkg-a")            # "after a background install marked a newer pair"
+            again = [plugin._engine_recipe("pkg-a") for _ in range(4)]   # the lookups of one sampler run
+        self.assertEqual(before[1], after[1])
+        self.assertEqual(before[2], after[2])
+        self.assertEqual(before[1][0], "contract.so")
+        self.assertTrue(all(r[1] == before[1] for r in again))
+        self.assertEqual(calls, [], "a cache lookup re-resolved (re-hashed) the engine pair")
 
     def test_cold_factory_graph_is_canonical_before_any_model_create(self):
         a, same, b = self.wrapper(), self.wrapper(), self.wrapper("B")

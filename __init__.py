@@ -364,7 +364,9 @@ def _sweep_dead_pipelines(keep_key):
 def _engine_recipe(model_dir, create_cfg=None, device_idx=0):
     """Resolve immutable create inputs without entering a cache critical section."""
     lib = qfe.load_lib()
-    ckey = (qfe.resolve_so_path(), model_dir, "svdq", int(device_idx),
+    # the library THIS process loaded, not the resolver's current answer: a newer pair marked mid-session must not
+    # split one model's cache entry (the lookup also re-hashed both files every time)
+    ckey = (qfe.loaded_so_path(), model_dir, "svdq", int(device_idx),
             json.dumps(create_cfg or {}, sort_keys=True))
     return lib, ckey, (qfe.library_identity(lib), ckey), create_cfg
 
@@ -1004,9 +1006,8 @@ if _IMPORT_OK:
         # is shaped after — use "model/loaders" (nodes.py); bare "loaders" is for file-loading
         # nodes. (ModelSampling* use "model/patch*", so the rule is per-precedent, not universal.)
         CATEGORY = "model/loaders"
-        DESCRIPTION = ("Attaches a sidecar LoRA to a QuantFunc native MODEL (wire downstream of a "
-                       "QuantFunc loader; chain several to stack). Changing the LoRA keeps the loaded "
-                       "model (no reload).")
+        DESCRIPTION = ("Applies a LoRA to a QuantFunc model (connect it after a QuantFunc loader; chain "
+                       "several to stack them). Changing or removing a LoRA keeps the loaded model (no reload).")
 
         @staticmethod
         def _refuse_foreign_lora_format(path):

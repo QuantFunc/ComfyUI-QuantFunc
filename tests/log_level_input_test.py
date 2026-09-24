@@ -21,7 +21,7 @@
   L10 qf_engine.info (the plugin's own per-run detail lines) prints only at info: silent before any loader ran and
       at warning (tests-07 ruling: the production default is warning for the plugin's output too);
   L11 those lines (loaded / SESSION OPEN / CLOSED / VRAM ledger / engine lib) reach the console only through it (AST).
-MUTATION: make info() print at every level -> L10 goes RED; turn one converted line back into print -> L11 goes RED;
+MUTATION: print the fingerprint at load (drop _FINGERPRINT_PENDING) -> L12 goes RED; make info() print at every level -> L10 goes RED; turn one converted line back into print -> L11 goes RED;
 make _run skip set_level -> L2/L3 go RED; forward log_level to the loader -> L2 goes RED; move the
 attach loop above the cloud-TE registration -> L5 goes RED; drop the __signature__ -> L6 goes RED; make
 set_log_level call load_lib(), or drop the pending-level apply in load_lib -> L7 goes RED; declare the input
@@ -226,6 +226,27 @@ def main():
             if not helper and any(t in text for t in tokens):
                 bare.append(f"{fn}:{node.lineno}")
     check(f"L11 the per-run detail lines print only through qf_engine.info (bare: {bare or 'none'})", not bare)
+
+    # L12: the library fingerprint (an info line) waits for the FIRST info-level loader. The engine usually loads before
+    #      any loader set a level (ComfyUI's node list asks it for the quality options); printed at load it would be
+    #      suppressed forever — and it is how a run proves which library it loaded.
+    eng2 = _load_qf_engine()
+    with tempfile.TemporaryDirectory() as d:
+        eng2.resolve_so_path = lambda: os.path.join(d, "engine-under-test")
+        eng2.assert_toolchain_compatible = lambda so_path: None
+        eng2.ctypes = types.SimpleNamespace(RTLD_GLOBAL=0, RTLD_LOCAL=0, CDLL=lambda *a, **k: object())
+        eng2._bind = lambda raw: types.SimpleNamespace(quantfunc_set_log_level=lambda level: None)
+        seen = []
+        for step in ("load", "warning", "info", "info again"):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                if step == "load":
+                    eng2.load_lib()
+                else:
+                    eng2.set_log_level(3 if step == "warning" else 2)
+            seen.append(buf.getvalue().count("engine lib:"))
+    check(f"L12 the library fingerprint waits for the first info-level loader, then prints once (seen {seen})",
+          seen == [0, 0, 1, 0])
 
     print(f"LOG_LEVEL_INPUT: {'PASS' if not failures else 'FAIL'} ({len(failures)} failure(s))")
     return 1 if failures else 0

@@ -763,6 +763,8 @@ def _bind(lib):
 
 
 _LIB = None
+_LIB_PATH = None             # the engine library load_lib loaded — constant for the process (loaded_so_path)
+_FINGERPRINT_PENDING = None  # (lib, path) whose fingerprint line waits for the first info-level loader
 _LOG_LEVEL = None   # the level a loader asked for (qf_log_level); applied when/after the library loads
 
 
@@ -774,6 +776,26 @@ def set_log_level(level):
     _LOG_LEVEL = int(level)
     if _LIB is not None:
         _LIB.quantfunc_set_log_level(_LOG_LEVEL)
+    _emit_fingerprint()
+
+
+def loaded_so_path():
+    """The engine library this process loaded (load_lib), or None before the load. Constant for the process: the
+    installer may mark a newer pair while ComfyUI runs, and that one loads at the next start. A cache keyed on this never
+    splits one model across two keys, and nothing re-resolves (or re-hashes the pair) per lookup."""
+    return _LIB_PATH
+
+
+def _emit_fingerprint():
+    """Print the loaded library's fingerprint line ONCE, as soon as the level allows it. It is an info line, but the
+    library usually loads before any loader set a level (ComfyUI's node list asks the engine for the quality options),
+    so it waits for the first info-level loader instead of being lost. At warning it is never printed, and its md5 is
+    never computed."""
+    global _FINGERPRINT_PENDING
+    if _FINGERPRINT_PENDING is not None and _LOG_LEVEL is not None and _LOG_LEVEL <= _LOG_INFO:
+        lib, path = _FINGERPRINT_PENDING
+        _FINGERPRINT_PENDING = None
+        _log_lib_fingerprint(lib, path)
 
 
 _LOG_INFO = 2   # info on the engine's scale (qf_log_level.LOG_LEVELS): the plugin's own detail lines follow the same level
@@ -1476,7 +1498,7 @@ def load_lib():
     input). Takes NO argument on purpose — a `so_path` parameter is the attack surface just removed.
     FORK-2: the fail-closed CUDA-toolchain guard runs BEFORE ctypes.CDLL, so a mismatched combination is
     refused rather than dlopen'd into torch's live CUDA context."""
-    global _LIB
+    global _LIB, _LIB_PATH, _FINGERPRINT_PENDING
     if _LIB is None:
         so_path = resolve_so_path()
         assert_toolchain_compatible(so_path)   # FORK-2 fail-closed torch-CUDA / .so-CUDA match check
@@ -1510,9 +1532,11 @@ def load_lib():
             raise RuntimeError(f"qf_native: {_engine_load_failed(so_path, e)}") from e
         _engine_load_ok(so_path)
         _LIB = _bind(lib)
+        _LIB_PATH = so_path
         if _LOG_LEVEL is not None:   # a loader asked for a level before the library was loaded
             _LIB.quantfunc_set_log_level(_LOG_LEVEL)
-        _log_lib_fingerprint(_LIB, so_path)
+        _FINGERPRINT_PENDING = (_LIB, so_path)
+        _emit_fingerprint()
     return _LIB
 
 

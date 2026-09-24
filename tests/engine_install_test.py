@@ -666,6 +666,36 @@ def main():
         shutil.rmtree(d, ignore_errors=True)
     check("the .qf_pair_id reader: the id of an ELF that carries one; None when absent, malformed, not ELF or empty",
           got == {k: v for k, (_, v) in cases.items()}, got)
+    # 19) G-1 (tests-07 re-CR round 2): the library a process loaded stays ITS library. A newer pair marked while it
+    #     runs moves resolve_so_path's answer, but loaded_so_path() (what the pipeline cache keys on) stays, and a later
+    #     load_lib() neither re-resolves nor re-hashes the pair.
+    rel = Release()
+    saved = (qfe.assert_toolchain_compatible, qfe.ctypes.CDLL, qfe._bind, qfe._LIB, qfe._LIB_PATH, qfe._FINGERPRINT_PENDING)
+    try:
+        with Env(rel) as env:
+            qfe.install_engine()
+            qfe._LIB = qfe._LIB_PATH = None
+            qfe.assert_toolchain_compatible = lambda p: None
+            qfe.ctypes.CDLL = lambda p, mode=0: object()
+            qfe._bind = lambda lib: types.SimpleNamespace(quantfunc_set_log_level=lambda level: None)
+            first = qfe.load_lib()
+            loaded = qfe.loaded_so_path()
+            qfe._engine_http_open = Release("0.0.14").open
+            qfe.install_engine()                       # a background update marks a newer pair
+            moved = qfe.resolve_so_path()
+            resolves = []
+            real_resolve = qfe.resolve_so_path
+            qfe.resolve_so_path = lambda: resolves.append(1) or real_resolve()
+            again = qfe.load_lib()
+            qfe.resolve_so_path = real_resolve
+            check("G-1: after a newer pair is marked, the loaded library stays the process's key; nothing re-resolves",
+                  loaded == os.path.realpath(env.path("0.0.13-consumer-cu13", HOSTS[13]))
+                  and moved == os.path.realpath(env.path("0.0.14-consumer-cu13", HOSTS[13]))
+                  and qfe.loaded_so_path() == loaded and again is first and resolves == [],
+                  f"loaded={loaded} moved={moved} resolves={len(resolves)}")
+    finally:
+        (qfe.assert_toolchain_compatible, qfe.ctypes.CDLL, qfe._bind, qfe._LIB, qfe._LIB_PATH,
+         qfe._FINGERPRINT_PENDING) = saved
     print("ENGINE_INSTALL:", "PASS" if bad == 0 else f"FAIL ({bad} wrong)")
     return 1 if bad else 0
 
