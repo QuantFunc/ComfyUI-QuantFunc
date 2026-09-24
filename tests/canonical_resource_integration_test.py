@@ -432,7 +432,10 @@ class CanonicalIntegration(unittest.TestCase):
         # Make persistent backing decisively larger than either request. Capacity belongs to the Owner
         # ledger, never peak demand.
         self.lib.capacity_bytes = 32 << 30
-        noise_shape = (1, 16, 8, 8)
+        # 32x32, not 8x8: at 8x8 ComfyUI's torch estimate (~44 MB) sits BELOW the comfy side's fixed base, so
+        # max(floor, comfy side) == comfy side and the arm could not tell floor from no-floor (measured: the
+        # precondition below failed on both the old and the fixed code). ~700 MB torch vs ~65 MB comfy side here.
+        noise_shape = (1, 16, 32, 32)
         cfg = supported_models.Krea2({"image_model": "krea2",
                                      "disable_unet_model_creation": True})
         qfm.ensure_model_config_attrs(cfg)

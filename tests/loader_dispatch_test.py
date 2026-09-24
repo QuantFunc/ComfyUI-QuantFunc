@@ -1024,6 +1024,11 @@ def main():
         _destroyed = []
 
         class _Eng:
+            # _retire_handle reads the loaded-image identity (lib) and the retained native resource (the host-vram
+            # prepared-entry check); a bare destroy()-only object raised AttributeError before the gate was reached.
+            lib = "LIB"
+            resource = None
+
             def destroy(self):
                 _destroyed.append(True)
         _shared_eng = _Eng()
