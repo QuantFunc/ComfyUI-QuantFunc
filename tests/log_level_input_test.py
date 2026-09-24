@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""The loaders' optional "log level" input (qf_log_level.add_log_level_input), without ComfyUI:
+"""The loaders' hidden `log_level` input (qf_log_level.add_log_level_input), without ComfyUI:
 
-  L1  the input lands in "optional" with default "warning" and exactly the plain choices;
+  L1  the input is declared HIDDEN, in ComfyUI's (type, options) form, and is never a required or optional
+      (visible) input: users do not choose the log level; only "warning" and "info" are accepted;
   L2  running the node applies the chosen level BEFORE the node's own function runs, and the
       loader itself never receives `log_level`;
   L3  a workflow that does not set it (every existing workflow) applies warning (engine level 3);
@@ -13,9 +14,15 @@
   L7  qf_engine.set_log_level never loads the engine library: with no library loaded it only records the
       level, load_lib() applies it right after loading, and later requests apply at once. (Loading the
       library for the level broke every loader run in a test environment without one.)
+  L8  ComfyUI does not validate hidden inputs, so the loader refuses any other value (or a non-string) with a
+      ValueError naming the accepted ones, before the level is set or the loader runs;
+  L9  a node that already declares hidden inputs (the quality loaders' retired quality_enhance) keeps them, and
+      the node's own spec dicts are never modified.
 MUTATION: make _run skip set_level -> L2/L3 go RED; forward log_level to the loader -> L2 goes RED; move the
 attach loop above the cloud-TE registration -> L5 goes RED; drop the __signature__ -> L6 goes RED; make
-set_log_level call load_lib(), or drop the pending-level apply in load_lib -> L7 goes RED.
+set_log_level call load_lib(), or drop the pending-level apply in load_lib -> L7 goes RED; declare the input
+optional again -> L1 goes RED; drop the value check in _run -> L8 goes RED; write log_level into the node's
+own hidden dict -> L9 goes RED.
 
 Run:  python tests/log_level_input_test.py   (pure Python; no ComfyUI, torch or engine library)
 """
@@ -60,6 +67,20 @@ class _KwLoader:
         return ("MODEL",)
 
 
+_SHARED_HIDDEN = {"quality_enhance": ("BOOLEAN", {})}   # module-level, like the quality loaders' own
+
+
+class _HiddenLoader:
+    FUNCTION = "load"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"transformer": (["a.safetensors"],)}, "hidden": _SHARED_HIDDEN}
+
+    def load(self, transformer, quality_enhance=None):
+        return ("MODEL",)
+
+
 def _load_qf_engine():
     """qf_engine by file path (it imports only the standard library)."""
     spec = importlib.util.spec_from_file_location("qf_engine_under_test", os.path.join(_PLUGIN, "qf_engine.py"))
@@ -79,11 +100,13 @@ def main():
     qf_log_level.add_log_level_input(_Loader, lambda level: events.append(("set_level", level)))
 
     spec = _Loader.INPUT_TYPES()
-    choices, opts = spec["optional"]["log_level"]
-    check("L1 optional input with plain choices (no debug in the UI)", choices == ["warning", "info"])
-    check("L1 default is warning", opts.get("default") == "warning")
+    check("L1 declared hidden, as ComfyUI's (type, options) input form",
+          spec.get("hidden", {}).get("log_level") == ("STRING", {}))
+    check("L1 never a visible input (not required, not optional)",
+          "log_level" not in spec["required"] and "log_level" not in spec.get("optional", {}))
+    check("L1 only warning and info are accepted (no debug)", list(qf_log_level.LOG_LEVELS) == ["warning", "info"])
     check("L4 other inputs untouched", spec["required"] == {"transformer": (["a.safetensors"],)}
-          and spec["optional"]["attention_backend"] == (["auto", "sage"],))
+          and spec["optional"] == {"attention_backend": (["auto", "sage"],)})
 
     events.clear()
     out = getattr(_Loader(), _Loader.FUNCTION)(transformer="a.safetensors", attention_backend="sage",
@@ -96,6 +119,25 @@ def main():
     getattr(_Loader(), _Loader.FUNCTION)(transformer="a.safetensors")
     check("L3 unset input applies warning (3)",
           events == [("set_level", 3), ("load", "a.safetensors", "auto")])
+
+    # L8: an unknown value is refused before anything runs (ComfyUI does not validate hidden inputs).
+    for bad in ("debug", "INFO", "", None, 2):
+        events.clear()
+        try:
+            getattr(_Loader(), _Loader.FUNCTION)(transformer="a.safetensors", log_level=bad)
+            refused = ""
+        except Exception as e:  # noqa: BLE001 — any other exception type is a FAIL of this arm, not a crash
+            refused = f"{type(e).__name__}: {e}"
+        check(f"L8 log_level={bad!r} refused (ValueError naming the accepted values) before anything runs",
+              refused.startswith("ValueError") and "['warning', 'info']" in refused and events == [])
+
+    # L9: an existing hidden declaration is kept, and the node's own dicts are not modified.
+    qf_log_level.add_log_level_input(_HiddenLoader, lambda level: None)
+    hid = _HiddenLoader.INPUT_TYPES()["hidden"]
+    check("L9 the node's own hidden inputs are kept next to log_level",
+          hid == {"quality_enhance": ("BOOLEAN", {}), "log_level": ("STRING", {})})
+    check("L9 the node's own spec dicts are not modified",
+          _SHARED_HIDDEN == {"quality_enhance": ("BOOLEAN", {})} and "log_level" not in _SHARED_HIDDEN)
 
     # L5: the attach must come after every registration (Call NODE_CLASS_MAPPINGS.update / subscript assignment).
     tree = ast.parse(open(os.path.join(_PLUGIN, "__init__.py"), encoding="utf-8").read())

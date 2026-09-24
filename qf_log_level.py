@@ -1,23 +1,17 @@
 """Engine log detail for the QuantFunc loader nodes.
 
-The engine prints only warnings and errors by default. Every family loader gets one optional
-"log level" input so a user (or the test harness) can ask for more. The setting is process-wide:
-it stays in force for the whole ComfyUI session until a loader run changes it.
+The engine prints only warnings and errors by default. Every family loader takes one HIDDEN
+`log_level` input: ComfyUI never shows it (users do not choose the log level), but a prompt that
+carries it (the test harness's) still reaches the loader. The setting is process-wide: it stays in
+force for the whole ComfyUI session until a loader run changes it.
 """
 
 import functools
 import inspect
 
-# Choice -> engine level (the engine's scale: 2 = info, 3 = warnings and errors). No "debug" on purpose: the
-# engine keeps some diagnostics at debug so ordinary users never see them; developers raise it outside the UI.
+# Value -> engine level (the engine's scale: 2 = info, 3 = warnings and errors). No "debug" on purpose: the
+# engine keeps some diagnostics at debug so ordinary users never see them; developers raise it outside ComfyUI.
 LOG_LEVELS = {"warning": 3, "info": 2}
-
-LOG_LEVEL_INPUT = (list(LOG_LEVELS), {
-    "default": "warning",
-    "tooltip": "How much the QuantFunc engine prints to the console. warning (default): only "
-               "warnings and errors. info: also loading and progress details. Applies to the whole "
-               "ComfyUI session until changed.",
-})
 
 
 def _with_log_level(sig):
@@ -29,20 +23,27 @@ def _with_log_level(sig):
 
 
 def add_log_level_input(cls, set_level):
-    """Give a loader node the optional `log_level` input. Its value is handed to
-    `set_level(engine_level)` before the node's own function runs. The node function keeps its
-    own name, docstring and parameters (plus `log_level`) for anything that inspects it."""
+    """Give a loader node the hidden `log_level` input. Its value is handed to
+    `set_level(engine_level)` before the node's own function runs; a prompt without it gets warning.
+    The node function keeps its own name, docstring and parameters (plus `log_level`) for anything
+    that inspects it."""
     base_inputs = cls.INPUT_TYPES      # bound to cls
     run = getattr(cls, cls.FUNCTION)
 
     def INPUT_TYPES(_cls):
-        spec = base_inputs()
-        spec.setdefault("optional", {})["log_level"] = LOG_LEVEL_INPUT
+        spec = dict(base_inputs())
+        # Hidden, in ComfyUI's (type, options) input form; new dicts, so the node's own spec is never modified
+        # (the node may already declare hidden inputs of its own).
+        spec["hidden"] = {**spec.get("hidden", {}), "log_level": ("STRING", {})}
         return spec
 
     @functools.wraps(run)
     def _run(self, *args, log_level="warning", **kwargs):
-        set_level(LOG_LEVELS[log_level])
+        # ComfyUI does not validate hidden inputs, so the value is checked here.
+        level = LOG_LEVELS.get(log_level) if isinstance(log_level, str) else None
+        if level is None:
+            raise ValueError(f"log_level must be one of {list(LOG_LEVELS)}, got {log_level!r}")
+        set_level(level)
         return run(self, *args, **kwargs)
 
     _run.__signature__ = _with_log_level(inspect.signature(run))

@@ -31,14 +31,6 @@ def _emit_skip(reason):
     return 0
 
 
-def _family_inputs(node):
-    """node.INPUT_TYPES() without the optional "log_level" input that qf_log_level adds to EVERY QuantFunc
-    loader (checked once in section 1; its behaviour is in log_level_input_test.py), so the per-family
-    surface checks read only the family's own inputs."""
-    spec = node.INPUT_TYPES()
-    return {**spec, "optional": {k: v for k, v in spec.get("optional", {}).items() if k != "log_level"}}
-
-
 def _load_plugin():
     """Import the plugin package the way ComfyUI does (by file path), with a real comfy on sys.path."""
     comfy_root = os.environ.get("COMFY_ROOT")
@@ -209,10 +201,17 @@ def main():
     LtxL = qfn.NODE_CLASS_MAPPINGS["QuantFuncLTXLoader"]()
     H3L = qfn.NODE_CLASS_MAPPINGS["QuantFuncH3Loader"]()
 
-    # Every QuantFunc loader carries the optional "log_level" input as its LAST optional key (qf_log_level,
-    # attached after every registration). The per-family surface checks below read _family_inputs(), without it.
-    check("log_level is the last optional input of the wan/ltx/h3 loaders",
-          all(list(n.INPUT_TYPES().get("optional", {}))[-1:] == ["log_level"] for n in (WanL, LtxL, H3L)))
+    # Every QuantFunc loader takes log_level as a HIDDEN input (qf_log_level, attached after every registration):
+    # users never see or choose it, and the per-family surface checks below see only the family's own inputs.
+    _ll_loaders = [n for n in qfn.NODE_CLASS_MAPPINGS if n.startswith("QuantFunc") and n.endswith("Loader")]
+    _ll_bad = []
+    for _n in _ll_loaders:
+        _s = qfn.NODE_CLASS_MAPPINGS[_n].INPUT_TYPES()
+        if ("log_level" in {**_s.get("required", {}), **_s.get("optional", {})}
+                or _s.get("hidden", {}).get("log_level") != ("STRING", {})):
+            _ll_bad.append(_n)
+    check("log_level is hidden (never a visible input) on every QuantFunc loader",
+          bool(_ll_loaders) and not _ll_bad, f"-> {len(_ll_loaders)} loaders, wrong: {_ll_bad}")
 
     # ── 1) UI surface (per-family pivot): wan = dual required transformers + DUAL MODEL outputs;
     #      single-expert nodes = one transformer; preset dropdowns are FAMILY-FILTERED ──
@@ -285,7 +284,7 @@ def main():
     # [token-prune switch, replaced the raw token_prune float 2026-09-12]; step_cache +
     # block_cache). Every optional is a session knob (no create key / no rebuild) — sparse is
     # deliberately NOT among them (removed 2026-08-29, only the caches came back).
-    _lit = _family_inputs(LtxL)
+    _lit = LtxL.INPUT_TYPES()
     check("ltx node surface = latent-duo required + session-dial optionals (no sparse)",
           list(_lit["required"].keys()) == ["transformer", "model_config"]
           and list(_lit.get("optional", {}).keys()) == ["attention_backend", "sol_tau", "quality_enhance",
@@ -293,7 +292,7 @@ def main():
           and "sparse" not in _lit.get("optional", {}),
           f"-> req={list(_lit['required'].keys())} opt={list(_lit.get('optional', {}).keys())}")
     # h3 node surface (same latent-duo + session dials shape as ltx; block-count removed 2026-09)
-    _h3it = _family_inputs(H3L)
+    _h3it = H3L.INPUT_TYPES()
     check("h3 node surface = latent-duo required + session-dial optionals",
           list(_h3it["required"].keys()) == ["transformer", "model_config"]
           and list(_h3it.get("optional", {}).keys()) == ["attention_backend", "sol_tau",

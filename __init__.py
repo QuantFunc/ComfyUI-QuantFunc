@@ -1134,8 +1134,9 @@ except Exception as _qf_ltx_afix_exc:  # noqa: BLE001
 
 
 # ── Engine log detail ─────────────────────────────────────────────────────────
-# One optional "log level" input on EVERY QuantFunc loader (family loaders and the cloud-TE loader alike;
-# default warning: warnings and errors only), handed to qf_engine before the loader runs and applied to the
+# One HIDDEN `log_level` input on EVERY QuantFunc loader (family loaders and the cloud-TE loader alike): never
+# shown, so users do not choose it; a prompt that carries it (the test harness's) still sets it. Default warning
+# (warnings and errors only). The value is handed to qf_engine before the loader runs and applied to the
 # engine library as soon as it is (or once it gets) loaded; asking never loads it. Process-wide. This runs LAST,
 # after every NODE_CLASS_MAPPINGS registration above, so no loader is missed (tests/log_level_input_test.py
 # checks that no registration comes after it). Fully guarded: it must never break plugin import.
