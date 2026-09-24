@@ -8,6 +8,9 @@ check. This test does, with the PRODUCTION predicate (qf_file_hints.name_matches
 calls), over the frozen list tests/published_names.json. Refresh that list after every publish:
     python3 tests/refresh_published_names.py            (--check: exit 1 when ModelScope drifted from the list)
 A new repo (UNCLASSIFIED) or a new file without a preset assignment turns this test RED until a person assigns it.
+A repo classified 'retiring: <why>' belongs to a family being removed from the release: each of its files is checked as
+native while its assigned preset is still in this tree, and as none (refused by every preset) once the preset is gone, so
+the test holds on both sides of the removal and never leaves a file unchecked.
 
 RED control (the accept check must be able to fail): the pre-#713 QI-2.1 hints refuse the published QI names.
 """
@@ -42,11 +45,16 @@ def main():
     n_native = 0
     for repo, r in sorted(listing["repos"].items()):
         loader = r.get("loader", "")
-        check(f"{repo}: classified (native | none: <why>)", loader == "native" or loader.startswith("none:"), f"-> {loader!r}")
+        check(f"{repo}: classified (native | none: <why> | retiring: <why>)",
+              loader == "native" or loader.startswith(("none:", "retiring:")), f"-> {loader!r}")
         for path, a in sorted(r.get("files", {}).items()):
             name = os.path.basename(path)
             accepted_by = [f"{p}:{arm}" for p, arm, pats in slots if name_matches_hints(name, pats)]
-            if loader != "native":
+            mode = loader
+            if loader.startswith("retiring:"):   # the TREE decides: preset still here -> native, removed -> none
+                mode = "native" if a.get("preset") in presets else "none: preset removed"
+                print(f"[RETIRING] {repo}/{name}: checked as {mode.split(':')[0]}")
+            if mode != "native":
                 check(f"{repo}/{name}: refused by every native preset", not accepted_by, f"-> accepted by {accepted_by}")
                 continue
             n_native += 1
