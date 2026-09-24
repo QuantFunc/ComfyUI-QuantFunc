@@ -5,6 +5,7 @@ verbatim from the PROVEN tests/scripts/native_session_t1.py). No tests/lib depen
 import ctypes
 from contextvars import ContextVar
 import json
+import mmap
 import os
 import time
 import platform
@@ -778,7 +779,9 @@ def set_log_level(level):
 # ── Engine library install (option C, user 2026-09-24 「在原生加载器里实现」) ─────────────────────────────────────────
 # The plugin installs the engine it needs into bin/linux/: ONE pair — the host library for torch's CUDA major (the FORK-2
 # guard refuses any other) and the kernel library of this GPU's class — SHA-256-verified against the release's published
-# verify.json. Layout; every pair is self-contained (the host finds its kernel in its own folder through $ORIGIN):
+# verify.json, and one build (the same .qf_pair_id in both). The release publishes one host per CUDA major
+# ({ver}/linux/<host>) and one kernel per class and major ({ver}/linux/<set>/<kernel>), keyed by those paths in
+# verify.json. Installed layout; every pair is self-contained (the host finds its kernel in its folder through $ORIGIN):
 #   bin/linux/<version>-<set>-cu<major>/{host, kernel}   one pair per (release, GPU class, CUDA major)
 #   bin/linux/.engine-<set>-cu<major>.json              its marker: names the loadable pair, records both SHA-256s
 # The marker is written LAST (an atomic rename), so a pair becomes loadable only once both files are verified and in
@@ -793,6 +796,7 @@ _ENGINE_KERNEL_RE = re.compile(r"libquantfunc_kernels[-A-Za-z0-9_.]*\.so")   # t
 _ENGINE_VERSION_RE = re.compile(r"\d+\.\d+\.\d+")    # a release version: a URL path segment and part of a folder name
 _ENGINE_SET_RE = re.compile(r"[a-z][a-z0-9_]{0,31}")  # a GPU class from sets.json: a URL path segment, part of a name
 _ENGINE_SHA256_RE = re.compile(r"[0-9a-f]{64}")
+_ENGINE_PAIR_ID_RE = re.compile(r"[0-9a-f]{32}")      # .qf_pair_id: one id per release and CUDA major, in every file
 _ENGINE_MARKER_RE = re.compile(r"\.engine-([a-z][a-z0-9_]{0,31})-cu(\d+)\.json")
 _ENGINE_PAIR_RE = re.compile(r"(\d+\.\d+\.\d+)-([a-z][a-z0-9_]{0,31})-cu(\d+)")
 _ENGINE_ARCHES = ("x86_64",)                          # platform.machine() of the published Linux engines
@@ -1007,6 +1011,12 @@ def _pair_intact(m):
         return False
 
 
+def _manifest_key(gpu_set, name):
+    """A file's key in verify.json, which is also its path under {ver}/linux/: a host is one per CUDA major, a kernel
+    one per class."""
+    return name if name in _ENGINE_HOSTS.values() else f"{gpu_set}/{name}"
+
+
 def _engine_sets(version, hashes):
     """A release's GPU classes {set: [sm, ...]}, from its sets.json — the ONLY source: the engine build prints it from
     the arch lists it builds with, and this plugin keeps no SM list of its own. Hash-checked against verify.json."""
@@ -1044,6 +1054,7 @@ def install_engine(device_idx=None):
     hashes its marker recorded; when it does not, that is a KNOWN mismatch — its marker goes first, so it is never loaded
     again. Otherwise, into the pair's own folder:
       - download the host, verify it; read its kernel's name from its DT_NEEDED; download the kernel, verify it;
+      - check both carry the same .qf_pair_id (one build), else install nothing;
       - rename the KERNEL into place first, then the host;
       - write the marker LAST: only now is the pair loadable. Older pairs of the same class and CUDA major go, except
         the one just replaced (a process may be between reading its marker and loading it).
@@ -1101,7 +1112,7 @@ def _install_pair(bin_dir, device_idx):
     have = _read_marker(marker)
     known_bad = None
     if have and have["version"] == version:
-        if all(hashes.get(f"{gpu_set}/{n}") == h for n, h in have["sha256"].items()):
+        if all(hashes.get(_manifest_key(gpu_set, n)) == h for n, h in have["sha256"].items()):
             _engine_status("installed", f"engine {version} ({gpu_set}, CUDA {major})")
             return have
         os.remove(marker)    # KNOWN mismatch: the release no longer publishes these bytes — never loaded again
@@ -1117,15 +1128,18 @@ def _install_pair(bin_dir, device_idx):
                     raise RuntimeError(f"the {version} host library names {len(needed)} QuantFunc kernel libraries "
                                        f"(expected exactly one): {needed}")
                 name = needed[0]
-            key = f"{gpu_set}/{name}"
+            key = _manifest_key(gpu_set, name)
             if not _ENGINE_SHA256_RE.fullmatch(str(hashes.get(key, ""))):
                 raise RuntimeError(f"the {version} manifest has no SHA-256 for {key}")
             parts.append(os.path.join(pair, f".{name}.part"))
-            got[name] = _engine_fetch_to(f"{_ENGINE_BASE_URL}/{version}/linux/{gpu_set}/{name}", parts[-1],
-                                         f"engine {version}: {name}")
+            got[name] = _engine_fetch_to(f"{_ENGINE_BASE_URL}/{version}/linux/{key}", parts[-1], f"engine {version}: {name}")
             if got[name] != hashes[key]:
                 raise RuntimeError(f"{key} does not match its published SHA-256 (download corrupt or tampered)")
         kernel = next(n for n in got if n != host)
+        ids = [_elf_pair_id(p) for p in parts]      # [host, kernel]
+        if ids[0] is None or ids[0] != ids[1]:
+            raise RuntimeError(f"the {version} host and kernel libraries are not one build (pair ids {ids[0]} / {ids[1]}); "
+                               f"nothing was installed")
         for n in (kernel, host):                    # the KERNEL first: a host is never in place without its kernel
             os.replace(os.path.join(pair, f".{n}.part"), os.path.join(pair, n))
     except Exception as e:
@@ -1270,57 +1284,82 @@ def resolve_so_path():
         f"{_LIB_BASENAME} in bin/{_BIN_SUBDIR}/ and create bin/{_BIN_SUBDIR}/{_ENGINE_LOCAL_BUILD_LOCK}.")
 
 
+def _elf_sections(data):
+    """[(name, type, offset, size, link)] of an ELF image's section headers (data: bytes or a memory map). Raises on a
+    malformed image; the callers turn any failure into "undeterminable"."""
+    if data[:4] != b"\x7fELF":
+        return []
+    is64 = data[4] == 2
+    end = "<" if data[5] == 1 else ">"               # 1 = little-endian
+    if is64:
+        shoff = struct.unpack_from(end + "Q", data, 0x28)[0]
+        shentsize, shnum, shstrndx = struct.unpack_from(end + "HHH", data, 0x3a)
+    else:
+        shoff = struct.unpack_from(end + "I", data, 0x20)[0]
+        shentsize, shnum, shstrndx = struct.unpack_from(end + "HHH", data, 0x2e)
+    raw = []                                         # (name offset, type, offset, size, link) per section header
+    for i in range(shnum):
+        b = shoff + i * shentsize
+        if is64:
+            raw.append(struct.unpack_from(end + "II", data, b) + struct.unpack_from(end + "QQ", data, b + 0x18)
+                       + struct.unpack_from(end + "I", data, b + 0x28))
+        else:
+            raw.append(struct.unpack_from(end + "II", data, b) + struct.unpack_from(end + "III", data, b + 0x10))
+    names = raw[shstrndx][2] if shstrndx < len(raw) else None    # the section-name string table's offset
+
+    return [("" if names is None else _cstr(data, names + n), t, o, s, l) for (n, t, o, s, l) in raw]
+
+
+def _cstr(data, off):
+    """The NUL-terminated string at `off` (data: bytes or a memory map — a map has find, not index)."""
+    z = data.find(b"\x00", off)
+    if z < 0:
+        raise ValueError("unterminated ELF string")
+    return data[off:z].decode("latin-1")
+
+
+def _elf_map(path, read):
+    """read(mapped image) on a read-only memory map of `path` (only the pages it touches are read); None on any failure."""
+    try:
+        with open(path, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as data:
+            return read(data)
+    except Exception:  # noqa: BLE001 — any unreadable / malformed ELF → "undeterminable", the caller fails closed
+        return None
+
+
 def _elf_needed(path):
     """The DT_NEEDED shared-library names of an ELF file, via a pure-stdlib parse of its .dynamic/.dynstr
     sections. Returns [] on ANY parse failure. Pure-stdlib on purpose: FORK-2's toolchain guard must not
     depend on readelf/ldd being installed on the consumer's box."""
-    try:
-        with open(path, "rb") as f:
-            data = f.read()
-        if data[:4] != b"\x7fELF":
-            return []
-        is64 = data[4] == 2
-        end = "<" if data[5] == 1 else ">"          # 1 = little-endian
-        if is64:
-            e_shoff = struct.unpack_from(end + "Q", data, 0x28)[0]
-            e_shentsize = struct.unpack_from(end + "H", data, 0x3a)[0]
-            e_shnum = struct.unpack_from(end + "H", data, 0x3c)[0]
-        else:
-            e_shoff = struct.unpack_from(end + "I", data, 0x20)[0]
-            e_shentsize = struct.unpack_from(end + "H", data, 0x2e)[0]
-            e_shnum = struct.unpack_from(end + "H", data, 0x30)[0]
-        secs = []                                    # (type, offset, size, link) per section header
-        for i in range(e_shnum):
-            b = e_shoff + i * e_shentsize
-            if is64:
-                secs.append((struct.unpack_from(end + "I", data, b + 4)[0],
-                             struct.unpack_from(end + "Q", data, b + 0x18)[0],
-                             struct.unpack_from(end + "Q", data, b + 0x20)[0],
-                             struct.unpack_from(end + "I", data, b + 0x28)[0]))
-            else:
-                secs.append((struct.unpack_from(end + "I", data, b + 4)[0],
-                             struct.unpack_from(end + "I", data, b + 0x10)[0],
-                             struct.unpack_from(end + "I", data, b + 0x14)[0],
-                             struct.unpack_from(end + "I", data, b + 0x18)[0]))
-        dyn = next(((o, s, l) for (t, o, s, l) in secs if t == _SHT_DYNAMIC), None)
-        if not dyn:
+    def read(data):
+        secs = _elf_sections(data)
+        dyn = next(((o, s, l) for (_, t, o, s, l) in secs if t == _SHT_DYNAMIC), None)
+        if not dyn or dyn[2] >= len(secs):
             return []
         dyn_off, dyn_sz, dyn_link = dyn
-        if dyn_link >= len(secs):
-            return []
-        dynstr_off = secs[dyn_link][1]               # .dynamic's linked string table = .dynstr
+        dynstr_off = secs[dyn_link][2]               # .dynamic's linked string table = .dynstr
+        is64 = data[4] == 2
+        end = "<" if data[5] == 1 else ">"
         needed = []
-        entsize = 16 if is64 else 8
-        for off in range(dyn_off, dyn_off + dyn_sz, entsize):
+        for off in range(dyn_off, dyn_off + dyn_sz, 16 if is64 else 8):
             tag, val = struct.unpack_from(end + ("qQ" if is64 else "iI"), data, off)
             if tag == _DT_NULL:
                 break
             if tag == _DT_NEEDED:
-                z = data.index(b"\x00", dynstr_off + val)
-                needed.append(data[dynstr_off + val:z].decode("latin-1"))
+                needed.append(_cstr(data, dynstr_off + val))
         return needed
-    except Exception:  # noqa: BLE001 — any malformed ELF → "undeterminable", the caller fails closed
-        return []
+    return _elf_map(path, read) or []
+
+
+def _elf_pair_id(path):
+    """The build's pair id — its `.qf_pair_id` section: 32 lowercase hex characters and a NUL, carried by every file of
+    one release's CUDA major (host, CLI, kernel) — or None when absent or malformed. Read from the file, never by
+    loading it."""
+    def read(data):
+        sec = next(((o, s) for (n, _, o, s, _) in _elf_sections(data) if n == ".qf_pair_id"), None)
+        pid = data[sec[0]:sec[0] + sec[1]].split(b"\x00")[0].decode("ascii") if sec else ""
+        return pid if _ENGINE_PAIR_ID_RE.fullmatch(pid) else None
+    return _elf_map(path, read)
 
 
 def _is_elf(path):

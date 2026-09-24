@@ -6,9 +6,10 @@ qf_engine is loaded standalone (no ComfyUI, no torch, no GPU, no network). The O
 torch's CUDA major, the driver's CUDA major, the GPU's SM, the CPU and the ELF DT_NEEDED reader are replaced, and the
 plugin's bin/ is a temp dir. The fake release has the layout the engine ships:
   version.json                    {"linux": {"<key>": {"comfy", "comfy-12", "lib", "lib-12", "kernel_so"}}}
-  <ver>/verify.json               {"schema", "linux": {"<set>/<file>": sha256, "sets.json": sha256}}
+  <ver>/verify.json               {"schema", "linux": {"<host>": sha256, "<set>/<kernel>": sha256, "sets.json": sha256}}
   <ver>/linux/sets.json           {"schema": 1, "sets": {"<set>": [sm, ...]}}   the ONLY source of the GPU classes
-  <ver>/linux/<set>/<file>        host + kernel per (GPU class, CUDA major)
+  <ver>/linux/<host>              one host per CUDA major (every file of a release's major carries one .qf_pair_id)
+  <ver>/linux/<set>/<kernel>      one kernel per (GPU class, CUDA major)
 Installed: bin/linux/<ver>-<set>-cu<major>/{host, kernel}, then (LAST) the marker bin/linux/.engine-<set>-cu<major>.json.
 """
 import contextlib
@@ -18,6 +19,7 @@ import io
 import json
 import os
 import shutil
+import struct
 import sys
 import tempfile
 import time
@@ -62,12 +64,13 @@ class Release:
         self.version = version
         body = {}
         for major in (13, 12):
+            h = f"HOST-{version}-cu{major}".encode()
+            self.files[f"{version}/linux/{HOSTS[major]}"] = h
+            body[HOSTS[major]] = sha(h)
             for gset in SETS:
-                h = f"HOST-{version}-{gset}-cu{major}".encode()
                 k = f"KERNEL-{version}-{gset}-cu{major}".encode()
-                self.files[f"{version}/linux/{gset}/{HOSTS[major]}"] = h
                 self.files[f"{version}/linux/{gset}/{KERNELS[major]}"] = k
-                body[f"{gset}/{HOSTS[major]}"], body[f"{gset}/{KERNELS[major]}"] = sha(h), sha(k)
+                body[f"{gset}/{KERNELS[major]}"] = sha(k)
         self.manifest = {"schema": 1, "linux": body}      # verify_manifest.py's shape: no version key (it is the path)
         if sets is not None:
             self.set_sets(json.dumps({"schema": 1, "sets": sets}).encode())
@@ -110,8 +113,40 @@ def fake_needed(path):
     return []
 
 
+def fake_pair_id(path):
+    """.qf_pair_id of a fake file: one id per (release, CUDA major), as the ship build stamps host and kernels."""
+    try:
+        parts = open(path, "rb").read().decode().split("-")   # HOST-<ver>-cu<major> / KERNEL-<ver>-<set>-cu<major>
+    except (OSError, UnicodeDecodeError):
+        return None
+    return sha(f"{parts[1]}-{parts[-1]}".encode())[:32] if parts[0] in ("HOST", "KERNEL") and len(parts) > 2 else None
+
+
+def mk_elf(sections):
+    """A minimal ELF64 little-endian image: header, the named sections, .shstrtab and the section headers — what a
+    section reader needs, nothing more."""
+    names = list(sections) + [".shstrtab"]
+    shstr = b"\0" + b"".join(n.encode() + b"\0" for n in names)
+    body, offs, name_at, at = b"", {}, {}, 1
+    for n in names:
+        name_at[n], at = at, at + len(n) + 1
+        offs[n] = 64 + len(body)
+        body += sections[n] if n in sections else shstr
+    head = bytearray(64)
+    head[0:7] = b"\x7fELF\x02\x01\x01"
+    struct.pack_into("<Q", head, 0x28, 64 + len(body))
+    struct.pack_into("<HHH", head, 0x3a, 64, len(names) + 1, len(names))
+    shdrs = bytes(64)                               # the null section
+    for n in names:
+        sh = bytearray(64)
+        struct.pack_into("<II", sh, 0, name_at[n], 3 if n == ".shstrtab" else 1)
+        struct.pack_into("<QQ", sh, 0x18, offs[n], len(sections[n]) if n in sections else len(shstr))
+        shdrs += bytes(sh)
+    return bytes(head) + body + shdrs
+
+
 _STUBBED = ("_engine_http_open", "_torch_cuda_major", "_driver_cuda_major", "_gpu_sm", "_engine_bin_dir", "_elf_needed",
-            "start_engine_install", "install_engine", "_ENGINE_DEVICE")
+            "_elf_pair_id", "start_engine_install", "install_engine", "_ENGINE_DEVICE")
 
 
 class Env:
@@ -131,6 +166,7 @@ class Env:
         qfe._gpu_sm = (lambda device_idx=0: sm[int(device_idx)]) if isinstance(sm, dict) else (lambda device_idx=0: sm)
         qfe._engine_bin_dir = lambda: self.dir
         qfe._elf_needed = fake_needed
+        qfe._elf_pair_id = fake_pair_id
         qfe.platform.machine = lambda: machine
         qfe._ENGINE_DEVICE = 0
         qfe._engine_status("idle")
@@ -184,7 +220,7 @@ def main():
                 finally:
                     qfe.os.replace = real_replace
                 pair = f"0.0.13-{gset}-cu{major}"
-                h, k = rel.files[f"0.0.13/linux/{gset}/{HOSTS[major]}"], rel.files[f"0.0.13/linux/{gset}/{KERNELS[major]}"]
+                h, k = rel.files[f"0.0.13/linux/{HOSTS[major]}"], rel.files[f"0.0.13/linux/{gset}/{KERNELS[major]}"]
                 want = {"version": "0.0.13", "set": gset, "cuda": major, "sms": SETS[gset], "host": HOSTS[major],
                         "kernel": KERNELS[major], "sha256": {HOSTS[major]: sha(h), KERNELS[major]: sha(k)}}
                 m = env.marker(gset, major)
@@ -269,7 +305,7 @@ def main():
     with Env(old) as env:
         qfe.install_engine()
         new = Release("0.0.14")
-        new.files[f"0.0.14/linux/consumer/{HOSTS[13]}"] = b"HOST-tampered-cu13"
+        new.files[f"0.0.14/linux/{HOSTS[13]}"] = b"HOST-tampered-cu13"
         qfe._engine_http_open = new.open
         try:
             qfe.install_engine()
@@ -277,7 +313,7 @@ def main():
         except RuntimeError as e:
             check("a corrupt download is refused; the installed pair and its marker are untouched",
                   "SHA-256" in str(e) and env.marker()["version"] == "0.0.13"
-                  and env.read("0.0.13-consumer-cu13", HOSTS[13]) == old.files[f"0.0.13/linux/consumer/{HOSTS[13]}"]
+                  and env.read("0.0.13-consumer-cu13", HOSTS[13]) == old.files[f"0.0.13/linux/{HOSTS[13]}"]
                   and not env.leftovers(), str(e)[:80])
         qfe._engine_http_open = Release("0.0.14").open
         qfe.install_engine()
@@ -454,15 +490,16 @@ def main():
         resolved = {}
         for dev in (0, 1):
             qfe._ENGINE_DEVICE = dev
-            resolved[dev] = open(qfe.resolve_so_path(), "rb").read()
+            folder = os.path.dirname(qfe.resolve_so_path())
+            resolved[dev] = (os.path.basename(folder), open(os.path.join(folder, KERNELS[13]), "rb").read())
         qfe._ENGINE_DEVICE = 0
         server_before = env.read("0.0.13-server-cu13", KERNELS[13])
         for v in ("0.0.14", "0.0.15"):
             qfe._engine_http_open = Release(v).open
             qfe.install_engine(0)
         check("two GPU classes in one folder: each device loads its own class; updating one leaves the other's pair",
-              resolved == {0: rel.files[f"0.0.13/linux/consumer/{HOSTS[13]}"],
-                           1: rel.files[f"0.0.13/linux/server/{HOSTS[13]}"]}
+              resolved == {0: ("0.0.13-consumer-cu13", rel.files[f"0.0.13/linux/consumer/{KERNELS[13]}"]),
+                           1: ("0.0.13-server-cu13", rel.files[f"0.0.13/linux/server/{KERNELS[13]}"])}
               and env.marker("server")["version"] == "0.0.13" and env.read("0.0.13-server-cu13", KERNELS[13]) == server_before
               and "0.0.13-server-cu13" in env.pairs(), env.pairs())
     # 14) V2: an update killed between its two renames (B's probe) — the marker still names the old pair, whose files are
@@ -495,8 +532,8 @@ def main():
     with Env(rel) as env:
         qfe.install_engine()
         repub = Release()
-        repub.files[f"0.0.13/linux/consumer/{HOSTS[13]}"] = b"HOST-0.0.13-consumer-republished-cu13"
-        repub.manifest["linux"][f"consumer/{HOSTS[13]}"] = sha(repub.files[f"0.0.13/linux/consumer/{HOSTS[13]}"])
+        repub.files[f"0.0.13/linux/{HOSTS[13]}"] = b"HOST-0.0.13-republished-cu13"
+        repub.manifest["linux"][HOSTS[13]] = sha(repub.files[f"0.0.13/linux/{HOSTS[13]}"])
         repub.publish()
 
         def flaky(url):
@@ -580,6 +617,51 @@ def main():
         check("without the lock, an unlocked library in bin/linux/ is ignored: the installed pair loads",
               qfe.resolve_so_path() == os.path.realpath(env.path("0.0.13-consumer-cu13", HOSTS[13]))
               and env.read(HOSTS[13]) == b"LOCAL-BUILD")
+    # 18) one build: host and kernel must carry the same .qf_pair_id before either is put in place — a kernel from another
+    #     build (its SHA-256 published, so only the id can tell) or a host with no id installs nothing
+    rel = Release()
+    other = b"KERNEL-0.0.12-consumer-cu13"             # hashes fine, but another release's id
+    rel.files[f"0.0.13/linux/consumer/{KERNELS[13]}"] = other
+    rel.manifest["linux"][f"consumer/{KERNELS[13]}"] = sha(other)
+    rel.publish()
+    with Env(rel) as env:
+        try:
+            qfe.install_engine()
+            msg = "installed!"
+        except RuntimeError as e:
+            msg = str(e)
+        check("a host and a kernel of different builds install nothing (no marker, nothing in place, no temp left)",
+              "not one build" in msg and env.marker() is None and env.read("0.0.13-consumer-cu13", HOSTS[13]) is None
+              and env.read("0.0.13-consumer-cu13", KERNELS[13]) is None and not env.leftovers(), msg[:80])
+    rel = Release()
+    with Env(rel) as env:
+        qfe._elf_pair_id = lambda p: None if os.path.basename(p) == f".{HOSTS[13]}.part" else fake_pair_id(p)
+        try:
+            qfe.install_engine()
+            msg = "installed!"
+        except RuntimeError as e:
+            msg = str(e)
+        check("a host without a pair id installs nothing", "not one build" in msg and env.marker() is None, msg[:80])
+    # the REAL reader: the section's bytes up to the NUL, on an ELF image; None for anything else
+    d = tempfile.mkdtemp(prefix="qf_pairid_")
+    pid = "0123456789abcdef0123456789abcdef"
+    cases = {"good": (mk_elf({".text": b"\x90" * 8, ".qf_pair_id": pid.encode() + b"\0"}), pid),
+             "absent": (mk_elf({".text": b"\x90" * 8}), None),
+             "uppercase": (mk_elf({".qf_pair_id": pid.upper().encode() + b"\0"}), None),
+             "short": (mk_elf({".qf_pair_id": pid[:31].encode() + b"\0"}), None),
+             "not ELF": (b"MZ" + bytes(200), None),
+             "empty": (b"", None)}
+    got = {}
+    try:
+        for label, (image, _) in cases.items():
+            p = os.path.join(d, label.replace(" ", "_"))
+            with open(p, "wb") as f:
+                f.write(image)
+            got[label] = qfe._elf_pair_id(p)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    check("the .qf_pair_id reader: the id of an ELF that carries one; None when absent, malformed, not ELF or empty",
+          got == {k: v for k, (_, v) in cases.items()}, got)
     print("ENGINE_INSTALL:", "PASS" if bad == 0 else f"FAIL ({bad} wrong)")
     return 1 if bad else 0
 
