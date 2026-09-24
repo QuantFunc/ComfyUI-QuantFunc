@@ -619,10 +619,11 @@ if _IMPORT_OK:
     # ONE wording for what the faster options do, on every family and every text (tooltips, README, workflow notes), from
     # the measurements vs best_quality: Qwen-Image-2.1 PSNR 23-27 dB (the note below), Krea-2 balance 20.7-22 dB / SSIM ~0.78
     # (a pose / composition shift), LTX-2.5 balance 15.8 dB (a different pose / motion); H3's 3-step turbo balance is
-    # byte-identical, where "can differ" still holds. So no "almost the same" / "nearly the same" / "closer" claim anywhere
-    # (enhance_switch_test arm 1b scans every text surface for them).
-    _QUALITY_DIFFERS = ("the picture stays the same, but details such as poses, faces or small objects can differ from "
-                        "best_quality")
+    # byte-identical, where "can differ" still holds. So no "almost the same" / "nearly the same" / "closer" claim anywhere,
+    # and not "the picture stays the same" either: pose or composition does change (enhance_switch_test arm 1b scans every
+    # text surface for all four).
+    _QUALITY_DIFFERS = ("the subject and scene stay the same, but details such as poses, faces or small objects can differ "
+                        "from best_quality")
     _QUALITY_TOOLTIP_FAST = ("Speed or quality. super_fast: usually the fastest. fast: usually faster than best_quality. balance "
                              f"(default): can be a little faster than best_quality. With these three {_QUALITY_DIFFERS}. "
                              "best_quality: the highest quality.")

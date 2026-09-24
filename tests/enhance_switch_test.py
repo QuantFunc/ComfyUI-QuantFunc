@@ -58,10 +58,10 @@ check(not hits, "arm1: no raw enhance knob reachable from the plugin path (%s)" 
 # ---- arm 1b: every user-visible text states the MEASURED quality behaviour ----------------------------------------------
 # (tests-07 re-CR rounds 4-5): vs best_quality the faster options change details on every family (QI-2.1 PSNR 23-27 dB,
 # Krea-2 balance 20.7-22 dB, LTX-2.5 balance 15.8 dB), so no text may claim "almost the same" / "nearly the same" /
-# "closer": not a tooltip or description (every string constant in the plugin's code, f-strings included), not the README,
+# "closer" / "the picture stays the same" (pose or composition does change): not a tooltip or description (every string constant in the plugin's code, f-strings included), not the README,
 # not a workflow note. And the QI-2.1 notes carry the measured wording plus the no-choice rule (a GPU without the fast mode
 # shows no choice and always runs best_quality).
-_CLAIM = ("almost the same", "nearly the same", "closer to best")
+_CLAIM = ("almost the same", "nearly the same", "closer to best", "picture stays the same")
 _claims = []
 for _root, _dirs, _files in os.walk(_PLUGIN):
     if "/tests" in _root or "/.git" in _root:
