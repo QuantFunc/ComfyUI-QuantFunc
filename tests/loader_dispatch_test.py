@@ -213,6 +213,16 @@ def main():
             self.unloaded = True
             return self.footprint_bytes
 
+        def vram_need_bytes(self, latent_shape):
+            # The quantfunc_vram_need_bytes ABI boundary, stubbed like the capacity ABI below: the engine's answer
+            # is the working set of ONE forward of that latent, so a shape-proportional stand-in (4 B per latent
+            # element) lets memory_required's real combination logic run. (memory_required asks the engine since
+            # c71c315; without this the file aborted at the D3 arm and never reached its later checks.)
+            n = 1
+            for d in latent_shape:
+                n *= int(d)
+            return 4 * n
+
         def destroy(self):
             self.pipeline = None
             self.current_session = None
