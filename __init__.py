@@ -1123,6 +1123,18 @@ if _IMPORT_OK:
     # register their display names beside their class mappings above.)
     NODE_DISPLAY_NAME_MAPPINGS.update({"QuantFuncNativeLoRA": "QuantFunc Native LoRA"})
 
+    # Engine library install / update (option C): on a daemon thread, so node registration never waits. A loader
+    # run before it finishes says plainly "still downloading" or why it failed (qf_engine.engine_install_status).
+    # Only a SERVING ComfyUI installs (its PromptServer exists while custom nodes load): importing the plugin in a
+    # test or a script never downloads an engine into the package.
+    try:
+        import sys as _qf_sys
+        _qf_srv = getattr(_qf_sys.modules.get("server"), "PromptServer", None)
+        if getattr(_qf_srv, "instance", None) is not None:
+            qfe.start_engine_install(_comfy_device_index())
+    except Exception as _qf_install_exc:  # noqa: BLE001 — installing must never break plugin import
+        logging.warning("[qf_native] engine install not started: %r", _qf_install_exc)
+
 
 # ── QuantFunc LTX-2.5 AV ancestral-sampler audio fix ─────────────────────────────
 # The engine's STATELESS flow-match forward requires a non-re-noised trajectory; comfy's

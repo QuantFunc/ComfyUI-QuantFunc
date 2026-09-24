@@ -776,6 +776,332 @@ def set_log_level(level):
         _LIB.quantfunc_set_log_level(_LOG_LEVEL)
 
 
+# ── Engine library install (option C, user 2026-09-24 「在原生加载器里实现」) ─────────────────────────────────────────
+# The plugin installs the engine it needs into bin/<platform>/: ONE host library per CUDA major (torch's — the FORK-2
+# guard refuses any other), ONE kernel library per GPU class, both SHA-256-verified against the release's published
+# verify.json. EVERY name this installer uses lives in this block; nothing it writes or fetches is named by the server.
+_ENGINE_BASE_URL = "https://www.modelscope.cn/models/QuantFunc/Plugin/resolve/master"   # HTTPS only (checked per fetch)
+_ENGINE_HOSTS = {13: "libquantfunc.so", 12: "libquantfunc-12.so"}   # Linux host library per CUDA major
+_ENGINE_KERNEL_RE = re.compile(r"libquantfunc_kernels[-A-Za-z0-9_.]*\.so")   # the host's DT_NEEDED names its kernel
+_ENGINE_SETS_FALLBACK = {"consumer": (75, 86, 89, 120), "server": (80, 90, 100, 103)}   # when sets.json is absent
+_ENGINE_VERSION_RE = re.compile(r"\d+\.\d+\.\d+")    # a release version as it may appear in a URL path segment
+_ENGINE_MARKER = ".engine-set.json"                   # {"version","set","cuda","host","kernel"} of the installed pair
+_ENGINE_REINSTALLED_SUFFIX = ".reinstalled"           # <kernel>.reinstalled = the version re-downloaded once already
+_ENGINE_VERIFY_SCHEMA_MAX = 1
+_ENGINE_HTTP_TIMEOUT_S = 120
+_ENGINE_PLUGIN_VERSION_FILE = "version.json"          # bin/<platform>/version.json: {"comfy": "<plugin version>"}
+
+_ENGINE_STATUS = {"state": "idle", "detail": ""}      # what the first loader run reports if no library is there yet
+_ENGINE_STATUS_LOCK = threading.Lock()
+_ENGINE_INSTALL_LOCK = threading.Lock()              # one install at a time (startup + a load-failure re-download)
+
+
+class EngineNotInstallable(RuntimeError):
+    """This machine cannot take a published engine (GPU class / CUDA / driver); the message says why."""
+
+
+def _engine_status(state, detail=""):
+    with _ENGINE_STATUS_LOCK:
+        _ENGINE_STATUS.update(state=state, detail=detail)
+
+
+def engine_install_status():
+    """(state, detail): idle | checking | downloading | installed | offline | unavailable | failed | override."""
+    with _ENGINE_STATUS_LOCK:
+        return _ENGINE_STATUS["state"], _ENGINE_STATUS["detail"]
+
+
+def _engine_bin_dir():
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "bin", _BIN_SUBDIR)
+
+
+def _torch_cuda_major():
+    """torch's CUDA major (13 for "13.0"), or None for a CPU-only / unreadable torch."""
+    try:
+        import torch
+        return int(str(torch.version.cuda).split(".")[0]) if torch.version.cuda else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _driver_cuda_major():
+    """The newest CUDA major the installed driver runs (cuDriverGetVersion 13010 -> 13), or None."""
+    try:
+        cuda = ctypes.CDLL("libcuda.so.1")
+        v = ctypes.c_int(0)
+        if cuda.cuDriverGetVersion(ctypes.byref(v)) != 0:
+            return None
+        return v.value // 1000
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _gpu_sm(device_idx=0):
+    try:
+        import torch
+        major, minor = torch.cuda.get_device_capability(int(device_idx))
+        return major * 10 + minor
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _engine_http_open(url):
+    """The ONE network entry. HTTPS only, before and after redirects; returns the open response."""
+    import urllib.request
+    if not url.startswith("https://"):
+        raise RuntimeError(f"refusing a non-HTTPS engine URL: {url}")
+    resp = urllib.request.urlopen(url, timeout=_ENGINE_HTTP_TIMEOUT_S)
+    if not resp.geturl().startswith("https://"):
+        resp.close()
+        raise RuntimeError(f"refusing a redirect to a non-HTTPS engine URL: {resp.geturl()}")
+    return resp
+
+
+def _engine_http_get(url):
+    """A small document (version.json / verify.json / sets.json), whole."""
+    with _engine_http_open(url) as resp:
+        return resp.read()
+
+
+def _engine_fetch_to(url, dest, label):
+    """Stream `url` into `dest` (fsync'd), reporting "x of y MB" progress; returns the SHA-256 of what was written."""
+    import hashlib
+    h, done = hashlib.sha256(), 0
+    with _engine_http_open(url) as resp, open(dest, "wb") as f:
+        total = int(resp.headers.get("Content-Length") or 0)
+        for chunk in iter(lambda: resp.read(1 << 20), b""):
+            f.write(chunk)
+            h.update(chunk)
+            done += len(chunk)
+            _engine_status("downloading", f"{label}: {done >> 20} of {total >> 20 if total else '?'} MB")
+        f.flush()
+        os.fsync(f.fileno())
+    return h.hexdigest()
+
+
+def _sha256_of(path):
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _version_key(v):
+    return tuple(int(x) for x in v.split("."))
+
+
+def engine_choice(device_idx=0):
+    """(cuda_major, sm): the host follows torch's CUDA major; the driver is only a CHECK. Raises
+    EngineNotInstallable with a one-line reason when this machine cannot take a published engine."""
+    torch_major, driver_major = _torch_cuda_major(), _driver_cuda_major()
+    major = torch_major if torch_major is not None else driver_major
+    if major not in _ENGINE_HOSTS:
+        raise EngineNotInstallable(
+            f"no QuantFunc engine is published for CUDA {major if major is not None else 'unknown'} "
+            f"(torch CUDA {torch_major}, driver CUDA {driver_major}); published: CUDA {sorted(_ENGINE_HOSTS)}")
+    if driver_major is not None and driver_major < major:
+        raise EngineNotInstallable(
+            f"your NVIDIA driver runs up to CUDA {driver_major}, but torch uses CUDA {major}: update the driver; "
+            f"no engine was installed")
+    sm = _gpu_sm(device_idx)
+    if sm is None:
+        raise EngineNotInstallable("no CUDA GPU is visible to torch; no engine was installed")
+    return major, sm
+
+
+def _engine_pick_version(versions, plugin_version, major):
+    """The newest published engine this plugin may use: its "comfy" (CUDA 13) / "comfy-12" (CUDA 12) requirement is
+    at most this plugin's version, and it ships the host/kernel split ("kernel_so": true)."""
+    need_key = "comfy" if major == 13 else "comfy-12"
+    best = None
+    for v, info in (versions or {}).items():
+        if not (isinstance(v, str) and _ENGINE_VERSION_RE.fullmatch(v) and isinstance(info, dict)):
+            continue
+        req = info.get(need_key)
+        if not (isinstance(req, str) and _ENGINE_VERSION_RE.fullmatch(req)) or not info.get("kernel_so"):
+            continue
+        if _version_key(req) <= _version_key(plugin_version) and (best is None or _version_key(v) > _version_key(best)):
+            best = v
+    return best
+
+
+def _engine_installed_marker(bin_dir):
+    try:
+        with open(os.path.join(bin_dir, _ENGINE_MARKER), encoding="utf-8") as f:
+            m = json.load(f)
+        return m if isinstance(m, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _engine_write_file(path, data):
+    """temp file in the SAME dir -> fsync -> atomic rename (a crash never leaves a half-written file)."""
+    tmp = f"{path}.part-{os.getpid()}"
+    with open(tmp, "wb") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def install_engine(device_idx=0):
+    """Fetch-verify-install the engine pair for THIS machine (idempotent; called on a background thread).
+
+    Remote-first: the release's version.json and verify.json are always read, so a newer compatible engine replaces
+    an older one. A pair already installed that matches the wanted (version, GPU class, CUDA) and hashes to the
+    manifest is kept. Otherwise:
+      - download the host, verify it;
+      - read the kernel's name from the host's DT_NEEDED, download it, verify it;
+      - rename the KERNEL into place first, then the host, then write the marker.
+    Nothing is replaced unless BOTH files verified (all-or-nothing). A failure keeps the old pair (never bricks)."""
+    if _BIN_SUBDIR != "linux":
+        # ponytail: Linux only — the host/kernel split ships for Linux; Windows ships one dll whose install layout is
+        # not published yet. Add it here when it is.
+        raise EngineNotInstallable(f"automatic engine install is Linux-only in this release; put the engine library in "
+                                   f"bin/{_BIN_SUBDIR}/")
+    bin_dir = _engine_bin_dir()
+    _engine_status("checking")
+    major, sm = engine_choice(device_idx)
+    try:
+        with open(os.path.join(bin_dir, _ENGINE_PLUGIN_VERSION_FILE), encoding="utf-8") as f:
+            plugin_version = str(json.load(f)["comfy"])
+    except (OSError, ValueError, KeyError) as e:
+        raise RuntimeError(f"cannot read this plugin's version from bin/{_BIN_SUBDIR}/{_ENGINE_PLUGIN_VERSION_FILE}: {e}")
+    if not _ENGINE_VERSION_RE.fullmatch(plugin_version):
+        raise RuntimeError(f"malformed plugin version {plugin_version!r}")
+    platform_key = "win32" if _IS_WINDOWS else "linux"
+    versions = json.loads(_engine_http_get(f"{_ENGINE_BASE_URL}/version.json")).get(platform_key)
+    version = _engine_pick_version(versions, plugin_version, major)
+    if version is None:
+        raise EngineNotInstallable(f"no published engine with the host/kernel split is compatible with this plugin "
+                                   f"({plugin_version}, CUDA {major})")
+    manifest = json.loads(_engine_http_get(f"{_ENGINE_BASE_URL}/{version}/verify.json"))
+    if not (isinstance(manifest, dict) and int(manifest.get("schema", 0)) <= _ENGINE_VERIFY_SCHEMA_MAX
+            and manifest.get("version") == version and isinstance(manifest.get(platform_key), dict)):
+        raise RuntimeError(f"the {version} verify.json is not a manifest this plugin understands")
+    hashes = manifest[platform_key]
+    sets = dict(_ENGINE_SETS_FALLBACK)
+    if "sets.json" in hashes:
+        raw = _engine_http_get(f"{_ENGINE_BASE_URL}/{version}/{platform_key}/sets.json")
+        import hashlib
+        if hashlib.sha256(raw).hexdigest() != hashes["sets.json"]:
+            raise RuntimeError(f"the {version} sets.json does not match its published SHA-256")
+        published = json.loads(raw).get("sets") or {}
+        sets = {k: tuple(int(x) for x in v) for k, v in published.items() if k in _ENGINE_SETS_FALLBACK}
+    gpu_set = next((k for k, sms in sets.items() if sm in sms), None)
+    if gpu_set is None:
+        raise EngineNotInstallable(f"no QuantFunc engine is published for this GPU (SM {sm}); published classes: "
+                                   f"{ {k: list(v) for k, v in sets.items()} }")
+    host = _ENGINE_HOSTS[major]
+    want = {"version": version, "set": gpu_set, "cuda": major, "host": host}
+    have = _engine_installed_marker(bin_dir)
+    if have and {k: have.get(k) for k in want} == want and have.get("kernel"):
+        paths = {host: os.path.join(bin_dir, host), have["kernel"]: os.path.join(bin_dir, have["kernel"])}
+        if all(os.path.isfile(p) and _sha256_of(p) == hashes.get(f"{gpu_set}/{n}") for n, p in paths.items()):
+            _engine_status("installed", f"engine {version} ({gpu_set}, CUDA {major})")
+            return want
+    os.makedirs(bin_dir, exist_ok=True)
+    staged = {}
+    try:
+        for name in (host, None):                   # the host first: its DT_NEEDED names the kernel
+            if name is None:
+                needed = [n for n in _elf_needed(staged[host]) if _ENGINE_KERNEL_RE.fullmatch(n)]
+                if len(needed) != 1:
+                    raise RuntimeError(f"the {version} host library names {len(needed)} QuantFunc kernel libraries "
+                                       f"(expected exactly one): {needed}")
+                name = needed[0]
+            key = f"{gpu_set}/{name}"
+            if key not in hashes:
+                raise RuntimeError(f"the {version} manifest has no entry for {key}")
+            tmp = os.path.join(bin_dir, f".{name}.part-{os.getpid()}")
+            staged[name] = tmp
+            got = _engine_fetch_to(f"{_ENGINE_BASE_URL}/{version}/{platform_key}/{gpu_set}/{name}", tmp,
+                                   f"engine {version}: {name}")
+            if got != hashes[key]:
+                raise RuntimeError(f"{key} does not match its published SHA-256 (download corrupt or tampered)")
+        kernel = [n for n in staged if n != host][0]
+        os.replace(staged.pop(kernel), os.path.join(bin_dir, kernel))   # the KERNEL first: a host is never
+        os.replace(staged.pop(host), os.path.join(bin_dir, host))       # installed without its kernel
+    finally:
+        for tmp in staged.values():
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+    want["kernel"] = kernel
+    _engine_write_file(os.path.join(bin_dir, _ENGINE_MARKER), json.dumps(want).encode())
+    _engine_status("installed", f"engine {version} ({gpu_set}, CUDA {major})")
+    print(f"[qf_native] installed QuantFunc engine {version} for {gpu_set} GPUs, CUDA {major}", flush=True)
+    return want
+
+
+def _engine_load_failed(so_path, err):
+    """A pair whose files exist but will not LOAD is re-downloaded at most ONCE per release (the bound from f53e39d's
+    classic updater: without it a driver/GPU mismatch re-downloads on every start). <kernel>.reinstalled records the
+    version; the marker is dropped and a background install starts now. A second failure of the same version only
+    reports the load error. Returns the message for the loader run."""
+    detail = str(err)[:400]
+    bin_dir = os.path.dirname(so_path)
+    m = _engine_installed_marker(bin_dir)
+    if (os.path.realpath(bin_dir) != os.path.realpath(_engine_bin_dir()) or not m or not m.get("kernel")
+            or not m.get("version")):
+        return f"the engine library failed to load: {detail}"
+    flag = os.path.join(bin_dir, m["kernel"] + _ENGINE_REINSTALLED_SUFFIX)
+    try:
+        with open(flag, encoding="utf-8") as f:
+            done = f.read().strip()
+    except OSError:
+        done = ""
+    if done == m["version"]:
+        return (f"the engine library {m['version']} failed to load again after one re-download: {detail}. It is not "
+                f"re-downloaded again for this release: check the NVIDIA driver and the GPU.")
+    _engine_write_file(flag, str(m["version"]).encode())
+    try:
+        os.remove(os.path.join(bin_dir, _ENGINE_MARKER))
+    except OSError:
+        pass
+    start_engine_install()
+    return (f"the engine library {m['version']} failed to load: {detail}. It is being re-downloaded once; queue the "
+            f"prompt again when the console says the engine is installed.")
+
+
+def _engine_load_ok(so_path):
+    """A successful load clears the reinstall-once flag of the installed kernel."""
+    m = _engine_installed_marker(os.path.dirname(so_path))
+    if m and m.get("kernel"):
+        try:
+            os.remove(os.path.join(os.path.dirname(so_path), m["kernel"] + _ENGINE_REINSTALLED_SUFFIX))
+        except OSError:
+            pass
+
+
+def start_engine_install(device_idx=0):
+    """Plugin import calls this: installs/updates the engine on a daemon thread, so node registration never waits.
+    Skipped when the dev override names a library. Never raises: the outcome lands in engine_install_status()."""
+    if os.environ.get(_ENV_SO_OVERRIDE, "").strip():
+        _engine_status("override", f"{_ENV_SO_OVERRIDE} is set")
+        return None
+
+    def _run():
+        try:
+            with _ENGINE_INSTALL_LOCK:
+                install_engine(device_idx)
+        except EngineNotInstallable as e:
+            _engine_status("unavailable", str(e))
+            print(f"[qf_native] QuantFunc engine not installed: {e}", flush=True)
+        except Exception as e:  # noqa: BLE001 — offline / manifest / hash: keep whatever is installed
+            installed = _engine_installed_marker(_engine_bin_dir())
+            _engine_status("offline" if installed else "failed", f"{type(e).__name__}: {e}")
+            print(f"[qf_native] QuantFunc engine update skipped ({type(e).__name__}: {e}); "
+                  f"{'keeping the installed engine' if installed else 'no engine is installed yet'}", flush=True)
+
+    t = threading.Thread(target=_run, name="qf-engine-install", daemon=True)
+    t.start()
+    return t
+
+
 def resolve_so_path():
     """Resolve the engine native library WITHOUT any workflow-serializable input.
 
@@ -795,15 +1121,22 @@ def resolve_so_path():
     override = os.environ.get(_ENV_SO_OVERRIDE, "").strip()
     if override:
         candidates.append(override)
+    host = _ENGINE_HOSTS.get(_torch_cuda_major()) if _BIN_SUBDIR == "linux" else None
+    if host and host != _LIB_BASENAME:
+        candidates.append(os.path.join(pkg, "bin", _BIN_SUBDIR, host))   # the installed host for torch's CUDA major
     candidates += [os.path.join(pkg, "bin", _BIN_SUBDIR, _LIB_BASENAME),
                    os.path.join(pkg, _LIB_BASENAME)]
     for c in candidates:
         if c and os.path.isfile(c):
             return os.path.realpath(c)
+    state, detail = engine_install_status()
+    if state in ("checking", "downloading"):
+        raise RuntimeError(f"qf_native: the QuantFunc engine library is still downloading ({detail}). Queue the prompt "
+                           f"again when the console says the engine is installed.")
     raise RuntimeError(
-        f"qf_native: no engine library found — bundle {_LIB_BASENAME} in the package "
-        f"bin/{_BIN_SUBDIR}/ , or set {_ENV_SO_OVERRIDE}=<abs path> on the (trusted) dev machine. "
-        f"tried={candidates}")
+        f"qf_native: no engine library found ({state}: {detail or 'no install attempted'}) — the plugin installs it "
+        f"automatically at ComfyUI start; or put {_LIB_BASENAME} in the package bin/{_BIN_SUBDIR}/, or set "
+        f"{_ENV_SO_OVERRIDE}=<abs path> on the (trusted) dev machine. tried={candidates}")
 
 
 def _elf_needed(path):
@@ -945,6 +1278,13 @@ def assert_toolchain_compatible(so_path):
             f"know it is safe: {_ENV_ALLOW_UNVERIFIED_TOOLCHAIN}=1.)")
 
 
+def _sidecar_preloads(entries, base):
+    """The libraries next to the engine host that load_lib preloads, in name order: real sonames only, never the
+    host itself, never a QuantFunc KERNEL library (the host's DT_NEEDED + $ORIGIN load it into the host's group)."""
+    return sorted(f for f in entries
+                  if _SONAME_RE.fullmatch(f) and f != base and not f.startswith("libquantfunc_kernels"))
+
+
 def load_lib():
     """Load + bind the engine library once. Path comes ONLY from resolve_so_path() (never a workflow
     input). Takes NO argument on purpose — a `so_path` parameter is the attack surface just removed.
@@ -991,18 +1331,14 @@ def load_lib():
         # 2026-09-12 showed THREE builds of libquantfunc_attention.so mapped into one ComfyUI
         # process (the real one + two backups), and the process aborted at exit with
         # "double free or corruption" from their colliding static destructors.
-        # A per-SM kernel .so (QF_SPLIT_KERNEL_SO two-.so build: libquantfunc_kernels_sm<NN>.so)
-        # is NOT preloaded as a sidecar. The engine .so DT_NEEDEDs it and finds it via its own
+        # A QuantFunc KERNEL library (libquantfunc_kernels*.so, every spelling the builds ship: the consumer/server
+        # sets, -12 for CUDA 12) is NOT preloaded as a sidecar. The engine .so DT_NEEDEDs it and finds it via its own
         # $ORIGIN rpath, so it loads as a member of the ENGINE's dlopen group — where the host<->kernel
         # symbols (engine's kernel launchers + the kernel's cachedConvPlanWorkspaceCap) resolve
         # bidirectionally in-group. Eagerly preloading it here (before the engine) would fail: its
         # host symbol is not yet available. Keeping it OUT of a preload also keeps the kernel's many
         # exported symbols out of the process-global scope (no clash with torch's own kernels).
-        pending = sorted(
-            f for f in entries
-            if _SONAME_RE.fullmatch(f) and f != base
-            and not f.startswith("libquantfunc_kernels_sm")
-        )
+        pending = _sidecar_preloads(entries, base)
         for _ in range(max(1, len(pending))):
             still = []
             for f in pending:
@@ -1014,7 +1350,13 @@ def load_lib():
             if not still:
                 break
             pending = still
-        _LIB = _bind(ctypes.CDLL(so_path, mode=ctypes.RTLD_GLOBAL))
+        try:
+            lib = ctypes.CDLL(so_path, mode=ctypes.RTLD_GLOBAL)
+        except OSError as e:
+            # an installed pair that will not load: re-download it once per release, never in a loop
+            raise RuntimeError(f"qf_native: {_engine_load_failed(so_path, e)}") from e
+        _engine_load_ok(so_path)
+        _LIB = _bind(lib)
         if _LOG_LEVEL is not None:   # a loader asked for a level before the library was loaded
             _LIB.quantfunc_set_log_level(_LOG_LEVEL)
         _log_lib_fingerprint(_LIB, so_path)
