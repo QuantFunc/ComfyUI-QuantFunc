@@ -28,9 +28,7 @@ math, parity+official-value death rules in test_minimax_h3_pack.cpp).
 import os
 import ctypes
 import time
-import weakref
 import json
-import logging
 import math
 
 import torch
@@ -44,7 +42,7 @@ import comfy.nested_tensor
 
 from . import qf_engine as qfe
 from . import qf_modelpatcher as qfmp
-from .qf_modelpatcher import (_qf_dtype, QFModelPatcher, _QFStub,
+from .qf_modelpatcher import (_qf_dtype, _QFStub,
                               _interrupt_poll_end_session_on_raise,
                               QFSessionModelMixin)
 
@@ -552,11 +550,7 @@ def matches(pipeline_class, transformer_class=""):
 
 def register(deps):
     """Return the minimax-h3 family BUILDER. `deps` gives the package-level helpers (engine cache,
-    liveness registry, lazy-engine class) without importing __init__."""
-    get_engine = deps["get_engine"]
-    bind_pipeline_model = deps["bind_pipeline_model"]
-
-
+    liveness registry) without importing __init__."""
     def build(transformer1_path, bundle_dir=None, lora_entries=()):
         """File-based loading for MiniMax-H3 — the shared staging pattern:
         stage the shipped config bundle (configs/minimax-h3-*/, official configs) + symlink
@@ -564,58 +558,14 @@ def register(deps):
         skipped — comfy's stock MiniMaxH3 nodes own conditioning/refs and comfy decodes;
         the engine reads the staged configs for session geometry only). No extra weight
         links: unlike ltx2 the H3 external session needs no engine-side connector/projection
-        weights (refs arrive as av_conds latents from comfy)."""
+        weights (refs arrive as av_conds latents from comfy). H3 svdq is PRE-quantized, so the create is
+        MINIMAL: the svdquant metadata carries the layout/precision, and anything on top competes and
+        mis-resolves (the LTX minimal note)."""
         model_dir = qfmp.stage_denoise_only_package(bundle_dir, transformer1_path)
-        create_extra = {"denoise_only": True}
-        return _build_from_package(model_dir, os.path.basename(transformer1_path),
-                                   lora_entries=lora_entries,
-                                   create_extra=create_extra)
-
-    def _build_from_package(model_dir, model_name, start_image=None,
-              connector_ckpt="(none)", lora_entries=(), create_extra=None):
-        if start_image is not None:
-            raise RuntimeError(
-                "qf_native H3: start_image is not an H3 input — the H3 seam takes its image/audio "
-                "references through the stock MiniMaxH3ImageToVideo / MiniMaxH3ReferenceToVideo "
-                "nodes (first_frame / last_frame / ref_image_*), which reach the engine as "
-                "av_conds. Disconnect start_image.")
-
-
-
-        def _build(lora_entries):
-            """Wrap the model's ONE pipeline (created without LoRA) in a patcher for THIS lora set, applied in place at run start."""
-            _lora_cfg = dict(create_extra or {})   # file-mode: {"denoise_only": True}
-            # NO "lora" in the create: the cache key is the weights only (user rule 2026-09-24), so every LoRA set of
-            # this model shares one pipeline; the lazy engine below applies THIS build's set in place (QFLazyEngine._apply_runtime_lora).
-            # H3 svdq is PRE-quantized: create is MINIMAL. The svdquant metadata carries the
-            # layout/precision; anything on top competes + mis-resolves (LTX minimal note).
-            # [leak fix 2026-08-29] the Wan discipline: the factory must NOT capture `model`
-            # strongly (model -> engine -> _factory -> model was a pure ref-CYCLE — comfy's
-            # "Potential memory leak ... full garbage collect / WARNING memory leak with
-            # QFH3Model" pair, measured on the user's box). Weakref list, resolved at call.
-            device, device_idx = qfmp.current_torch_device()
-            _factory, _register_model = qfmp.make_engine_factory(
-                lambda: get_engine(model_dir, create_cfg=(_lora_cfg or None),
-                                   device_idx=device_idx),
-                bind_pipeline_model)
-
-            # DEFERRED create (QFLazyEngine): a chained QuantFuncNativeLoRA rebuilds the PATCHER for its
-            # accumulated set; the pipeline is created only for the model the sampler touches, and every LoRA
-            # set of this model shares it (the set goes on in place at run start).
-            engine = qfmp.QFLazyEngine(_factory)
-            offload = comfy.model_management.unet_offload_device()
-
-            unet_config = {"image_model": "minimax_h3", "disable_unet_model_creation": True}
-            model_config = comfy.supported_models.MiniMaxH3(unet_config)
-            qfmp.ensure_model_config_attrs(model_config)
-
-            model = QFH3Model(model_config, engine, device=device)
-            _register_model(model)
-            patcher = QFModelPatcher(model, load_device=device, offload_device=offload)
-            qfe.info(f"[qf_native] loaded QuantFuncNativeLoader (MiniMax-H3 svdq AV) package={model_name} "
-                  f"capacity=native Prepared query (create deferred)", flush=True)
-            return qfmp.tag_lora_rebuild(patcher, lora_entries, _build)
-
-        return _build(list(lora_entries))
+        return qfmp.family_build(
+            deps, model_dir, {"denoise_only": True}, comfy.supported_models.MiniMaxH3,
+            {"image_model": "minimax_h3", "disable_unet_model_creation": True}, QFH3Model,
+            f"[qf_native] loaded QuantFuncNativeLoader (MiniMax-H3 svdq AV) package={os.path.basename(transformer1_path)} "
+            f"capacity=native Prepared query (create deferred)")(list(lora_entries))
 
     return build

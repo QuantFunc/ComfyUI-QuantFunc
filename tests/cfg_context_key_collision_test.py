@@ -37,7 +37,9 @@ _PLUGIN = os.path.dirname(_HERE)
 # the call site that uses it lives in each family module; the Krea-2 module's _apply_model carries the
 # cuid/ctx_key derivation this test extracts (the Wan module that used to host it left the release) — pin both.
 _SRC_PATH = os.path.join(_PLUGIN, "qf_modelpatcher.py")
-_CALLSITE_SRC_PATH = os.path.join(_PLUGIN, "qf_krea2_modelpatcher.py")
+# The call site: the shared image seam's step loop (qf_modelpatcher.QFImageSessionModel._apply_model), which the
+# Krea-2 and Qwen-Image-2.1 families run.
+_CALLSITE_SRC_PATH = os.path.join(_PLUGIN, "qf_modelpatcher.py")
 
 
 def _read_src():
@@ -324,8 +326,8 @@ def main():
     #          affine i/len keys for the UNCOND role too — exactly as A + B1 + B2 do for cond. That closes the
     #          a250211 NO-GO and its whole AFFINE family (K=a*i+b*len+c per role; non-affine is OUT OF SCOPE
     #          by the M5 reachability argument at the ★ SCOPE note below), not just the literal `else i` spelling.
-    # The CALL SITE lives in the Krea-2 family module (one module per family); the assigner class it
-    # uses is shared substrate. Read the family module for this arm.
+    # The CALL SITE is the shared image seam's step loop (qf_modelpatcher.py), which the Krea-2 and Qwen-Image-2.1
+    # families run; the assigner class it uses is shared substrate too. Read that module for this arm.
     callsite = _extract_callsite_key_derivation(
         open(_CALLSITE_SRC_PATH, encoding='utf-8').read())   # loud-fails if the derivation vanished
     try:
@@ -550,7 +552,7 @@ def main():
 
     # (8) WIRING (a cheap SYNTACTIC tripwire — NOT the content-hash coverage; arm (7) covers that by behaviour).
     # One module per model family: the assigner CLASS + its kNoCtxKey constant are shared substrate
-    # (`src`), while the CALL SITE that reads uuids / keys / resets lives in the Krea-2 family module.
+    # (`src`), while the CALL SITE that reads uuids / keys / resets lives in the shared image seam's step loop.
     # Each half is checked against the file that actually owns it — checking the wiring against the
     # shared file would silently pass on an EMPTY match once the seam moved out of it.
     callsite_src = open(_CALLSITE_SRC_PATH, encoding="utf-8").read()

@@ -338,8 +338,19 @@ def _t_shared_interrupt_helper(src):
             print(f"  [FAIL] {fam_file} has {raws[fam_file]} raw interrupt-poll call lines, expected 0 "
                   "(a family module must route through the shared helper)"); bad += 1
     helper_call = "_interrupt_poll_end_session_on_raise(self._qf)"
+    # The image families (Krea-2, Qwen-Image-2.1) step in the shared image seam, qf_modelpatcher.QFImageSessionModel:
+    # the seam's step loop must call the helper, and such a family's model must derive from it, with any _apply_model
+    # of its own delegating to super() (so no family can step without the poll).
+    image_seam = "class QFImageSessionModel(QFSessionModelMixin)"
+    shared_code = _code_lines(_shared_src_text())
+    if not any(image_seam in ln for ln in shared_code) or sum(helper_call in ln for ln in shared_code) < 1:
+        print("  [FAIL] the shared image seam (QFImageSessionModel) is missing or does not call the interrupt helper")
+        bad += 1
     for fam_file, fam_src in fam_srcs.items():
-        if sum(helper_call in ln for ln in _code_lines(fam_src)) < 1:
+        if "(qfmp.QFImageSessionModel," in fam_src:
+            if "def _apply_model" in fam_src and "super()._apply_model(" not in fam_src:
+                print(f"  [FAIL] {fam_file} overrides the image seam's _apply_model without delegating to it"); bad += 1
+        elif sum(helper_call in ln for ln in _code_lines(fam_src)) < 1:
             print(f"  [FAIL] {fam_file} does not call the shared interrupt helper"); bad += 1
     # FUNCTIONAL — the real helper body: interrupt → end + re-raise; no interrupt → no-op.
     helper = _bind_shared_helper(_make_comfy(interrupt_raises=True))

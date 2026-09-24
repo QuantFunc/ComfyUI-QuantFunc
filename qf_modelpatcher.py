@@ -577,6 +577,179 @@ class QFSessionModelMixin:
             raise RuntimeError(f"{fail_prefix} failed: {err}")
 
 
+class QFImageSessionModel(QFSessionModelMixin):
+    """The image families' seam (Krea-2, Qwen-Image-2.1), written once: comfy owns the text encoder, the VAE, the sampler
+    and CFG; the engine owns only the denoise, through the generic external session (quantfunc_denoise_begin, then one
+    quantfunc_denoise_step per cond group per sampler step). A family sets _TAG (its console / error tag), _VAE_S (latent
+    to pixel scale), _LATENT_CHANNELS, _NO_COND_HINT and _ENGINE_IGNORED_COND_KEYS — the comfy consumables it refuses
+    LOUD, never drops, audited per family by tests/reject_list_completeness.py — and may override _check_conds (more
+    run-start refusals) and _denoise_group (how one cond group's step is called)."""
+    _TAG = ""
+    _VAE_S = 8
+    _LATENT_CHANNELS = 16
+    _NO_COND_HINT = ""
+    _REFUSED_HINT = ""          # appended to a refused-conditioning message
+    _ENGINE_IGNORED_COND_KEYS = ()
+
+    def __init__(self, model_config, engine, device=None):
+        super().__init__(model_config, device=device)
+        self.diffusion_model = _QFStub()
+        self.diffusion_model.arm_concat_shape(self._LATENT_CHANNELS)   # in == latent channels → extra 0 → no concat
+        self._qf = engine
+        self._num_steps = 0
+        self._step_i = 0
+        self._ctx_key_assigner = _CtxKeyAssigner()
+        self._sess_denoise = 0
+        self._max_batch = 0
+        self._max_ctx_seq = 0
+        self._out = None
+
+    def _check_conds(self, kwargs):
+        """A family's own run-start refusals, after the ignored-keys check (default: none)."""
+
+    def extra_conds(self, **kwargs):
+        was_open, ok = self._qf.end_session_if_open()   # run-start clean slate (#2 lifecycle)
+        self._qf_needs_begin = True
+        if was_open:
+            qfe.info(f"[qf_native] {self._TAG}: closed a pre-existing session at run start "
+                     f"(prior run interrupted/uncleaned); end ok={ok}")
+        for _k in self._ENGINE_IGNORED_COND_KEYS:
+            if kwargs.get(_k) is not None:
+                raise RuntimeError(
+                    f"qf_native {self._TAG}: '{_k}' conditioning is wired, but the native session "
+                    f"cannot consume it — it would be silently ignored, so it is refused. "
+                    f"Remove the node feeding '{_k}'{self._REFUSED_HINT}.")
+        self._check_conds(kwargs)
+        out = super().extra_conds(**kwargs)
+        cross_attn = kwargs.get("cross_attn", None)
+        if cross_attn is not None:
+            self._max_ctx_seq = max(self._max_ctx_seq, int(cross_attn.shape[1]))
+        return out
+
+    def _begin(self, x_group, ctx_group):
+        lib = self._qf.lib                       # MATERIALIZE FIRST (deferred-wrapper no-op close)
+        self._qf.end_session_if_open()
+        bpx = qfe.DenoiseBeginParams()
+        ctypes.memset(ctypes.byref(bpx), 0, ctypes.sizeof(bpx))
+        bpx.struct_size = ctypes.sizeof(bpx)
+        bpx.width = int(x_group.shape[-1]) * self._VAE_S
+        bpx.height = int(x_group.shape[-2]) * self._VAE_S
+        bpx.num_steps = self._num_steps
+        _max_seq = max(self._max_ctx_seq, int(ctx_group.shape[1]))
+        bpx.max_context_dims = (ctypes.c_int * 3)(
+            int(ctx_group.shape[0]), _max_seq, int(ctx_group.shape[2]))
+        self._max_ctx_seq = 0
+        bpx.cond_dtype = _qf_dtype(ctx_group.dtype)
+        # IMAGE session: only the dials every family takes (the video residency_opts keys are engine-refused here).
+        bpx._opts = json.dumps(self.dial_opts()).encode()
+        bpx.options_json = bpx._opts
+        session = ctypes.c_void_p()
+        st = lib.quantfunc_denoise_begin(self._qf.pipeline, ctypes.byref(bpx), ctypes.byref(session))
+        self._begin_keep = bpx
+        if st != qfe.QUANTFUNC_OK:
+            raise RuntimeError(f"denoise_begin ({self._TAG}) failed: {qfe.last_err(lib)}")
+        self._qf.current_session = session
+        self._qf.unloaded = False
+        self._step_i = 0
+        self._sess_denoise = 0
+        self._max_batch = 0
+        self._ctx_key_assigner.reset()
+        qfe.info(f"[qf_native] {self._TAG.upper()} SESSION OPEN handle={session.value:#x} steps={self._num_steps} "
+                 f"latent={tuple(x_group.shape)} cond={tuple(ctx_group.shape)}")
+
+    def _apply_model(self, x, t, c_concat=None, c_crossattn=None, control=None,
+                     transformer_options={}, **kwargs):
+        sigma = t
+        ctx = c_crossattn
+        if ctx is None:
+            raise RuntimeError(f"qf_native {self._TAG}: no c_crossattn cond — {self._NO_COND_HINT}")
+        if control is not None:
+            raise RuntimeError(
+                f"qf_native {self._TAG}: a ControlNet is wired, but the native session consumes no "
+                "control input — it would be silently ignored, so it is refused.")
+        if c_concat is not None:
+            raise RuntimeError(
+                f"qf_native {self._TAG}: c_concat conditioning is not part of the {self._TAG} seam — remove "
+                "the node feeding it.")
+        # BF16-latent/BF16-cond families (the engine's activation dtype); comfy may hand FP32 and may keep the cond
+        # host-side (measured on cu12/3090, 2026-08-30: a CPU cond data_ptr reached the engine's cond copy as cudaMemcpy
+        # 'invalid argument'), so cast to the LATENT's device + bf16 in one .to() (a no-op when already there). The
+        # step ABI takes DEVICE pointers.
+        _dev = x.device
+        x_bf = x if x.dtype == torch.bfloat16 else x.to(torch.bfloat16)
+        if ctx.dtype != torch.bfloat16 or ctx.device != _dev:
+            ctx = ctx.to(device=_dev, dtype=torch.bfloat16)
+        sig_all = sigma.reshape(-1) if torch.is_tensor(sigma) else None
+        sched = transformer_options.get("sample_sigmas", None)
+        if sched is not None:
+            self._num_steps = max(1, int(sched.numel()) - 1)
+        elif self._num_steps <= 0:
+            self._num_steps = 1
+        xin = x_bf
+        B = int(xin.shape[0])
+        if getattr(self, "_qf_needs_begin", True) or self._qf.current_session is None:
+            self._begin(xin[0:1], ctx[0:1])
+            self._qf_needs_begin = False
+        if self._out is None or self._out.shape != xin.shape or self._out.dtype != xin.dtype \
+                or self._out.device != xin.device:
+            self._out = torch.empty_like(xin)
+        self._max_batch = max(self._max_batch, B)
+        # comfy carries the per-conditioning uuids as transformer_options["uuids"] (samplers.py:324/511). A wrong key
+        # silently yields ctx key 0 = the engine's step caches OFF: Krea-2 read "cond_uuids" until the Qwen-Image-2.1
+        # seam, cloned from it, logged cfg_context_key=0 (2026-09-22) — the reason this loop now exists once.
+        cuuids = transformer_options.get("uuids") if isinstance(transformer_options, dict) else None
+        step_index = self._sigma_step_index(sigma, sig_all, transformer_options)
+        for i in range(B):
+            _interrupt_poll_end_session_on_raise(self._qf)
+            xi = xin[i:i + 1].contiguous()
+            oi = self._out[i:i + 1]
+            # The engine session is IMAGE 4D. A latent format that rides a singleton T axis (Krea-2 on comfy's Wan21
+            # format, [B,C,T=1,H,W]) is squeezed for the ABI; both views share storage, so the velocity lands in _out.
+            if xi.dim() == 5 and xi.shape[2] == 1:
+                xi = xi.squeeze(2).contiguous()
+                oi = oi.squeeze(2)
+            ci = ctx[i:i + 1].contiguous()
+            cuid = cuuids[i] if (cuuids is not None and i < len(cuuids)) else None
+            ctx_key = self._ctx_key_assigner.key(cuid)
+            sig_i = float(sig_all[i].item()) if (sig_all is not None and sig_all.numel() >= B) else \
+                (float(sig_all[0].item()) if sig_all is not None else float(sigma))
+            p = qfe.DenoiseStepParams()
+            ctypes.memset(ctypes.byref(p), 0, ctypes.sizeof(p))
+            p.struct_size = ctypes.sizeof(p)
+            p.latent_in = xi.data_ptr()
+            p.velocity_out = oi.data_ptr()
+            p.velocity_out_capacity = oi.numel() * oi.element_size()
+            dims = list(xi.shape) + [0] * (5 - xi.dim())
+            p.dims = (ctypes.c_int * 5)(*dims)
+            p.dtype = _qf_dtype(xi.dtype)
+            p.sigma = sig_i
+            p.step_index = step_index
+            p.total_steps = self._num_steps
+            p.context = ci.data_ptr()
+            p.context_dims = (ctypes.c_int * 3)(*ci.shape)
+            p.context_dtype = _qf_dtype(ci.dtype)
+            p.cfg_context_key = ctx_key
+            self._denoise_group(p, i, xi, ci, kwargs, step_index, ctx_key)
+            self._qf.step_count += 1
+            self._sess_denoise += 1
+        self._step_i += 1
+        self._qf.sampler_step_count += 1
+        return self.model_sampling.calculate_denoised(sigma, self._out.float(), x)
+
+    def _denoise_group(self, p, i, xi, ci, kwargs, step_index, ctx_key):
+        """One cond group's step (default: the plain step; Qwen-Image-2.1 adds its reference latents)."""
+        self._call_denoise_step(p, f"{self._TAG} denoise_step[step={step_index},group={i},key={ctx_key}]")
+
+    def process_latent_out(self, latent):
+        # NORMAL end-of-sampling: close the session (no finalize — the image seam has no masked-blend); an INTERRUPT
+        # skips this and extra_conds closes it at the next run start.
+        if self._qf.current_session is not None:
+            self._qf.end_session_if_open()
+            qfe.info(f"[qf_native] {self._TAG.upper()} SESSION CLOSED after {self._step_i} sampler steps, "
+                     f"{self._sess_denoise} denoise_step calls")
+        return super().process_latent_out(latent)
+
+
 class QFLazyEngine:
     """A QFEngineHandle that materializes ON FIRST REAL USE.
 
@@ -908,6 +1081,32 @@ def tag_lora_rebuild(patcher, lora_entries, rebuild):
     setattr(m, QF_LORA_STACK_ATTR, list(lora_entries))
     setattr(m, QF_LORA_REBUILD_ATTR, rebuild)
     return patcher
+
+
+def family_build(deps, model_dir, create_extra, supported_model, unet_config, make_model, label):
+    """The ONE builder every family returns through (it was a closure copied into each family module). build(lora_entries)
+    makes a lazy engine for model_dir — the pipeline is created only when a sampler first needs it, and there is ONE per
+    model file whatever the LoRA set: the weights are the cache key, and QFLazyEngine applies this patcher's set in place
+    at run start — the family's comfy model around it, and its patcher, tagged so that QuantFuncNativeLoRA can rebuild the
+    patcher for another set. One device capture per build drives both the logical patcher and the engine identity; the
+    engine factory holds the model only weakly (make_engine_factory: a strong capture was a model -> engine -> factory ->
+    model cycle, comfy's "Potential memory leak" warning). make_model(model_config, engine, device) returns the family's
+    model (a model class fits)."""
+    get_engine, bind_pipeline_model = deps["get_engine"], deps["bind_pipeline_model"]
+
+    def build(lora_entries):
+        create_cfg = dict(create_extra or {}) or None
+        device, device_idx = current_torch_device()
+        factory, register_model = make_engine_factory(
+            lambda: get_engine(model_dir, create_cfg=create_cfg, device_idx=device_idx), bind_pipeline_model)
+        model_config = supported_model(dict(unet_config))
+        ensure_model_config_attrs(model_config)
+        model = make_model(model_config, QFLazyEngine(factory), device)
+        register_model(model)
+        patcher = QFModelPatcher(model, load_device=device, offload_device=comfy.model_management.unet_offload_device())
+        qfe.info(label)
+        return tag_lora_rebuild(patcher, lora_entries, build)
+    return build
 
 
 def lora_stack_of(patcher):
