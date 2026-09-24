@@ -128,7 +128,11 @@ class QFQwenImage21Model(QFSessionModelMixin, comfy.model_base.QwenImage21):
         # HERE because this _begin builds its own _o (as Krea-2's does) — otherwise the widget is silently dropped.
         # Always sent, boolean; the prune behind it is engine law. The engine prunes a one-cond-group session without
         # references only (text-to-image, img2img, mask inpainting); edit, CFG > 1 and batch > 1 run full.
-        _o["video_enhance"] = bool(getattr(self, "_video_enhance", False))
+        _q = getattr(self, "_quality", None)
+        if _q:
+            _o["quality"] = _q   # [quality] the loader's choice; the engine resolves it (never sent with video_enhance)
+        else:
+            _o["video_enhance"] = bool(getattr(self, "_video_enhance", False))
         bpx._opts = json.dumps(_o).encode()
         bpx.options_json = bpx._opts
         session = ctypes.c_void_p()
