@@ -73,11 +73,16 @@ def _model_config_choices(family=None):
         return [_NO_CFG_HINT]
 
 
+def _shipped_presets(family):
+    """The configs/ presets this plugin ships for a family (the listing without its no-preset hint)."""
+    return [c for c in _model_config_choices(family=family) if c != _NO_CFG_HINT]
+
+
 def _family_preset(family):
     """The ONE preset a family loader uses (user 2026-09-24 「model_config也不是设置啊 就一个选项没意义啊」): every family
     ships exactly one configs/ preset, so the loaders show no model_config choice. A family with more than one would need
     that choice again: the loader refuses instead of guessing — bring the dropdown back when a family ships a second one."""
-    presets = [c for c in _model_config_choices(family=family) if c != _NO_CFG_HINT]
+    presets = _shipped_presets(family)
     if len(presets) == 1:
         return presets[0]
     if not presets:
@@ -551,7 +556,7 @@ if _IMPORT_OK:
         if model_config is None:
             model_config = _family_preset(expect_family)
         else:
-            shipped = [c for c in _model_config_choices(family=expect_family) if c != _NO_CFG_HINT]
+            shipped = _shipped_presets(expect_family)
             if model_config not in shipped:
                 raise RuntimeError(
                     f"qf_native: this workflow was saved with model_config {model_config!r}, which is not a "
@@ -679,7 +684,7 @@ if _IMPORT_OK:
         Widget values are stored by POSITION, so every saved workflow keeps each value in its place, and a saved preset
         value is honoured by _run_family_load. Should a family ever ship a second preset, the dropdown shows again, so the
         user chooses and the loader never guesses."""
-        presets = [c for c in _model_config_choices(family=family) if c != _NO_CFG_HINT] or [_NO_CFG_HINT]
+        presets = _shipped_presets(family) or [_NO_CFG_HINT]
         opts = {"default": presets[0], "tooltip": "The model config that matches the chosen model file."}
         if len(presets) == 1:
             opts.update(hidden=True, socketless=True)
