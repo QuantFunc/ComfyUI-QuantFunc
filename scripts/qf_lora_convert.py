@@ -202,6 +202,13 @@ def krea2_engine_body(body):
 
 
 _TE_PREFIXES = ("lora_te_", "lora_te1_", "lora_te2_")
+_DIFFUSERS_TE = re.compile(r"text_encoder(_\d+)?\.")   # a diffusers pipeline save's text-encoder keys
+
+
+def is_text_encoder_key(key):
+    """A text-encoder LoRA key (kohya lora_te*, diffusers text_encoder[_N].*): dropped on purpose — the native loaders drive the
+    transformer only, and the engine refuses such keys (they reach no module), so keeping them would loop between the two."""
+    return key.startswith(_TE_PREFIXES) or bool(_DIFFUSERS_TE.match(key))
 
 
 def unsupported_kind(keys):
@@ -228,7 +235,7 @@ def kind_refusal(kind):
 def refusal(conv, meta, krea2):
     """Why a converted file would not be the source LoRA, else None: a key this tool cannot map (text-encoder keys are
     dropped on purpose), or per-module alpha / rank patterns that name modules the Krea-2 rename just renamed."""
-    lost = [k for k, nk in conv if nk is None and not k.startswith(_TE_PREFIXES)]
+    lost = [k for k, nk in conv if nk is None and not is_text_encoder_key(k)]
     if lost:
         return ("%d key(s) have a form this converter cannot map (first: %s) — refusing rather than writing a LoRA "
                 "without them" % (len(lost), lost[0]))
@@ -236,7 +243,7 @@ def refusal(conv, meta, krea2):
     if krea2 and lam:
         try:
             cfg = json.loads(lam)
-        except ValueError:
+        except (ValueError, TypeError):
             cfg = None
         if not isinstance(cfg, dict) or any(v for f, v in cfg.items() if f.endswith(("rank_pattern", "alpha_pattern"))):
             return ("its lora_adapter_metadata carries per-module rank / alpha patterns, which would name the module "
@@ -298,9 +305,9 @@ def convert_key(orig, src_fmt, model_inv=None):
     family. Vocab join is the model-less fallback."""
     if orig == "__metadata__":
         return None
+    if is_text_encoder_key(orig):
+        return None  # text-encoder LoRA — transformer-only loader
     if src_fmt == "kohya":
-        if orig.startswith(("lora_te_", "lora_te1_", "lora_te2_")):
-            return None  # text-encoder LoRA — transformer-only loader
         body, role = _split_role(orig)
         if body is None:
             return None
@@ -310,8 +317,6 @@ def convert_key(orig, src_fmt, model_inv=None):
                 break
         dotted = (model_inv or {}).get(body) or kohya_join(body)
     else:  # diffusers / peft
-        if orig.startswith(("lora_te_", "lora_te1_", "lora_te2_")):
-            return None
         body, role = _split_role(orig)
         if body is None:
             return None
@@ -500,6 +505,9 @@ def key_names_self_test():
                                                 {}, False) or "")),
         ("te dropped", refusal(convert_keys(["lora_te1_x.lora_down.weight", "lora_unet_blocks_0_attn_wq.lora_down.weight"],
                                             "kohya")[0], {}, False) is None),
+        ("te diffusers", [nk for _, nk in convert_keys(["text_encoder.text_model.encoder.layers.0.self_attn.q_proj.lora_A.weight",
+                                                        "text_encoder_2.x.lora_B.weight"] + ab, "diffusers")[0]] == [None, None] + ab
+                         and refusal(convert_keys(["text_encoder.x.lora_A.weight"] + ab, "diffusers")[0], {}, False) is None),
         ("krea2 patterns", renamed and "patterns" in (refusal(conv_raw, {"lora_adapter_metadata": pats}, renamed) or "")),
         ("krea2 plain meta", refusal(conv_raw, {"lora_adapter_metadata": json.dumps({"r": 8})}, renamed) is None),
     )
