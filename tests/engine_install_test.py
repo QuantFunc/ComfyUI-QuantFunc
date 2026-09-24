@@ -248,9 +248,16 @@ def main():
                   "update the driver" in str(e) and not rel.fetched, str(e)[:80])
     rel = Release()
     with Env(rel, torch_major=None, driver_major=12) as env:
-        qfe.install_engine()
-        check("torch CUDA unknown: the driver's major chooses the host", env.marker("consumer", 12) is not None
-              and env.marker("consumer", 13) is None)
+        try:
+            qfe.install_engine()
+            got = "installed"
+        except qfe.EngineNotInstallable as e:
+            got = str(e)
+        # self-CR round 6 (A): the resolver loads torch's major only, so a pair picked by the driver's major would never
+        # load — refuse up front, fetch nothing, install nothing
+        check("torch CUDA unknown: nothing is installed (no pair the resolver could load), with the reason",
+              "CUDA build of PyTorch" in got and not rel.fetched and env.marker("consumer", 12) is None
+              and env.marker("consumer", 13) is None, got[:80])
     rel = Release()
     with Env(rel, machine="aarch64") as env:
         out = io.StringIO()

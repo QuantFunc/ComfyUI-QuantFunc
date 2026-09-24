@@ -946,7 +946,10 @@ def engine_choice(device_idx=0):
     """(cuda_major, sm): the host follows torch's CUDA major; the driver is only a CHECK. Raises
     EngineNotInstallable with a one-line reason when this machine cannot take a published engine."""
     torch_major, driver_major = _torch_cuda_major(), _driver_cuda_major()
-    major = torch_major if torch_major is not None else driver_major
+    if torch_major is None:   # the resolver loads the pair for torch's CUDA major: nothing else would ever load
+        raise EngineNotInstallable("PyTorch reports no CUDA version (a CPU-only PyTorch?); the QuantFunc engine needs a "
+                                   "CUDA build of PyTorch; no engine was installed")
+    major = torch_major
     if major not in _ENGINE_HOSTS:
         raise EngineNotInstallable(
             f"no QuantFunc engine is published for CUDA {major if major is not None else 'unknown'} "
