@@ -518,65 +518,52 @@ class QFSessionModelMixin:
                            "invoke through ComfyUI's OUTER_SAMPLE hook or supply request geometry")
 
     def memory_required(self, input_shape, cond_shapes=None, **_kw):
-        """Official cold request floor, refined by hot native demand when available.
+        """ComfyUI's inference reserve for one forward of `input_shape`: ONLY native numbers (D3, tests-07 ruling
+        2026-09-24: "the plan side estimates; the upper layer doesn't invent numbers").
 
-        The ordinary Comfy BaseModel estimate is the only request-shaped cold
-        host estimate available before a native pipeline exists.  Keep it as a
-        floor exactly as quantfunc_vram_need_bytes documents; Prepared
-        persistent capacity is deliberately not used as transient demand.
-        Once a cached pipeline exists, combine its exact additional need with
-        the plugin-owned tensor copies, without creating during this query.
+        = comfy-side bytes (the plugin's own tensor copies) + (PRIMARY only) the ENGINE's working set for that shape:
+        quantfunc_vram_need_bytes(latent [B,C,(T,)H,W]) — the primary transformer's working set (MEASURED by an
+        earlier forward; else the same spatial shape at another batch scaled; else the model's config estimate) + the
+        plan margin − the allocator's cached pool it already holds. The engine is asked through the CACHED real
+        handle when one exists and is NEVER created here (comfy's eviction pass runs after this call).
 
-        comfy-side bytes + (PRIMARY only) the ENGINE's own "how much MORE do I need" for a forward of `input_shape`
-        — quantfunc_vram_need_bytes(latent [B,C,(T,)H,W]): the primary transformer's working set under that shape
-        (MEASURED by an earlier forward; else the same spatial shape at another batch scaled; else the config
-        estimate) + the plan margin − the allocator's cached pool it already holds. The engine is asked through the
-        CACHED real handle when one exists (a fresh lazy proxy answers 0 on its own while the cached engine already
-        holds the arena) and is NEVER created here — comfy's eviction pass runs after this call, so a create
-        here would run ahead of the room being made. Engine 0 = nothing to ask for (its cached pool already covers the
-        working set — counted in loaded_size — OR nothing measured yet on a first forward of a new shape) →
-        comfy-side only. This legacy estimate is not a complete cold-request
-        peak bound; prior measurements do not make a later request exact.
-        Missing ABI support and failed native queries propagate to the host.
+        NOT here, on purpose:
+          * ComfyUI's own BaseModel.memory_required — a TORCH activation estimate for a model this engine does not
+            run (38 GB for a Wan 80x80x21 latent): used as a floor it made comfy evict every other model at each
+            stage, the inter-stage thrash the D3 fix removed (c71c315 had re-added it as a cold floor).
+          * the engine WEIGHTS — the canonical resource adapters carry them as their own LoadedModel (model_size =
+            the Prepared capacity), so counting them here would charge them twice.
+        A COLD request (no pipeline yet) therefore reserves the comfy side only: no native pre-create working-set
+        estimate exists in the ABI (listed as an engine gap). The engine then runs its first forward inside the
+        admission ceiling (what comfy left free) and pages on demand; missing ABI support and failed native queries
+        still propagate to the host.
         Accepted by the user (2026-09-19 「comfyui 路径不合并 CFG 就好」): with a real need comfy runs cond/uncond
-        un-batched on a card that cannot hold 1.5× the B=2 working set — comfy's own rule, correct for us too (a B=2
-        forward the card cannot hold pages inside the engine); our own full-pipeline path keeps CFG batched."""
+        un-batched on a card that cannot hold 1.5x the B=2 working set; our own full-pipeline path keeps CFG batched."""
         comfy_side = self._qf_comfy_side_bytes(input_shape, cond_shapes)
-        try:
-            ordinary_request = int(super().memory_required(
-                input_shape, cond_shapes=cond_shapes or {}))
-        except AttributeError:
-            # Test/minimal subclasses without a Comfy BaseModel parent retain
-            # the explicit plugin-side request floor.
-            ordinary_request = 0
-        cold_floor = max(comfy_side, ordinary_request)
-        # Shadow/clone wrappers use the same physical dependency, but a sampler
-        # driving only a shadow still needs the engine's inference demand.
         eng = getattr(self, "_qf", None)
         need = 0
         if eng is not None:
-            # Lookup may bind an existing cached handle, but must never create
-            # ahead of host admission. Query errors must reach the host instead
-            # of authorizing execution with a fabricated zero demand.
+            # Lookup may bind an existing cached handle, but must never create ahead of host admission. Query errors
+            # must reach the host instead of authorizing execution with a fabricated zero demand.
             peek = getattr(eng, "ensure_if_cached", None)
             if callable(peek):
                 eng = peek()
             if eng is not None:
                 need = int(eng.vram_need_bytes(self._qf_engine_latent_dims(input_shape)))
-        total = int(max(cold_floor, comfy_side + need))
+        total = int(comfy_side + need)
         # One line per CHANGE of the answer (comfy asks per estimate + per cond-batch decision): the numbers comfy
         # will act on, so a ledger question is answerable from the log, not a guess.
-        sig = (tuple(int(d) for d in input_shape), cold_floor, comfy_side, need)
+        sig = (tuple(int(d) for d in input_shape), comfy_side, need, eng is None)
         if sig != getattr(self, "_qf_ledger_last", None):
             self._qf_ledger_last = sig
             try:
                 hold = f"{int(eng.resident_vram_bytes()) >> 20} MB" if eng is not None else "0 MB"
             except Exception as error:  # diagnostic only; never invent a measured zero
                 hold = f"unknown ({type(error).__name__}: {error})"
-            print("[qf_native] VRAM ledger: memory_required%s = %d MB "
-                  "(host cold floor %d MB, comfy-side %d MB, engine need %d MB%s); engine hold %s"
-                  % (list(sig[0]), total >> 20, cold_floor >> 20, comfy_side >> 20,
-                     need >> 20,
+            print("[qf_native] VRAM ledger: memory_required%s = %d MB (comfy-side %d MB, engine need %d MB%s); "
+                  "engine hold %s"
+                  % (list(sig[0]), total >> 20, comfy_side >> 20, need >> 20,
+                     " (cold: no pipeline yet, no native pre-create working-set estimate)" if eng is None else
                      "" if need else " (0: covered by what it holds, or nothing measured yet)",
                      hold), flush=True)
         return total
