@@ -642,19 +642,6 @@ if _IMPORT_OK:
             _quality_fast_cache[idx] = bool(ask is not None and ask(idx) == 1)
         return _quality_fast_cache[idx]
 
-    def _quality_fast_for_file(transformer, model_config, idx=None):
-        """super_fast / fast also depend on the model FILE (a checkpoint with no layer the fast mode speeds up, or one stored in
-        a form it cannot use): the engine answers for this file on this GPU (quantfunc_quality_fast_available_file). An engine
-        without that query keeps its GPU answer; any other answer than yes — including an error — runs balance."""
-        try:
-            key, surl = _read_auth()
-            ans = qfe.quality_fast_available_file(qfe.load_lib(), _load_model_config(model_config)[0],
-                                                  _resolve_transformer(transformer),
-                                                  _comfy_device_index() if idx is None else idx, surl, key)
-        except Exception:
-            return False
-        return ans is None or ans == 1
-
     def _loaded_device_index(patcher):
         """The CUDA index the family load captured (its load_device) — the ONE device capture of a load drives the quality
         decision too, never a second read of ComfyUI's device."""
@@ -685,12 +672,12 @@ if _IMPORT_OK:
                              "highest quality.")
     _QI21_QUALITY_TOOLTIP_FIXED = "On this GPU Qwen-Image-2.1 always uses the highest quality; this setting has no effect here."
 
-    def _qi21_resolve_quality(quality=None, quality_enhance=None, transformer=None, model_config=None, device_idx=None):
+    def _qi21_resolve_quality(quality=None, quality_enhance=None, device_idx=None):
         """QI-2.1's quality for this run on the load's device: _resolve_quality where the fast mode exists; elsewhere
         best_quality, whatever a saved workflow carries (the input is hidden there) — with one console line when that value
         was a fast option (a workflow saved on another GPU, or a multi-GPU box whose form device differs from the load's)."""
         if _quality_fast_tier(device_idx):
-            return _resolve_quality(quality, quality_enhance, transformer, model_config, device_idx)
+            return _resolve_quality(quality, quality_enhance, device_idx)
         if quality in ("super_fast", "fast"):
             print(f"[QuantFunc] '{quality}' is not available here; using best_quality.", flush=True)
         return "best_quality"
@@ -709,11 +696,12 @@ if _IMPORT_OK:
             return True
         return f"quality must be one of {', '.join(_QUALITY_FAST_OPTIONS)} (got {quality!r})"
 
-    def _resolve_quality(quality=None, quality_enhance=None, transformer=None, model_config=None, device_idx=None):
+    def _resolve_quality(quality=None, quality_enhance=None, device_idx=None):
         """The node's quality → the mode this run uses. An explicit quality wins; the retired switch (a boolean in quality's
         position, or by name when quality is absent) maps old ON → best_quality, OFF → balance; nothing given → the default. A
-        fast option that cannot run — on this GPU, or (given the loader's transformer + model_config) for this model file —
-        runs balance, with one console line, whatever the reason."""
+        fast option this GPU cannot run runs balance, with one console line. Whether the model FILE has a fast form is the
+        engine's to say AFTER the load (at no I/O; it warns once when it has none): the plugin never reads the file for it
+        before the load (that read cost up to 66 s cold)."""
         if isinstance(quality, bool):
             q = "best_quality" if quality else "balance"
         elif quality is not None:
@@ -724,9 +712,8 @@ if _IMPORT_OK:
             q = _QUALITY_DEFAULT
         if q not in _QUALITY_FAST_OPTIONS:
             raise ValueError(_validate_quality(q))
-        if q in ("super_fast", "fast") and not (_quality_fast_tier(device_idx) and
-                                                (transformer is None or _quality_fast_for_file(transformer, model_config, device_idx))):
-            print(f"[QuantFunc] '{q}' is not available here; using balance.", flush=True)   # this GPU / file, or an older engine
+        if q in ("super_fast", "fast") and not _quality_fast_tier(device_idx):
+            print(f"[QuantFunc] '{q}' is not available here; using balance.", flush=True)   # this GPU, or an older engine
             q = "balance"
         return q
 
@@ -841,7 +828,7 @@ if _IMPORT_OK:
             # conditioning (LTXVImgToVideoInplace).
             _p = _run_family_load("ltx2", transformer, model_config)
             _dev = _loaded_device_index(_p)
-            q = _resolve_quality(quality, quality_enhance, transformer, model_config, _dev)
+            q = _resolve_quality(quality, quality_enhance, _dev)
             _mm = getattr(_p, "model", None)
             if _mm is not None and hasattr(_mm, "set_attn_backend"):
                 _mm.set_attn_backend(_attn_backend_to_engine(attention_backend))
@@ -884,7 +871,7 @@ if _IMPORT_OK:
             # engine = no rebuild).
             _p = _run_family_load("krea2", transformer, model_config)
             _dev = _loaded_device_index(_p)
-            q = _resolve_quality(quality, quality_enhance, transformer, model_config, _dev)
+            q = _resolve_quality(quality, quality_enhance, _dev)
             _mm = getattr(_p, "model", None)
             if _mm is not None and hasattr(_mm, "set_attn_backend"):
                 _mm.set_attn_backend(_attn_backend_to_engine(attention_backend))
@@ -925,7 +912,7 @@ if _IMPORT_OK:
             # no rebuild), exactly like the Krea2 node.
             _p = _run_family_load("qwenimage21", transformer, model_config)
             _dev = _loaded_device_index(_p)
-            q = _qi21_resolve_quality(quality, quality_enhance, transformer, model_config, _dev)
+            q = _qi21_resolve_quality(quality, quality_enhance, _dev)
             _mm = getattr(_p, "model", None)
             if _mm is not None and hasattr(_mm, "set_attn_backend"):
                 _mm.set_attn_backend(_attn_backend_to_engine(attention_backend))
@@ -977,7 +964,7 @@ if _IMPORT_OK:
                  step_cache=0.0, block_cache=0.0, allow_partial_denoise=False, quality_enhance=None):  # H3: flash default (auto→sage is broken)
             _p = _run_family_load("minimax-h3", transformer, model_config)
             _dev = _loaded_device_index(_p)
-            q = _resolve_quality(quality, quality_enhance, transformer, model_config, _dev)
+            q = _resolve_quality(quality, quality_enhance, _dev)
             _mm = getattr(_p, "model", None)
             if _mm is not None and hasattr(_mm, "set_attn_backend"):
                 _mm.set_attn_backend(_attn_backend_to_engine(attention_backend))

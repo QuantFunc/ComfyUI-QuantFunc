@@ -791,10 +791,9 @@ def main():
         qfn._quality_fast_cache.clear()
     check("h3 load(): retired key applies when quality is absent, default balance, explicit quality wins",
           _hqs == ["best_quality", "balance", "balance", "best_quality"], f"-> {_hqs}")
-    # (DECISION 2) a fast option that cannot run for THIS model file behaves like one that cannot run on this GPU: the loader asks
-    # the engine about the file (quantfunc_quality_fast_available_file) and runs balance with the ONE console line on any answer
-    # but yes — 0 (no layer it speeds up / a form it cannot use) and -1 (an error) alike; an engine without that query keeps its
-    # GPU answer.
+    # (tests-07 ruling) picking a fast option never reads the model FILE before the create: the pre-load file query
+    # (quantfunc_quality_fast_available_file) read the checkpoint's scales first — up to 66 s cold for LTX-2.5. The engine
+    # decides a file's fast form after the load. An engine that still exports the query must never be asked it.
     class _FakeFn:
         def __init__(self, ret, calls=None):
             self.ret, self.calls = ret, calls
@@ -813,18 +812,21 @@ def main():
     import io as _io
     _orig_load_lib4 = qfn.qfe.load_lib
     try:
-        _fq = []
-        for _file_ans in (1, 0, -1, None):
+        _fq, _asked = [], []
+        for _q in ("super_fast", "fast"):
             qfn._quality_fast_cache.clear()
-            qfn.qfe.load_lib = (lambda fa=_file_ans: _FakeFileQLib(1, fa))
+            _lib = _FakeFileQLib(1, 0)                  # a GPU with the fast mode; the file query would say "no"
+            _lib.quantfunc_quality_fast_available_file.calls = _asked
+            qfn.qfe.load_lib = (lambda lib=_lib: lib)
             _buf = _io.StringIO()
             with _ctl.redirect_stdout(_buf):
-                _fq.append((_hq(quality="super_fast"), _buf.getvalue().count("'super_fast' is not available here; using balance.")))
+                _fq.append((_hq(quality=_q), _buf.getvalue().count("is not available here")))
     finally:
         qfn.qfe.load_lib = _orig_load_lib4
         qfn._quality_fast_cache.clear()
-    check("h3 load(): a fast option the model FILE cannot run → balance + the one line (0 and -1 alike); yes / no file query → kept",
-          _fq == [("super_fast", 0), ("balance", 1), ("balance", 1), ("super_fast", 0)], f"-> {_fq}")
+    check("h3 load(): a fast option never asks the engine about the model FILE before the create (no read, kept as chosen)",
+          _fq == [("super_fast", 0), ("fast", 0)] and _asked == [] and not hasattr(qfn.qfe, "quality_fast_available_file")
+          and not hasattr(qfn, "_quality_fast_for_file"), f"-> {_fq} file queries={len(_asked)}")
     _hmd = out_h3.model._qf._ckey[0]
     check("h3 staged: config-complete + xfm linked + transformer_2 pruned",
           all(os.path.isfile(os.path.join(_hmd, q)) for q in

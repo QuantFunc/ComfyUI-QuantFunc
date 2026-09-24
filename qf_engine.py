@@ -1708,22 +1708,6 @@ def estimate_resident_bytes(lib, model_dir, device_idx=0, transformer_path=None,
     return int(out.value)
 
 
-def quality_fast_available_file(lib, model_dir, transformer_path=None, device_idx=0, server_url=None, api_key=None):
-    """[quality] Can super_fast / fast take effect for THIS checkpoint on this GPU (quantfunc_quality_fast_available_file:
-    the GPU's tier AND the file — a layer the fast mode speeds up, none stored in a form it cannot use)? 1 yes, 0 no, -1
-    error; None = the engine predates the query (the caller keeps the GPU-level answer)."""
-    fn = getattr(lib, "quantfunc_quality_fast_available_file", None)
-    if fn is None:
-        return None
-    fn.restype = ctypes.c_int
-    fn.argtypes = [ctypes.POINTER(ResidentEstimateParams)]
-    p = ResidentEstimateParams(model_dir=_enc(model_dir) if model_dir else None,
-                               transformer_weights=_enc(transformer_path) if transformer_path else None,
-                               server_url=_enc(server_url) if server_url else None,
-                               api_key=_enc(api_key) if api_key else None, device_idx=int(device_idx))
-    return int(fn(ctypes.byref(p)))
-
-
 class QFEngineHandle:
     """Owns the .so + created pipeline + the (single, per-pipeline) open denoise session.
     Tracks the session HERE (not only on the model shim) so a stale session from a failed run is
