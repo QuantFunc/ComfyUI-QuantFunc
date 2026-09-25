@@ -45,7 +45,7 @@ LIVE = "https://www.modelscope.cn/models/QuantFunc/Plugin/resolve/master/version
 # The QI-2.1 t2i template's API prompt, as ComfyUI's frontend builds it from example_workflows/QuantFunc-QwenImage21-t2i.json
 PROMPT = {
     "2": {"inputs": {"transformer": "qwen-image-2.1-quantfunc-int4-r128-i8sidecar.qfc.safetensors",
-                     "model_config": "qwen-image-2.1-int4", "attention_backend": "auto", "quality": "balance"},
+                     "model_config": "qwen-image-2.1-int4", "attention_backend": "auto", "quality_enhance": False},
           "class_type": "QuantFuncQwenImage21Loader"},
     "3": {"inputs": {"clip_name": "qwen3vl_8b_bf16.safetensors", "type": "qwen_image", "device": "default"},
           "class_type": "CLIPLoader"},

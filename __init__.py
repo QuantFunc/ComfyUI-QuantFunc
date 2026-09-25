@@ -668,58 +668,32 @@ if _IMPORT_OK:
                           "tooltip": "A second speed-up that reuses work inside each pass when little changes. 0 (default) = "
                                      "off. 0.05-0.12 is typical; higher is faster but can lose detail. Can be combined "
                                      "with step_cache. Takes effect on the next run."})
-    # [quality — user 2026-09-24] ONE speed/quality choice on the four QuantFunc loaders (H3, LTX-2.5, Krea2, Qwen-Image-2.1). It
-    # replaces the quality_enhance switch (the engine's video_enhance). The option names are the user's; what each one does is
-    # ENGINE law, one table per model family (the engine's QualityLaw) — the loader sends only the name as the session's
-    # `quality` and the engine resolves it per run from that run's own step count. A quality change never rebuilds or reloads
-    # (user 「更换quality的时候不应该重建pipeline」): the create config never depends on it, so all four options share one cached
-    # pipeline; the engine prepares its fast mode in place at the first fast step of a run and drops it at a run that uses none.
-    # The two fast options exist only where the ENGINE says they can run on this GPU (quantfunc_quality_fast_available) — the
-    # plugin keeps no GPU list; everywhere else a two-way choice.
-    # User-facing text states only the speed / quality trade (user 「介绍上不要透露技术细节」).
-    _QUALITY_FAST_OPTIONS = ["super_fast", "fast", "balance", "best_quality"]
-    _QUALITY_BASE_OPTIONS = ["balance", "best_quality"]
-    # every GPU; the fast options are opt-in (user 「默认balance」)
-    _QUALITY_DEFAULT = "balance"
-    # What each option does, ONE clause per tier, on every family and every text (tooltips, README, workflow notes), from
-    # the measurements vs best_quality: Qwen-Image-2.1 PSNR 23-27 dB (the note below), Krea-2 balance 20.7-22 dB / SSIM ~0.78
-    # (a pose / composition shift), LTX-2.5 balance 15.8 dB (a different pose / motion); H3's 3-step turbo balance is
-    # byte-identical, where "can differ" still holds. On the few-step models fast / super_fast can give another variation of
-    # the seed — the user accepted that on the condition that the tooltip SAYS so. So: balance keeps the subject and scene
-    # (details differ), fast / super_fast can give a different variation, best_quality is the highest quality; no "almost the
-    # same" / "nearly the same" / "closer" / "the picture stays the same" claim anywhere (enhance_switch_test arm 1b and
-    # loader_dispatch_test check every text surface).
-    _QUALITY_BALANCE_CLAUSE = ("the subject and scene stay the same, but details such as poses, faces or small objects can "
-                               "differ from best_quality")
-    _QUALITY_FAST_CLAUSE = "can give a different variation of the same seed"
+    # [quality_enhance — user 2026-09-25: the quality dropdown is withdrawn; ONE switch, OFF = faster (the default), ON = full
+    # quality, no fast path anywhere] on the four QuantFunc loaders (H3, LTX-2.5, Krea-2, Qwen-Image-2.1), the same on every GPU.
+    # Every session sends only the engine's switch `video_enhance`: what OFF does, per model family, is ENGINE law (user rule
+    # 2026-09-19: the plugin carries no number and names no technique; 「引擎里定」), and `quality` / a fast-step count is never
+    # sent. It is a session knob: the create config never depends on it, so toggling it never rebuilds or reloads the pipeline.
+    # The tooltip states the measured trade of OFF against full quality: the scene is kept, details can move.
+    _QUALITY_ENHANCE_INPUT = ("BOOLEAN", {"default": False,
+                              "tooltip": "OFF (default): faster; the subject and scene stay the same, but details such as poses, "
+                                         "faces or small objects can differ. ON: the highest quality, a little slower. Takes "
+                                         "effect on the next run."})
+    # Saved workflows: the published loaders had this same switch in this same widget slot, so their workflows open unchanged.
+    # A workflow saved with the unpublished quality dropdown (0.0.07 release candidate) carries `quality`: an API-format prompt by
+    # NAME, declared hidden so ComfyUI hands it to load() (an undeclared key is dropped silently) and mapped best_quality -> ON,
+    # any other value -> OFF. A UI workflow stores widget values by POSITION, so its dropdown string lands in this switch's slot,
+    # where ComfyUI's BOOLEAN conversion (bool(value)) turns it ON before any node code runs.
+    _QUALITY_LEGACY_HIDDEN = {"quality": ("STRING", {})}
 
-    def _quality_tooltip(options):
-        """The quality tooltip for exactly these options (the loader's list on this GPU), one clause per tier."""
-        fast = [o for o in ("super_fast", "fast") if o in options]
-        return " ".join(["Speed or quality."]
-                        + (["super_fast: usually the fastest."] if "super_fast" in fast else [])
-                        + (["fast: usually faster than best_quality."] if "fast" in fast else [])
-                        + ([f"{' and '.join(fast)} {_QUALITY_FAST_CLAUSE}."] if fast else [])
-                        + [f"balance (default): can be a little faster than best_quality; {_QUALITY_BALANCE_CLAUSE}.",
-                           "best_quality: the highest quality."])
-    # [user 2026-09-24 「LTX-2.5 不提供 super_fast」] On LTX-2.5 super_fast visibly smears fast-moving faces and hands.
-    # [user 2026-09-24 「H3 去掉 super_fast，降到 fast」, #736] On MiniMax-H3 super_fast put a one-frame block patch in a video
-    # (SM89); fast / balance / best_quality were clean. Krea-2 / QI-2.1 stay sharp. The ONE place a family drops options (the
-    # LTX-2.5 and MiniMax-H3 loaders pass their family key): its loader never offers them, and a saved workflow's value runs
-    # the substitute with one console line (never an error, so old workflows still open and run). Where the GPU has no fast
-    # mode the substitute runs balance, and the line still names the dropped option (_resolve_quality).
-    _QUALITY_DROPPED = {"ltx2": {"super_fast": "fast"}, "minimax-h3": {"super_fast": "fast"}}
-    # Saved workflows (migration): they carry the retired quality_enhance switch — API-format prompts under its NAME (declared
-    # hidden, in ComfyUI's (type, options) input form, so ComfyUI hands it to load() and can validate it when it is linked; an
-    # undeclared key would be dropped silently), UI workflows as a boolean in this widget's POSITION (widget values are stored by
-    # position). Old ON (full quality) → best_quality, old OFF (the speed default) → balance.
-    _QUALITY_LEGACY_HIDDEN = {"quality_enhance": ("BOOLEAN", {})}
+    def _quality_enhance_on(quality_enhance=None, quality=None):
+        """This run's switch. It wins when the prompt has it; else a legacy dropdown value (best_quality -> ON, anything else ->
+        OFF); else OFF (the default)."""
+        return bool(quality_enhance) if quality_enhance is not None else quality == "best_quality"
 
     def _model_config_input(family):
         """The loaders' model_config input: the FIRST optional input, right after the transformer (widget index 1, where the
         dropdown always was). Each family ships one preset, and a setting with one choice is not a setting (user 2026-09-24
-        「model_config也不是设置啊 就一个选项没意义啊」), so the widget is HIDDEN, the same way _qi21_quality_input hides QI-2.1's
-        quality: ComfyUI's input option `hidden` keeps the widget, invisible, in its slot, and `socketless` = no input dot.
+        「model_config也不是设置啊 就一个选项没意义啊」), so the widget is HIDDEN: ComfyUI's input option `hidden` keeps the widget, invisible, in its slot, and `socketless` = no input dot.
         Widget values are stored by POSITION, so every saved workflow keeps each value in its place, and a saved preset
         value is honoured by _run_family_load. Should a family ever ship a second preset, the dropdown shows again, so the
         user chooses and the loader never guesses."""
@@ -728,101 +702,6 @@ if _IMPORT_OK:
         if len(presets) == 1:
             opts.update(hidden=True, socketless=True)
         return presets, opts
-    _quality_fast_cache = {}
-
-    def _quality_fast_tier(idx=None):
-        """super_fast / fast can take effect on this GPU (default: the one ComfyUI computes on — a load passes the device IT
-        captured): the ENGINE's answer (quantfunc_quality_fast_available, its own arming rule; the plugin keeps no GPU list),
-        asked once per device. Only an answer is cached: while the engine cannot load yet (a fresh install still downloading,
-        say) this says no WITHOUT caching it, so the next ask — the next page load, the next run — asks the engine again."""
-        idx = _comfy_device_index() if idx is None else int(idx)
-        if idx not in _quality_fast_cache:
-            try:
-                lib = qfe.load_lib()
-            except Exception:
-                return False
-            ask = getattr(lib, "quantfunc_quality_fast_available", None)
-            _quality_fast_cache[idx] = bool(ask is not None and ask(idx) == 1)
-        return _quality_fast_cache[idx]
-
-    def _loaded_device_index(patcher):
-        """The CUDA index the family load captured (its load_device) — the ONE device capture of a load drives the quality
-        decision too, never a second read of ComfyUI's device."""
-        dev = getattr(patcher, "load_device", None)
-        return int(dev.index) if getattr(dev, "type", "") == "cuda" and dev.index is not None else 0
-
-    def _quality_input(family=None):
-        """The loader's quality input on this GPU: the engine's options minus what the family drops (_QUALITY_DROPPED), with
-        the tooltip for exactly that list."""
-        dropped = _QUALITY_DROPPED.get(family, {})
-        opts = [o for o in (_QUALITY_FAST_OPTIONS if _quality_fast_tier() else _QUALITY_BASE_OPTIONS) if o not in dropped]
-        return opts, {"default": _QUALITY_DEFAULT, "tooltip": _quality_tooltip(opts)}
-
-    # [quality — Qwen-Image-2.1, user 2026-09-24 「balance改为只快慢路径 fast 以及supper改为剪枝 0.9」「sm120不要展示这个选项就好」]
-    # QI-2.1 keeps the four names (what each does for this family is the engine's table), but where the engine offers only the
-    # two-way choice (no fast mode on this GPU) QI-2.1 shows NO quality choice and always runs best_quality. The input stays
-    # DECLARED there, hidden (ComfyUI's input option `hidden` keeps the widget, invisible, in its slot; `socketless` = no input
-    # dot), so the node's widget layout is the same on every GPU: widget values are stored by POSITION, and a workflow saved on
-    # one kind of GPU opens on the other with every value in its place (including any widget added after quality later).
-    # Whatever value a saved workflow carries there is ignored on such a GPU.
-    # Measured on SM89 (RTX 4090 D 24 GB, QI-2.1 int4, 1024², same seed; two timing runs x 25/40 steps, each mode's steady-state
-    # median against best_quality's in the same run, a 22 GB budget so the 27 GB pack streams): super_fast +13..+15 % and fast
-    # +7..+9 % in the quiet run; in the noisy run (best_quality itself varying up to 58 %) fast was once 11 % slower and super_fast
-    # once behind fast and balance — hence "usually". balance -3..+3 % there, +11..+20 % with the whole card (its gain depends on memory
-    # headroom). All three keep the scene but change details — a subject's pose or expression, which people stand where, small
-    # objects — about equally (PSNR 23-27 dB vs best_quality); it shows the tooltip every family shows for its options.
-    _QI21_QUALITY_TOOLTIP_FIXED = "On this GPU Qwen-Image-2.1 always uses the highest quality; this setting has no effect here."
-
-    def _qi21_resolve_quality(quality=None, quality_enhance=None, device_idx=None):
-        """QI-2.1's quality for this run on the load's device: _resolve_quality where the fast mode exists; elsewhere
-        best_quality, whatever a saved workflow carries (the input is hidden there) — with one console line when that value
-        was a fast option (a workflow saved on another GPU, or a multi-GPU box whose form device differs from the load's)."""
-        if _quality_fast_tier(device_idx):
-            return _resolve_quality(quality, quality_enhance, device_idx)
-        if quality in ("super_fast", "fast"):
-            qfe.say(f"[QuantFunc] '{quality}' is not available here; using best_quality.", flush=True)
-        return "best_quality"
-
-    def _qi21_quality_input():
-        if _quality_fast_tier():
-            return (list(_QUALITY_FAST_OPTIONS), {"default": _QUALITY_DEFAULT, "tooltip": _quality_tooltip(_QUALITY_FAST_OPTIONS)})
-        return (list(_QUALITY_FAST_OPTIONS), {"default": "best_quality", "hidden": True, "socketless": True,
-                                              "tooltip": _QI21_QUALITY_TOOLTIP_FIXED})
-
-    def _validate_quality(quality):
-        """The loaders' VALIDATE_INPUTS body (it replaces ComfyUI's own list check for `quality`): any of the four names on every
-        GPU (a workflow saved on a GPU with the fast options still opens), a boolean (the retired switch, positional), or None —
-        ComfyUI's value for a LINKED input (resolved at run time, where _resolve_quality refuses anything else)."""
-        if quality is None or isinstance(quality, bool) or quality in _QUALITY_FAST_OPTIONS:
-            return True
-        # ComfyUI logs it (execution.py): console-safe like every plugin line
-        return qfe.console_safe(f"quality must be one of {', '.join(_QUALITY_FAST_OPTIONS)} (got {quality!r})")
-
-    def _resolve_quality(quality=None, quality_enhance=None, device_idx=None, family=None):
-        """The node's quality → the mode this run uses. An explicit quality wins; the retired switch (a boolean in quality's
-        position, or by name when quality is absent) maps old ON → best_quality, OFF → balance; nothing given → the default. An
-        option the family does not offer (_QUALITY_DROPPED: a saved workflow) runs its substitute; a fast option this GPU cannot
-        run (or an older engine) runs balance — one console line either way. The model FILE is the engine's call: a loaded model
-        without the fast form runs such a call as balance and the engine warns once — the plugin reads no file before the load
-        (that read took 66 s for LTX-2.5 on a cold spinning disk)."""
-        if isinstance(quality, bool):
-            q = "best_quality" if quality else "balance"
-        elif quality is not None:
-            q = str(quality)
-        elif quality_enhance is not None:
-            q = "best_quality" if bool(quality_enhance) else "balance"
-        else:
-            q = _QUALITY_DEFAULT
-        if q not in _QUALITY_FAST_OPTIONS:
-            raise ValueError(_validate_quality(q))
-        note = None
-        if q in _QUALITY_DROPPED.get(family, {}):
-            note, q = f"'{q}' is not offered for this model", _QUALITY_DROPPED[family][q]
-        if q in ("super_fast", "fast") and not _quality_fast_tier(device_idx):
-            note, q = note or f"'{q}' is not available here", "balance"   # this GPU, or an older engine
-        if note:
-            qfe.say(f"[QuantFunc] {note}; using {q}.", flush=True)
-        return q
 
 
     # [audio_enhance switch, user 2026-09-13] H3-only. OFF (default) = byte-identical to no knob.
@@ -911,14 +790,10 @@ if _IMPORT_OK:
                 "model_config": _model_config_input("ltx2"),   # hidden; widget index 1 (see _model_config_input)
                 "attention_backend": _attn_backend_input(),
                 "sol_tau": _SOL_TAU_INPUT,
-                "quality": _quality_input("ltx2"),
+                "quality_enhance": _QUALITY_ENHANCE_INPUT,
                 "step_cache": _STEP_CACHE_INPUT,
                 "block_cache": _BLOCK_CACHE_INPUT,
             }, "hidden": dict(_QUALITY_LEGACY_HIDDEN)}
-
-        @classmethod
-        def VALIDATE_INPUTS(cls, quality=None):
-            return _validate_quality(quality)
 
         RETURN_TYPES = ("MODEL",)
         FUNCTION = "load"
@@ -928,19 +803,17 @@ if _IMPORT_OK:
                        "the latent input. " + _COMMON_LIMITS)
 
         def load(self, transformer, model_config=None,
-                 attention_backend="auto", sol_tau=1.0, quality=None, step_cache=0.0, block_cache=0.0, quality_enhance=None):
+                 attention_backend="auto", sol_tau=1.0, quality_enhance=None, step_cache=0.0, block_cache=0.0, quality=None):
             # NO aux file widgets and NO image socket (user 2026-08-22 "只保留
             # transformer/block/model_config … 只关注latent"): i2v is the workflow's own latent
             # conditioning (LTXVImgToVideoInplace).
             _p = _run_family_load("ltx2", transformer, model_config)
-            _dev = _loaded_device_index(_p)
-            q = _resolve_quality(quality, quality_enhance, _dev, "ltx2")
             _mm = getattr(_p, "model", None)
             if _mm is not None and hasattr(_mm, "set_attn_backend"):
                 _mm.set_attn_backend(_attn_backend_to_engine(attention_backend))
             if _mm is not None and hasattr(_mm, "set_sol_tau"):
                 _mm.set_sol_tau(sol_tau)
-            _mm.set_quality(q)   # mandatory + unguarded: a patcher without it is a wiring error
+            _mm.set_video_enhance(_quality_enhance_on(quality_enhance, quality))   # mandatory + unguarded: a patcher without it is a wiring error
             _arm_session_caches(_mm, step_cache, block_cache)
             return (_p,)
 
@@ -957,12 +830,8 @@ if _IMPORT_OK:
             }, "optional": {
                 "model_config": _model_config_input("krea2"),   # hidden; widget index 1 (see _model_config_input)
                 "attention_backend": _attn_backend_input(),
-                "quality": _quality_input(),
+                "quality_enhance": _QUALITY_ENHANCE_INPUT,
             }, "hidden": dict(_QUALITY_LEGACY_HIDDEN)}
-
-        @classmethod
-        def VALIDATE_INPUTS(cls, quality=None):
-            return _validate_quality(quality)
 
         RETURN_TYPES = ("MODEL",)
         FUNCTION = "load"
@@ -971,16 +840,14 @@ if _IMPORT_OK:
                        "place of the usual diffusion-model loader. " + _COMMON_LIMITS)
 
         def load(self, transformer, model_config=None, attention_backend="auto",
-                 quality=None, quality_enhance=None):
-            # [runtime dials] backend + quality are SESSION knobs (NOT create keys — a widget change never re-keys the
+                 quality_enhance=None, quality=None):
+            # [runtime dials] backend + quality_enhance are SESSION knobs (NOT create keys — a widget change never re-keys the
             # engine = no rebuild).
             _p = _run_family_load("krea2", transformer, model_config)
-            _dev = _loaded_device_index(_p)
-            q = _resolve_quality(quality, quality_enhance, _dev)
             _mm = getattr(_p, "model", None)
             if _mm is not None and hasattr(_mm, "set_attn_backend"):
                 _mm.set_attn_backend(_attn_backend_to_engine(attention_backend))
-            _mm.set_quality(q)   # mandatory + unguarded: a patcher without it is a wiring error
+            _mm.set_video_enhance(_quality_enhance_on(quality_enhance, quality))   # mandatory + unguarded: a patcher without it is a wiring error
             return (_p,)
 
     class QuantFuncQwenImage21Loader:
@@ -997,12 +864,8 @@ if _IMPORT_OK:
             }, "optional": {
                 "model_config": _model_config_input("qwenimage21"),   # hidden; widget index 1 (see _model_config_input)
                 "attention_backend": _attn_backend_input(),
-                "quality": _qi21_quality_input(),
+                "quality_enhance": _QUALITY_ENHANCE_INPUT,
             }, "hidden": dict(_QUALITY_LEGACY_HIDDEN)}
-
-        @classmethod
-        def VALIDATE_INPUTS(cls, quality=None):
-            return _validate_quality(quality)
 
         RETURN_TYPES = ("MODEL",)
         FUNCTION = "load"
@@ -1011,16 +874,14 @@ if _IMPORT_OK:
                        "editing with TextEncodeQwenImage21 reference images (plus its VAE). Transparent images: VAE Decode + "
                        "Save Image keep the transparency. " + _COMMON_LIMITS)
 
-        def load(self, transformer, model_config=None, attention_backend="auto", quality=None, quality_enhance=None):
-            # [runtime dials] backend + quality are SESSION knobs (NOT create keys — a widget change never re-keys the engine =
+        def load(self, transformer, model_config=None, attention_backend="auto", quality_enhance=None, quality=None):
+            # [runtime dials] backend + quality_enhance are SESSION knobs (NOT create keys — a widget change never re-keys the engine =
             # no rebuild), exactly like the Krea2 node.
             _p = _run_family_load("qwenimage21", transformer, model_config)
-            _dev = _loaded_device_index(_p)
-            q = _qi21_resolve_quality(quality, quality_enhance, _dev)
             _mm = getattr(_p, "model", None)
             if _mm is not None and hasattr(_mm, "set_attn_backend"):
                 _mm.set_attn_backend(_attn_backend_to_engine(attention_backend))
-            _mm.set_quality(q)   # mandatory + unguarded: a patcher without it is a wiring error
+            _mm.set_video_enhance(_quality_enhance_on(quality_enhance, quality))   # mandatory + unguarded: a patcher without it is a wiring error
             return (_p,)
 
 
@@ -1042,7 +903,7 @@ if _IMPORT_OK:
                 # auto/sage/native. (Wan/LTX → auto is fine → they keep 'auto'.)
                 "attention_backend": _attn_backend_input("flash"),
                 "sol_tau": _SOL_TAU_INPUT,
-                "quality": _quality_input("minimax-h3"),
+                "quality_enhance": _QUALITY_ENHANCE_INPUT,
                 "audio_enhance": _AUDIO_ENHANCE_INPUT,
                 "step_cache": _STEP_CACHE_INPUT,
                 "block_cache": _BLOCK_CACHE_INPUT,
@@ -1052,10 +913,6 @@ if _IMPORT_OK:
                 }),
             }, "hidden": dict(_QUALITY_LEGACY_HIDDEN)}
 
-        @classmethod
-        def VALIDATE_INPUTS(cls, quality=None):
-            return _validate_quality(quality)
-
         RETURN_TYPES = ("MODEL",)
         FUNCTION = "load"
         CATEGORY = "loaders"
@@ -1063,17 +920,15 @@ if _IMPORT_OK:
                        "place of the usual diffusion-model loader. " + _COMMON_LIMITS)
 
         def load(self, transformer, model_config=None,
-                 attention_backend="flash", sol_tau=1.0, quality=None, audio_enhance=False,
-                 step_cache=0.0, block_cache=0.0, allow_partial_denoise=False, quality_enhance=None):  # H3: flash default (auto->sage is broken)
+                 attention_backend="flash", sol_tau=1.0, quality_enhance=None, audio_enhance=False,
+                 step_cache=0.0, block_cache=0.0, allow_partial_denoise=False, quality=None):  # H3: flash default (auto->sage is broken)
             _p = _run_family_load("minimax-h3", transformer, model_config)
-            _dev = _loaded_device_index(_p)
-            q = _resolve_quality(quality, quality_enhance, _dev, "minimax-h3")
             _mm = getattr(_p, "model", None)
             if _mm is not None and hasattr(_mm, "set_attn_backend"):
                 _mm.set_attn_backend(_attn_backend_to_engine(attention_backend))
             if _mm is not None and hasattr(_mm, "set_sol_tau"):
                 _mm.set_sol_tau(sol_tau)
-            _mm.set_quality(q)   # mandatory + unguarded: a patcher without it is a wiring error
+            _mm.set_video_enhance(_quality_enhance_on(quality_enhance, quality))   # mandatory + unguarded: a patcher without it is a wiring error
             if _mm is not None and hasattr(_mm, "set_audio_enhance"):
                 _mm.set_audio_enhance(audio_enhance)
             _mm.set_allow_partial_denoise(bool(allow_partial_denoise))

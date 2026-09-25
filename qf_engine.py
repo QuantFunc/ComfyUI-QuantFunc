@@ -760,11 +760,6 @@ def _bind(lib):
     if hasattr(lib, "quantfunc_denoise_step_refs"):
         lib.quantfunc_denoise_step_refs.restype = ctypes.c_int
         lib.quantfunc_denoise_step_refs.argtypes = [v, ctypes.POINTER(DenoiseStepRefsParams)]
-    if hasattr(lib, "quantfunc_quality_fast_available"):
-        # [quality] can the loaders' super_fast / fast take effect on CUDA device N — the ENGINE's own arming rule for
-        # that GPU (the plugin keeps no GPU list): 1 yes, 0 no (balance / best_quality only), -1 bad device.
-        lib.quantfunc_quality_fast_available.restype = ctypes.c_int
-        lib.quantfunc_quality_fast_available.argtypes = [ctypes.c_int]
     if hasattr(lib, "quantfunc_denoise_cond_tail_supported"):
         # CR A-1 capability query (per-pipeline): 1 = this pipeline consumes a
         # begin_edit_cond cond-latent. Probe THIS (presence + answer), not the
@@ -833,7 +828,7 @@ def loaded_so_path():
 
 def _emit_fingerprint():
     """Print the loaded library's fingerprint line ONCE, as soon as the level allows it. It is an info line, but the
-    library usually loads before any loader set a level (ComfyUI's node list asks the engine for the quality options),
+    library can load before any loader set a level,
     so it waits for the first info-level loader instead of being lost. At warning it is never printed, and its md5 is
     never computed."""
     global _FINGERPRINT_PENDING
@@ -2126,7 +2121,8 @@ def _refuse_session_knobs_in_create(config_json):
             # create-side leak would rebuild the pipeline per widget change).
             if any(k in obj for k in ("cache_mode", "cache_thresh",
                                       "step_cache", "block_cache", "step_cache_thresh",
-                                      "block_cache_thresh", "sparse", "sparse_cdf", "quality")):
+                                      "block_cache_thresh", "sparse", "sparse_cdf", "quality",
+                                      "video_enhance")):
                 return True
             return any(_scan(v) for v in obj.values())
         if isinstance(obj, list):

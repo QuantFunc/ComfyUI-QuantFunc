@@ -41,8 +41,7 @@ cannot hold raises UnicodeEncodeError out of the print() / log call, and out of 
               FUNCTION, its VALIDATE_INPUTS, a denoise method, a property, a constructor and the ComfyUI sampler the
               LTX audio fix wraps never raises a second exception either, keeps its type and its original text
               (qf_console_original), and is unchanged where the console holds it (cp936, UTF-8); one whose text
-              comes from its __str__ becomes a RuntimeError carrying that text escaped; the loaders' VALIDATE_INPUTS
-              message, logged the way execution.py logs it, is never lost. An OOM or a user cancel raised while
+              comes from its __str__ becomes a RuntimeError carrying that text escaped. An OOM or a user cancel raised while
               handling (or from) an exception whose text cannot be rewritten keeps its type, which is how
               execution.py tells them apart, and the chained text stays in the traceback, escaped; so does the chain
               of a replaced top, even raised inside ComfyUI's own exception handler. An exception group with such a
@@ -575,13 +574,6 @@ def _console_child(job):
         out["console group"] = ["ok", "n/a: no exception groups before Python 3.11"]
     if out["console fallback keeps chain"][0] == "ok" and opaque.args != (_CONSOLE_PATH,):   # the stand-in carries it
         out["console fallback keeps chain"] = ["error", "Mutated", f"the replaced exception now has {opaque.args!r}"]
-    validate = _extract(os.path.join(job["root"], "__init__.py"), "_validate_quality", {"qfe": qfe},
-                        consts=("_QUALITY_FAST_OPTIONS",))
-
-    def comfy_logs_a_validation_failure():   # ComfyUI execution.py:1098 + :1227 around the loaders' VALIDATE_INPUTS
-        logging.getLogger().error(f"  - Custom validation failed for node: quality - {validate(_CONSOLE_TEXT)}")
-    out["console validate message"] = (_outcome(comfy_logs_a_validation_failure) if validate
-                                       else ["error", "Missing", "no _validate_quality in __init__.py"])
     afix = sys.modules.get("qfn_textio_pkg.qf_ltx_ancestral_audio_fix")
     out["console audio-fix"] = (_outcome(afix._log_once, "sampler " + _CONSOLE_TEXT, "euler") if afix
                                 else ["error", "Missing", "the audio-fix module was not imported"])
@@ -724,7 +716,7 @@ def _console_arms(root, tmp):
                     "console init error", "console property error", "console fallback error",
                     "console oom keeps type", "console cancel keeps type", "console fallback keeps chain",
                     "console fallback chain in a handler", "console group",
-                    "console validate message", "console sampler error", "console audio-fix", "console loggers"):
+                    "console sampler error", "console audio-fix", "console loggers"):
             g = got.get(arm, ["error", "Missing", "the child did not run this arm"])
             ok, act = g[0] == "ok", _show(g)
             if ok and arm in want:   # the line reached the console, with what the code page cannot hold escaped

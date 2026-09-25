@@ -229,7 +229,7 @@ def main():
     check(f"L11 the per-run detail lines print only through qf_engine.info (bare: {bare or 'none'})", not bare)
 
     # L12: the library fingerprint (an info line) waits for the FIRST info-level loader. The engine usually loads before
-    #      any loader set a level (ComfyUI's node list asks it for the quality options); printed at load it would be
+    #      any loader set a level; printed at load it would be
     #      suppressed forever — and it is how a run proves which library it loaded.
     eng2 = _load_qf_engine()
     with tempfile.TemporaryDirectory() as d:

@@ -28,14 +28,14 @@ ComfyUI plugin for **QuantFunc** — the fastest diffusion model inference engin
 
 | Plugin (`comfy`) | Engine (`lib`) | Summary |
 |:---:|:---:|---|
-| **0.0.07** *(current)* | **0.0.13** | `quality` option · settings and LoRA changes without a rebuild · one LoRA format · per-GPU-architecture engine · warning-only logging — details below |
+| **0.0.07** *(current)* | **0.0.13** | `quality_enhance` switch · settings and LoRA changes without a rebuild · one LoRA format · per-GPU-architecture engine · warning-only logging — details below |
 | 0.0.06 | 0.0.12 | New modes — Ideogram4 · Layered (RGBA) · ControlNet · img2img · VRAM-budget · FBCache · Klein auto-download · SHA-256 integrity check — details below |
 | 0.0.02 | 0.0.07 | v2 loader architecture · inpainting · full GPU coverage · faster editing |
 | 0.0.01 | 0.0.01 – 0.0.06 | Base release: runtime/offline quantization · model & LoRA loaders · reference-image editing · export · auto-update |
 
 ### What's New in 0.0.07 (engine 0.0.13)
 
-- **One `quality` option** on the loaders: `super_fast` / `fast` / `balance` / `best_quality` (default `balance`). `fast` and `super_fast` are faster and can give a different variation of the same seed. Some GPUs (for example the RTX 50 series, SM 12.0) offer only `balance` and `best_quality`. Details in section 3.
+- **One `quality_enhance` switch** on the MiniMax-H3, LTX-2.5, Krea-2 and Qwen-Image-2.1 loaders, the same on every GPU: OFF (default) is faster; the subject and scene stay the same, but details such as poses, faces or small objects can differ. ON gives the highest quality. Details in section 3.
 - **No rebuild when you change settings or LoRAs**: the loaded pipeline is reused; only different model weights load a new one.
 - **One LoRA format**: diffusers / PEFT. Convert other formats with `scripts/qf_lora_convert.py`; LyCORIS LoHa / LoKr files are not supported.
 - **An engine per GPU architecture (Linux and Windows)**: the plugin downloads only the engine for your GPU's architecture (on Linux about 125-175 MB) and installs it automatically. One ComfyUI serves one GPU architecture; for GPUs of different architectures, run one ComfyUI per architecture (section 2.5).
@@ -261,12 +261,9 @@ python3 scripts/qf_lora_convert.py --in my_kohya_lora.safetensors --out my_lora-
 Qwen-Image-2.1 native-loader workflows are in [`example_workflows/`](example_workflows/) — ComfyUI lists them under
 **Templates → ComfyUI-QuantFunc**. They use the stock `CLIPLoader` (type `qwen_image`), `TextEncodeQwenImage21`, VAE and
 `KSampler`; only the transformer loader is QuantFunc's. The VAE is RGBA, so `VAE Decode` + `Save Image` keep transparency.
-The loader's `quality` choice (default `balance` on the MiniMax-H3, LTX-2, Krea-2 and Qwen-Image-2.1 loaders): `balance`
-can be a little faster than `best_quality`; the subject and scene stay the same, but details such as poses, faces or small
-objects can differ from `best_quality`. On GPUs that offer them, `fast` and `super_fast` are usually faster still and can
-give a different variation of the same seed. `best_quality` gives the highest quality. The LTX-2 and MiniMax-H3 loaders never
-offer `super_fast` (a workflow saved with it runs `fast`, or `balance` on a GPU without `fast`). On GPUs without
-`fast` and `super_fast`, the Qwen-Image-2.1 loader shows no `quality` choice and always gives the highest quality.
+The loaders' `quality_enhance` switch (MiniMax-H3, LTX-2, Krea-2 and Qwen-Image-2.1; default OFF): OFF is faster; the
+subject and scene stay the same, but details such as poses, faces or small objects can differ. ON gives the highest
+quality. Changing it never reloads the model.
 
 | File | Use Case |
 |------|----------|

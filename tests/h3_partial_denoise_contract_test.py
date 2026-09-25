@@ -140,7 +140,7 @@ def _load_real_plugin(test_case):
 
 class _HarnessBase:
     def residency_opts(self):
-        return {"sparse_cdf": 1.0, "attention_backend": "auto", "quality": "balance"}
+        return {"sparse_cdf": 1.0, "attention_backend": "auto", "video_enhance": False}
 
     def process_latent_out(self, latent):
         self._base_process_calls += 1
@@ -493,7 +493,7 @@ class _LoaderModel:
     def set_audio_enhance(self, _value):
         pass
 
-    def set_quality(self, _value):   # the ONE quality switch every loader must reach (mandatory, unguarded)
+    def set_video_enhance(self, _value):   # the quality_enhance switch every loader must reach (mandatory, unguarded)
         pass
 
     def set_allow_partial_denoise(self, value):
@@ -508,10 +508,9 @@ _loader_namespace = {
     "_model_config_input": lambda _family: (["config"], {"default": "config", "hidden": True, "socketless": True}),
     "_attn_backend_input": lambda default: ([default], {"default": default}),
     "_SOL_TAU_INPUT": ("FLOAT", {"default": 1.0}),
-    "_quality_input": lambda _family: (["balance", "best_quality"], {"default": "balance"}),
-    "_QUALITY_LEGACY_HIDDEN": {"quality_enhance": ("BOOLEAN", {})},
-    "_loaded_device_index": lambda _patcher: 0,
-    "_resolve_quality": lambda *_args: "balance",
+    "_QUALITY_ENHANCE_INPUT": ("BOOLEAN", {"default": False}),
+    "_QUALITY_LEGACY_HIDDEN": {"quality": ("STRING", {})},
+    "_quality_enhance_on": lambda *_args: False,
     "_AUDIO_ENHANCE_INPUT": ("BOOLEAN", {"default": False}),
     "_STEP_CACHE_INPUT": ("FLOAT", {"default": 0.0}),
     "_BLOCK_CACHE_INPUT": ("FLOAT", {"default": 0.0}),
