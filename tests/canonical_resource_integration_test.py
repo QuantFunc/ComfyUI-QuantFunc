@@ -133,7 +133,9 @@ class Library:
                             request.owner_limit_bytes, request.shared_limit_bytes,
                             request.device_limit_bytes))
         if owner_key is not None and self.resources[owner_key].get("phase") == qfe.QUANTFUNC_RESOURCE_PHASE_CLOSED:
-            return 2   # quantfunc.h: setting a grant checks Owned lifetime, and a Closed one is INVALID_ARG
+            # release engine 47e49de58, include/quantfunc.h:209: setting a grant "checks Owned lifetime: Closed is
+            # INVALID_ARG"
+            return qfe.QUANTFUNC_ERROR_INVALID_ARG
         out._obj.state = self.domain_grant_state
         out._obj.applied_mask = 0
         if self.domain_grant_state != qfe.QUANTFUNC_RESOURCE_READY:
@@ -1835,10 +1837,10 @@ class CanonicalIntegration(unittest.TestCase):
         loaded_a = self.official_loaded_model(owner_a)
         del patcher_a
         gc.collect()
-        _, owner_b, _ = self.warm_native_model("B")
+        patcher_b, owner_b, _ = self.warm_native_model("B")
         self.assertIn(("destroy", owner_a._owner_epoch), self.lib.events)   # Closed by the sweep...
         self.assertIn(loaded_a, mm.current_loaded_models)                    # ...and still listed
-        return loaded_a, owner_a, owner_b
+        return loaded_a, owner_a, owner_b, patcher_b   # workflow 2's MODEL stays live (a later cold create keeps it)
 
     def test_workflow_switch_never_breaks_the_next_models_load(self):
         """Release blocker (the user's 4090, QI-2.1 and Krea-2 alike): the FIRST run after switching workflows died in
@@ -1847,7 +1849,7 @@ class CanonicalIntegration(unittest.TestCase):
         Prepared capacity as its size. Its partial unload frees nothing and writes no grant (the retire marked it; a
         Closed Owned grant is INVALID_ARG), so Comfy's own model_unload falls back to the full detach, whose release_all
         is the old owner's final cleanup, and free_memory drops it."""
-        loaded_a, owner_a, owner_b = self.switch_workflows(residual=512)
+        loaded_a, owner_a, owner_b, _patcher_b = self.switch_workflows(residual=512)
         cap, key_a = self.lib.capacity_bytes, owner_a._owner_epoch
         self.assertEqual([loaded_a.model_memory(), loaded_a.model_loaded_memory(), loaded_a.model_offloaded_memory()],
                          [cap, 512, cap - 512])
@@ -1861,11 +1863,13 @@ class CanonicalIntegration(unittest.TestCase):
         self.assertIn(("full", key_a), after)
         self.assertEqual(owner_a.loaded_size(), 0)
 
-    def test_free_memory_unloads_a_retired_owner_before_the_live_model(self):
+    def test_free_memory_unloads_a_retired_owner_before_the_live_models(self):
         """ComfyUI 0.37's free_memory unloads the largest offloaded first; a Closed owner sized by its capacity is
-        taken before the live model (sizing it by what it holds flipped the order: the live model went first)."""
-        loaded_a, owner_a, owner_b = self.switch_workflows()
+        taken before every live model (sizing it by what it holds flipped the order: the live models went first)."""
+        loaded_a, owner_a, owner_b, _patcher_b = self.switch_workflows()
+        _patcher_c, owner_c, _ = self.warm_native_model("C")   # a third, live model (B stays live: not swept)
         self.official_loaded_model(owner_b)
+        self.official_loaded_model(owner_c)
         order, unload = [], mm.LoadedModel.model_unload
 
         def spy(loaded, *args, **kwargs):
@@ -1875,7 +1879,21 @@ class CanonicalIntegration(unittest.TestCase):
              mock.patch.object(mm, "cleanup_models_gc", return_value=None, create=True), \
              mock.patch.object(mm, "soft_empty_cache", return_value=None, create=True):
             mm.free_memory(1 << 30, owner_b.load_device)
-        self.assertEqual([id(m) for m in order], [id(owner_a), id(owner_b)])
+        self.assertEqual(len(order), 3)
+        self.assertIs(order[0], owner_a)
+        self.assertEqual({id(m) for m in order[1:]}, {id(owner_b), id(owner_c)})
+
+    def test_retired_owner_is_known_closed_without_a_lifecycle_read(self):
+        """The retire marks the identity it Closes, so its partial unload needs no read: with the lifecycle answering
+        BUSY past the deadline it still frees nothing and writes no grant (a read-only check would fall through to the
+        fence and write a grant on a Closed identity)."""
+        loaded_a, owner_a, owner_b, _patcher_b = self.switch_workflows(residual=512)
+        self.short_busy_deadline()
+        self.busy_first("query_lifecycle")
+        before = len(self.lib.events)
+        self.assertEqual(owner_a.partially_unload(owner_a.offload_device, 256), 0)
+        self.assertFalse([e for e in self.lib.events[before:]
+                          if e[0] in ("release", "grant", "domain_grants") and e[1] == owner_a._owner_epoch])
 
     def test_closed_identity_is_sized_but_refuses_every_load(self):
         """Sizing a Closed identity answers (its capacity, what it holds) and never refuses; every LOAD still refuses
@@ -1889,6 +1907,15 @@ class CanonicalIntegration(unittest.TestCase):
         cap = self.lib.capacity_bytes
         self.assertEqual([loaded.model_memory(), loaded.model_loaded_memory(), loaded.model_offloaded_memory()],
                          [cap, 512, cap - 512])
+        # Closed natively, NOT by our retire (no mark): the partial unload reads the lifecycle itself, frees nothing
+        # and writes no grant, and Comfy's own model_unload falls back to the full detach (release_all).
+        before = len(self.lib.events)
+        self.assertEqual(owner.partially_unload(owner.offload_device, 256), 0)
+        self.assertFalse([e for e in self.lib.events[before:]
+                          if e[0] in ("release", "grant", "device_grant", "domain_grants")])
+        self.assertTrue(loaded.model_unload(256))
+        mm.current_loaded_models.remove(loaded)      # ...and free_memory pops what model_unload released
+        self.assertEqual([owner.model_size(), owner.loaded_size()], [cap, 0])
         with self.assertRaisesRegex(RuntimeError, "Closed resource identity is not reloadable"):
             owner.partially_load(owner.load_device, 4096)
         with self.assertRaisesRegex(RuntimeError, "Closed resource identity"):

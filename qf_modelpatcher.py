@@ -1944,17 +1944,29 @@ class QFNativeResourcePatcher(comfy.model_patcher.ModelPatcher):
             finally:
                 self._admitting_thread = None
 
+    def _closed_now(self):
+        """Is this identity Closed? Closed is final, so a True answer is kept: the retire marks what it Closes, which
+        needs no read. Otherwise ONE lifecycle read (BUSY re-issued to the deadline): only a READY Closed answer counts.
+        A BUSY past the deadline or an UNKNOWN answer is not a Closed answer, so the caller's fence still runs."""
+        if self._closed_identity or not self._owner_epoch:
+            return self._closed_identity
+        try:
+            lifecycle = _read_past_busy(self._resource.lifecycle, "resource lifecycle")
+        except _NativeStillBusy:
+            return False
+        self._closed_identity = (lifecycle.state == qfe.QUANTFUNC_RESOURCE_READY and
+                                 lifecycle.phase == qfe.QUANTFUNC_RESOURCE_PHASE_CLOSED)
+        return self._closed_identity
+
     @_comfy_facing(_busy_zero_freed)
     def partially_unload(self, device_to, memory_to_free=0, force_patch_weights=False):
         want = max(0, min(int(memory_to_free), (1 << 64) - 1))
         if not want:
             return 0
         with _domain_transaction(self):
-            if self._closed_identity:
-                # Set where the identity was Closed (the retire; a detach or a load that read the lifecycle sets it too),
-                # so no read here: a new BUSY point would skip the fence below. A Closed Owned grant is INVALID_ARG
-                # natively: free nothing, and Comfy falls back to the full detach, whose release_all is the old owner's
-                # final cleanup.
+            if self._closed_now():
+                # A Closed Owned grant is INVALID_ARG natively: free nothing, and Comfy falls back to the full detach,
+                # whose release_all is the old owner's final cleanup.
                 return 0
             if self._host_managed:
                 if self is not self._domain.shared:
