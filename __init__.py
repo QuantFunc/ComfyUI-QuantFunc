@@ -421,6 +421,49 @@ def _sweep_dead_pipelines(keep_key):
                   "(comfy dropped its patcher) - freed its CPU backup", flush=True)
 
 
+def _dead_pipelines():
+    """(count, bytes): the cached handles bound only to consumers ComfyUI has garbage-collected, and the engine's own
+    capacity figure summed over them. capacity_bytes is the Prepared capacity the engine reported for the model; it
+    approximates the pipeline's host copy (Krea-2: 10.1 GB reported against its 8.85 + 1.27 GB backup, measured); an
+    exact host-copy read is a post-release engine API. Read-only (it never drops an entry from a binding list: the
+    sweep's bound-only gate reads them) and cheap, because ComfyUI's staging asks it before every pin."""
+    with _ENGINE_IDENTITY_LOCK:
+        dead = [k for k in _PIPELINE_CACHE
+                if _PIPELINE_MODELS.get(k) and all(r() is None for r in _PIPELINE_MODELS[k])]
+        return len(dead), sum(int(getattr(_PIPELINE_CACHE[k], "capacity_bytes", 0) or 0) for k in dead)
+
+
+def _install_host_ram_release():
+    """Wrap comfy.memory_management.extra_ram_release. ComfyUI calls it before it pins host memory for a model's weights
+    (while the model runs, a forward-time cast, a partial unload); not on --fast-disk or --disable-pinned-memory, which
+    pin nothing, and not from its own release between nodes, which goes to its cache directly. After ComfyUI's own
+    release, once the available host RAM (ComfyUI's own reading: get_free_memory(cpu)) is less than ComfyUI's headroom
+    (its target) plus what the pipelines of models ComfyUI dropped still hold, those pipelines are destroyed
+    (_sweep_dead_pipelines: only-all-dead, no use-after-free). With RAM ample, or nothing dead, nothing changes. The
+    wrapper passes every argument through and returns ComfyUI's own answer; a failure of ours only logs."""
+    import torch
+    import comfy.memory_management as cmm
+    orig, cpu = cmm.extra_ram_release, torch.device("cpu")
+
+    def extra_ram_release(target, *args, **kwargs):
+        freed = orig(target, *args, **kwargs)
+        try:
+            count, held = _dead_pipelines()
+            if count:
+                available = comfy.model_management.get_free_memory(cpu)
+                if available < target + held:
+                    qfe.info(f"[qf_native] host RAM: {int(available) >> 20} MB available, under ComfyUI's "
+                             f"{int(target) >> 20} MB headroom plus the {held >> 20} MB that {count} pipeline(s) of a "
+                             "model ComfyUI dropped still hold: releasing them", flush=True)
+                    _sweep_dead_pipelines(None)
+        except Exception as exc:  # noqa: BLE001 - ComfyUI's pinning must never fail on our release
+            _log.warning("[qf_native] host-RAM release skipped: %s", ascii(exc))
+        return freed
+
+    extra_ram_release._qf_host_ram_release = True
+    cmm.extra_ram_release = extra_ram_release
+
+
 def _engine_recipe(model_dir, create_cfg=None, device_idx=0):
     """Resolve immutable create inputs without entering a cache critical section."""
     lib = qfe.load_lib()
@@ -515,8 +558,11 @@ def _materialize_engine(entry, lib, ckey):
             qfmp._require_engine_host_grants(entry)
             _sweep_dead_pipelines(ckey)
             # The exact configured-Prepared native capacity Comfy admitted is
-            # retained on this identity. It is VRAM authority, not CPU-backup
-            # footprint, and is never re-estimated from paths at create time.
+            # retained on this identity, never re-estimated from paths at create
+            # time. Its authority is VRAM. It has ONE second, approximate use: the
+            # host-RAM release (_install_host_ram_release) reads a dead pipeline's
+            # capacity as the size of its host copy, which it matches within a few
+            # percent (measured per family in the commit that added that release).
             eng = qfe.QFEngineHandle.create(lib, create_params=entry.create_params,
                                            capacity_bytes=int(entry.capacity_bytes),
                                            prepared_resource=entry.resource)
@@ -1072,6 +1118,14 @@ if _IMPORT_OK:
             qfe.start_engine_install(_comfy_device_index())
     except Exception as _qf_install_exc:  # noqa: BLE001 - installing must never break plugin import
         _log.warning("[qf_native] engine install not started: %s", ascii(_qf_install_exc))
+
+
+# ── Host RAM: a dropped model's pipeline releases its backup when ComfyUI runs short (see _install_host_ram_release)
+if _IMPORT_OK:
+    try:
+        _install_host_ram_release()
+    except Exception as _qf_hr_exc:  # noqa: BLE001 - never break plugin import
+        _log.warning("[qf_native] host-RAM release hook not installed: %s", ascii(_qf_hr_exc))
 
 
 # ── QuantFunc LTX-2.5 AV ancestral-sampler audio fix ─────────────────────────────
