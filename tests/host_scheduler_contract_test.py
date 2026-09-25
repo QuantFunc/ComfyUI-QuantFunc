@@ -190,7 +190,7 @@ class HostSchedulerContract(unittest.TestCase):
 
     def test_common_model_demand_failure_reaches_host(self):
         class Model(qfm.QFSessionModelMixin):
-            pass
+            device = None   # ComfyUI's BaseModel stores its device argument; this double has no base to do it
         model = Model()
         model._qf = self.engine
         def demand(*args):
@@ -344,7 +344,7 @@ class HostSchedulerContract(unittest.TestCase):
 
     def test_ledger_log_does_not_label_failed_residency_query_as_zero(self):
         class Model(qfm.QFSessionModelMixin):
-            pass
+            device = None   # ComfyUI's BaseModel stores its device argument; this double has no base to do it
         model = Model()
         model._qf = self.engine
         self.library.query_status = 1

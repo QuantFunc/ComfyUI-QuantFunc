@@ -404,7 +404,7 @@ class NativeResource:
                 return ColdNeed(int(out.value), None)
             if status == QUANTFUNC_ERROR_INVALID_ARG:
                 raise RuntimeError(f"QuantFunc cold VRAM need refused: {last_err(self._lib)}")
-            note = ("not estimable for this layout" if status == QUANTFUNC_ERROR_UNSUPPORTED
+            note = (f"not estimable for this layout: {last_err(self._lib)}" if status == QUANTFUNC_ERROR_UNSUPPORTED
                     else f"unknown (engine status {status}: {last_err(self._lib)})")
             if note not in self._cold_need_warned:
                 self._cold_need_warned.add(note)
@@ -953,8 +953,11 @@ def _stand_in(e):
     e's text escaped, e's traceback and chain, and e itself as `qf_console_original`."""
     safe = RuntimeError(console_safe("".join(traceback.format_exception_only(type(e), e)).strip()))
     safe.qf_console_original = e
-    safe.__cause__, safe.__context__ = e.__cause__, e.__context__
-    safe.__suppress_context__ = e.__suppress_context__
+    # a context-only chain becomes the cause: raised inside another handler, the stand-in gets that handler's exception
+    # as its __context__, and a set cause always prints (plugin CR R1/C-L1)
+    safe.__cause__ = e.__cause__ if e.__cause__ is not None or e.__suppress_context__ else e.__context__
+    safe.__context__ = e.__context__
+    safe.__suppress_context__ = e.__suppress_context__   # assigning __cause__ set it
     return safe.with_traceback(e.__traceback__)
 
 
@@ -992,9 +995,7 @@ def console_safe_exception(exc):
         for attr in ("__cause__", "__context__"):
             link = getattr(e, attr)
             if link is not None and id(link) in stand:
-                suppress = e.__suppress_context__   # assigning __cause__ sets it
                 setattr(e, attr, stand[id(link)])
-                e.__suppress_context__ = suppress
     return stand.get(id(exc), exc)
 
 
@@ -1642,7 +1643,7 @@ def resolve_so_path():
             if os.path.isfile(c):
                 return os.path.realpath(c)
         raise RuntimeError(
-            f"qf_native: no engine library found: "
+            "qf_native: no engine library found: "
             + (f"bin/{_BIN_SUBDIR}/{_ENGINE_LOCAL_BUILD_LOCK} marks a local build, but bin/{_BIN_SUBDIR}/{_LIB_BASENAME} "
                f"is not there (build it there, or delete the lock to use the installed engine)" if local else
                f"put {_LIB_BASENAME} in the package bin/{_BIN_SUBDIR}/, or set {_ENV_SO_OVERRIDE}=<abs path> on the "

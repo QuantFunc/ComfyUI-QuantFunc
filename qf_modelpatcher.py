@@ -298,11 +298,12 @@ class QFSessionModelMixin:
     # lighting::CacheMode::the step cache with this mean_abs_diff skip budget. ──
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # #738 (plugin CR F1): the card these weights are BUILT for (family_build's device, the patcher's load_device;
-        # every family passes it as device=) keys the host-inference reserve. ComfyUI rewrites self.device to the
-        # offload device on every full unload (model_patcher.detach -> unpatch_model), so a reserve keyed by it goes
-        # stale for the grant, which reads it by the load device.
-        self._qf_build_device = kwargs.get("device")
+        # #738 (plugin CR F1): the card these weights are BUILT for (family_build's device, the patcher's load_device)
+        # keys the host-inference reserve. ComfyUI's BaseModel.__init__ stores its device argument as self.device
+        # however it was passed (plugin CR G-L1), so read it here, before anything moves the model: ComfyUI rewrites
+        # self.device to the offload device on every full unload (model_patcher.detach -> unpatch_model), so a
+        # reserve keyed by it later goes stale for the grant, which reads it by the load device.
+        self._qf_build_device = self.device
 
     _step_cache = 0.0             # class default; loaders set the widget value (step_cache)
     _block_cache = 0.0            # class default; loaders set the widget value (block_cache)

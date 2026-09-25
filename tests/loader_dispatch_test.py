@@ -531,7 +531,7 @@ def main():
     from qfn_test_pkg import qf_modelpatcher as _qmp_q
 
     class _QProbe(_qmp_q.QFSessionModelMixin):
-        pass
+        device = None   # ComfyUI's BaseModel stores its device argument; this double has no base to do it
     _qp = _QProbe()
     _qp.set_quality("fast")
     _dq = _qp.residency_opts()

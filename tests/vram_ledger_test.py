@@ -72,6 +72,9 @@ FLOOR_MB = 50000                      # comfy's torch estimate stand-in: bigger 
 
 class _TorchBase:
     """comfy's BaseModel.memory_required stand-in (the next class after the mixin in a real family's MRO)."""
+    def __init__(self, model_config=None, model_type=None, device=None):
+        self.device = device   # what BaseModel.__init__ does first: the mixin reads it as the build device
+
     def memory_required(self, input_shape, cond_shapes=None):
         _TorchBase.asked.append(list(input_shape))
         return getattr(self, "_floor_mb", FLOOR_MB) * MB

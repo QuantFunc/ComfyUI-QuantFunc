@@ -45,7 +45,8 @@ cannot hold raises UnicodeEncodeError out of the print() / log call, and out of 
               message, logged the way execution.py logs it, is never lost. An OOM or a user cancel raised while
               handling (or from) an exception whose text cannot be rewritten keeps its type, which is how
               execution.py tells them apart, and the chained text stays in the traceback, escaped; so does the chain
-              of a replaced top.
+              of a replaced top, even raised inside ComfyUI's own exception handler. An exception group with such a
+              member is replaced whole, the group kept on qf_console_original.
   boundary    static: every class ComfyUI calls into (its base named by module path or by a name imported from comfy)
               carries @qfe.console_safe_methods, every registered node's entry points are wrapped by
               qfe.console_safe_nodes after the last registration, and no wrapped method is async or a generator.
@@ -533,14 +534,45 @@ def _console_child(job):
             raise OSError(2, "No such file or directory", _CONSOLE_PATH)
         except OSError:
             raise opaque
+    nested = _Opaque(_CONSOLE_PATH)
+
+    def nested_while_handling():   # the same, reached while ComfyUI handles another exception (below)
+        try:
+            raise OSError(2, "No such file or directory", _CONSOLE_PATH)
+        except OSError:
+            raise nested
+    import builtins
+    group = (builtins.ExceptionGroup("qf textio group", [ValueError("a plain member"), KeyError((_CONSOLE_PATH,))])
+             if hasattr(builtins, "ExceptionGroup") else None)   # a member whose text cannot be rewritten
+
+    def group_raise():
+        raise group
     safe = getattr(qfe, "console_safe", lambda t: t)
-    chains = [("console oom keeps type", oom_while_handling, _OutOfMemoryError, safe(str(process_error))),
-              ("console cancel keeps type", cancel_from, _InterruptProcessingException, safe(str(key_error))),
-              ("console fallback keeps chain", opaque_while_handling,
-               _Opaque if safe(_BOUNDARY_MSG) == _BOUNDARY_MSG else RuntimeError, "No such file or directory")]
+    fits = safe(_BOUNDARY_MSG) == _BOUNDARY_MSG
+    chains = [("console oom keeps type", oom_while_handling, _OutOfMemoryError, safe(str(process_error)), None),
+              ("console cancel keeps type", cancel_from, _InterruptProcessingException, safe(str(key_error)), None),
+              ("console fallback keeps chain", opaque_while_handling, _Opaque if fits else RuntimeError,
+               "No such file or directory", opaque),
+              ("console fallback chain in a handler", nested_while_handling, _Opaque if fits else RuntimeError,
+               "No such file or directory", nested),
+              ("console group", group_raise, builtins.ExceptionGroup if fits else RuntimeError, "qf textio group",
+               group)] if group is not None else []
     if hasattr(qfe, "console_safe_errors"):   # the boundary every node FUNCTION and comfy-facing method runs under
-        chains = [(arm, qfe.console_safe_errors(f), want, text) for arm, f, want, text in chains]
-    out.update({arm: _chain_outcome(qfe, f, want, text) for arm, f, want, text in chains})
+        chains = [(arm, qfe.console_safe_errors(f), *rest) for arm, f, *rest in chains]
+    wrapped = dict((arm, f) for arm, f, *_ in chains)
+    if "console fallback chain in a handler" in wrapped:
+        inner = wrapped["console fallback chain in a handler"]
+
+        def inside_comfys_handler():   # execution.py:644 runs unload_all_models() -> our detach inside its except
+            try:
+                raise MemoryError("ComfyUI is handling an out-of-memory error")
+            except MemoryError:
+                inner()
+        chains = [(arm, inside_comfys_handler if arm == "console fallback chain in a handler" else f, *rest)
+                  for arm, f, *rest in chains]
+    out.update({arm: _chain_outcome(qfe, f, want, text, original) for arm, f, want, text, original in chains})
+    if group is None:   # Python < 3.11: there are no exception groups to print
+        out["console group"] = ["ok", "n/a: no exception groups before Python 3.11"]
     if out["console fallback keeps chain"][0] == "ok" and opaque.args != (_CONSOLE_PATH,):   # the stand-in carries it
         out["console fallback keeps chain"] = ["error", "Mutated", f"the replaced exception now has {opaque.args!r}"]
     validate = _extract(os.path.join(job["root"], "__init__.py"), "_validate_quality", {"qfe": qfe},
@@ -599,10 +631,11 @@ class _InterruptProcessingException(Exception):
     """Stands in for comfy.model_management's: execution.py tells a user cancel from an error by its type."""
 
 
-def _chain_outcome(qfe, call, want, chained):
+def _chain_outcome(qfe, call, want, chained, original=None):
     """ComfyUI's logging around one plugin call whose exception has a chain: logged without a second exception or a lost
-    line; the exception ComfyUI sees is of type `want` (execution.py tells an OOM and a user cancel by type); and the
-    chained exception's text (`chained`) is still in its traceback, escaped where the console cannot hold it."""
+    line; the exception ComfyUI sees is of type `want` (execution.py tells an OOM and a user cancel by type); the
+    chained exception's text (`chained`) is still in its traceback, escaped where the console cannot hold it; and a
+    replaced exception (`original`) is on the stand-in's qf_console_original."""
     import traceback
     caught, err = _comfy_logs(call)
     if err:
@@ -612,6 +645,8 @@ def _chain_outcome(qfe, call, want, chained):
     text = "".join(traceback.format_exception(type(caught), caught, caught.__traceback__))
     if chained not in text:
         return ["error", "ChainLost", f"the traceback lacks the chained text {chained[:60]!r}"]
+    if original is not None and caught is not original and getattr(caught, "qf_console_original", None) is not original:
+        return ["error", "OriginalLost", "the replaced exception is not on the stand-in's qf_console_original"]
     return ["ok", f"ComfyUI sees {want.__name__}, chain logged"]
 
 
@@ -688,6 +723,7 @@ def _console_arms(root, tmp):
                     "console engine error", "console node error", "console validate error", "console denoise error",
                     "console init error", "console property error", "console fallback error",
                     "console oom keeps type", "console cancel keeps type", "console fallback keeps chain",
+                    "console fallback chain in a handler", "console group",
                     "console validate message", "console sampler error", "console audio-fix", "console loggers"):
             g = got.get(arm, ["error", "Missing", "the child did not run this arm"])
             ok, act = g[0] == "ok", _show(g)

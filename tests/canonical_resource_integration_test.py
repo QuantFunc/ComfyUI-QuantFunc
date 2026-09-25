@@ -2,7 +2,6 @@
 """Batch CPU integration: actual plugin factories + official host; only native ABI doubled."""
 import ast
 import ctypes
-import os
 import sys
 import threading
 import time
@@ -604,11 +603,27 @@ class CanonicalIntegration(unittest.TestCase):
                 self.assertEqual(model.device, torch.device("cpu"), "premise: ComfyUI's unload rewrote model.device")
         self.assertLess(sides[0], sides[1], "discriminating: the second sampling's comfy side is the larger")
 
+    def test_host_reserve_key_is_the_build_device_when_a_family_passes_it_positionally(self):
+        """#738 plugin CR G-L1/S4: the reserve key is the device ComfyUI's BaseModel stored (self.device, right after
+        super().__init__), however a family passes it. Red before: the mixin read kwargs.get("device"), so a family
+        calling super().__init__(config, model_type, device) keyed the reserve under None, and the grant read 0 for
+        it."""
+        import comfy.model_base as model_base
+        import comfy.supported_models as supported_models
+
+        class Positional(qfm.QFSessionModelMixin, model_base.BaseModel):
+            pass
+        cuda0 = torch.device("cuda:0")
+        cfg = supported_models.Krea2({"image_model": "krea2", "disable_unet_model_creation": True})
+        qfm.ensure_model_config_attrs(cfg)
+        model = Positional(cfg, model_base.ModelType.FLOW, cuda0)
+        self.assertEqual(model._qf_build_device, cuda0)
+
     def test_cold_need_status_split_names_why_the_engine_cannot_say(self):
         """#738 plugin CR D-V2: the cold need's status is never folded into one silent None. An older library (no entry)
         is silent by design; INVALID_ARG is a contract violation and raises; UNSUPPORTED says the layout is not
-        estimable, any other status carries the engine's own error. Each reason is warned about ONCE per resource, and
-        none of them reads as 0 or as an older library."""
+        estimable and why (the engine's own reason, plugin CR C-L2), any other status carries the engine's own error.
+        Each reason is warned about ONCE per resource, and none of them reads as 0 or as an older library."""
         resource = qfe.NativeResource(self.lib, ctypes.c_void_p(1))
         self.assertEqual(resource.cold_vram_need_bytes(), qfe.ColdNeed(None, None))
         status = [qfe.QUANTFUNC_OK]
@@ -624,15 +639,18 @@ class CanonicalIntegration(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "cold VRAM need refused: resource busy"):
                 resource.cold_vram_need_bytes()
             status[0] = qfe.QUANTFUNC_ERROR_UNSUPPORTED
+            self.lib.quantfunc_last_error = lambda: b"no plan models this layout"
             for _ in range(2):
-                self.assertEqual(resource.cold_vram_need_bytes(), qfe.ColdNeed(None, "not estimable for this layout"))
+                self.assertEqual(resource.cold_vram_need_bytes(),
+                                 qfe.ColdNeed(None, "not estimable for this layout: no plan models this layout"))
             status[0] = 5   # the engine's INTERNAL (a busy resource, an engine failure)
+            self.lib.quantfunc_last_error = lambda: b"resource busy"
             for _ in range(2):
                 self.assertEqual(resource.cold_vram_need_bytes(),
                                  qfe.ColdNeed(None, "unknown (engine status 5: resource busy)"))
         self.assertEqual([c.args[0] for c in say.call_args_list], [
-            "[qf_native] WARNING the engine's cold VRAM need is not estimable for this layout; ComfyUI's own "
-            "estimate is the floor",
+            "[qf_native] WARNING the engine's cold VRAM need is not estimable for this layout: no plan models this "
+            "layout; ComfyUI's own estimate is the floor",
             "[qf_native] WARNING the engine's cold VRAM need is unknown (engine status 5: resource busy); ComfyUI's "
             "own estimate is the floor"])
 
