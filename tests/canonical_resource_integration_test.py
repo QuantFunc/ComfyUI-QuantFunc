@@ -2,6 +2,7 @@
 """Batch CPU integration: actual plugin factories + official host; only native ABI doubled."""
 import ast
 import ctypes
+import gc
 import sys
 import threading
 import time
@@ -1808,8 +1809,92 @@ class CanonicalIntegration(unittest.TestCase):
         self.assertEqual(owner.loaded_size(), 0)
         self.assertFalse(any(e[0] in ("grant", "device_grant", "domain_grants")
                              for e in self.lib.events))
+        self.assertEqual(owner.model_size(), 0)   # sized by what it holds; only a LOAD refuses it
+        with self.assertRaisesRegex(RuntimeError, "Closed resource identity is not reloadable"):
+            owner.partially_load(owner.load_device, 4096)
+
+    def destroy_closes_owner(self, residual=0):
+        """The engine's quantfunc_destroy: the pipeline goes, its Owned identity is Closed for good, and only what
+        retained aliases still pin stays backed (warm_native_model's handle is c_void_p(70 + resource key))."""
+        def destroy(pipeline):
+            key = pipeline.value - 70
+            self.lib.resources[key].update(phase=qfe.QUANTFUNC_RESOURCE_PHASE_CLOSED, held=residual)
+            self.lib.events.append(("destroy", key))
+        self.lib.quantfunc_destroy = destroy
+
+    def test_workflow_switch_never_breaks_the_next_models_load(self):
+        """Release blocker (the user's 4090, QI-2.1 and Krea-2 alike): the FIRST run after switching workflows died in
+        VAEDecode. Its load_models_gpu -> free_memory sizes EVERY listed model. This run's own cold create had just
+        Closed the previous workflow's identity (the host-RAM sweep destroys a pipeline whose MODEL Comfy dropped), but
+        Comfy still listed that owner (it is garbage only once gc breaks its prepared-entry cycle) and model_size raised
+        "Closed resource identity is not reloadable". The second run passed only because Comfy's prompt worker had
+        gc-collected the owner in between. A Closed identity is SIZED by what it still holds; only a LOAD refuses it."""
+        self.lib.capabilities = 7
+        self.destroy_closes_owner()
+        patcher_a, owner_a, _ = self.warm_native_model("A")
+        loaded_a = self.official_loaded_model(owner_a)
+        key_a = owner_a._owner_epoch
+        del patcher_a   # the switch: Comfy's cache drops workflow 1's MODEL
+        gc.collect()
+        _, owner_b, _ = self.warm_native_model("B")   # workflow 2's cold create sweeps workflow 1's dead pipeline
+        # the reported state, both halves: Closed by the sweep, still listed by Comfy
+        self.assertIn(("destroy", key_a), self.lib.events)
+        self.assertIn(loaded_a, mm.current_loaded_models)
+        self.assertTrue(owner_a._closed_identity)   # the retire says so itself: no native read is needed to know it
+        self.assertEqual([loaded_a.model_memory(), loaded_a.model_loaded_memory(), loaded_a.model_offloaded_memory()],
+                         [0, 0, 0])
+        with mock.patch.object(mm, "cleanup_models_gc", return_value=None, create=True), \
+             mock.patch.object(mm, "soft_empty_cache", return_value=None, create=True):
+            mm.free_memory(1 << 30, owner_b.load_device)   # VAEDecode's load_models_gpu (model_management.py:1001)
+        self.assertNotIn(loaded_a, mm.current_loaded_models)   # Comfy's own unload dropped the retired identity
+        self.assertEqual(owner_b.model_size(), self.lib.capacity_bytes)   # the live model is untouched
+
+    def test_closed_identity_is_sized_by_what_it_holds_and_refuses_every_load(self):
+        """What a Closed identity still holds (retained aliases) is all Comfy can act on: it sizes as that, so nothing is
+        ever 'offloaded' to bring back; a partial unload frees nothing and writes no grant (a Closed Owned grant is
+        INVALID_ARG natively), so Comfy falls back to the full detach whose release_all is the old owner's final
+        cleanup. Every LOAD still refuses loudly, before Comfy pops anything."""
+        p = self.wrapper()
+        owner, _ = p.model_patches_models()
+        self.lib.capabilities = 7
+        self.lib.resources[2]["phase"] = qfe.QUANTFUNC_RESOURCE_PHASE_CLOSED
+        self.lib.resources[2]["held"] = 512
+        loaded = self.official_loaded_model(owner)
+        self.assertEqual([loaded.model_memory(), loaded.model_loaded_memory(), loaded.model_offloaded_memory()],
+                         [512, 512, 0])
+        before = len(self.lib.events)
+        self.assertEqual(owner.partially_unload(owner.offload_device, 256), 0)
+        self.assertFalse([e for e in self.lib.events[before:]
+                          if e[0] in ("release", "grant", "device_grant", "domain_grants")])
+        self.assertTrue(loaded.model_unload(256))   # Comfy's own fallback: the full detach, release_all
+        mm.current_loaded_models.remove(loaded)      # ...and free_memory pops what model_unload released
+        self.assertEqual([owner.model_size(), owner.loaded_size()], [0, 0])
+        with self.assertRaisesRegex(RuntimeError, "Closed resource identity is not reloadable"):
+            owner.partially_load(owner.load_device, 4096)
         with self.assertRaisesRegex(RuntimeError, "Closed resource identity"):
-            owner.model_size()
+            owner.model_patches_models()
+        listed = list(mm.current_loaded_models)
+        with self.assertRaisesRegex(RuntimeError, "Closed resource identity"):
+            mm.load_models_gpu([p])   # sampling with the MODEL that depends on it: refused at dependency expansion
+        self.assertEqual(mm.current_loaded_models, listed)
+
+    def test_retired_identity_leaves_comfys_list_without_memory_pressure(self):
+        """No free_memory needed: nothing in the plugin keeps a retired owner alive, so once gc runs Comfy's own
+        model finalizer (LoadedModel as model_load builds it: weak real_model + cleanup_models) drops its entry."""
+        self.lib.capabilities = 7
+        self.destroy_closes_owner()
+        patcher_a, owner_a, _ = self.warm_native_model("A")
+        loaded_a = mm.LoadedModel(owner_a)
+        loaded_a.real_model = weakref.ref(owner_a.model)
+        loaded_a.model_finalizer = weakref.finalize(owner_a.model, mm.cleanup_models)
+        mm.current_loaded_models.append(loaded_a)
+        key_a = owner_a._owner_epoch
+        del patcher_a, owner_a
+        gc.collect()
+        self.warm_native_model("B")
+        self.assertIn(("destroy", key_a), self.lib.events)
+        gc.collect()
+        self.assertNotIn(loaded_a, mm.current_loaded_models)
 
     def test_zero_grant_blocks_warm_ensure_after_failed_and_full_release(self):
         p = self.wrapper()
@@ -2199,7 +2284,7 @@ class CanonicalIntegration(unittest.TestCase):
     def test_704_model_size_busy_shared_answers_the_last_ready_residency(self):
         _patcher, _owner, shared = self.warm_native_model("704-size-shared")
         seen = shared.loaded_size()
-        self.sizing_busy("query_lifecycle")
+        self.sizing_busy("query_residency")   # Shared sizing reads only residency (it is never Closed)
         with self.assertLogs(qfm._log.name, "WARNING"):
             self.assertEqual(shared.model_size(), seen)
 

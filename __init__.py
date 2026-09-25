@@ -394,6 +394,10 @@ def _retire_handle(ckey, eng, requester=None, *, keep_binding=False, reason=""):
         eng.destroy()   # idempotent (pipeline->None); closes any session first
     except Exception:  # noqa: BLE001 - retire must never mask the caller's continuation
         pass
+    # Destroying the pipeline Closed its Owned identity, and Comfy may still list that owner until gc collects it:
+    # say so where it happens, so its sizing and unload answers never depend on a native read that may stay BUSY.
+    for owner in getattr(eng, "_qf_resource_adapters", ())[:1]:
+        owner._closed_identity = True
     return True
 
 

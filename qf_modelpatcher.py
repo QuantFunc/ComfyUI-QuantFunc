@@ -1868,14 +1868,24 @@ class QFNativeResourcePatcher(comfy.model_patcher.ModelPatcher):
                 raise qfe.NativeContractUnavailable(
                     "QuantFunc evicted resource has no retained cold-capacity contract")
 
+    def _is_closed(self):
+        """One READY lifecycle read; Closed is final (a closed identity is never reused), so a True answer is kept."""
+        if self._owner_epoch and not self._closed_identity:
+            lifecycle = _ready_read(self._resource.lifecycle, "resource lifecycle")
+            self._closed_identity = lifecycle.phase == qfe.QUANTFUNC_RESOURCE_PHASE_CLOSED
+        return self._closed_identity
+
     @_comfy_facing(_busy_model_size)
     def model_size(self):
+        # Sizing, never a load check: free_memory sizes EVERY listed model on every load_models_gpu, for prompts that
+        # never touch this one. A retired owner stays listed until gc collects it (the host-RAM sweep Closes it while
+        # Comfy still lists it), so refusing here killed the next model's load. A LOAD still refuses a Closed identity
+        # (partially_load, preflight_host_load).
         with _domain_transaction(self):
-            self.require_load_contract()
-            if self._capacity_bytes is not None:
+            if self._capacity_bytes is not None and not self._is_closed():
                 return int(self._capacity_bytes)
-            # Shared has no Prepared model capacity. Its already-resident bytes
-            # remain a zero-deficit dependency in Comfy's ledger.
+            # Closed: what retained aliases still hold is all Comfy can free, and nothing is offloaded to bring back.
+            # Shared has no Prepared capacity: its resident bytes remain a zero-deficit dependency in Comfy's ledger.
             return self._resident_bytes()
 
     @_comfy_facing("refuses")
@@ -1946,6 +1956,12 @@ class QFNativeResourcePatcher(comfy.model_patcher.ModelPatcher):
         if not want:
             return 0
         with _domain_transaction(self):
+            if self._closed_identity:
+                # Known without a read (a new BUSY point here would skip the fence below): the retire that Closed it
+                # marks it, and free_memory sizes every listed model (model_size reads it) before it unloads any.
+                # A Closed Owned grant is INVALID_ARG natively: free nothing, and Comfy falls back to the full detach,
+                # whose release_all is the old owner's final cleanup.
+                return 0
             if self._host_managed:
                 if self is not self._domain.shared:
                     self._needs_readmission = True
