@@ -319,7 +319,7 @@ def _pin_pipeline_consumer_locked(ckey):
 
 def _bind_pipeline_model(ckey, model):
     """Register `model` as a live consumer of ckey's cached handle (called by every family builder
-    after constructing its model). Prunes dead refs so the list tracks the true live set."""
+    after constructing its model). Drops dead refs so the list tracks the true live set."""
     with _ENGINE_IDENTITY_LOCK:
         # Cold preparation also binds consumers but owns no pipeline. Keep that
         # metadata bounded by live consumers, not every historical cold recipe.
@@ -333,7 +333,7 @@ def _bind_pipeline_model(ckey, model):
 
 
 def _live_pipeline_models(ckey):
-    """The models still alive on ckey's handle (prunes dead refs in place)."""
+    """The models still alive on ckey's handle (drops dead refs in place)."""
     with _ENGINE_IDENTITY_LOCK:
         refs = [r for r in _PIPELINE_MODELS.get(ckey, []) if r() is not None]
         if refs:
@@ -668,12 +668,11 @@ if _IMPORT_OK:
                           "tooltip": "A second speed-up that reuses work inside each pass when little changes. 0 (default) = "
                                      "off. 0.05-0.12 is typical; higher is faster but can lose detail. Can be combined "
                                      "with step_cache. Takes effect on the next run."})
-    # [quality_enhance — user 2026-09-25: the quality dropdown is withdrawn; ONE switch, OFF = faster (the default), ON = full
-    # quality, no fast path anywhere] on the four QuantFunc loaders (H3, LTX-2.5, Krea-2, Qwen-Image-2.1), the same on every GPU.
-    # Every session sends only the engine's switch `video_enhance`: what OFF does, per model family, is ENGINE law (user rule
-    # 2026-09-19: the plugin carries no number and names no technique; 「引擎里定」), and `quality` / a fast-step count is never
-    # sent. It is a session knob: the create config never depends on it, so toggling it never rebuilds or reloads the pipeline.
-    # The tooltip states the measured trade of OFF against full quality: the scene is kept, details can move.
+    # [quality_enhance — user 2026-09-25] ONE switch on the four QuantFunc loaders (H3, LTX-2.5, Krea-2, Qwen-Image-2.1), the same
+    # on every GPU: OFF (default) = the engine's faster default, ON = maximum quality. Every session sends only the engine's
+    # switch `video_enhance`; what each state does, per model family, is ENGINE law (user rule 2026-09-19: the plugin carries no
+    # implementation detail). It is a session knob: the create config never depends on it, so toggling it never rebuilds or
+    # reloads the pipeline. The tooltip states the measured trade of OFF against ON: the scene is kept, details can move.
     _QUALITY_ENHANCE_INPUT = ("BOOLEAN", {"default": False,
                               "tooltip": "OFF (default): faster; the subject and scene stay the same, but details such as poses, "
                                          "faces or small objects can differ. ON: the highest quality, a little slower. Takes "
@@ -716,7 +715,7 @@ if _IMPORT_OK:
                                 "Most useful with fast turbo settings; it has no effect at long, high-quality settings."})
 
     # [sol-tau dial 2026-08-31] the ONE user-facing Sol-Attn knob (user "就一个就好"). Applies to
-    # the flash/sage backends — the engine's applySolTauDial engages the Sol-Attn keep-ratio per
+    # the flash/sage backends — the engine's applySolTauDial engages the Sol-Attn threshold per
     # block regardless of attention_backend (it is NOT tied to the removed qfa choice). Same
     # runtime-session-knob class as step_cache/sparse: re-sent each run, no rebuild; 1.0 default is
     # omitted (older engines refuse unknown keys loud) and the engine resets an absent key to 1.0.

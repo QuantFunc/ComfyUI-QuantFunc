@@ -5,9 +5,9 @@ The Krea2 shape (the shared image seam, qf_modelpatcher.QFImageSessionModel): co
 engine owns ONLY the 32-block denoise via the generic external session (QwenImage21Pipeline::prepareExternalDenoise /
 quantfunc_denoise_begin + quantfunc_denoise_step). comfy's own QwenImage21Transformer2DModel receives
 (x [B,64,H/16,W/16] normalized latent, timestep = sigma, context) per cond group — exactly what this seam forwards,
-so cond and latent pass through unchanged (cast to bf16, the engine's activation dtype). The engine prunes a
-one-cond-group session without references only (text-to-image, img2img, mask inpainting); edit, CFG > 1 and
-batch > 1 run full.
+so cond and latent pass through unchanged (cast to bf16, the engine's activation dtype). The quality_enhance switch
+acts on a one-cond-group session without references only (text-to-image, img2img, mask inpainting); edit, CFG > 1
+and batch > 1 always run at maximum quality.
 Reference-image EDIT: TextEncodeQwenImage21 (with a VAE + images) appends reference_latents to both conds and
 reports image_slots per cond; model_base.QwenImage.extra_conds normalizes the references (process_latent_in).
 Both ride every step through quantfunc_denoise_step_refs — the engine splices them exactly like comfy's own

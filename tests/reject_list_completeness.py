@@ -103,7 +103,7 @@ _AUDITED_MODELS = (
     #    through quantfunc_denoise_step_refs (the engine's forwardEdit = comfy build_sequence).
     #  • denoise_mask — SAMPLER-honoured: KSamplerX0Inpaint blends outside the model; comfy's QwenImage21 has no
     #    concat keys, so its concat_cond never reads it — SetLatentNoiseMask inpainting behaves as in comfy, with
-    #    the engine's own (switchable) token-prune applied to the model output exactly as on plain t2i.
+    #    the engine's own quality_enhance behaviour applied to the model output exactly as on plain t2i.
     _Model("QwenImage21", "qf_qwenimage21_modelpatcher.py",
            {"image_slots", "reference_latents", "denoise_mask"},
            ("concat_cond", "encode_adm")),

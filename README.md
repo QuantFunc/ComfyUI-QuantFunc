@@ -20,7 +20,7 @@ ComfyUI plugin for **QuantFunc** — the fastest diffusion model inference engin
 - Native C++/CUDA acceleration via `libquantfunc.so` / `quantfunc.dll`
 - QuantFunc loaders for MiniMax-H3, LTX-2.5, Krea-2 and Qwen-Image-2.1 that work with ComfyUI's own text encoder, VAE and
   sampler nodes
-- Changing quality, attention, caches or LoRAs reuses the loaded model: only a different model file loads again
+- Changing quality_enhance, attention, caches or LoRAs reuses the loaded model: only a different model file loads again
 - Image editing with reference images (Qwen-Image-2.1)
 - The engine installs itself on Linux and Windows, checked against the release's published SHA-256 manifest
 

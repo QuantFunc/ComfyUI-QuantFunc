@@ -403,12 +403,13 @@ def main():
                                                           "quality_enhance", "audio_enhance", "step_cache", "block_cache",
                                                           "allow_partial_denoise"],
           f"-> req={list(_h3it['required'].keys())} opt={list(_h3it.get('optional', {}).keys())}")
-    # (B) quality_enhance (user 2026-09-25 「只有quality enhence这个开关吧 打开就走剪枝 不走快路径了」「关闭就是剪枝 qwenimage=0.85
-    #     其他都是0.8」): ONE switch on the four loaders, the same on every GPU. DEATH RULES: the switch sits in the withdrawn
-    #     dropdown's widget slot (where the published loaders had it); the session sends only the engine's switch video_enhance
-    #     (what OFF does per model family is engine law, user 「引擎里定」: the plugin carries no number), never `quality` or a
-    #     fast step (no fast path); an API prompt saved with the dropdown maps best_quality -> ON, any other value -> OFF; the
-    #     switch adds no create key.
+    # (B) quality_enhance (user 2026-09-25): ONE switch on the four loaders, the same on every GPU. DEATH RULES: the switch sits
+    #     in the widget slot of the earlier `quality` input (where the published loaders had it); the session sends only the
+    #     engine's switch video_enhance (what each state does per model family is engine law: the plugin carries no
+    #     implementation detail), never `quality` or a retired key (tests/_banned_terms.py, hashed); an API prompt saved with the
+    #     earlier input maps best_quality -> ON, any other value -> OFF; the switch adds no create key.
+    sys.path.insert(0, _HERE)
+    import _banned_terms as _bt
     _FOUR = ("QuantFuncLTXLoader", "QuantFuncH3Loader", "QuantFuncKrea2Loader", "QuantFuncQwenImage21Loader")
     _sw = {n: qfn.NODE_CLASS_MAPPINGS[n].INPUT_TYPES() for n in _FOUR}
     _SLOT = {"QuantFuncLTXLoader": 4, "QuantFuncH3Loader": 4, "QuantFuncKrea2Loader": 3, "QuantFuncQwenImage21Loader": 3}
@@ -422,17 +423,17 @@ def main():
           "dropdown is no input, its name is declared hidden as a (type, options) spec (an old API prompt reaches load())",
           not _sw_bad, f"-> {_sw_bad}")
     E = qfn._quality_enhance_on
-    _row = (E(), E(False), E(True), E(None, "best_quality"), [E(None, q) for q in ("balance", "fast", "super_fast", "")],
+    _row = (E(), E(False), E(True), E(None, "best_quality"), [E(None, q) for q in ("balance", "other", "")],
             E(True, "balance"), E(False, "best_quality"))
-    check("the switch: default OFF; a saved dropdown value maps best_quality -> ON and any other value -> OFF; the switch wins "
-          "over a saved dropdown value",
-          _row == (False, False, True, True, [False] * 4, True, False), f"-> {_row}")
+    check("the switch: default OFF; a saved earlier value maps best_quality -> ON and any other value -> OFF; the switch wins "
+          "over a saved earlier value",
+          _row == (False, False, True, True, [False] * 3, True, False), f"-> {_row}")
     check("no dropdown machinery or plugin-side keep table survives (no options, no GPU tier, no engine query, no "
           "VALIDATE_INPUTS, no create key, no number)",
           not any(hasattr(qfn, a) for a in ("_quality_fast_tier", "_quality_fast_cache", "_resolve_quality", "_validate_quality",
                                              "_quality_input", "_qi21_quality_input", "_qi21_resolve_quality", "_QUALITY_DROPPED",
-                                             "_loaded_device_index", "_quality_create_opts", "_QUALITY_ENHANCE_OFF_KEEP",
-                                             "_quality_enhance_keep"))
+                                             "_loaded_device_index", "_quality_create_opts"))
+          and not [a for a in dir(qfn) if _bt.h(a) in _bt.NAMES]
           and not any(hasattr(qfn.NODE_CLASS_MAPPINGS[n], "VALIDATE_INPUTS") for n in _FOUR),
           "-> a dropdown helper is still present")
     from qfn_test_pkg import qf_modelpatcher as _qmp_q
@@ -459,18 +460,15 @@ def main():
         _unset = "sent"
     except RuntimeError:
         _unset = "refused"
-    _NEVER = ("quality", "token_prune_keep_ratio", "w4a4_fast", "end_step", "extra_audio_steps")
     check("session: the engine's switch video_enhance is ALWAYS sent (both states) and nothing else decides quality: never "
-          "`quality`, a raw key or a fast step (no fast path); a model its loader never configured refuses to begin",
-          all(o.get("video_enhance") is on and not any(x in o for x in _NEVER) for on, o in _sess.items())
+          "`quality` or a retired key; a model its loader never configured refuses to begin",
+          all(o.get("video_enhance") is on and not any(k == "quality" or _bt.h(k) in _bt.KEYS for k in o)
+              for on, o in _sess.items())
           and _unset == "refused", f"-> {_sess} / unset {_unset}")
     # (B) the four loaders' user-visible text states only the speed / quality trade (user 「介绍上不要透露技术细节」,
-    #     「四个 loader 的所有说明都改」): no technique word in any DESCRIPTION or tooltip. Widget NAMES are the user's and stay
-    #     (a whole-word match, so the step_cache widget name is not a hit).
-    import re as _re
-    _BANNED = _re.compile(r"prun|token|int4|int8|fp4|w4a4|quanti[sz]|sidecar|rowscale|fast.path|fast.law|\bsteps?\b|precision|"
-                          r"kernel|svdq|denoise_only|easycache|first.block|sol.attn|\bseam\b|lora rank|"
-                          r"\bflash\b|\bsage\b", _re.I)   # A4c: the attention options are named, never explained
+    #     「四个 loader 的所有说明都改」): no technique word in any DESCRIPTION or tooltip — the words live hashed in
+    #     _banned_terms (DESC_*). Widget NAMES are the user's and stay (a whole-word match, so the step_cache widget name
+    #     is not a hit); the attention options are named, never explained (A4c).
     _texts = []
     for _n in _FOUR + ("QuantFuncNativeLoRA",):   # the LoRA node's text is user-visible too (A, round 2)
         _c = qfn.NODE_CLASS_MAPPINGS[_n]
@@ -479,7 +477,7 @@ def main():
             for _k, _v in _c.INPUT_TYPES().get(_sec, {}).items():
                 if len(_v) > 1 and isinstance(_v[1], dict) and _v[1].get("tooltip"):
                     _texts.append((f"{_n}.{_k}", _v[1]["tooltip"]))
-    _hits = [(w, m.group(0)) for w, t in _texts for m in [_BANNED.search(t)] if m]
+    _hits = [(w, x) for w, t in _texts for x in _bt.desc_hits(t) + _bt.term_hits(t) + _bt.mode_id_hits(t)]
     check("the four loaders' user-visible text carries no technique word (DESCRIPTIONs + every tooltip)",
           not _hits and len(_texts) > 20, f"-> {len(_texts)} texts, hits {_hits[:4]}")
     _qe_tips = {w: t for w, t in _texts if w.endswith(".quality_enhance")}
@@ -488,7 +486,7 @@ def main():
           len(_qe_tips) == 4 and all("subject and scene stay the same" in t and "can differ" in t and "highest quality" in t
                                      for t in _qe_tips.values()), f"-> {_qe_tips}")
     _refused = []
-    for _knob in ({"quality": "fast"}, {"video_enhance": False}):
+    for _knob in ({"quality": "balance"}, {"video_enhance": False}):
         try:
             qfn.qfe._refuse_session_knobs_in_create(_knob)
             _refused.append(False)
@@ -497,11 +495,9 @@ def main():
     check("create boundary refuses `quality` and video_enhance (session knobs) in a create config",
           _refused == [True, True], f"-> {_refused}")
     from qfn_test_pkg import qf_modelpatcher as _qmp_tp
-    check("the session carries the engine's switch (set_video_enhance) and no retired setter or keep mapper survives "
-          "(set_quality, set_token_prune / _keep, the old keep mapper)",
+    check("the session carries the engine's switch (set_video_enhance) and no retired setter or mapper survives",
           hasattr(_qmp_tp.QFSessionModelMixin, "set_video_enhance")
-          and not hasattr(qfn, "_quality_enhance_to_token_prune") and not hasattr(_qmp_tp.QFSessionModelMixin, "set_token_prune")
-          and not hasattr(_qmp_tp.QFSessionModelMixin, "set_token_prune_keep")
+          and not [a for a in dir(_qmp_tp.QFSessionModelMixin) + dir(qfn) if _bt.h(a) in _bt.NAMES]
           and not hasattr(_qmp_tp.QFSessionModelMixin, "set_quality") and not hasattr(qfn, "_apply_quality"),
           "-> a retired setter / mapper is still present")
     # qfa REMOVED as a user-facing attention_backend choice (2026-09-13)
@@ -631,8 +627,8 @@ def main():
     # ── positive path: the all-in file alone loads (AV via the packed audio connector) ──
     out_ltx = LtxL.load(_allin_name, "ltx2-2.5-22b")[0]
     _lk = lambda **kw: getattr(LtxL.load(_allin_name, "ltx2-2.5-22b", **kw)[0].model, "_video_enhance", "MISSING")
-    _ltx_k = [_lk(), _lk(quality_enhance=True), _lk(quality="best_quality"), _lk(quality="super_fast")]
-    check("ltx2 load(): OFF by default, ON when set; a saved dropdown best_quality runs ON, super_fast runs OFF",
+    _ltx_k = [_lk(), _lk(quality_enhance=True), _lk(quality="best_quality"), _lk(quality="balance")]
+    check("ltx2 load(): OFF by default, ON when set; a saved earlier best_quality runs ON, any other value runs OFF",
           _ltx_k == [False, True, True, False], f"-> {_ltx_k}")
     check("ltx2 AV file-mode returns a QFModelPatcher",
           type(out_ltx).__name__ == "QFModelPatcher")
@@ -651,7 +647,7 @@ def main():
     check("ltx2 staged: NO text_encoder and NO audio_vae weights (one-file contract)",
           not os.path.exists(os.path.join(_lmd, "text_encoder", "model.safetensors"))
           and not os.path.exists(os.path.join(_lmd, "audio_vae", "model.safetensors")))
-    check("ltx2 staged: config-complete + transformer_2 pruned (single-expert)",
+    check("ltx2 staged: config-complete + transformer_2 removed (single-expert)",
           all(os.path.isfile(os.path.join(_lmd, q)) for q in
               ("model_index.json", "transformer/config.json", "vae/config.json",
                "connectors/config.json", "audio_vae/config.json"))
@@ -745,20 +741,20 @@ def main():
     _hcfg = creates[-1] if len(creates) > _n0 else json.loads(out_h3.model._qf._ckey[-1])
     check("h3 create cfg carries denoise_only", _hcfg.get("denoise_only") is True, f"-> {_hcfg}")
     # quality_enhance through the REAL load() (behaviour, not a signature read — a loader wrapped by another input layer keeps
-    # it): OFF (default) / ON; a saved dropdown value by name when the switch is absent (best_quality -> ON, anything else ->
+    # it): OFF (default) / ON; a saved earlier value by name when the switch is absent (best_quality -> ON, anything else ->
     # OFF); the switch wins over a saved dropdown value. Krea-2 likewise.
     _hk = lambda **kw: getattr(H3L.load("fx-minimax-h3-quantfunc-int4.safetensors", "minimax-h3-fl2va", **kw)[0].model,
                                "_video_enhance", "MISSING")
     _kk = lambda **kw: getattr(KreaL.load("fx-krea2-turbo-quantfunc-int4.safetensors", "krea2-turbo-int4", **kw)[0].model,
                                "_video_enhance", "MISSING")
     _hks = [_hk(), _hk(quality_enhance=True), _hk(quality_enhance=False), _hk(quality="best_quality"),
-            _hk(quality="best_quality", quality_enhance=False), _hk(quality="fast")]
-    _kks = [_kk(), _kk(quality_enhance=True), _kk(quality="super_fast")]
-    check("h3 load(): OFF by default, ON when set; a saved dropdown value maps best_quality -> ON, fast -> OFF; the switch wins",
+            _hk(quality="best_quality", quality_enhance=False), _hk(quality="other")]
+    _kks = [_kk(), _kk(quality_enhance=True), _kk(quality="balance")]
+    check("h3 load(): OFF by default, ON when set; a saved earlier value maps best_quality -> ON, any other -> OFF; the switch wins",
           _hks == [False, True, False, True, False, False], f"-> {_hks}")
-    check("krea2 load(): OFF by default, ON when set; a saved super_fast runs OFF", _kks == [False, True, False], f"-> {_kks}")
+    check("krea2 load(): OFF by default, ON when set; a saved other value runs OFF", _kks == [False, True, False], f"-> {_kks}")
     _hmd = out_h3.model._qf._ckey[0]
-    check("h3 staged: config-complete + xfm linked + transformer_2 pruned",
+    check("h3 staged: config-complete + xfm linked + transformer_2 removed",
           all(os.path.isfile(os.path.join(_hmd, q)) for q in
               ("model_index.json", "transformer/config.json", "vae/config.json"))
           and os.path.realpath(os.path.join(_hmd, "transformer", "model.safetensors")).endswith("fx-minimax-h3-quantfunc-int4.safetensors")

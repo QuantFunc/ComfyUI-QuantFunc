@@ -334,9 +334,8 @@ class QFSessionModelMixin:
             self._sol_tau = 1.0
 
     def set_video_enhance(self, on):
-        # [quality_enhance 2026-09-25] the loaders' switch → the engine's `video_enhance` (OFF = the model family's faster setting,
-        # engine law; ON = full quality). Rides residency_opts like the other dials; the session never sends `quality`, so
-        # no fast path runs.
+        # [quality_enhance 2026-09-25] the loaders' switch → the engine's `video_enhance` (OFF = the engine's faster default for
+        # the model family; ON = maximum quality). Rides residency_opts like the other dials; `quality` is never sent.
         self._video_enhance = bool(on)
 
     # Every loader-set session dial: each set_* on this mixin or a family model writes exactly one of these (a death
@@ -398,7 +397,7 @@ class QFSessionModelMixin:
           auto rendered byte-for-byte as the flash run before it). "auto" is every family's create-time default.
         - video_enhance: ALWAYS sent, both states (the quality_enhance switch; what OFF does per model family is engine
           law). Every loader sets it on the model it builds, so a model without one is a wiring error: refused here,
-          never a silent default. `quality` is never sent: no fast path runs."""
+          never a silent default. `quality` is never sent."""
         on = getattr(self, "_video_enhance", None)
         if on is None:
             raise RuntimeError("QuantFunc: this model has no quality_enhance setting (the loader sets one on every model it "
