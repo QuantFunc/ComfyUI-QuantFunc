@@ -1313,7 +1313,7 @@ def _busy_model_size(adapter, busy, *_args, **_kwargs):
     """An Owned view's size is its Prepared capacity, fixed at prepare time; a Shared view's is its residency."""
     if adapter._capacity_bytes is None:
         return _busy_loaded_size(adapter, busy)
-    _log.warning("[qf_native] %s; model_size answers the Prepared capacity, %d B (exact)", busy,
+    _log.warning("[qf_native] %s; model_size answers the Prepared capacity, %d B (fixed at prepare time)", busy,
                  adapter._capacity_bytes)
     return int(adapter._capacity_bytes)
 
@@ -1868,24 +1868,18 @@ class QFNativeResourcePatcher(comfy.model_patcher.ModelPatcher):
                 raise qfe.NativeContractUnavailable(
                     "QuantFunc evicted resource has no retained cold-capacity contract")
 
-    def _is_closed(self):
-        """One READY lifecycle read; Closed is final (a closed identity is never reused), so a True answer is kept."""
-        if self._owner_epoch and not self._closed_identity:
-            lifecycle = _ready_read(self._resource.lifecycle, "resource lifecycle")
-            self._closed_identity = lifecycle.phase == qfe.QUANTFUNC_RESOURCE_PHASE_CLOSED
-        return self._closed_identity
-
     @_comfy_facing(_busy_model_size)
     def model_size(self):
-        # Sizing, never a load check: free_memory sizes EVERY listed model on every load_models_gpu, for prompts that
-        # never touch this one. A retired owner stays listed until gc collects it (the host-RAM sweep Closes it while
-        # Comfy still lists it), so refusing here killed the next model's load. A LOAD still refuses a Closed identity
-        # (partially_load, preflight_host_load).
+        # Sizing only, never a load check: free_memory sizes EVERY listed model on every load_models_gpu, for prompts
+        # that never touch this one, and a retired owner stays listed until gc collects it (the host-RAM sweep Closes it
+        # while Comfy still lists it), so refusing here killed the next model's load. A LOAD still refuses a Closed
+        # identity (partially_load, preflight_host_load). A Closed owner keeps its Prepared capacity as its size: in
+        # ComfyUI 0.37 that only orders free_memory's evictions (largest offloaded first), which puts the dead owner first.
         with _domain_transaction(self):
-            if self._capacity_bytes is not None and not self._is_closed():
+            if self._capacity_bytes is not None:
                 return int(self._capacity_bytes)
-            # Closed: what retained aliases still hold is all Comfy can free, and nothing is offloaded to bring back.
-            # Shared has no Prepared capacity: its resident bytes remain a zero-deficit dependency in Comfy's ledger.
+            # Shared has no Prepared model capacity. Its already-resident bytes
+            # remain a zero-deficit dependency in Comfy's ledger.
             return self._resident_bytes()
 
     @_comfy_facing("refuses")
@@ -1957,10 +1951,10 @@ class QFNativeResourcePatcher(comfy.model_patcher.ModelPatcher):
             return 0
         with _domain_transaction(self):
             if self._closed_identity:
-                # Known without a read (a new BUSY point here would skip the fence below): the retire that Closed it
-                # marks it, and free_memory sizes every listed model (model_size reads it) before it unloads any.
-                # A Closed Owned grant is INVALID_ARG natively: free nothing, and Comfy falls back to the full detach,
-                # whose release_all is the old owner's final cleanup.
+                # Set where the identity was Closed (the retire; a detach or a load that read the lifecycle sets it too),
+                # so no read here: a new BUSY point would skip the fence below. A Closed Owned grant is INVALID_ARG
+                # natively: free nothing, and Comfy falls back to the full detach, whose release_all is the old owner's
+                # final cleanup.
                 return 0
             if self._host_managed:
                 if self is not self._domain.shared:
