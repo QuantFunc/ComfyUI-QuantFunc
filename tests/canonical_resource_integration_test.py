@@ -579,6 +579,89 @@ class CanonicalIntegration(unittest.TestCase):
                 self.assertEqual(qfm._host_inference_bytes(torch.device("cuda:0")), comfy_side)
                 self.assertFalse(lazy.materialized)
 
+    def test_host_reserve_is_keyed_by_the_build_device_after_comfy_unloads_the_model(self):
+        """#738 plugin CR F1: ComfyUI's full unload (ModelPatcher.detach -> unpatch_model(offload device), reached by
+        LoadedModel.model_unload, free_memory and POST /free) rewrites model.device to the offload device: cpu under
+        NORMAL/LOW/NO_VRAM, every 8 GB target. The reserve is keyed by the card the weights were built for, the key the
+        grant reads, so the next sampling's comfy side still reaches the grant. Red before: that sampling was noted under
+        cpu and the grant kept the previous run's smaller value."""
+        import comfy.sampler_helpers as sampler_helpers
+        import comfy.supported_models as supported_models
+        from qf_loader_contract import qf_krea2_modelpatcher as krea2
+
+        cuda0 = torch.device("cuda:0")
+        cfg = supported_models.Krea2({"image_model": "krea2", "disable_unet_model_creation": True})
+        qfm.ensure_model_config_attrs(cfg)
+        model = krea2.QFKrea2Model(cfg, qfm.QFLazyEngine(lambda: plugin._get_engine("build-device-key")), device=cuda0)
+        patcher = qfm.QFModelPatcher(model, cuda0, torch.device("cpu"))
+        sides = []
+        with mock.patch.object(mm, "load_models_gpu"):
+            for noise_shape in ((1, 16, 32, 32), (1, 16, 128, 128)):
+                sampler_helpers.prepare_sampling(patcher, noise_shape, {}, model_options=patcher.model_options)
+                sides.append(model._qf_comfy_side_bytes([noise_shape[0] * 2, *noise_shape[1:]], {}))
+                self.assertEqual(qfm._host_inference_bytes(cuda0), sides[-1])
+                patcher.detach(True)
+                self.assertEqual(model.device, torch.device("cpu"), "premise: ComfyUI's unload rewrote model.device")
+        self.assertLess(sides[0], sides[1], "discriminating: the second sampling's comfy side is the larger")
+
+    def test_cold_need_status_split_names_why_the_engine_cannot_say(self):
+        """#738 plugin CR D-V2: the cold need's status is never folded into one silent None. An older library (no entry)
+        is silent by design; INVALID_ARG is a contract violation and raises; UNSUPPORTED says the layout is not
+        estimable, any other status carries the engine's own error. Each reason is warned about ONCE per resource, and
+        none of them reads as 0 or as an older library."""
+        resource = qfe.NativeResource(self.lib, ctypes.c_void_p(1))
+        self.assertEqual(resource.cold_vram_need_bytes(), qfe.ColdNeed(None, None))
+        status = [qfe.QUANTFUNC_OK]
+
+        def need(pointer, out):
+            out._obj.value = (7 << 20) if status[0] == qfe.QUANTFUNC_OK else 0
+            return status[0]
+        self.lib.quantfunc_resource_vram_need_bytes = need
+        self.lib.quantfunc_last_error = lambda: b"resource busy"
+        with mock.patch.object(qfe, "say") as say:
+            self.assertEqual(resource.cold_vram_need_bytes(), qfe.ColdNeed(7 << 20, None))
+            status[0] = qfe.QUANTFUNC_ERROR_INVALID_ARG
+            with self.assertRaisesRegex(RuntimeError, "cold VRAM need refused: resource busy"):
+                resource.cold_vram_need_bytes()
+            status[0] = qfe.QUANTFUNC_ERROR_UNSUPPORTED
+            for _ in range(2):
+                self.assertEqual(resource.cold_vram_need_bytes(), qfe.ColdNeed(None, "not estimable for this layout"))
+            status[0] = 5   # the engine's INTERNAL (a busy resource, an engine failure)
+            for _ in range(2):
+                self.assertEqual(resource.cold_vram_need_bytes(),
+                                 qfe.ColdNeed(None, "unknown (engine status 5: resource busy)"))
+        self.assertEqual([c.args[0] for c in say.call_args_list], [
+            "[qf_native] WARNING the engine's cold VRAM need is not estimable for this layout; ComfyUI's own "
+            "estimate is the floor",
+            "[qf_native] WARNING the engine's cold VRAM need is unknown (engine status 5: resource busy); ComfyUI's "
+            "own estimate is the floor"])
+
+    def test_both_publications_of_one_admission_read_one_reserve_that_no_clock_ages(self):
+        """#738 plugin CR D-S5: ComfyUI admits the Shared adapter and then the Owner adapter, two grant publications,
+        and both leave the same host reserve free. The reserve is the largest answer since the record restarted, and the
+        first answer after a publication restarts it, so a smaller next sampling is not held to this one's reserve.
+        Recording reads no clock, so a slow card's answers never age the record out. Red before: a 2 s wall-clock burst
+        decided when a record restarted (answers inside it carried the previous sampling's larger value)."""
+        patcher = self.wrapper("host-reserve-record")
+        owner, shared = patcher.model_patches_models()
+        key = owner._resource._pointer.value
+        self.lib.resources[key].update(held=10, limit=0, phase=qfe.QUANTFUNC_RESOURCE_PHASE_ATTACHED)
+        self.lib.resources[1].update(held=0, limit=0)
+        self.lib.device_limit = 0
+        cuda0 = torch.device("cuda:0")
+        no_clock = mock.Mock(monotonic=mock.Mock(side_effect=AssertionError("the reserve record read a clock")))
+        for answers in ((6, 2), (1, 4)):          # prepare_sampling: the full shape, then the minimum shape
+            with mock.patch.object(qfm, "time", no_clock):
+                for nbytes in answers:
+                    qfm._note_host_inference_bytes(cuda0, nbytes)
+            growth = 30 - max(answers)
+            with mock.patch.object(mm, "get_free_memory", return_value=30):
+                for adapter in (shared, owner):    # ComfyUI's admission order: two publications
+                    self.assertEqual(adapter.partially_load(adapter.load_device, 5), 0)
+            self.assertEqual((self.lib.resources[key]["limit"], self.lib.resources[1]["limit"],
+                              self.lib.device_limit), (10 + growth, growth, 10 + growth))
+        self.lib.resources[key].update(held=0)
+
     def test_domain_actual_and_load_delta_never_sum_per_resource_residency(self):
         patcher = self.wrapper("coherent-domain")
         owner, _ = patcher.model_patches_models()

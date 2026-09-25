@@ -21,6 +21,7 @@ import json
 import os
 import sys
 import tempfile
+import types
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _PLUGIN = os.path.dirname(_HERE)
@@ -187,7 +188,8 @@ def main():
     class _DummyPrepared(qfn.qfmp.QFPreparedEntry):
         """Prepared/resource half of the production lazy-factory contract."""
         def __init__(self):
-            self.resource = object()
+            # an engine without the cold-need entry (#738): the cold ask keeps comfy's own floor
+            self.resource = types.SimpleNamespace(cold_vram_need_bytes=lambda: qfn.qfmp.qfe.ColdNeed(None, None))
             self.capacity_bytes = 4096
             self._materializers = []
 

@@ -211,6 +211,13 @@ class ResourceCapacity(NamedTuple):
     required_persistent_bytes: Optional[int]
 
 
+class ColdNeed(NamedTuple):
+    """#738 The engine's COLD create-time need. `bytes` None = the engine cannot say; `note` says why - None only when
+    that is by design (an older library without the entry), so an engine failure never reads like an older library."""
+    bytes: Optional[int]
+    note: Optional[str]
+
+
 class ResourceSnapshot(NamedTuple):
     """Native categories, not ModelPatcher capacity or a demand estimate.
 
@@ -283,6 +290,7 @@ class NativeResource:
     def __init__(self, lib, pointer):
         self._lib, self._pointer = lib, pointer
         self._lock = threading.Lock()
+        self._cold_need_warned = set()   # each reason the cold need is unknown is warned about once per resource
         self._finalizer = weakref.finalize(self, _destroy_resource_view, lib, pointer)
 
     @classmethod
@@ -380,22 +388,28 @@ class NativeResource:
     def cold_vram_need_bytes(self):
         """#738 The engine's COLD create-time device need for this configured Prepared resource
         (quantfunc_resource_vram_need_bytes: its CCA-resident persistent bytes + its largest paged block + the ambient
-        reserve — the plan side's number, header facts only). None = this engine cannot say (an older library, a layout
-        the plan does not model, a busy resource): the caller keeps its own floor, it never reads None as 0."""
+        reserve - the plan side's number, header facts only), as a ColdNeed. When the engine cannot say, the caller keeps
+        its own floor and never reads that as 0: an older library is silent (by design); a layout the plan does not model
+        or an engine failure is named in the note and warned about once (plugin CR D-V2)."""
         with self._lock:
             self._check_open()
             function = getattr(self._lib, "quantfunc_resource_vram_need_bytes", None)
             if function is None:
-                return None
+                return ColdNeed(None, None)
             function.restype = ctypes.c_int
             function.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint64)]
             out = ctypes.c_uint64(0)
             status = function(self._pointer, ctypes.byref(out))
             if status == QUANTFUNC_OK and out.value:
-                return int(out.value)
+                return ColdNeed(int(out.value), None)
             if status == QUANTFUNC_ERROR_INVALID_ARG:
                 raise RuntimeError(f"QuantFunc cold VRAM need refused: {last_err(self._lib)}")
-            return None
+            note = ("not estimable for this layout" if status == QUANTFUNC_ERROR_UNSUPPORTED
+                    else f"unknown (engine status {status}: {last_err(self._lib)})")
+            if note not in self._cold_need_warned:
+                self._cold_need_warned.add(note)
+                say(f"[qf_native] WARNING the engine's cold VRAM need is {note}; ComfyUI's own estimate is the floor")
+            return ColdNeed(None, note)
 
     def query(self):
         with self._lock:

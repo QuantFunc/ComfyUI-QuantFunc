@@ -296,6 +296,14 @@ class QFSessionModelMixin:
     # engine spec stays cache_mode=0/thresh=0 → the step path is BYTE-IDENTICAL (the
     # engine-side off-path guarantee, the engine's cache layer the engine's step-cache wrapper). >0 arms
     # lighting::CacheMode::the step cache with this mean_abs_diff skip budget. ──
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # #738 (plugin CR F1): the card these weights are BUILT for (family_build's device, the patcher's load_device;
+        # every family passes it as device=) keys the host-inference reserve. ComfyUI rewrites self.device to the
+        # offload device on every full unload (model_patcher.detach -> unpatch_model), so a reserve keyed by it goes
+        # stale for the grant, which reads it by the load device.
+        self._qf_build_device = kwargs.get("device")
+
     _step_cache = 0.0             # class default; loaders set the widget value (step_cache)
     _block_cache = 0.0            # class default; loaders set the widget value (block_cache)
     _sparse = 1.0                 # class default; 1.0 = dense (loaders set the sparse widget)
@@ -491,7 +499,7 @@ class QFSessionModelMixin:
         comfy_side = self._qf_comfy_side_bytes(input_shape, cond_shapes)
         lazy = eng = getattr(self, "_qf", None)
         need = 0
-        cold_need = None
+        cold_need = cold_note = None
         if eng is not None:
             # Lookup may bind an existing cached handle, but must never create ahead of host admission. Query errors
             # must reach the host instead of authorizing execution with a fabricated zero demand.
@@ -506,14 +514,13 @@ class QFSessionModelMixin:
                 # and Krea-2's create failed physically on a 6 GB card). It stays UNDER comfy's own estimate as the
                 # floor: the create-time need has no forward working set, and the first forward follows this one ask
                 # (#716: LTX-2.5 1920x1088 cold needed comfy to evict an 11 GB TE for it). Unknown -> the floor alone.
-                reader = getattr(lazy, "cold_vram_need_bytes", None)
-                cold_need = reader() if callable(reader) else None
+                cold_need, cold_note = lazy.cold_vram_need_bytes()
         if cold_need is not None:
             need = int(cold_need)
         floor = int(super().memory_required(input_shape, cond_shapes=cond_shapes or {})) if eng is None else 0
         total = int(max(floor, comfy_side + need))
         # #738: the host's OWN inference tensors for this sampling (comfy side) stay outside our grant
-        _note_host_inference_bytes(getattr(self, "device", None), comfy_side)
+        _note_host_inference_bytes(self._qf_build_device, comfy_side)
         # One line per CHANGE of the answer (comfy asks per estimate + per cond-batch decision): the numbers comfy
         # will act on, so a ledger question is answerable from the log, not a guess.
         sig = (tuple(int(d) for d in input_shape), comfy_side, need, floor, eng is None)
@@ -527,8 +534,10 @@ class QFSessionModelMixin:
                   "engine hold %s"
                   % (list(sig[0]), total >> 20, comfy_side >> 20, need >> 20,
                      (" (cold: no pipeline yet; the engine's create-time need, floored by comfy's own estimate %d MB)"
-                      if cold_need is not None else " (cold: no pipeline yet; comfy's own estimate %d MB is the floor)")
-                     % (floor >> 20)
+                      % (floor >> 20) if cold_need is not None else
+                      " (cold: no pipeline yet; the engine's need is %s: comfy's own estimate %d MB is the floor)"
+                      % (cold_note, floor >> 20) if cold_note else
+                      " (cold: no pipeline yet; comfy's own estimate %d MB is the floor)" % (floor >> 20))
                      if eng is None else
                      "" if need else " (0: covered by what it holds, or nothing measured yet)",
                      hold), flush=True)
@@ -984,11 +993,9 @@ class QFLazyEngine:
 
     def cold_vram_need_bytes(self):
         """#738 No pipeline yet: the engine's create-time need for these weights, from the Prepared resource the cold
-        path already configured (never a create). None = unknown (an older engine / an unmodeled layout / busy)."""
-        entry = self._prepared_entry
-        resource = getattr(entry, "resource", None) if entry is not None else None
-        reader = getattr(resource, "cold_vram_need_bytes", None)
-        return reader() if callable(reader) else None
+        path already configured (never a create): a qf_engine.ColdNeed (bytes None = the engine cannot say; its note
+        says why, None when that is by design - an older library)."""
+        return self._prepared_entry.resource.cold_vram_need_bytes()
 
     # NOTE: deliberately NO destroy() and NO release() on the wrapper: native backing is evicted by the canonical
     # resource adapters, and the cache's _sweep_dead_pipelines destroys REAL handles, never wrappers. A caller
@@ -1432,11 +1439,10 @@ def _domain_loaded_size(adapter):
 
 
 # #738 The host's own inference bytes for the sampling being admitted, per device: the ledger's comfy side. ComfyUI asks
-# memory_required for the full (cond+uncond) shape and then the minimum shape back to back, so the reserve is the larger
-# of one burst of answers (answers seconds apart start a new sampling's value). Read by _publish_domain_grants so the
-# grant leaves them free — they are torch allocations ComfyUI makes outside any QuantFunc ceiling.
+# memory_required for the full (cond+uncond) shape and then the minimum shape right before it admits, so the reserve is
+# the larger of those answers (see _note_host_inference_bytes for when a record restarts). Read by _publish_domain_grants
+# so the grant leaves them free - they are torch allocations ComfyUI makes outside any QuantFunc ceiling.
 _QF_HOST_INFERENCE_BYTES = {}
-_QF_HOST_INFERENCE_BURST_S = 2.0
 
 
 def _device_key(device):
@@ -1445,14 +1451,26 @@ def _device_key(device):
 
 
 def _note_host_inference_bytes(device, nbytes):
-    key, now = _device_key(device), time.monotonic()
-    previous, when = _QF_HOST_INFERENCE_BYTES.get(key, (0, float("-inf")))
-    value = max(0, int(nbytes))
-    _QF_HOST_INFERENCE_BYTES[key] = (max(previous, value) if now - when < _QF_HOST_INFERENCE_BURST_S else value, now)
+    # The record is the largest answer since it (re)started, and it restarts at the first answer after a grant
+    # publication read it: the two publications of one admission (Shared, then Owner) read the same value, and the
+    # next sampling's answers start fresh. No clock (plugin CR D-S5): a record never ages out while a run is slow.
+    # The one residue: the answers a running sampling gives after its admission carry into the next sampling's
+    # record - an over-reserve when that run is smaller, never less.
+    key, value = _device_key(device), max(0, int(nbytes))
+    held, published = _QF_HOST_INFERENCE_BYTES.get(key, (0, False))
+    _QF_HOST_INFERENCE_BYTES[key] = (value if published else max(held, value), False)
 
 
 def _host_inference_bytes(device):
-    return _QF_HOST_INFERENCE_BYTES.get(_device_key(device), (0, 0.0))[0]
+    return _QF_HOST_INFERENCE_BYTES.get(_device_key(device), (0, False))[0]
+
+
+def _publish_host_inference_bytes(device):
+    """A grant publication's read: the record's value, and the next answer restarts it."""
+    key = _device_key(device)
+    held, _ = _QF_HOST_INFERENCE_BYTES.get(key, (0, False))
+    _QF_HOST_INFERENCE_BYTES[key] = (held, True)
+    return held
 
 
 def _publish_domain_grants(adapter, *, publish_owner=False, growth_allowance=0):
@@ -1491,7 +1509,8 @@ def _publish_domain_grants(adapter, *, publish_owner=False, growth_allowance=0):
             # #738 C4b/C4d: ComfyUI's OWN tensors for this sampling (latent, noise, conversions — the ledger's comfy
             # side) plus its --reserve-vram are torch allocations OUTSIDE our grant; granting all of `free` left none
             # (MEASURED: --novram / --disable-dynamic-vram at a 6 GB card -> torch OOM in samplers.inner_sample).
-            host_reserve = _host_inference_bytes(shared.load_device) + int(comfy.model_management.extra_reserved_memory())
+            host_reserve = (_publish_host_inference_bytes(shared.load_device) +
+                            int(comfy.model_management.extra_reserved_memory()))
             allowance = min(max(allowance, free - host_reserve), total)
             device_limit = min(total, domain_actual + allowance)
 

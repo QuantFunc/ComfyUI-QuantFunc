@@ -220,8 +220,17 @@ def _non_ascii_code_lines(tree, path):
             if any(ord(c) > 127 for c in lines[ln - 1])]
 
 
-# ComfyUI's entry points on a node class besides its FUNCTION (execution.py / server.py call each one when present).
-_COMFY_NODE_ENTRY_POINTS = ("INPUT_TYPES", "VALIDATE_INPUTS", "IS_CHANGED", "check_lazy_status")
+def _node_entry_points():
+    """ComfyUI's entry points on a node class besides its FUNCTION (execution.py / server.py call each one when present),
+    read from the plugin's qf_engine._NODE_ENTRY_POINTS - the list the boundary wraps, whatever tree is scanned - never
+    a copy, so an entry point added there is checked here too (plugin CR D-S4). Parsed, not imported: this static arm
+    executes no plugin code."""
+    with open(os.path.join(_ROOT, "qf_engine.py"), encoding="utf-8") as f:
+        engine_tree = ast.parse(f.read())
+    for n in engine_tree.body:
+        if isinstance(n, ast.Assign) and any(getattr(t, "id", None) == "_NODE_ENTRY_POINTS" for t in n.targets):
+            return tuple(ast.literal_eval(n.value))
+    raise AssertionError("qf_engine.py defines no _NODE_ENTRY_POINTS")
 
 
 def _suspends(f):
@@ -272,10 +281,11 @@ def _boundary_sites(root):
         fn, node, _ = classes[c]
         if not any(ast.unparse(d).endswith("console_safe_methods") for d in node.decorator_list):
             sites.append(f"{fn}:{node.lineno} class {c}: ComfyUI calls into it, but it lacks @qfe.console_safe_methods")
+    entry_points = set(_node_entry_points())
     for c, (fn, node, _) in sorted(classes.items()):
         wrapped = {s.value.value for s in node.body if isinstance(s, ast.Assign) and isinstance(s.value, ast.Constant)
                    and any(getattr(t, "id", None) == "FUNCTION" for t in s.targets)}
-        wrapped |= set(_COMFY_NODE_ENTRY_POINTS) if wrapped else set()
+        wrapped |= entry_points if wrapped else set()
         for m in node.body:
             if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef)) and _suspends(m) and (m.name in wrapped or (
                     c in facing and (m.name == "__init__" or not (m.name.startswith("__") and m.name.endswith("__"))))):

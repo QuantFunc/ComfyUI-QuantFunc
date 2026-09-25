@@ -159,7 +159,8 @@ r, _ = _quiet(m.memory_required, SHAPE, cond_shapes=COND)
 check(r == side + 9000 * MB and real.vram_need_bytes.asked == [SHAPE], "arm4a: cache HIT → the REAL handle's need is used")
 created = []
 proxy = SimpleNamespace(vram_need_bytes=lambda s: 0, footprint_bytes=1, ensure_if_cached=lambda: None,
-                        ensure=lambda: created.append(1), current_session=None)
+                        ensure=lambda: created.append(1), current_session=None,
+                        cold_vram_need_bytes=lambda: qfmp.qfe.ColdNeed(None, None))   # an engine without the entry
 m = _Model(); m._qf = proxy
 r, log = _quiet(m.memory_required, SHAPE, cond_shapes=COND)
 check(r == FLOOR_MB * MB and created == [] and "cold: no pipeline yet" in log and f"{FLOOR_MB} MB is the floor" in log
@@ -168,6 +169,12 @@ check(r == FLOOR_MB * MB and created == [] and "cold: no pipeline yet" in log an
 m = _Model(); m._qf = proxy; m._floor_mb = 1
 r, _ = _quiet(m.memory_required, SHAPE, cond_shapes=COND)
 check(r == side, "arm4b: a cold floor below the comfy-side bytes never lowers them (max)")
+proxy.cold_vram_need_bytes = lambda: qfmp.qfe.ColdNeed(None, "unknown (engine status 5: resource busy)")
+m = _Model(); m._qf = proxy
+r, log = _quiet(m.memory_required, SHAPE, cond_shapes=COND)
+check(r == FLOOR_MB * MB and "the engine's need is unknown (engine status 5: resource busy)" in log
+      and f"{FLOOR_MB} MB is the floor" in log,
+      "arm4c: an engine that cannot say names WHY in the ledger line (plugin CR D-V2), the floor still applies")
 # the real QFLazyEngine demand surface: cold native demand is zero (memory_required then takes comfy's floor,
 # arm4b); a hot retained handle supplies native need without a create.
 Lazy = qfmp.QFLazyEngine
@@ -230,6 +237,7 @@ if _h3 is not None:
     H3 = _h3.QFH3Model
     h = H3.__new__(H3)                    # memory_required reads only mixin attrs — no comfy ctor needed
     h._qf = _engine(need_mb=12000); h.latent_shapes = [(1, 24, 31, 48, 50), (1, 32, 2, 207)]
+    h._qf_build_device = torch.device("cuda:0")   # the mixin's construction-time attr (the reserve key)
     side_p = h._qf_comfy_side_bytes(PACKED, COND)
     r, _ = _quiet(h.memory_required, PACKED, cond_shapes=COND)
     check(r == side_p + 12000 * MB and h._qf.vram_need_bytes.asked == [[2, 24, 31, 48, 50]],
