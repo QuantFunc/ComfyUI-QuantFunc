@@ -1190,7 +1190,7 @@ def register(deps):
     liveness registry) without importing __init__."""
 
 
-    def build(transformer1_path, bundle_dir=None, lora_entries=()):
+    def build(transformer1_path, bundle_dir=None, lora_entries=(), pinned_memory=False):
         """File-based (ComfyUI single-file) loading for LTX-2.5 — the shared staging pattern.
         CONNECTORS-SOURCE contract (user 2026-08-31 — fully support the transformer-only
         export; supersedes the 2026-08-22 one-file-only ruling):
@@ -1281,16 +1281,13 @@ def register(deps):
         model_dir = qfmp.stage_denoise_only_package(bundle_dir, transformer1_path, extra_links=extra)
         return _build_from_package(model_dir, os.path.basename(transformer1_path),
                                    lora_entries=lora_entries,
-                                   # use_pinned_memory (perf, 2026-08-23): the two-stage flow
-                                   # round-trips the 18.3GB weight set between stages (comfy
-                                   # evicts for the VAE/upsampler) — pageable copies ran at
-                                   # ~2-4GB/s (nsys: memcpy = 86% of API time). Pinned host
-                                   # backups cut every offload/reload 3-6x. RAM budget: one
-                                   # model's footprint, freed with the backup.
-                                   create_extra={"denoise_only": True, "use_pinned_memory": True})
+                                   # pinned memory is the loaders' pinned_memory switch (user 2026-09-26, default
+                                   # OFF), as for every family; LTX-2.5 no longer forces it on (it did since
+                                   # 2026-08-23, for the two-stage flow's offload round trips)
+                                   create_extra={"denoise_only": True}, pinned_memory=pinned_memory)
 
     def _build_from_package(model_dir, model_name,
-              connector_ckpt="(none)", lora_entries=(), create_extra=None):
+              connector_ckpt="(none)", lora_entries=(), create_extra=None, pinned_memory=False):
         if connector_ckpt and connector_ckpt != "(none)":
             import folder_paths as _fp
             connector_ckpt = _fp.get_full_path_or_raise("checkpoints", connector_ckpt)
@@ -1336,7 +1333,7 @@ def register(deps):
                 deps, model_dir, create_extra, comfy.supported_models.LTXAV,
                 {"image_model": "ltxav", "disable_unet_model_creation": True}, QFLTXAVModel,
                 f"[qf_native] loaded QuantFuncNativeLoader (LTX-2.5 JOINT-AV svdq) package={model_name} "
-                f"capacity=native Prepared query (create deferred)")(list(lora_entries))
+                f"capacity=native Prepared query (create deferred)", pinned_memory)(list(lora_entries))
         if not connector_ckpt:
             raise RuntimeError("QuantFuncNativeLoader: connector_ckpt (comfy LTX-2.3 ckpt with the "
                                "video_embeddings_connector) is required")
@@ -1377,6 +1374,6 @@ def register(deps):
             deps, model_dir, create_extra, comfy.supported_models.LTXV,
             {"image_model": "ltxv", "disable_unet_model_creation": True}, _video_model,
             f"[qf_native] loaded QuantFuncNativeLoader (LTX-2 svdq) package={model_name} "
-            f"capacity=native Prepared query (create deferred)")(list(lora_entries))
+            f"capacity=native Prepared query (create deferred)", pinned_memory)(list(lora_entries))
 
     return build

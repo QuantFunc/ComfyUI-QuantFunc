@@ -116,6 +116,7 @@ def main():
     for root, f in ((dm, "fx-ltx-2.5-quantfunc-4bit.safetensors"),
                     (dm, "fx-minimax-h3-quantfunc-int4.safetensors"),
                     (dm, "fx-krea2-turbo-quantfunc-int4.safetensors"),
+                    (dm, "fx-qwen-image-2.1-quantfunc-int4.safetensors"),
                     (te_root, "fx-gemma4-with-proj.safetensors"),
                     (vae_root, "fx-ltx25-audio-vae.safetensors")):
         with open(os.path.join(root, f), "wb") as fh:
@@ -173,6 +174,8 @@ def main():
                     os.path.join(cfgroot, "minimax-h3-fl2va"))
     shutil.copytree(os.path.join(_PLUGIN, "configs", "krea2-turbo-int4"),
                     os.path.join(cfgroot, "krea2-turbo-int4"))
+    shutil.copytree(os.path.join(_PLUGIN, "configs", "qwen-image-2.1-int4"),
+                    os.path.join(cfgroot, "qwen-image-2.1-int4"))
     for name, mf in (("fx-ltx", {"family": "ltx2"}),
                      ("fx-h3", {"family": "minimax-h3"}),
                      ("fx-alien", {"family": "no-such-family"})):
@@ -392,7 +395,7 @@ def main():
     check("ltx node surface = transformer required + hidden model_config + session-dial optionals (no sparse)",
           list(_lit["required"].keys()) == ["transformer"]
           and list(_lit.get("optional", {}).keys()) == ["model_config", "attention_backend", "sol_tau", "quality_enhance",
-                                                        "step_cache", "block_cache"]
+                                                        "step_cache", "block_cache", "pinned_memory"]
           and "sparse" not in _lit.get("optional", {}),
           f"-> req={list(_lit['required'].keys())} opt={list(_lit.get('optional', {}).keys())}")
     # h3 node surface (same latent-duo + session dials shape as ltx; block-count removed 2026-09)
@@ -401,7 +404,7 @@ def main():
           list(_h3it["required"].keys()) == ["transformer"]
           and list(_h3it.get("optional", {}).keys()) == ["model_config", "attention_backend", "sol_tau",
                                                           "quality_enhance", "audio_enhance", "step_cache", "block_cache",
-                                                          "allow_partial_denoise"],
+                                                          "allow_partial_denoise", "pinned_memory"],
           f"-> req={list(_h3it['required'].keys())} opt={list(_h3it.get('optional', {}).keys())}")
     # (B) quality_enhance (user 2026-09-25): ONE switch on the four loaders, the same on every GPU. DEATH RULES: the switch sits
     #     in the widget slot of the earlier `quality` input (where the published loaders had it); the session sends only the
@@ -500,6 +503,22 @@ def main():
           and not [a for a in dir(_qmp_tp.QFSessionModelMixin) + dir(qfn) if _bt.h(a) in _bt.NAMES]
           and not hasattr(_qmp_tp.QFSessionModelMixin, "set_quality") and not hasattr(qfn, "_apply_quality"),
           "-> a retired setter / mapper is still present")
+    # (C) pinned_memory (user 2026-09-26 「pin能用 透出个开关让用户选择开启」): ONE load-time switch on the four loaders, default
+    #     OFF. It is a CREATE key (the engine's use_pinned_memory), so its two states are two cached pipelines: changing it
+    #     reloads the model. It is the LAST optional input, so every saved workflow's widget values keep their slots.
+    _pm_bad = {}
+    for _n, _it in _sw.items():
+        _opt = list(_it.get("optional", {}))
+        _pms = _it["optional"].get("pinned_memory")
+        if _opt[-1:] != ["pinned_memory"] or _pms[0] != "BOOLEAN" or _pms[1].get("default") is not False:
+            _pm_bad[_n] = (_opt[-2:], _pms)
+    check("every loader: pinned_memory is a BOOLEAN, default OFF, and its LAST optional input (saved widget values keep "
+          "their slots)", not _pm_bad, f"-> {_pm_bad}")
+    _pm_tips = {w: t for w, t in _texts if w.endswith(".pinned_memory")}
+    check("every loader's pinned_memory tooltip says that changing it reloads the model and that, once on, it stays on until "
+          "ComfyUI restarts (the engine cannot turn it back off in a running process)",
+          len(_pm_tips) == 4 and all("reloads the model" in t and "until ComfyUI restarts" in t for t in _pm_tips.values()),
+          f"-> {_pm_tips}")
     # qfa REMOVED as a user-facing attention_backend choice (2026-09-13)
     check("attention_backend choices drop qfa (SM80+ and SM75)",
           "qfa" not in qfn._ATTN_BACKEND_SM80PLUS and "qfa" not in qfn._ATTN_BACKEND_SM75,
@@ -740,6 +759,39 @@ def main():
     _ = out_h3.model._qf.lib
     _hcfg = creates[-1] if len(creates) > _n0 else json.loads(out_h3.model._qf._ckey[-1])
     check("h3 create cfg carries denoise_only", _hcfg.get("denoise_only") is True, f"-> {_hcfg}")
+    # (C) pinned_memory through the REAL load() of each family: ON puts use_pinned_memory in the create config; OFF (the
+    #     default) leaves the config exactly {denoise_only: true}, as before the switch (a saved Krea-2 / QI-2.1 / H3 workflow
+    #     keeps its cached pipeline; LTX-2.5's config no longer forces pinned memory on). A LoRA rebuild keeps the switch.
+    QiL = qfn.NODE_CLASS_MAPPINGS["QuantFuncQwenImage21Loader"]()
+    _pm_loads = {"ltx2": (LtxL, _allin_name, "ltx2-2.5-22b"),
+                 "minimax-h3": (H3L, "fx-minimax-h3-quantfunc-int4.safetensors", "minimax-h3-fl2va"),
+                 "krea2": (KreaL, "fx-krea2-turbo-quantfunc-int4.safetensors", "krea2-turbo-int4"),
+                 "qwenimage21": (QiL, "fx-qwen-image-2.1-quantfunc-int4.safetensors", "qwen-image-2.1-int4")}
+
+    def _pm_cfg(node, xfm, preset, **kw):
+        out = node.load(xfm, preset, **kw)[0]
+        _ = out.model._qf.lib   # first touch: the create (or the cached pipeline of the same config)
+        return json.loads(out.model._qf._ckey[-1]), out
+    _pm_rows, _pm_on = {}, {}
+    for _fam, (_node, _xfm, _preset) in _pm_loads.items():
+        _off = _pm_cfg(_node, _xfm, _preset)[0]
+        _on, _pm_on[_fam] = _pm_cfg(_node, _xfm, _preset, pinned_memory=True)
+        _pm_rows[_fam] = (_off, _on, _pm_cfg(_node, _xfm, _preset, pinned_memory=False)[0])
+    check("pinned_memory ON: every family's create config carries use_pinned_memory=true and nothing else changes; OFF and "
+          "the default: the key is absent and the config is {denoise_only: true}",
+          all(_off == _off2 == {"denoise_only": True} and _on == {"denoise_only": True, "use_pinned_memory": True}
+              for _off, _on, _off2 in _pm_rows.values()), f"-> {_pm_rows}")
+    from qfn_test_pkg import qf_modelpatcher as _qmp_pm
+    _pm_rb = _qmp_pm.rebuild_of(_pm_on["krea2"])([])
+    _ = _pm_rb.model._qf.lib
+    check("a LoRA rebuild of a pinned_memory=ON model keeps the switch (the same create config)",
+          json.loads(_pm_rb.model._qf._ckey[-1]) == _pm_rows["krea2"][1], f"-> {_pm_rb.model._qf._ckey[-1]}")
+    try:
+        qfn.qfe._refuse_session_knobs_in_create({"denoise_only": True, "use_pinned_memory": True})
+        _pm_create_ok = True
+    except RuntimeError:
+        _pm_create_ok = False
+    check("use_pinned_memory is a create key the create boundary accepts (not a session knob)", _pm_create_ok)
     # quality_enhance through the REAL load() (behaviour, not a signature read — a loader wrapped by another input layer keeps
     # it): OFF (default) / ON; a saved earlier value by name when the switch is absent (best_quality -> ON, anything else ->
     # OFF); the switch wins over a saved dropdown value. Krea-2 likewise.

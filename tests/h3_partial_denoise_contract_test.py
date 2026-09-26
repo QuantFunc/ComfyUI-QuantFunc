@@ -514,6 +514,7 @@ _loader_namespace = {
     "_AUDIO_ENHANCE_INPUT": ("BOOLEAN", {"default": False}),
     "_STEP_CACHE_INPUT": ("FLOAT", {"default": 0.0}),
     "_BLOCK_CACHE_INPUT": ("FLOAT", {"default": 0.0}),
+    "_PINNED_MEMORY_INPUT": ("BOOLEAN", {"default": False}),
     "_run_family_load": lambda *_args, **_kwargs: _loader_patcher,
     "_attn_backend_to_engine": lambda value: value,
     "_arm_session_caches": lambda *_args: None,

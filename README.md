@@ -20,7 +20,8 @@ ComfyUI plugin for **QuantFunc** — the fastest diffusion model inference engin
 - Native C++/CUDA acceleration via `libquantfunc.so` / `quantfunc.dll`
 - QuantFunc loaders for MiniMax-H3, LTX-2.5, Krea-2 and Qwen-Image-2.1 that work with ComfyUI's own text encoder, VAE and
   sampler nodes
-- Changing quality_enhance, attention, caches or LoRAs reuses the loaded model: only a different model file loads again
+- Changing quality_enhance, attention, caches or LoRAs reuses the loaded model: only a different model file, or the
+  pinned_memory switch, loads it again
 - Image editing with reference images (Qwen-Image-2.1)
 - The engine installs itself on Linux and Windows, checked against the release's published SHA-256 manifest
 
@@ -28,7 +29,7 @@ ComfyUI plugin for **QuantFunc** — the fastest diffusion model inference engin
 
 | Plugin (`comfy`) | Engine (`lib`) | Summary |
 |:---:|:---:|---|
-| **0.0.07** *(current)* | **0.0.13** | `quality_enhance` switch · settings and LoRA changes without a rebuild · one LoRA format · per-GPU-architecture engine · warning-only logging — details below |
+| **0.0.07** *(current)* | **0.0.13** | `quality_enhance` switch · `pinned_memory` switch · settings and LoRA changes without a rebuild · one LoRA format · per-GPU-architecture engine · warning-only logging — details below |
 | 0.0.06 | 0.0.12 | New modes — Ideogram4 · Layered (RGBA) · ControlNet · img2img · VRAM-budget · FBCache · Klein auto-download · SHA-256 integrity check — details below |
 | 0.0.02 | 0.0.07 | v2 loader architecture · inpainting · full GPU coverage · faster editing |
 | 0.0.01 | 0.0.01 – 0.0.06 | Base release: runtime/offline quantization · model & LoRA loaders · reference-image editing · export · auto-update |
@@ -36,7 +37,8 @@ ComfyUI plugin for **QuantFunc** — the fastest diffusion model inference engin
 ### What's New in 0.0.07 (engine 0.0.13)
 
 - **One `quality_enhance` switch** on the MiniMax-H3, LTX-2.5, Krea-2 and Qwen-Image-2.1 loaders, the same on every GPU: OFF (default) is faster; the subject and scene stay the same, but details such as poses, faces or small objects can differ. ON gives the highest quality. Details in section 3.
-- **No rebuild when you change settings or LoRAs**: the loaded pipeline is reused; only different model weights load a new one.
+- **A `pinned_memory` switch** (default OFF) on the same four loaders: ON is faster on graphics cards with little VRAM. When enough RAM is free, the model is kept in locked system memory, which the rest of the PC cannot use while the model is loaded; on a PC with little RAM this can make the system unstable. Changing it reloads the model, and once a loader has turned it on it stays on until ComfyUI restarts.
+- **No rebuild when you change settings or LoRAs**: the loaded pipeline is reused; only different model weights, or the `pinned_memory` switch, load a new one.
 - **One LoRA format**: diffusers / PEFT. Convert other formats with `scripts/qf_lora_convert.py`; LyCORIS LoHa / LoKr files are not supported.
 - **An engine per GPU architecture (Linux and Windows)**: the plugin downloads only the engine for your GPU's architecture (on Linux about 125-175 MB) and installs it automatically. One ComfyUI serves one GPU architecture; for GPUs of different architectures, run one ComfyUI per architecture (section 2.5).
 - **Quieter console**: the engine prints only warnings and errors by default.
@@ -264,6 +266,10 @@ Qwen-Image-2.1 native-loader workflows are in [`example_workflows/`](example_wor
 The loaders' `quality_enhance` switch (MiniMax-H3, LTX-2, Krea-2 and Qwen-Image-2.1; default OFF): OFF is faster; the
 subject and scene stay the same, but details such as poses, faces or small objects can differ. ON gives the highest
 quality. Changing it never reloads the model.
+The loaders' `pinned_memory` switch (default OFF): ON is faster on graphics cards with little VRAM. When enough RAM is
+free, the model is kept in locked system memory, which the rest of the PC cannot use while the model is loaded; on a PC
+with little RAM this can make the system unstable. Changing it reloads the model; once a loader has turned it on, it
+stays on until ComfyUI restarts.
 
 | File | Use Case |
 |------|----------|

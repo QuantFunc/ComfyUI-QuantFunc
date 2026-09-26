@@ -115,7 +115,7 @@ class QFQwenImage21Model(qfmp.QFImageSessionModel, comfy.model_base.QwenImage21)
 
 
 def register(deps):
-    def build(transformer1_path, bundle_dir=None, lora_entries=()):
+    def build(transformer1_path, bundle_dir=None, lora_entries=(), pinned_memory=False):
         """File-based Qwen-Image-2.1 (t2i + edit) — the Krea2 single-expert staging pattern: stage the shipped
         config bundle (configs/qwen-image-2.1-*/, model_index.json only — the engine synthesizes the
         per-component configs from the reference arch) + symlink the transformer file; engine create
@@ -126,6 +126,6 @@ def register(deps):
             deps, model_dir, {"denoise_only": True}, comfy.supported_models.QwenImage21,
             {"image_model": "qwen_image21", "disable_unet_model_creation": True}, QFQwenImage21Model,
             f"[qf_native] loaded QuantFuncNativeLoader (Qwen-Image-2.1 svdq) package={os.path.basename(transformer1_path)} "
-            f"capacity=native Prepared query (create deferred)")(list(lora_entries))
+            f"capacity=native Prepared query (create deferred)", pinned_memory)(list(lora_entries))
 
     return build

@@ -635,7 +635,7 @@ if _IMPORT_OK:
 
 
 
-    def _run_family_load(expect_family, transformer1, model_config=None):
+    def _run_family_load(expect_family, transformer1, model_config=None, pinned_memory=False):
         """The SHARED loader core behind the per-family nodes (user 2026-08-21 pivot). The loaders show no
         model_config choice (each family ships ONE preset: _family_preset); `model_config` is only a saved workflow's
         value of the retired widget (a hidden input). It is honoured when it names this family's preset and refused
@@ -693,7 +693,7 @@ if _IMPORT_OK:
         # 2026-08-28 "调整sparse要重建pipeline完全没必要" + "调整block/step cache
         # 能复用pipeline"). OFF values (0.0 / 1.0) omit the begin keys entirely →
         # the engine paths are byte-identical.
-        out = builder(transformer1_path=xfm1, bundle_dir=bundle_dir)
+        out = builder(transformer1_path=xfm1, bundle_dir=bundle_dir, pinned_memory=bool(pinned_memory))
         # [cache/sparse surface REMOVED, user 2026-08-29 「移除所有loader的cache以及
         # 稀疏入口 整体默认不生效」] The per-model set_step_cache/set_block_cache/
         # set_sparse arming that lived here is GONE with the loader widgets — the
@@ -728,6 +728,19 @@ if _IMPORT_OK:
                               "tooltip": "OFF (default): faster; the subject and scene stay the same, but details such as poses, "
                                          "faces or small objects can differ. ON: the highest quality, a little slower. Takes "
                                          "effect on the next run."})
+    # [pinned_memory — user 2026-09-26 「pin能用 透出个开关让用户选择开启」] ONE load-time switch on the four loaders, default OFF (the
+    # user's standing no-pin default). ON sends the engine's use_pinned_memory create key: a CREATE key, not a session knob, so
+    # its two states are two cached pipelines and changing it reloads the model (never a faked runtime toggle). The engine then
+    # keeps a model's host copy in page-locked memory when the host has room for it; it turns pinned memory on for the whole
+    # process and has no call that turns it off, so once any loader has turned it on, later loads can pin too until restart.
+    # It is each loader's LAST optional input: widget values are stored by position, so saved workflows keep their slots.
+    _PINNED_MEMORY_INPUT = ("BOOLEAN", {"default": False,
+                            "tooltip": "OFF (default): the model is kept in ordinary system memory. ON: faster on graphics "
+                                       "cards with little VRAM. When enough RAM is free, the model is kept in locked "
+                                       "system memory, which the rest of the PC cannot use while the model is loaded; on a "
+                                       "PC with little RAM this can make the system unstable. Changing it reloads the model. "
+                                       "Once a QuantFunc loader has turned it on, it stays on for every model until "
+                                       "ComfyUI restarts."})
     # Saved workflows: the published loaders had this same switch in this same widget slot, so their workflows open unchanged.
     # A workflow saved with the unpublished quality dropdown (0.0.07 release candidate) carries `quality`: an API-format prompt by
     # NAME, declared hidden so ComfyUI hands it to load() (an undeclared key is dropped silently) and mapped best_quality -> ON,
@@ -843,6 +856,7 @@ if _IMPORT_OK:
                 "quality_enhance": _QUALITY_ENHANCE_INPUT,
                 "step_cache": _STEP_CACHE_INPUT,
                 "block_cache": _BLOCK_CACHE_INPUT,
+                "pinned_memory": _PINNED_MEMORY_INPUT,
             }, "hidden": dict(_QUALITY_LEGACY_HIDDEN)}
 
         RETURN_TYPES = ("MODEL",)
@@ -853,11 +867,12 @@ if _IMPORT_OK:
                        "the latent input. " + _COMMON_LIMITS)
 
         def load(self, transformer, model_config=None,
-                 attention_backend="auto", sol_tau=1.0, quality_enhance=None, step_cache=0.0, block_cache=0.0, quality=None):
+                 attention_backend="auto", sol_tau=1.0, quality_enhance=None, step_cache=0.0, block_cache=0.0, quality=None,
+                 pinned_memory=False):
             # NO aux file widgets and NO image socket (user 2026-08-22 "只保留
             # transformer/block/model_config … 只关注latent"): i2v is the workflow's own latent
             # conditioning (LTXVImgToVideoInplace).
-            _p = _run_family_load("ltx2", transformer, model_config)
+            _p = _run_family_load("ltx2", transformer, model_config, pinned_memory)
             _mm = getattr(_p, "model", None)
             if _mm is not None and hasattr(_mm, "set_attn_backend"):
                 _mm.set_attn_backend(_attn_backend_to_engine(attention_backend))
@@ -881,6 +896,7 @@ if _IMPORT_OK:
                 "model_config": _model_config_input("krea2"),   # hidden; widget index 1 (see _model_config_input)
                 "attention_backend": _attn_backend_input(),
                 "quality_enhance": _QUALITY_ENHANCE_INPUT,
+                "pinned_memory": _PINNED_MEMORY_INPUT,
             }, "hidden": dict(_QUALITY_LEGACY_HIDDEN)}
 
         RETURN_TYPES = ("MODEL",)
@@ -890,10 +906,10 @@ if _IMPORT_OK:
                        "place of the usual diffusion-model loader. " + _COMMON_LIMITS)
 
         def load(self, transformer, model_config=None, attention_backend="auto",
-                 quality_enhance=None, quality=None):
+                 quality_enhance=None, quality=None, pinned_memory=False):
             # [runtime dials] backend + quality_enhance are SESSION knobs (NOT create keys — a widget change never re-keys the
             # engine = no rebuild).
-            _p = _run_family_load("krea2", transformer, model_config)
+            _p = _run_family_load("krea2", transformer, model_config, pinned_memory)
             _mm = getattr(_p, "model", None)
             if _mm is not None and hasattr(_mm, "set_attn_backend"):
                 _mm.set_attn_backend(_attn_backend_to_engine(attention_backend))
@@ -915,6 +931,7 @@ if _IMPORT_OK:
                 "model_config": _model_config_input("qwenimage21"),   # hidden; widget index 1 (see _model_config_input)
                 "attention_backend": _attn_backend_input(),
                 "quality_enhance": _QUALITY_ENHANCE_INPUT,
+                "pinned_memory": _PINNED_MEMORY_INPUT,
             }, "hidden": dict(_QUALITY_LEGACY_HIDDEN)}
 
         RETURN_TYPES = ("MODEL",)
@@ -924,10 +941,11 @@ if _IMPORT_OK:
                        "editing with TextEncodeQwenImage21 reference images (plus its VAE). Transparent images: VAE Decode + "
                        "Save Image keep the transparency. " + _COMMON_LIMITS)
 
-        def load(self, transformer, model_config=None, attention_backend="auto", quality_enhance=None, quality=None):
+        def load(self, transformer, model_config=None, attention_backend="auto", quality_enhance=None, quality=None,
+                 pinned_memory=False):
             # [runtime dials] backend + quality_enhance are SESSION knobs (NOT create keys — a widget change never re-keys the engine =
             # no rebuild), exactly like the Krea2 node.
-            _p = _run_family_load("qwenimage21", transformer, model_config)
+            _p = _run_family_load("qwenimage21", transformer, model_config, pinned_memory)
             _mm = getattr(_p, "model", None)
             if _mm is not None and hasattr(_mm, "set_attn_backend"):
                 _mm.set_attn_backend(_attn_backend_to_engine(attention_backend))
@@ -961,6 +979,7 @@ if _IMPORT_OK:
                     "default": False,
                     "tooltip": "Opt in to split/trimmed sigma schedules for intentional H3 double-sampling workflows.",
                 }),
+                "pinned_memory": _PINNED_MEMORY_INPUT,
             }, "hidden": dict(_QUALITY_LEGACY_HIDDEN)}
 
         RETURN_TYPES = ("MODEL",)
@@ -971,8 +990,9 @@ if _IMPORT_OK:
 
         def load(self, transformer, model_config=None,
                  attention_backend="flash", sol_tau=1.0, quality_enhance=None, audio_enhance=False,
-                 step_cache=0.0, block_cache=0.0, allow_partial_denoise=False, quality=None):  # H3: flash default (auto->sage is broken)
-            _p = _run_family_load("minimax-h3", transformer, model_config)
+                 step_cache=0.0, block_cache=0.0, allow_partial_denoise=False, quality=None,
+                 pinned_memory=False):  # H3: flash default (auto->sage is broken)
+            _p = _run_family_load("minimax-h3", transformer, model_config, pinned_memory)
             _mm = getattr(_p, "model", None)
             if _mm is not None and hasattr(_mm, "set_attn_backend"):
                 _mm.set_attn_backend(_attn_backend_to_engine(attention_backend))

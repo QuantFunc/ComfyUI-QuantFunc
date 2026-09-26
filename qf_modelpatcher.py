@@ -1123,7 +1123,7 @@ def tag_lora_rebuild(patcher, lora_entries, rebuild):
     return patcher
 
 
-def family_build(deps, model_dir, create_extra, supported_model, unet_config, make_model, label):
+def family_build(deps, model_dir, create_extra, supported_model, unet_config, make_model, label, pinned_memory=False):
     """The ONE builder every family returns through (it was a closure copied into each family module). build(lora_entries)
     makes a lazy engine for model_dir — the pipeline is created only when a sampler first needs it, and there is ONE per
     model file whatever the LoRA set: the weights are the cache key, and QFLazyEngine applies this patcher's set in place
@@ -1131,11 +1131,12 @@ def family_build(deps, model_dir, create_extra, supported_model, unet_config, ma
     patcher for another set. One device capture per build drives both the logical patcher and the engine identity; the
     engine factory holds the model only weakly (make_engine_factory: a strong capture was a model -> engine -> factory ->
     model cycle, comfy's "Potential memory leak" warning). make_model(model_config, engine, device) returns the family's
-    model (a model class fits)."""
+    model (a model class fits). pinned_memory (the loaders' switch, default OFF) adds the engine's use_pinned_memory create
+    key, so its two states are two pipelines: changing it reloads the model; OFF leaves the create config as it was."""
     get_engine, bind_pipeline_model = deps["get_engine"], deps["bind_pipeline_model"]
 
     def build(lora_entries):
-        create_cfg = dict(create_extra or {}) or None
+        create_cfg = dict(create_extra or {}, **({"use_pinned_memory": True} if pinned_memory else {})) or None
         device, device_idx = current_torch_device()
         factory, register_model = make_engine_factory(
             lambda: get_engine(model_dir, create_cfg=create_cfg, device_idx=device_idx), bind_pipeline_model)

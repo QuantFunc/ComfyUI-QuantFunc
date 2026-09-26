@@ -552,7 +552,7 @@ def matches(pipeline_class, transformer_class=""):
 def register(deps):
     """Return the minimax-h3 family BUILDER. `deps` gives the package-level helpers (engine cache,
     liveness registry) without importing __init__."""
-    def build(transformer1_path, bundle_dir=None, lora_entries=()):
+    def build(transformer1_path, bundle_dir=None, lora_entries=(), pinned_memory=False):
         """File-based loading for MiniMax-H3 — the shared staging pattern:
         stage the shipped config bundle (configs/minimax-h3-*/, official configs) + symlink
         the single transformer file; engine create runs denoise_only=True (TE + VAE weights
@@ -567,6 +567,6 @@ def register(deps):
             deps, model_dir, {"denoise_only": True}, comfy.supported_models.MiniMaxH3,
             {"image_model": "minimax_h3", "disable_unet_model_creation": True}, QFH3Model,
             f"[qf_native] loaded QuantFuncNativeLoader (MiniMax-H3 svdq AV) package={os.path.basename(transformer1_path)} "
-            f"capacity=native Prepared query (create deferred)")(list(lora_entries))
+            f"capacity=native Prepared query (create deferred)", pinned_memory)(list(lora_entries))
 
     return build
