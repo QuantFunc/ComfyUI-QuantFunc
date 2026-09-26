@@ -47,6 +47,8 @@ def _method_node(source, class_name, method_name):
     for node in _class_node(source, class_name).body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == method_name:
             return copy.deepcopy(node)
+        if isinstance(node, ast.Assign) and any(getattr(t, "id", None) == method_name for t in node.targets):
+            return copy.deepcopy(node)   # a class attribute a method reads (the loader's QF_FAMILY)
     raise AssertionError(f"method {class_name}.{method_name} not found")
 
 
@@ -524,7 +526,7 @@ QuantFuncH3LoaderContract = _subset_class(
     "QuantFuncH3Loader",
     "QuantFuncH3LoaderContract",
     "object",
-    ("INPUT_TYPES", "load"),
+    ("QF_FAMILY", "INPUT_TYPES", "load"),
     _loader_namespace,
 )
 
