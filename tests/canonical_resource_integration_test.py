@@ -34,6 +34,8 @@ class Library:
                      "query_capacity", "query_domain_residency"):
             method = getattr(self, name if name != "acquire_shared" else "shared")
             setattr(self, "quantfunc_resource_" + name, lambda *a, fn=method: fn(*a))
+        # The residency-ABI-2 engine's enrollment symbol (#751); the old name is its refusing legacy stub.
+        self.quantfunc_resource_enroll_host_v2 = self.quantfunc_resource_enroll_host
 
     def shared(self, device, version, out):
         self.events.append(("shared", device))

@@ -434,15 +434,15 @@ class NativeResource:
             return ResourceLifecycle(out.state, out.phase if out.state == QUANTFUNC_RESOURCE_READY else None)
 
     def enroll_host(self):
-        """Tell the engine a host framework (ComfyUI) shares this view's device (quantfunc_resource_enroll_host): from
+        """Tell the engine a host framework (ComfyUI) shares this view's device (quantfunc_resource_enroll_host_v2): from
         then on another library's allocation that fails for lack of memory takes what the card lacks from the engine's
         reclaimable memory, then retries. It grants and reserves nothing. Idempotent; a repeated call picks up the
         libraries loaded since."""
         with self._lock:
             self._check_open()
-            function = getattr(self._lib, "quantfunc_resource_enroll_host", None)
+            function = getattr(self._lib, "quantfunc_resource_enroll_host_v2", None)
             if function is None:
-                raise RuntimeError("QuantFunc library lacks quantfunc_resource_enroll_host; update the native library")
+                raise RuntimeError(ENGINE_PLUGIN_MISMATCH)
             function.restype = ctypes.c_int
             function.argtypes = [ctypes.c_void_p]
             if function(self._pointer) != QUANTFUNC_OK:
@@ -605,7 +605,21 @@ class DenoiseStepRefsParams(ctypes.Structure):
     ]
 
 
+ENGINE_PLUGIN_MISMATCH = (
+    "QuantFunc engine/plugin mismatch: this ComfyUI-QuantFunc plugin needs the QuantFunc engine with resource "
+    "residency ABI 2 (one VRAM entry, #751) and the loaded library is older - update the QuantFunc engine library")
+
+
+def _require_residency_abi2(lib):
+    """An engine that still exports the host-grant verbs is residency ABI 1: its quantfunc_resource_enroll_host takes a
+    grant out-struct this plugin does not pass (undefined behaviour at the C boundary), so it is refused here, at load,
+    before any call reaches it. The ABI-2 engine exports quantfunc_resource_enroll_host_v2."""
+    if hasattr(lib, "quantfunc_resource_set_domain_grants") or not hasattr(lib, "quantfunc_resource_enroll_host_v2"):
+        raise RuntimeError(ENGINE_PLUGIN_MISMATCH)
+
+
 def _bind(lib):
+    _require_residency_abi2(lib)
     v = ctypes.c_void_p
     lib.quantfunc_create.restype = ctypes.c_int
     lib.quantfunc_create.argtypes = [ctypes.POINTER(InitParams), ctypes.POINTER(v)]

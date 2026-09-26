@@ -233,27 +233,27 @@ class EngineResourceContract(unittest.TestCase):
 
 
 class HostEnrollmentContract(unittest.TestCase):
-    """quantfunc_resource_enroll_host means only "a host framework shares this device": it takes the view and nothing
-    else, returns a status, and the bridge binds no grant verb."""
+    """quantfunc_resource_enroll_host_v2 means only "a host framework shares this device": it takes the view and
+    nothing else, returns a status, and the bridge binds no grant verb."""
     def test_enrollment_passes_only_the_view_and_returns_nothing(self):
         lib = library()
         calls = []
         def enroll(handle):   # a grant-era out struct would be a second argument: TypeError here
             calls.append(handle.value)
             return lib.status
-        lib.quantfunc_resource_enroll_host = enroll
+        lib.quantfunc_resource_enroll_host_v2 = enroll
         with qfe.NativeResource.shared(lib, 2) as shared, qfe.NativeResource.prepare(lib, 2) as owned:
             self.assertIsNone(shared.enroll_host())
             self.assertIsNone(owned.enroll_host())
             self.assertEqual(calls, [18, 19])
-            self.assertEqual(lib.quantfunc_resource_enroll_host.argtypes, [ctypes.c_void_p])
-            self.assertEqual(lib.quantfunc_resource_enroll_host.restype, ctypes.c_int)
+            self.assertEqual(lib.quantfunc_resource_enroll_host_v2.argtypes, [ctypes.c_void_p])
+            self.assertEqual(lib.quantfunc_resource_enroll_host_v2.restype, ctypes.c_int)
             lib.status = 1
             with self.assertRaisesRegex(RuntimeError, "host enrollment failed: native resource failure"):
                 shared.enroll_host()
             lib.status = 0
-            del lib.quantfunc_resource_enroll_host
-            with self.assertRaisesRegex(RuntimeError, "quantfunc_resource_enroll_host"):
+            del lib.quantfunc_resource_enroll_host_v2
+            with self.assertRaisesRegex(RuntimeError, "engine/plugin mismatch"):
                 shared.enroll_host()
         with self.assertRaisesRegex(RuntimeError, "closed"):
             shared.enroll_host()
@@ -265,6 +265,37 @@ class HostEnrollmentContract(unittest.TestCase):
         for name in ("_ResourceGrant", "_ResourceDomainGrants", "_ResourceDomainGrantsResult", "ResourceGrant",
                      "QUANTFUNC_RESOURCE_GRANT_ABI_VERSION", "QUANTFUNC_RESOURCE_GRANT_OWNER"):
             self.assertFalse(hasattr(qfe, name), name)
+
+
+class EnginePluginPairing(unittest.TestCase):
+    """#751, the new-plugin -> old-engine direction: a residency-ABI-1 library (it exports the grant verbs; its
+    enroll_host takes a grant out-struct) is refused when it is bound, loudly and by name, before any call reaches it.
+    (The old-plugin -> new-engine direction is the engine's: its legacy quantfunc_resource_enroll_host refuses with the
+    mismatch text; tests/cpp/test_host_resource_header.c and the rc7 old-plugin E2E arm.)"""
+    class Lib:
+        pass
+
+    def abi(self, *names):
+        lib = self.Lib()
+        for name in names:
+            setattr(lib, name, object())
+        return lib
+
+    def test_abi1_engine_refused_at_bind(self):
+        old = self.abi("quantfunc_resource_enroll_host", "quantfunc_resource_set_domain_grants")
+        with self.assertRaisesRegex(RuntimeError, "engine/plugin mismatch.*update the QuantFunc engine library"):
+            qfe._require_residency_abi2(old)
+        with self.assertRaisesRegex(RuntimeError, "engine/plugin mismatch"):
+            qfe._bind(old)   # the load path's own bind refuses before it binds a single symbol
+
+    def test_grant_verb_alone_is_refused_even_beside_v2(self):
+        both = self.abi("quantfunc_resource_enroll_host_v2", "quantfunc_resource_set_domain_grants")
+        with self.assertRaisesRegex(RuntimeError, "engine/plugin mismatch"):
+            qfe._require_residency_abi2(both)
+
+    def test_abi2_engine_accepted(self):
+        new = self.abi("quantfunc_resource_enroll_host_v2", "quantfunc_resource_enroll_host")
+        self.assertIsNone(qfe._require_residency_abi2(new))   # the ABI-2 engine keeps only a refusing legacy stub
 
 
 class FrozenCapacityDomainContract(unittest.TestCase):
