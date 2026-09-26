@@ -5,7 +5,9 @@ that native KSampler / KSamplerAdvanced drive via quantfunc_denoise_step. CLIP +
 comfy nodes (maximize comfy-ecosystem compatibility).
 """
 import os
+import sys
 import json
+import inspect
 import weakref
 import threading
 
@@ -272,6 +274,10 @@ _PIPELINE_MODELS = {}    # ckey -> [weakref.ref(consumer), ...] - ALL live consu
 #                          to liveness (measured: a sibling's release/sweep could destroy the shared
 #                          handle under a still-live patcher → NULL pipeline at its next denoise +
 #                          a ledger that kept reporting the destroyed backup).
+_PIPELINE_SIGS = {}      # ckey -> {_loader_sig of each loader whose models bound it}: lives and dies with the
+#                          binding list. The sweep reads it: a dead pipeline that a loader of the RUNNING prompt makes
+#                          again (a settings-only change: ComfyUI drops the old patcher before the new loader runs)
+#                          is that loader's, not dead (_pending_loader_sigs).
 # CONCURRENCY CONTRACT: the three cache dictionaries above are protected by short
 # `_ENGINE_IDENTITY_LOCK` lookup/publication/removal sections.  The lock is NEVER
 # held while constructing QFPreparedEntry, creating or destroying a pipeline, or
@@ -292,6 +298,7 @@ def _unpin_pipeline_consumer(ckey, consumer):
             _PIPELINE_MODELS[ckey] = refs
         else:
             _PIPELINE_MODELS.pop(ckey, None)
+            _PIPELINE_SIGS.pop(ckey, None)
 
 
 def _pin_pipeline_consumer_locked(ckey):
@@ -329,6 +336,9 @@ def _bind_pipeline_model(ckey, model):
         if not any(r() is model for r in refs):   # re-materialize of a live model must not accumulate
             refs.append(weakref.ref(model))
         _PIPELINE_MODELS[ckey] = refs
+        sig = getattr(model, "_qf_loader_sig", None)
+        if sig is not None:
+            _PIPELINE_SIGS.setdefault(ckey, set()).add(sig)
 
 
 def _live_pipeline_models(ckey):
@@ -339,6 +349,7 @@ def _live_pipeline_models(ckey):
             _PIPELINE_MODELS[ckey] = refs
         else:
             _PIPELINE_MODELS.pop(ckey, None)
+            _PIPELINE_SIGS.pop(ckey, None)
         return [r() for r in refs]
 
 
@@ -386,6 +397,7 @@ def _retire_handle(ckey, eng, requester=None, *, keep_binding=False, reason=""):
             retired_entry = candidate
         if not keep_binding:
             _PIPELINE_MODELS.pop(ckey, None)
+            _PIPELINE_SIGS.pop(ckey, None)
     if retired_entry is not None:
         retired_entry.retire_materialized()
     # Native teardown may be slow and must never run under the cache lock.
@@ -403,33 +415,80 @@ def _retire_handle(ckey, eng, requester=None, *, keep_binding=False, reason=""):
 
 def _sweep_dead_pipelines(keep_key):
     """Reclaim HOST RAM: destroy any cached handle whose model comfy has GC'd (no live reference → no
-    UAF). A still-live model is kept; ComfyUI decides its VRAM residency. Never
-    touches keep_key or a handle not yet bound to a model (its load() may still be in flight)."""
-    with _ENGINE_IDENTITY_LOCK:
-        keys = list(_PIPELINE_CACHE.keys())
-    for k in keys:
+    UAF) and that no loader of the running prompt makes again (_dead_keys). A still-live model is kept; ComfyUI
+    decides its VRAM residency. Never touches keep_key or a handle not yet bound to a model (its load() may still be
+    in flight)."""
+    for k in _dead_keys():
         if k == keep_key:
             continue
         with _ENGINE_IDENTITY_LOCK:
-            if not _PIPELINE_MODELS.get(k):
-                continue   # UNBOUND (load may be in flight) -> never touch; only ever-bound entries sweep
             eng = _PIPELINE_CACHE.get(k)
-        # requester=None ⇒ _retire_handle refuses while ANY consumer is live (only-all-dead sweeps)
+        # requester=None ⇒ _retire_handle refuses while ANY consumer is live (a consumer bound since _dead_keys read)
         if eng is not None and _retire_handle(k, eng, None, reason="host-RAM sweep"):
             qfe.info("[qf_native] host-RAM sweep: destroyed a cached pipeline whose model was GC'd "
                   "(comfy dropped its patcher) - freed its CPU backup", flush=True)
 
 
-def _dead_pipelines():
-    """(count, bytes): the cached handles bound only to consumers ComfyUI has garbage-collected, and the engine's own
-    capacity figure summed over them. capacity_bytes is the Prepared capacity the engine reported for the model; it
-    approximates the pipeline's host copy (Krea-2: 10.1 GB reported against its 8.85 + 1.27 GB backup, measured); an
-    exact host-copy read is a post-release engine API. Read-only (it never drops an entry from a binding list: the
-    sweep's bound-only gate reads them) and cheap, because ComfyUI's staging asks it before every pin."""
+def _loader_sig(family, transformer, model_config, pinned_memory):
+    """A loader's create inputs, as its load() hands them to _run_family_load (ComfyUI's validation already made
+    pinned_memory a bool, in the queued prompt too): everything else on a loader is a session knob, so two loaders with
+    equal signatures make the same pipeline."""
+    return family, transformer, model_config, pinned_memory
+
+
+def _pending_loader_sigs():
+    """The _loader_sig of every QuantFunc loader the running prompt executes (the nodes its outputs depend on), from
+    ComfyUI's queue. After a settings-only change ComfyUI drops the old patcher at the prompt's first model load, and
+    the new loader may run only after another node staged its model (measured #748: the TE, 14.6 GB, on a 32 GB PC):
+    the pipeline those inputs made is that loader's. Keeping it holds what a same-settings rerun holds (its patcher
+    alive); destroying it cost a full rebuild. A linked create input is unknown until its node runs: no signature."""
+    queue = getattr(getattr(getattr(sys.modules.get("server"), "PromptServer", None), "instance", None), "prompt_queue", None)
+    if queue is None:
+        return set()
+    with queue.mutex:
+        running = list(queue.currently_running.values())
+    sigs = set()
+    for item in running:   # (number, prompt_id, prompt, extra_data, outputs to execute, ...)
+        prompt, todo, seen = item[2], [str(o) for o in item[4]], set()
+        while todo:
+            nid = todo.pop()
+            node = prompt.get(nid)
+            if nid in seen or not isinstance(node, dict):
+                continue
+            seen.add(nid)
+            ins = node.get("inputs") or {}
+            todo += [str(v[0]) for v in ins.values() if isinstance(v, list) and v]
+            cls = NODE_CLASS_MAPPINGS.get(node.get("class_type"))
+            family = getattr(cls, "QF_FAMILY", None)
+            if family is None or any(isinstance(ins.get(k), list) for k in ("transformer", "model_config", "pinned_memory")):
+                continue
+            defaults = inspect.signature(cls.load).parameters   # what load() takes for an input the prompt omits
+            sigs.add(_loader_sig(family, ins.get("transformer"), ins.get("model_config", defaults["model_config"].default),
+                                 ins.get("pinned_memory", defaults["pinned_memory"].default)))
+    return sigs
+
+
+def _dead_keys():
+    """The cached handles bound only to consumers ComfyUI has garbage-collected, less those a loader of the running prompt
+    makes again (_pending_loader_sigs, read only when something is dead). Read-only (it never drops an entry from a
+    binding list: the sweep's bound-only gate reads them) and cheap, because ComfyUI's staging asks before every pin."""
     with _ENGINE_IDENTITY_LOCK:
         dead = [k for k in _PIPELINE_CACHE
                 if _PIPELINE_MODELS.get(k) and all(r() is None for r in _PIPELINE_MODELS[k])]
-        return len(dead), sum(int(getattr(_PIPELINE_CACHE[k], "capacity_bytes", 0) or 0) for k in dead)
+    if not dead:
+        return []
+    pending = _pending_loader_sigs()
+    with _ENGINE_IDENTITY_LOCK:
+        return [k for k in dead if not (_PIPELINE_SIGS.get(k, set()) & pending)]
+
+
+def _dead_pipelines():
+    """(count, bytes): the _dead_keys handles, and the engine's own capacity figure summed over them. capacity_bytes is
+    the Prepared capacity the engine reported for the model; it approximates the pipeline's host copy (Krea-2: 10.1 GB
+    reported against its 8.85 + 1.27 GB backup, measured); an exact host-copy read is a post-release engine API."""
+    dead = _dead_keys()
+    with _ENGINE_IDENTITY_LOCK:
+        return len(dead), sum(int(getattr(_PIPELINE_CACHE.get(k), "capacity_bytes", 0) or 0) for k in dead)
 
 
 def _install_host_ram_release():
@@ -637,6 +696,7 @@ if _IMPORT_OK:
         value of the retired widget (a hidden input). It is honoured when it names this family's preset and refused
         otherwise, naming what the plugin ships. The family guard below is defense-in-depth against a preset dir whose
         manifest family changed between the listing and the read. Returns the family builder's result AS-IS."""
+        sig = _loader_sig(expect_family, transformer1, model_config, pinned_memory)   # before model_config resolves
         if model_config is None:
             model_config = _family_preset(expect_family)
         else:
@@ -689,7 +749,11 @@ if _IMPORT_OK:
         # 2026-08-28 "调整sparse要重建pipeline完全没必要" + "调整block/step cache
         # 能复用pipeline"). OFF values (0.0 / 1.0) omit the begin keys entirely →
         # the engine paths are byte-identical.
-        out = builder(transformer1_path=xfm1, bundle_dir=bundle_dir, pinned_memory=bool(pinned_memory))
+        token = qfmp.LOADER_SIG.set(sig)   # family_build stamps it on every model it makes (_PIPELINE_SIGS)
+        try:
+            out = builder(transformer1_path=xfm1, bundle_dir=bundle_dir, pinned_memory=bool(pinned_memory))
+        finally:
+            qfmp.LOADER_SIG.reset(token)
         # [cache/sparse surface REMOVED, user 2026-08-29 「移除所有loader的cache以及
         # 稀疏入口 整体默认不生效」] The per-model set_step_cache/set_block_cache/
         # set_sparse arming that lived here is GONE with the loader widgets — the
@@ -848,6 +912,8 @@ if _IMPORT_OK:
     class QuantFuncLTXLoader:
         """LTX-2 loader — single MODEL output (single-expert family)."""
 
+        QF_FAMILY = "ltx2"   # the family its create inputs belong to (_loader_sig, _pending_loader_sigs)
+
         @classmethod
         def INPUT_TYPES(cls):
             return {"required": {
@@ -876,7 +942,7 @@ if _IMPORT_OK:
             # NO aux file widgets and NO image socket (user 2026-08-22 "只保留
             # transformer/block/model_config … 只关注latent"): i2v is the workflow's own latent
             # conditioning (LTXVImgToVideoInplace).
-            _p = _run_family_load("ltx2", transformer, model_config, pinned_memory)
+            _p = _run_family_load(self.QF_FAMILY, transformer, model_config, pinned_memory)
             _mm = getattr(_p, "model", None)
             if _mm is not None and hasattr(_mm, "set_attn_backend"):
                 _mm.set_attn_backend(_attn_backend_to_engine(attention_backend))
@@ -890,6 +956,8 @@ if _IMPORT_OK:
         """Krea-2 Turbo loader (svdq, denoise_only, t2i) — the first IMAGE family on the
         native seam: one MODEL a stock KSampler drives with latents; CLIP (type krea2) +
         VAE + sampler stay comfy-owned (drop-in for the official UNETLoader slot)."""
+
+        QF_FAMILY = "krea2"   # the family its create inputs belong to (_loader_sig, _pending_loader_sigs)
 
         @classmethod
         def INPUT_TYPES(cls):
@@ -913,7 +981,7 @@ if _IMPORT_OK:
                  quality_enhance=None, quality=None, pinned_memory=False):
             # [runtime dials] backend + quality_enhance are SESSION knobs (NOT create keys — a widget change never re-keys the
             # engine = no rebuild).
-            _p = _run_family_load("krea2", transformer, model_config, pinned_memory)
+            _p = _run_family_load(self.QF_FAMILY, transformer, model_config, pinned_memory)
             _mm = getattr(_p, "model", None)
             if _mm is not None and hasattr(_mm, "set_attn_backend"):
                 _mm.set_attn_backend(_attn_backend_to_engine(attention_backend))
@@ -925,6 +993,8 @@ if _IMPORT_OK:
         KSampler drives with latents; CLIP (type qwen_image, TextEncodeQwenImage21) + VAE + sampler stay
         comfy-owned (drop-in for the official UNETLoader slot). Edit = TextEncodeQwenImage21 with a VAE and
         reference images: the references ride every step into the engine (quantfunc_denoise_step_refs)."""
+
+        QF_FAMILY = "qwenimage21"   # the family its create inputs belong to (_loader_sig, _pending_loader_sigs)
 
         @classmethod
         def INPUT_TYPES(cls):
@@ -949,7 +1019,7 @@ if _IMPORT_OK:
                  pinned_memory=False):
             # [runtime dials] backend + quality_enhance are SESSION knobs (NOT create keys — a widget change never re-keys the engine =
             # no rebuild), exactly like the Krea2 node.
-            _p = _run_family_load("qwenimage21", transformer, model_config, pinned_memory)
+            _p = _run_family_load(self.QF_FAMILY, transformer, model_config, pinned_memory)
             _mm = getattr(_p, "model", None)
             if _mm is not None and hasattr(_mm, "set_attn_backend"):
                 _mm.set_attn_backend(_attn_backend_to_engine(attention_backend))
@@ -959,6 +1029,8 @@ if _IMPORT_OK:
 
     class QuantFuncH3Loader:
         """MiniMax-H3 loader — single MODEL output (single-expert AV family)."""
+
+        QF_FAMILY = "minimax-h3"   # the family its create inputs belong to (_loader_sig, _pending_loader_sigs)
 
         @classmethod
         def INPUT_TYPES(cls):
@@ -996,7 +1068,7 @@ if _IMPORT_OK:
                  attention_backend="flash", sol_tau=1.0, quality_enhance=None, audio_enhance=False,
                  step_cache=0.0, block_cache=0.0, allow_partial_denoise=False, quality=None,
                  pinned_memory=False):  # H3: flash default (auto->sage is broken)
-            _p = _run_family_load("minimax-h3", transformer, model_config, pinned_memory)
+            _p = _run_family_load(self.QF_FAMILY, transformer, model_config, pinned_memory)
             _mm = getattr(_p, "model", None)
             if _mm is not None and hasattr(_mm, "set_attn_backend"):
                 _mm.set_attn_backend(_attn_backend_to_engine(attention_backend))

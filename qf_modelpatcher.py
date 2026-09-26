@@ -90,6 +90,9 @@ class _EngineCacheAcquisition:
 
 
 _QF_ENGINE_CACHE_ACQUISITION = ContextVar("quantfunc_engine_cache_acquisition", default=None)
+# The create inputs of the loader running now (set by the package's loader core). family_build stamps them on every model
+# its build makes, LoRA rebuilds included, so the pipeline those models bind records which loader inputs make it.
+LOADER_SIG = ContextVar("quantfunc_loader_sig", default=None)
 
 
 def _current_engine_cache_acquisition():
@@ -1117,6 +1120,7 @@ def family_build(deps, model_dir, create_extra, supported_model, unet_config, ma
     model (a model class fits). pinned_memory (the loaders' switch, default OFF) adds the engine's use_pinned_memory create
     key, so its two states are two pipelines: changing it reloads the model; OFF leaves the create config as it was."""
     get_engine, bind_pipeline_model = deps["get_engine"], deps["bind_pipeline_model"]
+    loader_sig = LOADER_SIG.get()
 
     def build(lora_entries):
         create_cfg = dict(create_extra or {}, **({"use_pinned_memory": True} if pinned_memory else {})) or None
@@ -1126,6 +1130,7 @@ def family_build(deps, model_dir, create_extra, supported_model, unet_config, ma
         model_config = supported_model(dict(unet_config))
         ensure_model_config_attrs(model_config)
         model = make_model(model_config, QFLazyEngine(factory), device)
+        model._qf_loader_sig = loader_sig
         register_model(model)
         patcher = QFModelPatcher(model, load_device=device, offload_device=comfy.model_management.unet_offload_device())
         qfe.info(label)
