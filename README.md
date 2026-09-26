@@ -37,7 +37,7 @@ ComfyUI plugin for **QuantFunc** — the fastest diffusion model inference engin
 ### What's New in 0.0.07 (engine 0.0.13)
 
 - **One `quality_enhance` switch** on the MiniMax-H3, LTX-2.5, Krea-2 and Qwen-Image-2.1 loaders, the same on every GPU: OFF (default) is faster; the subject and scene stay the same, but details such as poses, faces or small objects can differ. ON gives the highest quality. Details in section 3.
-- **A `pinned_memory` switch** (default OFF) on the same four loaders: ON is faster on graphics cards with little VRAM. When enough RAM is free, the model is kept in locked system memory, which the rest of the PC cannot use while the model is loaded; on a PC with little RAM this can make the system unstable. Changing it reloads the model, and once a loader has turned it on it stays on until ComfyUI restarts.
+- **A `pinned_memory` switch** on the same four loaders: ON is faster on graphics cards with little VRAM. It is ON by default on the LTX-2.5 loader, which moves the most model data on such cards (earlier releases always used it for LTX-2.5), and OFF by default on the MiniMax-H3, Krea-2 and Qwen-Image-2.1 loaders. When enough RAM is free, the model is kept in locked system memory, which the rest of the PC cannot use while the model is loaded; on a PC with little RAM this can make the system unstable. Changing it reloads the model. It applies to the whole ComfyUI session: once any loader has turned it on (the LTX-2.5 loader does by default), it stays on for every model until ComfyUI restarts.
 - **No rebuild when you change settings or LoRAs**: the loaded pipeline is reused; only different model weights, or the `pinned_memory` switch, load a new one.
 - **One LoRA format**: diffusers / PEFT. Convert other formats with `scripts/qf_lora_convert.py`; LyCORIS LoHa / LoKr files are not supported.
 - **An engine per GPU architecture (Linux and Windows)**: the plugin downloads only the engine for your GPU's architecture (on Linux about 125-175 MB) and installs it automatically. One ComfyUI serves one GPU architecture; for GPUs of different architectures, run one ComfyUI per architecture (section 2.5).
@@ -266,10 +266,12 @@ Qwen-Image-2.1 native-loader workflows are in [`example_workflows/`](example_wor
 The loaders' `quality_enhance` switch (MiniMax-H3, LTX-2, Krea-2 and Qwen-Image-2.1; default OFF): OFF is faster; the
 subject and scene stay the same, but details such as poses, faces or small objects can differ. ON gives the highest
 quality. Changing it never reloads the model.
-The loaders' `pinned_memory` switch (default OFF): ON is faster on graphics cards with little VRAM. When enough RAM is
-free, the model is kept in locked system memory, which the rest of the PC cannot use while the model is loaded; on a PC
-with little RAM this can make the system unstable. Changing it reloads the model; once a loader has turned it on, it
-stays on until ComfyUI restarts.
+The loaders' `pinned_memory` switch: ON is faster on graphics cards with little VRAM. It is ON by default on the LTX-2.5
+loader (LTX-2.5 moves the most model data on such cards) and OFF by default on the MiniMax-H3, Krea-2 and Qwen-Image-2.1
+loaders. When enough RAM is free, the model is kept in locked system memory, which the rest of the PC cannot use while
+the model is loaded; on a PC with little RAM this can make the system unstable. Changing it reloads the model. It applies
+to the whole ComfyUI session: once any loader has turned it on (the LTX-2.5 loader does by default), it stays on for every
+model until ComfyUI restarts.
 
 | File | Use Case |
 |------|----------|

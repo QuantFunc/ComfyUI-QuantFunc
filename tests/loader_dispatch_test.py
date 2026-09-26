@@ -503,21 +503,27 @@ def main():
           and not [a for a in dir(_qmp_tp.QFSessionModelMixin) + dir(qfn) if _bt.h(a) in _bt.NAMES]
           and not hasattr(_qmp_tp.QFSessionModelMixin, "set_quality") and not hasattr(qfn, "_apply_quality"),
           "-> a retired setter / mapper is still present")
-    # (C) pinned_memory (user 2026-09-26 「pin能用 透出个开关让用户选择开启」): ONE load-time switch on the four loaders, default
-    #     OFF. It is a CREATE key (the engine's use_pinned_memory), so its two states are two cached pipelines: changing it
-    #     reloads the model. It is the LAST optional input, so every saved workflow's widget values keep their slots.
+    # (C) pinned_memory (user 2026-09-26 「pin能用 透出个开关让用户选择开启」): ONE load-time switch on the four loaders; default ON
+    #     on LTX-2.5 (the user's decision: the plugin before it always turned it on there, and LTX-2.5 moves the most model data
+    #     with little VRAM), OFF on the other three. It is a CREATE key (the engine's use_pinned_memory), so its two states are
+    #     two cached pipelines: changing it reloads the model. It is the LAST optional input, so every saved workflow's widget
+    #     values keep their slots.
+    _PM_DEFAULT_ON = {"QuantFuncLTXLoader"}
     _pm_bad = {}
     for _n, _it in _sw.items():
         _opt = list(_it.get("optional", {}))
         _pms = _it["optional"].get("pinned_memory")
-        if _opt[-1:] != ["pinned_memory"] or _pms[0] != "BOOLEAN" or _pms[1].get("default") is not False:
+        if _opt[-1:] != ["pinned_memory"] or _pms[0] != "BOOLEAN" or _pms[1].get("default") is not (_n in _PM_DEFAULT_ON):
             _pm_bad[_n] = (_opt[-2:], _pms)
-    check("every loader: pinned_memory is a BOOLEAN, default OFF, and its LAST optional input (saved widget values keep "
-          "their slots)", not _pm_bad, f"-> {_pm_bad}")
+    check("every loader: pinned_memory is a BOOLEAN, its LAST optional input (saved widget values keep their slots), default ON "
+          "on LTX-2.5 and OFF on MiniMax-H3, Krea-2 and Qwen-Image-2.1", not _pm_bad, f"-> {_pm_bad}")
     _pm_tips = {w: t for w, t in _texts if w.endswith(".pinned_memory")}
-    check("every loader's pinned_memory tooltip says that changing it reloads the model and that, once on, it stays on until "
-          "ComfyUI restarts (the engine cannot turn it back off in a running process)",
-          len(_pm_tips) == 4 and all("reloads the model" in t and "until ComfyUI restarts" in t for t in _pm_tips.values()),
+    check("every loader's pinned_memory tooltip states its own default (ON for LTX-2.5, OFF elsewhere), names LTX-2.5, and says "
+          "that changing it reloads the model and that, once on, it stays on until ComfyUI restarts (the engine cannot turn "
+          "it back off in a running process)",
+          len(_pm_tips) == 4 and all("reloads the model" in t and "until ComfyUI restarts" in t and "LTX-2.5" in t
+                                     and t.startswith("ON (default for LTX-2.5" if w.split(".")[0] in _PM_DEFAULT_ON
+                                                      else "OFF (default)") for w, t in _pm_tips.items()),
           f"-> {_pm_tips}")
     # qfa REMOVED as a user-facing attention_backend choice (2026-09-13)
     check("attention_backend choices drop qfa (SM80+ and SM75)",
@@ -759,9 +765,9 @@ def main():
     _ = out_h3.model._qf.lib
     _hcfg = creates[-1] if len(creates) > _n0 else json.loads(out_h3.model._qf._ckey[-1])
     check("h3 create cfg carries denoise_only", _hcfg.get("denoise_only") is True, f"-> {_hcfg}")
-    # (C) pinned_memory through the REAL load() of each family: ON puts use_pinned_memory in the create config; OFF (the
-    #     default) leaves the config exactly {denoise_only: true}, as before the switch (a saved Krea-2 / QI-2.1 / H3 workflow
-    #     keeps its cached pipeline; LTX-2.5's config no longer forces pinned memory on). A LoRA rebuild keeps the switch.
+    # (C) pinned_memory through the REAL load() of each family: ON puts use_pinned_memory in the create config; OFF leaves the
+    #     config exactly {denoise_only: true}. A load WITHOUT the input (an API prompt) gets the loader's own default: ON on
+    #     LTX-2.5 (its create config as before the switch), OFF on the others (theirs as before). A LoRA rebuild keeps it.
     QiL = qfn.NODE_CLASS_MAPPINGS["QuantFuncQwenImage21Loader"]()
     _pm_loads = {"ltx2": (LtxL, _allin_name, "ltx2-2.5-22b"),
                  "minimax-h3": (H3L, "fx-minimax-h3-quantfunc-int4.safetensors", "minimax-h3-fl2va"),
@@ -774,13 +780,15 @@ def main():
         return json.loads(out.model._qf._ckey[-1]), out
     _pm_rows, _pm_on = {}, {}
     for _fam, (_node, _xfm, _preset) in _pm_loads.items():
-        _off = _pm_cfg(_node, _xfm, _preset)[0]
+        _dflt = _pm_cfg(_node, _xfm, _preset)[0]
         _on, _pm_on[_fam] = _pm_cfg(_node, _xfm, _preset, pinned_memory=True)
-        _pm_rows[_fam] = (_off, _on, _pm_cfg(_node, _xfm, _preset, pinned_memory=False)[0])
-    check("pinned_memory ON: every family's create config carries use_pinned_memory=true and nothing else changes; OFF and "
-          "the default: the key is absent and the config is {denoise_only: true}",
-          all(_off == _off2 == {"denoise_only": True} and _on == {"denoise_only": True, "use_pinned_memory": True}
-              for _off, _on, _off2 in _pm_rows.values()), f"-> {_pm_rows}")
+        _pm_rows[_fam] = (_dflt, _on, _pm_cfg(_node, _xfm, _preset, pinned_memory=False)[0])
+    _PM_ON, _PM_OFF = {"denoise_only": True, "use_pinned_memory": True}, {"denoise_only": True}
+    check("pinned_memory ON: every family's create config carries use_pinned_memory=true and nothing else changes; OFF: the "
+          "key is absent and the config is {denoise_only: true}; the default (the input absent): ON for LTX-2.5, OFF for "
+          "MiniMax-H3, Krea-2 and Qwen-Image-2.1",
+          all(_on == _PM_ON and _off == _PM_OFF and _dflt == (_PM_ON if _fam == "ltx2" else _PM_OFF)
+              for _fam, (_dflt, _on, _off) in _pm_rows.items()), f"-> {_pm_rows}")
     from qfn_test_pkg import qf_modelpatcher as _qmp_pm
     _pm_rb = _qmp_pm.rebuild_of(_pm_on["krea2"])([])
     _ = _pm_rb.model._qf.lib

@@ -728,19 +728,27 @@ if _IMPORT_OK:
                               "tooltip": "OFF (default): faster; the subject and scene stay the same, but details such as poses, "
                                          "faces or small objects can differ. ON: the highest quality, a little slower. Takes "
                                          "effect on the next run."})
-    # [pinned_memory — user 2026-09-26 「pin能用 透出个开关让用户选择开启」] ONE load-time switch on the four loaders, default OFF (the
-    # user's standing no-pin default). ON sends the engine's use_pinned_memory create key: a CREATE key, not a session knob, so
-    # its two states are two cached pipelines and changing it reloads the model (never a faked runtime toggle). The engine then
-    # keeps a model's host copy in page-locked memory when the host has room for it; it turns pinned memory on for the whole
-    # process and has no call that turns it off, so once any loader has turned it on, later loads can pin too until restart.
-    # It is each loader's LAST optional input: widget values are stored by position, so saved workflows keep their slots.
-    _PINNED_MEMORY_INPUT = ("BOOLEAN", {"default": False,
-                            "tooltip": "OFF (default): the model is kept in ordinary system memory. ON: faster on graphics "
-                                       "cards with little VRAM. When enough RAM is free, the model is kept in locked "
-                                       "system memory, which the rest of the PC cannot use while the model is loaded; on a "
-                                       "PC with little RAM this can make the system unstable. Changing it reloads the model. "
-                                       "Once a QuantFunc loader has turned it on, it stays on for every model until "
-                                       "ComfyUI restarts."})
+    # [pinned_memory — user 2026-09-26 「pin能用 透出个开关让用户选择开启」] ONE load-time switch on the four loaders. ON sends the
+    # engine's use_pinned_memory create key: a CREATE key, not a session knob, so its two states are two cached pipelines and
+    # changing it reloads the model (never a faked runtime toggle). The engine then keeps a model's host copy in page-locked
+    # memory when the host has room for it; it turns pinned memory on for the whole process and has no call that turns it off,
+    # so once any loader has turned it on, later loads can pin too until restart. Defaults (user 2026-09-26, measured on the
+    # final engine): ON for LTX-2.5 — with little VRAM it moves the most model data (7.5 GiB free: 0.675 -> 0.309 s/step), and
+    # the plugin before this switch always turned it on for LTX-2.5, so OFF there would be a regression; OFF for the others
+    # (the user's no-pin default). It is each loader's LAST optional input: widget values are stored by position, so saved
+    # workflows keep their slots; load() takes the same default, so an API prompt without the input gets it too.
+    def _pinned_memory_input(default_on):
+        return ("BOOLEAN", {"default": default_on, "tooltip": (
+            "ON (default for LTX-2.5, which moves the most model data on graphics cards with little VRAM): faster on such "
+            "cards. " if default_on else
+            "OFF (default): the model is kept in ordinary system memory. ON: faster on graphics cards with little VRAM. ") +
+            "When enough RAM is free, the model is kept in locked system memory, which the rest of the PC cannot use while "
+            "the model is loaded; on a PC with little RAM this can make the system unstable. " +
+            ("OFF: the model is kept in ordinary system memory. " if default_on else "") +
+            "Changing it reloads the model. Once a QuantFunc loader has turned it on (the LTX-2.5 loader does by default), "
+            "it stays on for every model until ComfyUI restarts."})
+    _PINNED_MEMORY_INPUT = _pinned_memory_input(False)       # MiniMax-H3, Krea-2, Qwen-Image-2.1
+    _PINNED_MEMORY_INPUT_LTX = _pinned_memory_input(True)    # LTX-2.5
     # Saved workflows: the published loaders had this same switch in this same widget slot, so their workflows open unchanged.
     # A workflow saved with the unpublished quality dropdown (0.0.07 release candidate) carries `quality`: an API-format prompt by
     # NAME, declared hidden so ComfyUI hands it to load() (an undeclared key is dropped silently) and mapped best_quality -> ON,
@@ -856,7 +864,7 @@ if _IMPORT_OK:
                 "quality_enhance": _QUALITY_ENHANCE_INPUT,
                 "step_cache": _STEP_CACHE_INPUT,
                 "block_cache": _BLOCK_CACHE_INPUT,
-                "pinned_memory": _PINNED_MEMORY_INPUT,
+                "pinned_memory": _PINNED_MEMORY_INPUT_LTX,
             }, "hidden": dict(_QUALITY_LEGACY_HIDDEN)}
 
         RETURN_TYPES = ("MODEL",)
@@ -868,7 +876,7 @@ if _IMPORT_OK:
 
         def load(self, transformer, model_config=None,
                  attention_backend="auto", sol_tau=1.0, quality_enhance=None, step_cache=0.0, block_cache=0.0, quality=None,
-                 pinned_memory=False):
+                 pinned_memory=True):   # LTX-2.5: ON by default (_PINNED_MEMORY_INPUT_LTX)
             # NO aux file widgets and NO image socket (user 2026-08-22 "只保留
             # transformer/block/model_config … 只关注latent"): i2v is the workflow's own latent
             # conditioning (LTXVImgToVideoInplace).
