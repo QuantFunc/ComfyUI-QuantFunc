@@ -30,8 +30,9 @@ Design (measured from comfy 0.27.0 + include/quantfunc.h + the proven native_ses
   Interrupt (comfy skips process_latent_in for empty/denoise=1.0 latents + caches+reuses this
   instance across requeues), so the next run never continues an aborted one (its KV cache);
   end-on-failure per step.
-- Co-eviction: when comfy needs the VRAM for a sibling model, the ModelPatcher frees the engine's VRAM
-  (quantfunc_unload_sync) and reports the real freed bytes, so comfy's ledger is honest.
+- Co-eviction: the native resource adapters (QFNativeResourcePatcher) are ordinary ComfyUI models. When comfy needs
+  the VRAM for a sibling model it asks them back (release_eligible / release_all: the engine's own walk) and they report
+  the real freed bytes, so comfy's ledger is honest.
 """
 import ctypes
 from contextlib import contextmanager
@@ -296,15 +297,6 @@ class QFSessionModelMixin:
     # engine spec stays cache_mode=0/thresh=0 → the step path is BYTE-IDENTICAL (the
     # engine-side off-path guarantee, the engine's cache layer the engine's step-cache wrapper). >0 arms
     # lighting::CacheMode::the step cache with this mean_abs_diff skip budget. ──
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        # #738 (plugin CR F1): the card these weights are BUILT for (family_build's device, the patcher's load_device)
-        # keys the host-inference reserve. ComfyUI's BaseModel.__init__ stores its device argument as self.device
-        # however it was passed (plugin CR G-L1), so read it here, before anything moves the model: ComfyUI rewrites
-        # self.device to the offload device on every full unload (model_patcher.detach -> unpatch_model), so a
-        # reserve keyed by it later goes stale for the grant, which reads it by the load device.
-        self._qf_build_device = self.device
-
     _step_cache = 0.0             # class default; loaders set the widget value (step_cache)
     _block_cache = 0.0            # class default; loaders set the widget value (block_cache)
     _sparse = 1.0                 # class default; 1.0 = dense (loaders set the sparse widget)
@@ -485,10 +477,9 @@ class QFSessionModelMixin:
 
         COLD (no pipeline exists for these weights yet — #716, tests-07 ruling (a), interim): ComfyUI's own
         BaseModel.memory_required for the shape is the FLOOR, so comfy makes room BEFORE the engine's first forward.
-        The engine has no pre-create working-set estimate yet (G3), and under the admission ceiling it cannot take
-        room from its own idle weight pages yet (E4). MEASURED without the floor: LTX-2.5 1920x1088 cold asked 127 MB,
-        comfy kept its 11 GB text encoder, and step 0 hit the ceiling (release-ltx25-allin-1); with it, 10/10
-        (host-vram-ltx25-accept-26). Both engine fixes delete this floor.
+        The engine has no pre-create working-set estimate yet (G3). MEASURED without the floor: LTX-2.5 1920x1088
+        cold asked 127 MB, comfy kept its 11 GB text encoder, and step 0 hit the ceiling (release-ltx25-allin-1); with
+        it, 10/10 (host-vram-ltx25-accept-26). The G3 fix deletes this floor.
         HOT (a pipeline exists; a stage-2 model shares it): native numbers only (D3). comfy's torch estimate is never
         a floor there: at every stage it made comfy evict every other model (38 GB for a Wan 80x80x21 latent), the
         inter-stage thrash D3 removed.
@@ -519,8 +510,6 @@ class QFSessionModelMixin:
             need = int(cold_need)
         floor = int(super().memory_required(input_shape, cond_shapes=cond_shapes or {})) if eng is None else 0
         total = int(max(floor, comfy_side + need))
-        # #738: the host's OWN inference tensors for this sampling (comfy side) stay outside our grant
-        _note_host_inference_bytes(self._qf_build_device, comfy_side)
         # One line per CHANGE of the answer (comfy asks per estimate + per cond-batch decision): the numbers comfy
         # will act on, so a ledger question is answerable from the log, not a guess.
         sig = (tuple(int(d) for d in input_shape), comfy_side, need, floor, eng is None)
@@ -844,7 +833,6 @@ class QFLazyEngine:
     def _adopt_real(self, real, ckey):
         if not isinstance(real, qfe.QFEngineHandle) or real.pipeline is None:
             raise RuntimeError("QuantFunc factory did not materialize a live engine handle")
-        _require_engine_host_grants(real)
         self._bind_capacity(real.capacity_bytes)
         self._real, self._ckey = real, ckey
         self._real.step_count = self.step_count
@@ -852,12 +840,11 @@ class QFLazyEngine:
         return self._real
 
     def _materialize_prepared(self, entry):
-        """The one host-admitted cold-create path used by every family."""
+        """The one cold-create path used by every family."""
         if self._real is not None and self._real.pipeline is not None:
             return self._real
         if entry is not self._prepared_entry:
             raise RuntimeError("QuantFunc prepared identity is not bound to this lazy engine")
-        _require_engine_host_grants(entry)
         with _engine_cache_acquisition(self):
             real, ckey = self._factory()
             if isinstance(real, QFPreparedEntry):
@@ -875,10 +862,6 @@ class QFLazyEngine:
                 entry.materialize(preferred=self)
             else:
                 self._adopt_real(entry, ckey)
-        # An existing handle may have survived a full-release attempt, including
-        # Busy/Unknown after the native grant was fenced. Cache hits are not a
-        # new host admission and must not resume it implicitly.
-        _require_engine_host_grants(self._real)
         # The ONE materialization chokepoint also puts this consumer's LoRA set on the shared pipeline, so no family
         # needs a per-begin hook it could forget.
         self._apply_runtime_lora()
@@ -1159,21 +1142,9 @@ def rebuild_of(patcher):
 
 
 _CANONICAL_LOCK = threading.RLock()
-# One strong Shared root per loaded image/device, not per model. Owned lookups
-# are weak; actual entries/handles/consuming patchers retain their adapters.
+# One strong Shared adapter per loaded image/device, not per model. It keeps its device's Owned adapters by owner
+# epoch, weakly (`_owners`); actual entries/handles/consuming patchers retain their adapters.
 _RESOURCE_DOMAINS = {}
-
-
-class _CanonicalResourceDomain:
-    """Per-device host ledger state; serializes host transitions, not native forwards."""
-    def __init__(self, shared):
-        self.shared = shared
-        self.owners = weakref.WeakValueDictionary()
-        self.shared_growth_fenced = False
-        # Serializes one host admission/measurement transaction.  Native load
-        # and release do not call back into this Python scheduler. Native
-        # inference may still run concurrently and is constrained by grants.
-        self.transaction_lock = threading.RLock()
 
 
 _log = qfe.logger(__name__)   # console-safe (#738)
@@ -1182,12 +1153,10 @@ _log = qfe.logger(__name__)   # console-safe (#738)
 # the allocator's or the target's lock at that instant, which is ordinary while native work runs. MEASURED (issue
 # #704, 远程-linux-c): an LTX-2.5 run died before step 2 on one such answer, 1 run in 4 under card contention.
 # Identity survives BUSY: the engine fills device, owner_epoch and capabilities before its reader runs. Values
-# (grants, lifecycle phase, bytes) do not.
+# (lifecycle phase, bytes) do not.
 _IDENTITY_STATES = (qfe.QUANTFUNC_RESOURCE_READY, qfe.QUANTFUNC_RESOURCE_BUSY, qfe.QUANTFUNC_RESOURCE_UNKNOWN)
 # A value read that answers BUSY is re-read until this deadline, then refused. BUSY lasts one native critical
-# section; the bound is far above that and only stops a lock that never frees. The re-reads run inside the caller's
-# _domain_transaction, so another thread on the same device domain (e.g. Comfy's /free -> detach) waits for them: at
-# most this deadline per read, never a deadlock (native code never takes that Python lock).
+# section; the bound is far above that and only stops a lock that never frees.
 _NATIVE_BUSY_DEADLINE_S = 2.0
 _NATIVE_BUSY_FIRST_BACKOFF_S = 0.001
 _NATIVE_BUSY_MAX_BACKOFF_S = 0.05
@@ -1219,7 +1188,7 @@ class _NativeStillBusy(RuntimeError):
 
 def _read_past_busy(read, what):
     """One native call, re-issued while it answers BUSY, until _NATIVE_BUSY_DEADLINE_S: a read, or a command whose
-    re-issue is safe (see _set_domain_grants and partially_unload).
+    re-issue is safe (see partially_unload).
 
     Only BUSY is retried. Any other state (READY, UNKNOWN, CLOSED) returns at once for the caller to judge, and an
     API error raises from `read` unchanged.
@@ -1261,6 +1230,7 @@ def _ready_read(read, what):
 #   detach                LoadedModel.model_unload :841, load_models_gpu :988 (unpatch_all=False)
 #   partially_load        LoadedModel.model_use_more_vram :848 <- model_load :820 <- load_models_gpu :1033
 #   model_patches_models  load_models_gpu :954
+#   is_dynamic            free_memory :914, load_models_gpu :964 :996 :1036 (no resource read: always False)
 #   get_additional_models ModelPatcher.get_nested_additional_models (model_patcher.py:1405) <- unload_model_and_clones
 #                         :2130 and sampler_helpers._prepare_sampling :193, both for a prompt's own model
 #   loaded_ram_size       load_models_gpu :1036, only when model.is_dynamic()
@@ -1296,15 +1266,15 @@ def _comfy_facing(policy):
 
 def _busy_loaded_size(adapter, busy, *_args, **_kwargs):
     """The last READY residency, stale by whatever the engine paged since; ComfyUI still reads the device's real free
-    memory (get_free_memory) for every decision that matters. None ever observed means the view was never admitted
-    (every host-managed admission reads it READY in _publish_domain_grants), so nothing is materialized and 0 is the
-    fact. Under-counting is also ComfyUI 0.37.0's evict-MORE side, never its OOM side: model_unload (:837) then skips
+    memory (get_free_memory) for every decision that matters. None ever observed means no READY residency was ever
+    read for this view (ComfyUI reads it right after every load, load_models_gpu :1035), so it was never loaded: 0.
+    Under-counting is also ComfyUI 0.37.0's evict-MORE side, never its OOM side: model_unload (:837) then skips
     the partial path and fully detaches, free_memory (:905) orders this model first, and model_memory_required (:808)
     frees its full size when it is requested; over-counting would make ComfyUI free nothing for it. Do not flip this."""
     seen = adapter._last_ready_resident
     if seen is None:
         _log.warning("[qf_native] %s; loaded_size answers 0: no READY residency was ever observed, so this view was "
-                     "never admitted and nothing is materialized", busy)
+                     "never loaded", busy)
         return 0
     _log.warning("[qf_native] %s; loaded_size answers the last READY residency, %d B (stale)", busy, seen)
     return seen
@@ -1326,281 +1296,38 @@ def _busy_zero_freed(adapter, busy, *_args, **_kwargs):
 
 
 def _busy_stop_eviction(adapter, busy, unpatch_all=True):
-    """The eviction stops where it is (nothing more is released), like release_all's non-READY branch: growth stays
-    fenced, an Owned view is re-admitted formally, and ComfyUI's record is dropped as usual.
-
-    This runs after detach's transaction has released the domain lock, and that is safe. The BUSY answer applied
-    nothing, and detach's earlier writes only fence and mark. A peer that takes the lock in between runs its whole
-    transaction first. Both writes below then land in one hold of that lock, so the result is the peer's transaction
-    followed by this eviction."""
-    with _domain_transaction(adapter):
-        adapter._domain.shared_growth_fenced = True
-        if adapter._owner_epoch:
-            adapter._needs_readmission = True
-    _log.warning("[qf_native] %s; full eviction stopped, growth stays fenced until the next formal admission", busy)
+    """The eviction stops where it is (nothing more is released), like release_all's non-READY branch, and ComfyUI's
+    record is dropped as usual: the next run faults back what it needs."""
+    _log.warning("[qf_native] %s; full eviction stopped", busy)
     return comfy.model_patcher.ModelPatcher.detach(adapter, unpatch_all=unpatch_all)
 
 
-def _set_domain_grants(shared, owned, mask, **limits):
-    """One atomic domain-grant command, re-issued while it answers BUSY (bounded, like a read).
-
-    Re-issuing is exact: a BUSY answer applied NOTHING and the command carries absolute limits. The C API answers BUSY
-    on an owned-target lock or phase miss before it reaches the allocator (quantfunc_api.cpp:2071-2076), and the
-    allocator's setHostDomainGrants returns every non-Ready before its first assignment (Tensor.h:3098-3134). An
-    engine change that breaks either premise must revisit this retry.
-    """
-    return _ready_read(lambda: shared._resource.set_domain_grants(owned, mask, **limits), "atomic domain grant")
-
-
-def _ready_grant(resource, *, enroll=False):
-    result = resource.enroll_host() if enroll else _read_past_busy(resource.query_grant, "host grant")
-    if result.state == qfe.QUANTFUNC_RESOURCE_BUSY:
-        # Only enrollment reaches here: it is a native transaction, so a BUSY answer is refused, never re-issued.
-        raise RuntimeError("QuantFunc host enrollment answered BUSY: another native thread held the lock")
-    if result.state != qfe.QUANTFUNC_RESOURCE_READY or not result.enrolled:
-        raise RuntimeError(f"QuantFunc host grant unavailable (state={result.state}, "
-                           f"enrolled={result.enrolled}); an Attached engine cannot be migrated")
-    return result
-
-
-def _ready_device_grant(resource):
-    result = _read_past_busy(resource.query_device_grant, "device grant")
-    if result.state != qfe.QUANTFUNC_RESOURCE_READY or not result.enrolled:
-        raise RuntimeError(f"QuantFunc device grant unavailable (state={result.state}, "
-                           f"enrolled={result.enrolled})")
-    return result
-
-
 def _resource_domain(lib, device, *, prepare=False):
+    """The device's canonical Shared adapter, created on first use. prepare=True also tells the engine a host framework
+    shares the device (enroll_host: another library's failed allocation takes the engine's reclaimable memory; nothing
+    is granted), before an Owned identity or any backing exists."""
     key = (qfe.library_identity(lib), int(device))
     with _CANONICAL_LOCK:
-        domain = _RESOURCE_DOMAINS.get(key)
-    if domain is None:
+        shared = _RESOURCE_DOMAINS.get(key)
+    if shared is None:
         # Native view creation may enter the driver.  Do it outside the global
         # registry lock, then publish one winner; a racing spare view is closed
         # only after the registry lock has been released.
-        shared = qfe.NativeResource.shared(lib, device)
-        adapter = QFNativeResourcePatcher(shared)
-        candidate = _CanonicalResourceDomain(adapter)
-        adapter._domain_key = key
-        adapter._domain = candidate
-        adapter._shared_adapter = adapter
+        candidate = QFNativeResourcePatcher(qfe.NativeResource.shared(lib, device))
+        candidate._shared_adapter = candidate
+        candidate._owners = weakref.WeakValueDictionary()
         with _CANONICAL_LOCK:
-            domain = _RESOURCE_DOMAINS.get(key)
-            if domain is None:
-                _RESOURCE_DOMAINS[key] = candidate
-                domain = candidate
-                candidate = None
-        if candidate is not None:
-            candidate.shared._resource.close()
+            shared = _RESOURCE_DOMAINS.setdefault(key, candidate)
+        if shared is not candidate:
+            candidate._resource.close()
     if prepare:
-        with domain.transaction_lock:
-            # Public native authority validates empty-device enrollment; never
-            # migrate a live Attached engine or reset an already-issued limit.
-            _ready_grant(domain.shared._resource, enroll=True)
-            domain.shared._host_managed = True
-    return domain.shared, domain.owners, domain.transaction_lock
-
-
-_QF_FULL_LOAD_SENTINEL = 10 ** 30
-_QF_UINT64_MAX = (1 << 64) - 1
-
-
-def _host_allowance(extra_memory):
-    """Normalize Comfy allowance; None is full-load and negatives request shrink."""
-    if isinstance(extra_memory, float) and not math.isfinite(extra_memory):
-        raise ValueError("host allowance must be finite")
-    try:
-        value = int(extra_memory)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError("host allowance must be a finite byte count") from exc
-    return None if value >= _QF_FULL_LOAD_SENTINEL else max(-_QF_UINT64_MAX, min(value, _QF_UINT64_MAX))
-
-
-def _domain_members(adapter):
-    domain = getattr(adapter, "_domain", None)
-    if domain is None:
-        raise RuntimeError("QuantFunc canonical resource domain was retired")
-    with domain.transaction_lock:
-        return domain.shared, list(domain.owners.values())
-
-
-def _domain_transaction(adapter):
-    domain = getattr(adapter, "_domain", None)
-    if domain is None:
-        raise RuntimeError("QuantFunc canonical resource domain was retired")
-    return domain.transaction_lock
+        shared._resource.enroll_host()
+    return shared
 
 
 def _domain_loaded_size(adapter):
-    """One coherent native snapshot of all Shared + Owned backing in the domain."""
-    with _domain_transaction(adapter):
-        shared, _ = _domain_members(adapter)
-        return _ready_read(shared._resource.query_domain_residency, "domain residency").resident_bytes
-
-
-# #738 The host's own inference bytes for the sampling being admitted, per device: the ledger's comfy side. ComfyUI asks
-# memory_required for the full (cond+uncond) shape and then the minimum shape right before it admits, so the reserve is
-# the larger of those answers (see _note_host_inference_bytes for when a record restarts). Read by _publish_domain_grants
-# so the grant leaves them free - they are torch allocations ComfyUI makes outside any QuantFunc ceiling.
-_QF_HOST_INFERENCE_BYTES = {}
-
-
-def _device_key(device):
-    # torch.device("cuda") and torch.device("cuda:0") are one card to comfy: key by (type, index or 0)
-    return (getattr(device, "type", str(device)), getattr(device, "index", None) or 0)
-
-
-def _note_host_inference_bytes(device, nbytes):
-    # The record is the largest answer since it (re)started, and it restarts at the first answer after a grant
-    # publication read it: the two publications of one admission (Shared, then Owner) read the same value, and the
-    # next sampling's answers start fresh. No clock (plugin CR D-S5): a record never ages out while a run is slow.
-    # The one residue: the answers a running sampling gives after its admission carry into the next sampling's
-    # record - an over-reserve when that run is smaller, never less.
-    key, value = _device_key(device), max(0, int(nbytes))
-    held, published = _QF_HOST_INFERENCE_BYTES.get(key, (0, False))
-    _QF_HOST_INFERENCE_BYTES[key] = (value if published else max(held, value), False)
-
-
-def _host_inference_bytes(device):
-    return _QF_HOST_INFERENCE_BYTES.get(_device_key(device), (0, False))[0]
-
-
-def _publish_host_inference_bytes(device):
-    """A grant publication's read: the record's value, and the next answer restarts it."""
-    key = _device_key(device)
-    held, _ = _QF_HOST_INFERENCE_BYTES.get(key, (0, False))
-    _QF_HOST_INFERENCE_BYTES[key] = (held, True)
-    return held
-
-
-def _publish_domain_grants(adapter, *, publish_owner=False, growth_allowance=0):
-    """Publish one formal Comfy admission from exact native residency.
-
-    Owner and Shared each use their own current residency plus the one official
-    growth (Comfy's allowance, or what Comfy left free when that is more: see
-    below).  Only the aggregate Device ceiling uses coherent domain residency.
-    The Device ceiling bounds both resource ceilings.
-    """
-    with _domain_transaction(adapter):
-        domain = adapter._domain
-        shared, owners = _domain_members(adapter)
-        total = int(comfy.model_management.get_total_memory(shared.load_device))
-        if total <= 0:
-            raise RuntimeError("ComfyUI returned no physical capacity for the QuantFunc device")
-        total = min(total, _QF_UINT64_MAX)
-        domain_actual = min(_ready_read(shared._resource.query_domain_residency, "domain residency").resident_bytes,
-                            total)
-        free = host_reserve = None
-        if growth_allowance is None:
-            allowance = None
-            device_limit = total
-        else:
-            allowance = int(growth_allowance)
-            if allowance < 0:
-                raise ValueError("domain grant growth allowance must be nonnegative")
-            # Comfy's extra_memory is its WEIGHTS budget: load_models_gpu computes it as
-            # free - minimum_memory_required, i.e. with the inference reserve it holds for THIS model's
-            # sampling taken out. A Torch model spends that reserve on activations outside any ceiling;
-            # native weights, activations and cache all live under this one, so publishing the budget
-            # alone refuses the engine the room Comfy freed for it. MEASURED (H3, 32 GB): 24017 MB free,
-            # 20951 MB budget, 14270 MB of weights -> step 0 refused with ~10 GB physically free.
-            # The ceiling is what Comfy left free at this admission, never less than its own budget.
-            free = max(0, int(comfy.model_management.get_free_memory(shared.load_device)))
-            # #738 C4b/C4d: ComfyUI's OWN tensors for this sampling (latent, noise, conversions — the ledger's comfy
-            # side) plus its --reserve-vram are torch allocations OUTSIDE our grant; granting all of `free` left none
-            # (MEASURED: --novram / --disable-dynamic-vram at a 6 GB card -> torch OOM in samplers.inner_sample).
-            host_reserve = (_publish_host_inference_bytes(shared.load_device) +
-                            int(comfy.model_management.extra_reserved_memory()))
-            allowance = min(max(allowance, free - host_reserve), total)
-            device_limit = min(total, domain_actual + allowance)
-
-        def resource_limit(resource_adapter):
-            actual = min(int(resource_adapter._resident_bytes()), total)
-            limit = total if allowance is None else min(total, actual + allowance)
-            return min(device_limit, limit)
-
-        target_owner = adapter if publish_owner else None
-        if target_owner is not None and target_owner is shared:
-            raise ValueError("Shared has no Owner grant")
-        if target_owner is not None and target_owner not in owners:
-            raise RuntimeError("QuantFunc Owner is not retained by its canonical domain")
-        shared_target = resource_limit(shared)
-        if target_owner is None:
-            mask = qfe.QUANTFUNC_RESOURCE_GRANT_SHARED | qfe.QUANTFUNC_RESOURCE_GRANT_DEVICE
-            _set_domain_grants(shared, None, mask, shared_limit_bytes=shared_target, device_limit_bytes=device_limit)
-        else:
-            owner_target = resource_limit(target_owner)
-            mask = (qfe.QUANTFUNC_RESOURCE_GRANT_OWNER |
-                    qfe.QUANTFUNC_RESOURCE_GRANT_SHARED |
-                    qfe.QUANTFUNC_RESOURCE_GRANT_DEVICE)
-            _set_domain_grants(shared, target_owner._resource, mask, owner_limit_bytes=owner_target,
-                               shared_limit_bytes=shared_target, device_limit_bytes=device_limit)
-        domain.shared_growth_fenced = False
-        # #738 (tests-07): the published grant is observable in the log, one line per publication (info level: hidden at
-        # the production default), after the state it describes. A cell that never pages would otherwise show no grant.
-        qfe.info("[qf_native] grant: device=%d MB owner=%s shared=%d MB comfy_free=%s host_reserve=%s "
-                 "engine_resident=%d MB (%s)",
-                 device_limit >> 20,
-                 "%d MB" % (owner_target >> 20) if target_owner is not None else "-",
-                 shared_target >> 20,
-                 "%d MB" % (free >> 20) if free is not None else "-",
-                 "%d MB" % (host_reserve >> 20) if host_reserve is not None else "-",
-                 domain_actual >> 20,
-                 "full load: no growth ceiling" if allowance is None
-                 else "comfy budget %d MB; growth %d MB" % (int(growth_allowance) >> 20, allowance >> 20))
-        return device_limit
-
-
-def _revoke_domain_growth(adapter):
-    """Passively revoke growth without claiming that existing occupancy vanished."""
-    with _domain_transaction(adapter):
-        domain = adapter._domain
-        shared, owners = _domain_members(adapter)
-        domain.shared_growth_fenced = True
-        target_owner = None if adapter is shared else adapter
-        if target_owner is not None and target_owner not in owners:
-            raise RuntimeError("QuantFunc Owner is not retained by its canonical domain")
-        if target_owner is None:
-            mask = qfe.QUANTFUNC_RESOURCE_GRANT_SHARED | qfe.QUANTFUNC_RESOURCE_GRANT_DEVICE
-            _set_domain_grants(shared, None, mask, shared_limit_bytes=0, device_limit_bytes=0)
-        else:
-            mask = (qfe.QUANTFUNC_RESOURCE_GRANT_OWNER |
-                    qfe.QUANTFUNC_RESOURCE_GRANT_SHARED |
-                    qfe.QUANTFUNC_RESOURCE_GRANT_DEVICE)
-            _set_domain_grants(shared, target_owner._resource, mask, owner_limit_bytes=0,
-                               shared_limit_bytes=0, device_limit_bytes=0)
-        qfe.info("[qf_native] grant: device=0 MB owner=%s shared=0 MB (revoked: growth fenced, what is held stays)",
-                 "0 MB" if target_owner is not None else "-")
-
-
-def _capture_domain_grants(adapter, identity):
-    """Capture exact pre-admission authorization; grants are not occupancy."""
-    shared = adapter._domain.shared
-    owner_limit = (int(_ready_grant(adapter._resource).limit_bytes)
-                   if identity.owner_epoch else None)
-    shared_fenced = bool(adapter._domain.shared_growth_fenced)
-    shared_limit = int(_ready_grant(shared._resource).limit_bytes)
-    device_limit = int(_ready_device_grant(shared._resource).limit_bytes)
-    return owner_limit, shared_limit, device_limit, shared_fenced
-
-
-def _restore_domain_grants(adapter, snapshot):
-    """Attempt one atomic restoration; native non-Ready remains all-or-none."""
-    owner_limit, shared_limit, device_limit, shared_fenced = snapshot
-    shared = adapter._domain.shared
-    if owner_limit is None:
-        _set_domain_grants(shared, None, qfe.QUANTFUNC_RESOURCE_GRANT_SHARED | qfe.QUANTFUNC_RESOURCE_GRANT_DEVICE,
-                           shared_limit_bytes=shared_limit, device_limit_bytes=device_limit)
-    else:
-        _set_domain_grants(shared, adapter._resource,
-                           qfe.QUANTFUNC_RESOURCE_GRANT_OWNER | qfe.QUANTFUNC_RESOURCE_GRANT_SHARED |
-                           qfe.QUANTFUNC_RESOURCE_GRANT_DEVICE,
-                           owner_limit_bytes=owner_limit, shared_limit_bytes=shared_limit,
-                           device_limit_bytes=device_limit)
-    adapter._domain.shared_growth_fenced = shared_fenced
-    qfe.info("[qf_native] grant: device=%d MB owner=%s shared=%d MB (restored)", device_limit >> 20,
-             "%d MB" % (owner_limit >> 20) if owner_limit is not None else "-", shared_limit >> 20)
+    """One coherent native snapshot of all Shared + Owned backing on the adapter's device."""
+    return _ready_read(adapter._shared_adapter._resource.query_domain_residency, "domain residency").resident_bytes
 
 
 def canonical_resource_adapters(engine):
@@ -1610,51 +1337,16 @@ def canonical_resource_adapters(engine):
     snapshot = _query_identity(resource)
     if snapshot.owner_epoch == 0:
         raise RuntimeError("QuantFunc model requires an Owned resource, not Shared")
-    shared, owners, transaction_lock = _resource_domain(resource._lib, snapshot.device)
-    with transaction_lock:
-        owner = owners.get(snapshot.owner_epoch)
+    shared = _resource_domain(resource._lib, snapshot.device)
+    with _CANONICAL_LOCK:
+        owner = shared._owners.get(snapshot.owner_epoch)
         if owner is None:
             owner = QFNativeResourcePatcher(resource)
-            owners[snapshot.owner_epoch] = owner
-            owner._domain_key = (qfe.library_identity(resource._lib), int(snapshot.device))
-            owner._domain = shared._domain
             owner._shared_adapter = shared
-        # Production canonical adapters may only execute with actual native
-        # enrollment. Querying the graph itself remains non-mutating; Attached
-        # identities are never enrolled here as a migration shortcut.
-        owner._host_managed = shared._host_managed = True
+            shared._owners[snapshot.owner_epoch] = owner
         # Retained by actual identity, not a primary/shadow wrapper or host weakref.
         engine._qf_resource_adapters = (owner, shared)
         return engine._qf_resource_adapters
-
-
-def _require_engine_host_grants(engine):
-    adapters = canonical_resource_adapters(engine)
-    with _domain_transaction(adapters[0]):
-        shared = None
-        shared_grant = None
-        for adapter in adapters:
-            if (adapter._admission_failed and
-                    adapter._admitting_thread != threading.get_ident()):
-                raise qfe.NativeContractUnavailable(
-                    "QuantFunc execution is fenced after a failed host admission; "
-                    "retry through ComfyUI model loading")
-            adapter.require_load_contract()
-            grant = _ready_grant(adapter._resource)
-            if adapter is adapter._shared_adapter:
-                shared = adapter
-                shared_grant = grant
-            elif int(grant.limit_bytes) == 0:
-                raise qfe.NativeContractUnavailable(
-                    "QuantFunc engine execution requires a positive Owned host grant")
-        if shared is None:
-            raise RuntimeError("QuantFunc canonical resource domain has no Shared adapter")
-        if shared._domain.shared_growth_fenced or int(shared_grant.limit_bytes) == 0:
-            raise qfe.NativeContractUnavailable(
-                "QuantFunc engine execution requires a positive Shared host grant")
-        if int(_ready_device_grant(shared._resource).limit_bytes) == 0:
-            raise qfe.NativeContractUnavailable(
-                "QuantFunc engine execution requires a positive aggregate device grant")
 
 
 class QFPreparedEntry:
@@ -1668,7 +1360,7 @@ class QFPreparedEntry:
         self._cache_usable = True
         self._materializers = weakref.WeakSet()
         self._materialize_lock = threading.RLock()
-        _resource_domain(lib, device, prepare=True)  # Shared BEFORE Owned/backing.
+        _resource_domain(lib, device, prepare=True)  # host enrollment of the device, BEFORE Owned/backing.
         self.resource = qfe.NativeResource.prepare(lib, device)
         try:
             if create_params is None:
@@ -1679,11 +1371,9 @@ class QFPreparedEntry:
             capacity = _ready_read(self.resource.query_capacity, "resource capacity")
             self.capacity_bytes = int(capacity.required_persistent_bytes)
             self.component_count = int(capacity.component_count)
-            _ready_grant(self.resource, enroll=True)
             owner, shared = canonical_resource_adapters(self)
             self._owner_adapter, self._shared_adapter = owner, shared
             owner._prepared = True
-            owner._host_managed = True
             owner.bind_prepared(self, self.capacity_bytes)
         except BaseException:
             if hasattr(self, "_owner_adapter"):
@@ -1696,24 +1386,23 @@ class QFPreparedEntry:
     def retire_unpublished(self):
         """Make a losing prepared candidate invisible, then close its native view.
 
-        Candidate construction registers the Owned adapter in the canonical
-        domain before cache publication.  A loser therefore must be removed by
-        its exact owner epoch while holding the domain transaction; closing it
-        first would leave refresh traversals able to observe a dead adapter.
+        Candidate construction registers the Owned adapter under its device's
+        Shared adapter before cache publication. A loser is removed by its
+        exact owner epoch before its view closes, so no lookup can hand out a
+        closed adapter.
         """
         owner = self._owner_adapter
-        with _domain_transaction(owner):
+        with self._materialize_lock:
             if not self._cache_usable:
                 return
             self._cache_usable = False
-            domain = owner._domain
-            epoch = owner._owner_epoch
-            if domain.owners.get(epoch) is owner:
-                domain.owners.pop(epoch, None)
-            owner._closed_identity = True
-            owner._host_managed = False
             self._materializers.clear()
-            self.resource.close()
+        with _CANONICAL_LOCK:
+            owners = owner._shared_adapter._owners
+            if owners.get(owner._owner_epoch) is owner:
+                owners.pop(owner._owner_epoch, None)
+        owner._closed_identity = True
+        self.resource.close()
 
     def retire_materialized(self):
         """Remove an old Attached/Closed identity from future create lookup.
@@ -1722,59 +1411,53 @@ class QFPreparedEntry:
         aliases may still report/reclaim residual backing after pipeline
         teardown.  A same-recipe retry must prepare a new owner epoch.
         """
-        with _domain_transaction(self._owner_adapter):
-            with self._materialize_lock:
-                self._cache_usable = False
-                self._materializers.clear()
+        with self._materialize_lock:
+            self._cache_usable = False
+            self._materializers.clear()
 
     def bind_materializer(self, engine, cache_key):
-        with _domain_transaction(self._owner_adapter):
-            with self._materialize_lock:
-                if not self._cache_usable:
-                    raise qfe.NativeContractUnavailable(
-                        "QuantFunc prepared cache candidate was retired before publication")
-                if self.cache_key is not None and self.cache_key != cache_key:
-                    raise RuntimeError("QuantFunc prepared identity was rebound to a different cache recipe")
-                if self.capacity_bytes is None or self.capacity_bytes <= 0:
-                    raise qfe.NativeContractUnavailable(
-                        "QuantFunc prepared identity has no native persistent capacity")
-                self.cache_key = cache_key
-                self._materializers.add(engine)
-                engine._bind_capacity(self.capacity_bytes)
+        with self._materialize_lock:
+            if not self._cache_usable:
+                raise qfe.NativeContractUnavailable(
+                    "QuantFunc prepared cache candidate was retired before publication")
+            if self.cache_key is not None and self.cache_key != cache_key:
+                raise RuntimeError("QuantFunc prepared identity was rebound to a different cache recipe")
+            if self.capacity_bytes is None or self.capacity_bytes <= 0:
+                raise qfe.NativeContractUnavailable(
+                    "QuantFunc prepared identity has no native persistent capacity")
+            self.cache_key = cache_key
+            self._materializers.add(engine)
+            engine._bind_capacity(self.capacity_bytes)
 
     def has_materializer(self, engine):
-        with _domain_transaction(self._owner_adapter):
-            with self._materialize_lock:
-                return self._cache_usable and engine in self._materializers
+        with self._materialize_lock:
+            return self._cache_usable and engine in self._materializers
 
     def materialize(self, preferred=None):
-        # Fixed order: domain -> prepared entry. The factory may take the global
-        # engine cache lock only for short lookup/publication sections; no cache
-        # holder may enter this pair in the opposite direction.
-        with _domain_transaction(self._owner_adapter):
-            with self._materialize_lock:
-                if not self._cache_usable:
-                    raise qfe.NativeContractUnavailable(
-                        "QuantFunc prepared cache candidate is no longer materializable")
-                candidates = ([preferred] if preferred is not None else []) + list(self._materializers)
-                for engine in candidates:
-                    if engine is not None and engine in self._materializers:
-                        return engine._materialize_prepared(self)
+        # Single flight per identity. Fixed order: prepared entry -> engine cache. The factory may take the global
+        # engine cache lock only for short lookup/publication sections; no cache holder may take this entry's lock.
+        with self._materialize_lock:
+            if not self._cache_usable:
+                raise qfe.NativeContractUnavailable(
+                    "QuantFunc prepared cache candidate is no longer materializable")
+            candidates = ([preferred] if preferred is not None else []) + list(self._materializers)
+            for engine in candidates:
+                if engine is not None and engine in self._materializers:
+                    return engine._materialize_prepared(self)
         raise qfe.NativeContractUnavailable(
             "QuantFunc prepared resource has no live common lazy-engine materializer")
 
 
 @qfe.console_safe_methods   # an exception leaving it is console-safe (#738)
 class QFNativeResourcePatcher(comfy.model_patcher.ModelPatcher):
-    """Host adapter for an existing native resource, not a model-load estimate.
-
-    The caller owns one canonical adapter per resource and must retain it while
-    registered: ComfyUI holds patchers weakly. No native model is created here.
-    Current backing is the entire size of this *residency-only* dependency;
-    model capacity, inference demand and load grants belong to their distinct
-    native contracts. Do not substitute this adapter for a lazy model loader.
-    Full detach requires CAP_RELEASE_ALL and a growth-denying grant (or an
-    already Closed target). A plain zero snapshot never authorizes deregistration.
+    """ComfyUI's ModelPatcher for one native resource view: an Owned view per model identity, a Shared view per
+    device (design #751 §6.1). The caller owns one canonical adapter per resource and must retain it while
+    registered: ComfyUI holds patchers weakly. It creates no native model except a Prepared identity's cold create.
+    - is_dynamic: False. Our pages are not aimdo VBARs, so load_models_gpu frees memory for our load.
+    - model_size: the Prepared capacity (a Shared view: its residency). loaded_size: the engine's resident bytes.
+    - partially_load: materializes a Prepared identity; it sets no budget.
+    - partially_unload(n): release_eligible(n), the engine's walk over this owner's reclaimable classes; returns freed.
+    - detach: release_all (requires CAP_RELEASE_ALL). A plain zero snapshot never authorizes deregistration.
     """
     def __init__(self, resource):
         # The adapter's own identity, fixed for the life of its native view; every later check must see exactly it.
@@ -1785,49 +1468,40 @@ class QFNativeResourcePatcher(comfy.model_patcher.ModelPatcher):
         super().__init__(model, load_device, torch.device("cpu"))
         self._resource = resource
         self._prepared = False
-        self._host_managed = False
-        self._needs_readmission = False
         self._closed_identity = False
         self._owner_epoch = identity.owner_epoch  # 0 for the device's Shared view
-        self._domain_key = None
-        self._domain = None
         self._shared_adapter = None
         self._prepared_entry = None
         self._capacity_bytes = None
         self._last_ready_resident = None  # ComfyUI-facing sizing answers it on a persistent BUSY
-        self._admission_failed = False
-        self._admitting_thread = None
 
     def _identity(self, *, allow_closed=False):
         return _query_identity(self._resource, owner_epoch=self._owner_epoch,
                                device=self.load_device.index, allow_closed=allow_closed)
 
+    @_comfy_facing("no resource read")
+    def is_dynamic(self):
+        # Our pages are not aimdo VBARs: ComfyUI must free memory for our load (load_models_gpu, for_dynamic=False).
+        return False
+
     def preflight_host_load(self):
         """Read-only fail-before-pop validation used during dependency expansion.
 
-        Zero grants on a Prepared resource are valid: this is not admission.
-        The check deliberately performs no grant mutation, release, create, or
-        engine-cache operation.
+        The check deliberately performs no release, create, or engine-cache operation.
         """
-        with _domain_transaction(self):
-            identity = self._identity()
-            lifecycle = _ready_read(self._resource.lifecycle, "host preflight lifecycle")
-            if lifecycle.phase == qfe.QUANTFUNC_RESOURCE_PHASE_CLOSED:
-                raise RuntimeError("QuantFunc host preflight rejected a Closed resource identity")
-            grant = _ready_grant(self._resource)
-            if self._prepared_entry is not None and not self._prepared_entry._cache_usable:
+        identity = self._identity()
+        lifecycle = _ready_read(self._resource.lifecycle, "host preflight lifecycle")
+        if lifecycle.phase == qfe.QUANTFUNC_RESOURCE_PHASE_CLOSED:
+            raise RuntimeError("QuantFunc host preflight rejected a Closed resource identity")
+        if self._prepared_entry is not None and not self._prepared_entry._cache_usable:
+            raise qfe.NativeContractUnavailable(
+                "QuantFunc host preflight rejected a retired create identity")
+        if identity.owner_epoch and lifecycle.phase == qfe.QUANTFUNC_RESOURCE_PHASE_PREPARED:
+            if (self._prepared_entry is None or self._capacity_bytes is None or
+                    self._capacity_bytes <= 0 or not self._prepared_entry._cache_usable):
                 raise qfe.NativeContractUnavailable(
-                    "QuantFunc host preflight rejected a retired create identity")
-            if identity.owner_epoch and lifecycle.phase == qfe.QUANTFUNC_RESOURCE_PHASE_PREPARED:
-                if (self._prepared_entry is None or self._capacity_bytes is None or
-                        self._capacity_bytes <= 0 or not self._prepared_entry._cache_usable):
-                    raise qfe.NativeContractUnavailable(
-                        "QuantFunc host preflight lacks a usable Prepared capacity contract")
-            shared = self._domain.shared
-            _ready_grant(shared._resource)
-            _ready_device_grant(shared._resource)
-            _ready_read(shared._resource.query_domain_residency, "domain residency")
-            return grant
+                    "QuantFunc host preflight lacks a usable Prepared capacity contract")
+        _domain_loaded_size(self)
 
     @_comfy_facing("refuses")
     def model_patches_models(self):
@@ -1837,37 +1511,31 @@ class QFNativeResourcePatcher(comfy.model_patcher.ModelPatcher):
         return super().model_patches_models()
 
     def bind_prepared(self, entry, capacity_bytes):
-        with _domain_transaction(self):
-            capacity = int(capacity_bytes)
-            if self._prepared_entry is not None and self._prepared_entry is not entry:
-                raise RuntimeError("QuantFunc owner adapter was rebound to another prepared identity")
-            if self._capacity_bytes is not None and self._capacity_bytes != capacity:
-                raise RuntimeError("QuantFunc owner capacity changed for one native identity")
-            self._prepared_entry, self._capacity_bytes = entry, capacity
+        capacity = int(capacity_bytes)
+        if self._prepared_entry is not None and self._prepared_entry is not entry:
+            raise RuntimeError("QuantFunc owner adapter was rebound to another prepared identity")
+        if self._capacity_bytes is not None and self._capacity_bytes != capacity:
+            raise RuntimeError("QuantFunc owner capacity changed for one native identity")
+        self._prepared_entry, self._capacity_bytes = entry, capacity
 
     def _resident_bytes(self):
         """This view's READY residency (strict: past the BUSY deadline it raises), remembered for ComfyUI's sizing."""
-        with _domain_transaction(self):
-            self._last_ready_resident = _ready_read(self._resource.residency, "resource residency").resident_bytes
-            return self._last_ready_resident
+        self._last_ready_resident = _ready_read(self._resource.residency, "resource residency").resident_bytes
+        return self._last_ready_resident
 
     @_comfy_facing(_busy_loaded_size)
     def loaded_size(self):
         return self._resident_bytes()
 
     def require_load_contract(self):
-        with _domain_transaction(self):
-            lifecycle = _ready_read(self._resource.lifecycle, "resource lifecycle")
-            self._closed_identity = lifecycle.phase == qfe.QUANTFUNC_RESOURCE_PHASE_CLOSED
-            if self._closed_identity:
-                raise RuntimeError("QuantFunc Closed resource identity is not reloadable")
-            if lifecycle.phase == qfe.QUANTFUNC_RESOURCE_PHASE_PREPARED:
-                if self._prepared_entry is None or self._capacity_bytes is None:
-                    raise qfe.NativeContractUnavailable(
-                        "QuantFunc Prepared resource is not bound to the common cold-load adapter")
-            if self._needs_readmission and self._capacity_bytes is None:
+        lifecycle = _ready_read(self._resource.lifecycle, "resource lifecycle")
+        self._closed_identity = lifecycle.phase == qfe.QUANTFUNC_RESOURCE_PHASE_CLOSED
+        if self._closed_identity:
+            raise RuntimeError("QuantFunc Closed resource identity is not reloadable")
+        if lifecycle.phase == qfe.QUANTFUNC_RESOURCE_PHASE_PREPARED:
+            if self._prepared_entry is None or self._capacity_bytes is None:
                 raise qfe.NativeContractUnavailable(
-                    "QuantFunc evicted resource has no retained cold-capacity contract")
+                    "QuantFunc Prepared resource is not bound to the common cold-load adapter")
 
     @_comfy_facing(_busy_model_size)
     def model_size(self):
@@ -1876,79 +1544,37 @@ class QFNativeResourcePatcher(comfy.model_patcher.ModelPatcher):
         # while Comfy still lists it), so refusing here killed the next model's load. A LOAD still refuses a Closed
         # identity (partially_load, preflight_host_load). A Closed owner keeps its Prepared capacity as its size: in
         # ComfyUI 0.37 that only orders free_memory's evictions (largest offloaded first), which puts the dead owner first.
-        with _domain_transaction(self):
-            if self._capacity_bytes is not None:
-                return int(self._capacity_bytes)
-            # Shared has no Prepared model capacity. Its already-resident bytes
-            # remain a zero-deficit dependency in Comfy's ledger.
-            return self._resident_bytes()
+        if self._capacity_bytes is not None:
+            return int(self._capacity_bytes)
+        # Shared has no Prepared model capacity. Its already-resident bytes
+        # remain a zero-deficit dependency in Comfy's ledger.
+        return self._resident_bytes()
 
     @_comfy_facing("refuses")
     def partially_load(self, device_to, extra_memory=0, force_patch_weights=False):
+        """Materialize a Prepared identity (its one cold create); a loaded one has nothing to load. The engine places
+        and streams its own pages, so ComfyUI's weights budget sets nothing here. Returns the domain residency added."""
         if device_to != self.load_device:
             raise ValueError("a native resource cannot migrate to another device")
-        allowance = _host_allowance(extra_memory)
-        with _domain_transaction(self):
-            # ONE critical section for the whole Comfy operation, like every other method here: the shrink revokes
-            # growth domain-wide, so releasing the lock before the re-admission would show a peer the fenced state.
-            if allowance is not None and allowance < 0:
-                # Comfy's negative budget means "shrink by this much, THEN RUN" (load_models_gpu computes
-                # max(0, free - minimum_memory_required, ...) - loaded_memory; a stock patcher unloads that much and
-                # samples in low-VRAM mode). The release revokes growth, so returning here left the engine fenced
-                # with nothing to re-open it before the sampler starts. MEASURED (host-vram-h3 measure-10): stage 2
-                # of the double-sample asks 17 GB, Comfy shrank the engine 15.7 -> 11.7 GB, and seven runs in a
-                # row died at session begin on "requires a positive Owned host grant". The shrink is now followed
-                # by the same formal admission as any load, with no weights budget of its own: the ceiling is
-                # what Comfy left free (its inference reserve), which is exactly the room it made for this run.
-                qfe.info(f"[qf_native] Comfy's budget is negative: shrinking {-allowance >> 20} MB, then admitting "
-                      "the run without a weights budget", flush=True)
-                self.partially_unload(device_to, -allowance,
-                                      force_patch_weights=force_patch_weights)
-                allowance = 0
-            self.require_load_contract()
-            identity = self._identity()
-            before_domain = _domain_loaded_size(self)
-            prior = (_capture_domain_grants(self, identity)
-                     if self._host_managed else None)
-            published = False
-            self._admitting_thread = threading.get_ident()
-            try:
-                if self._host_managed:
-                    _publish_domain_grants(
-                        self, publish_owner=bool(identity.owner_epoch),
-                        growth_allowance=allowance)
-                    published = True
-                if self._prepared_entry is not None:
-                    # A non-READY answer carries no phase; reading None as "not Prepared" skipped materialize().
-                    lifecycle = _ready_read(self._resource.lifecycle, "admission lifecycle")
-                    if lifecycle.phase == qfe.QUANTFUNC_RESOURCE_PHASE_PREPARED:
-                        self._prepared_entry.materialize()
-                self._prepared = False
-                self._needs_readmission = False
-                after_domain = _domain_loaded_size(self)
-                self._admission_failed = False
-                return max(0, after_domain - before_domain)
-            except BaseException as error:
-                if published:
-                    self._admission_failed = True
-                    self._domain.shared_growth_fenced = True
-                    try:
-                        _restore_domain_grants(self, prior)
-                    except BaseException as rollback_error:
-                        try:
-                            error.add_note(
-                                "QuantFunc grant rollback was unavailable; Python admission remains fenced: "
-                                f"{rollback_error}")
-                        except Exception:
-                            pass
-                raise
-            finally:
-                self._admitting_thread = None
+        if extra_memory < 0:
+            # Comfy's negative budget means "shrink by this much, then run" (load_models_gpu computes
+            # max(0, free - minimum_memory_required, ...) - loaded_memory); a stock patcher unloads that much too.
+            qfe.info(f"[qf_native] Comfy's budget is negative: shrinking {int(-extra_memory) >> 20} MB", flush=True)
+            self.partially_unload(device_to, -extra_memory, force_patch_weights=force_patch_weights)
+        self.require_load_contract()
+        before_domain = _domain_loaded_size(self)
+        if self._prepared_entry is not None:
+            # A non-READY answer carries no phase; reading None as "not Prepared" skipped materialize().
+            lifecycle = _ready_read(self._resource.lifecycle, "admission lifecycle")
+            if lifecycle.phase == qfe.QUANTFUNC_RESOURCE_PHASE_PREPARED:
+                self._prepared_entry.materialize()
+        self._prepared = False
+        return max(0, _domain_loaded_size(self) - before_domain)
 
     def _closed_now(self):
         """Is this identity Closed? Closed is final, so a True answer is kept: the retire marks what it Closes, which
         needs no read. Otherwise ONE lifecycle read (BUSY re-issued to the deadline): only a READY Closed answer counts.
-        A BUSY past the deadline or an UNKNOWN answer is not a Closed answer, so the caller's fence still runs."""
+        A BUSY past the deadline or an UNKNOWN answer is not a Closed answer, so the caller's release still runs."""
         if self._closed_identity or not self._owner_epoch:
             return self._closed_identity
         try:
@@ -1964,23 +1590,15 @@ class QFNativeResourcePatcher(comfy.model_patcher.ModelPatcher):
         want = max(0, min(int(memory_to_free), (1 << 64) - 1))
         if not want:
             return 0
-        with _domain_transaction(self):
-            if self._closed_now():
-                # A Closed Owned grant is INVALID_ARG natively: free nothing, and Comfy falls back to the full detach,
-                # whose release_all is the old owner's final cleanup.
-                return 0
-            if self._host_managed:
-                if self is not self._domain.shared:
-                    self._needs_readmission = True
-                # Native inference does not take the Python transaction lock.
-                # Revoke growth before release so freed capacity cannot be
-                # reclaimed concurrently; release failure never restores it.
-                _revoke_domain_growth(self)
-            # A BUSY release may already have freed eligible backing it does not report (engine releaseEligible,
-            # vram_manager/HostMemory.cpp:145-181), so the retry can free more than `want`: a reload-time cost only.
-            # `freed` is only what a READY answer reports, never an estimate; it errs low and Comfy then falls back
-            # to its own full detach.
-            return _ready_read(lambda: self._resource.release_eligible(want), "resource release").freed_bytes
+        if self._closed_now():
+            # A Closed identity has nothing eligible (native answers CLOSED): free nothing, and Comfy falls back to the
+            # full detach, whose release_all is the old owner's final cleanup.
+            return 0
+        # The engine walks this owner's reclaimable classes (quantfunc_resource_release_eligible). A BUSY release may
+        # already have freed eligible backing it does not report, so the retry can free more than `want`: a
+        # reload-time cost only. `freed` is only what a READY answer reports, never an estimate; it errs low and
+        # Comfy then falls back to its own full detach.
+        return _ready_read(lambda: self._resource.release_eligible(want), "resource release").freed_bytes
 
     def clone(self, disable_dynamic=False, model_override=None, force_deepcopy=False):
         if model_override is not None or force_deepcopy:
@@ -1996,37 +1614,21 @@ class QFNativeResourcePatcher(comfy.model_patcher.ModelPatcher):
     @_comfy_facing(_busy_stop_eviction)
     def detach(self, unpatch_all=True):
         if unpatch_all:
-            with _domain_transaction(self):
-                identity = self._identity(allow_closed=True)
-                if not identity.capabilities & qfe.QUANTFUNC_RESOURCE_CAP_RELEASE_ALL:
-                    raise qfe.NativeContractUnavailable("QuantFunc native resource full eviction is unsupported "
-                                                        "without CAP_RELEASE_ALL; keep the host record")
-                lifecycle = _ready_read(self._resource.lifecycle, "full eviction lifecycle")
-                closed = lifecycle.phase == qfe.QUANTFUNC_RESOURCE_PHASE_CLOSED
-                self._closed_identity = closed
-                if not closed:
-                    _ready_grant(self._resource)
-                    # Even a failing foreign call may already have changed the
-                    # grant. Do not allow a cache hit to undo this admission fence.
-                    if identity.owner_epoch:
-                        self._needs_readmission = True
-                    _revoke_domain_growth(self)
-                    self._host_managed = True
-                # Closed targets cannot grow; native permits final exact-old-owner
-                # cleanup but this never makes their identity reusable.
-                result = self._resource.release_all()
-                if result.state != qfe.QUANTFUNC_RESOURCE_READY:
-                    # Comfy's unload hook has no failure channel: unload_all_models() runs unguarded on the
-                    # prompt worker (its OOM handler and POST /free), so an error escaping here ends the
-                    # server's only worker and every later prompt hangs. Native Busy is also the ORDINARY
-                    # answer for a live pipeline: release_all certifies ZERO backing, and the non-paged
-                    # floor never reaches zero. Everything eligible is already released; growth was revoked
-                    # above and is revoked again below, so nothing regrows before the next formal admission,
-                    # which re-reads native residency. What remains is physically visible to Comfy.
-                    qfe.say(f"[qf_native] full eviction left native backing (state={result.state}); "
-                            "growth stays fenced until the next formal admission", flush=True)
-                if self._host_managed and not closed:
-                    _revoke_domain_growth(self)
+            identity = self._identity(allow_closed=True)
+            if not identity.capabilities & qfe.QUANTFUNC_RESOURCE_CAP_RELEASE_ALL:
+                raise qfe.NativeContractUnavailable("QuantFunc native resource full eviction is unsupported "
+                                                    "without CAP_RELEASE_ALL; keep the host record")
+            # The engine walks everything this owner holds (quantfunc_resource_release_all). A Closed target is
+            # forwarded too: native permits final exact-old-owner cleanup, which never makes its identity reusable.
+            result = self._resource.release_all()
+            if result.state != qfe.QUANTFUNC_RESOURCE_READY:
+                # Comfy's unload hook has no failure channel: unload_all_models() runs unguarded on the
+                # prompt worker (its OOM handler and POST /free), so an error escaping here ends the
+                # server's only worker and every later prompt hangs. Native Busy is also the ORDINARY
+                # answer for a live pipeline: release_all certifies ZERO backing, and the non-paged
+                # floor never reaches zero. Everything eligible is already released; what remains is
+                # physically visible to Comfy, and the next run faults back what it needs.
+                qfe.say(f"[qf_native] full eviction left native backing (state={result.state})", flush=True)
         # Keep the view and canonical object alive across host deregistration.
         return super().detach(unpatch_all=unpatch_all)
 
@@ -2087,7 +1689,6 @@ class QFModelPatcher(comfy.model_patcher.ModelPatcher):
             raise ValueError("a QuantFunc MODEL cannot migrate its native resources")
         for adapter in self._native_dependencies():
             adapter.require_load_contract()
-            _ready_grant(adapter._resource)
         # Native bytes are loaded by the canonical dependencies. The official
         # base implementation owns only this model's ordinary Torch parameters.
         return super().partially_load(device_to, extra_memory,

@@ -232,199 +232,39 @@ class EngineResourceContract(unittest.TestCase):
         self.assertEqual(lib.destroyed, [18, 19])
 
 
-class GrantContract(unittest.TestCase):
-    def setUp(self):
-        self.assertTrue(hasattr(qfe.NativeResource, "enroll_host"), "finite grant Python bridge missing")
-
-    @staticmethod
-    def grant_library():
+class HostEnrollmentContract(unittest.TestCase):
+    """quantfunc_resource_enroll_host means only "a host framework shares this device": it takes the view and nothing
+    else, returns a status, and the bridge binds no grant verb."""
+    def test_enrollment_passes_only_the_view_and_returns_nothing(self):
         lib = library()
-        lib.grant_calls = []
-        lib.enrolled = 1
-        def call(name, handle, limit, out):
-            value = out._obj
-            assert value.struct_size == 32 and value.abi_version == 1
-            lib.grant_calls.append((name, handle.value, limit))
-            value.state, value.enrolled = lib.state, lib.enrolled
-            value.limit_bytes, value.pending_bytes = (1 << 63) + 512, 1024
+        calls = []
+        def enroll(handle):   # a grant-era out struct would be a second argument: TypeError here
+            calls.append(handle.value)
             return lib.status
-        lib.quantfunc_resource_enroll_host = lambda h, o: call("enroll", h, None, o)
-        lib.quantfunc_resource_query_grant = lambda h, o: call("query", h, None, o)
-        lib.quantfunc_resource_set_grant = lambda h, n, o: call("set", h, n, o)
-        lib.quantfunc_resource_query_device_grant = lambda h, o: call("query_device", h, None, o)
-        lib.quantfunc_resource_set_device_grant = lambda h, n, o: call("set_device", h, n, o)
-        return lib
+        lib.quantfunc_resource_enroll_host = enroll
+        with qfe.NativeResource.shared(lib, 2) as shared, qfe.NativeResource.prepare(lib, 2) as owned:
+            self.assertIsNone(shared.enroll_host())
+            self.assertIsNone(owned.enroll_host())
+            self.assertEqual(calls, [18, 19])
+            self.assertEqual(lib.quantfunc_resource_enroll_host.argtypes, [ctypes.c_void_p])
+            self.assertEqual(lib.quantfunc_resource_enroll_host.restype, ctypes.c_int)
+            lib.status = 1
+            with self.assertRaisesRegex(RuntimeError, "host enrollment failed: native resource failure"):
+                shared.enroll_host()
+            lib.status = 0
+            del lib.quantfunc_resource_enroll_host
+            with self.assertRaisesRegex(RuntimeError, "quantfunc_resource_enroll_host"):
+                shared.enroll_host()
+        with self.assertRaisesRegex(RuntimeError, "closed"):
+            shared.enroll_host()
+        self.assertEqual((lib.requests, lib.created), ([], []))
 
-    def test_native_fields_are_forwarded_without_estimation(self):
-        lib = self.grant_library()
-        with qfe.NativeResource.prepare(lib, 2) as resource:
-            for operation in (resource.enroll_host, resource.query_grant, lambda: resource.set_grant((1 << 64) - 1)):
-                self.assertEqual(operation(), (0, True, (1 << 63) + 512, 1024))
-            self.assertEqual(lib.grant_calls, [("enroll", 19, None), ("query", 19, None), ("set", 19, (1 << 64) - 1)])
-            self.assertEqual(lib.requests, [])
-            self.assertEqual(lib.created, [])
-
-    def test_device_grant_fields_are_forwarded_without_occupancy_arithmetic(self):
-        lib = self.grant_library()
-        with qfe.NativeResource.shared(lib, 2) as resource:
-            self.assertEqual(resource.query_device_grant(), (0, True, (1 << 63) + 512, 1024))
-            self.assertEqual(resource.set_device_grant((1 << 64) - 1),
-                             (0, True, (1 << 63) + 512, 1024))
-        self.assertEqual(lib.grant_calls,
-                         [("query_device", 18, None), ("set_device", 18, (1 << 64) - 1)])
-        self.assertEqual(lib.quantfunc_resource_query_device_grant.restype, ctypes.c_int)
-        self.assertEqual(lib.quantfunc_resource_query_device_grant.argtypes,
-                         [ctypes.c_void_p, ctypes.POINTER(qfe._ResourceGrant)])
-        self.assertEqual(lib.quantfunc_resource_set_device_grant.restype, ctypes.c_int)
-        self.assertEqual(lib.quantfunc_resource_set_device_grant.argtypes,
-                         [ctypes.c_void_p, ctypes.c_uint64, ctypes.POINTER(qfe._ResourceGrant)])
-
-    def test_device_grant_nonready_and_unenrolled_never_become_numeric_permission(self):
-        lib = self.grant_library()
-        with qfe.NativeResource.shared(lib, 2) as resource:
-            for state in (1, 2, 3):
-                lib.state = state
-                self.assertEqual(resource.query_device_grant(), (state, None, None, None))
-                self.assertEqual(resource.set_device_grant(512), (state, None, None, None))
-            lib.state = 0
-            lib.enrolled = 0
-            self.assertEqual(resource.query_device_grant(), (0, False, None, None))
-            self.assertEqual(resource.set_device_grant(512), (0, False, None, None))
-
-    def test_device_grant_rejects_invalid_missing_error_and_closed_calls(self):
-        lib = self.grant_library()
-        resource = qfe.NativeResource.shared(lib, 2)
-        for value in (-1, 1 << 64, 2.5):
-            with self.assertRaises((ValueError, TypeError)):
-                resource.set_device_grant(value)
-        self.assertEqual(lib.grant_calls, [])
-
-        lib.status = 1
-        for operation in (resource.query_device_grant, lambda: resource.set_device_grant(512)):
-            with self.assertRaisesRegex(RuntimeError, "native resource failure"):
-                operation()
-        lib.status = 0
-        calls_before_missing = list(lib.grant_calls)
-        for name, operation in (("query_device_grant", resource.query_device_grant),
-                                ("set_device_grant", lambda: resource.set_device_grant(512))):
-            delattr(lib, "quantfunc_resource_" + name)
-            with self.assertRaisesRegex(RuntimeError, "quantfunc_resource_" + name):
-                operation()
-        self.assertEqual(lib.grant_calls, calls_before_missing)
-
-        resource.close()
-        calls_before_closed = list(lib.grant_calls)
-        for operation in (resource.query_device_grant, lambda: resource.set_device_grant(0)):
-            with self.assertRaisesRegex(RuntimeError, "closed"):
-                operation()
-        self.assertEqual(lib.grant_calls, calls_before_closed)
-        self.assertEqual(lib.destroyed, [18])
-
-    def test_nonready_and_unenrolled_never_become_numeric_permission(self):
-        lib = self.grant_library()
-        with qfe.NativeResource.prepare(lib, 2) as resource:
-            for state in (1, 2, 3):
-                lib.state = state
-                for operation in (resource.enroll_host, resource.query_grant, lambda: resource.set_grant(512)):
-                    self.assertEqual(operation(), (state, None, None, None))
-            lib.state = 0; lib.enrolled = 0
-            self.assertEqual(resource.query_grant(), (0, False, None, None))
-
-    def test_invalid_integers_errors_missing_symbols_and_closed_view(self):
-        lib = self.grant_library()
-        resource = qfe.NativeResource.prepare(lib, 2)
-        for value in (-1, 1 << 64, 2.5):
-            with self.assertRaises((ValueError, TypeError)):
-                resource.set_grant(value)
-        self.assertEqual(lib.grant_calls, [])
-        lib.status = 1
-        for operation in (resource.enroll_host, resource.query_grant, lambda: resource.set_grant(512)):
-            with self.assertRaisesRegex(RuntimeError, "native resource failure"):
-                operation()
-        lib.status = 0
-        for name, operation in (("enroll_host", resource.enroll_host), ("query_grant", resource.query_grant),
-                                ("set_grant", lambda: resource.set_grant(512))):
-            delattr(lib, "quantfunc_resource_" + name)
-            with self.assertRaisesRegex(RuntimeError, "quantfunc_resource_" + name):
-                operation()
-        self.assertEqual(lib.created, [])
-        resource.close()
-        for operation in (resource.enroll_host, resource.query_grant, lambda: resource.set_grant(0)):
-            with self.assertRaisesRegex(RuntimeError, "closed"):
-                operation()
-
-    def test_each_grant_call_holds_the_view_lock_until_native_returns(self):
-        operations = (("enroll_host", False), ("query_grant", False), ("set_grant", False),
-                      ("query_device_grant", True), ("set_device_grant", True))
-        for name, device_grant in operations:
-            with self.subTest(operation=name):
-                lib = self.grant_library()
-                resource = (qfe.NativeResource.shared if device_grant else qfe.NativeResource.prepare)(lib, 2)
-                original = getattr(lib, "quantfunc_resource_" + name)
-                observed = []
-                def checked(*args):
-                    acquired = resource._lock.acquire(blocking=False)
-                    observed.append(acquired)
-                    if acquired:
-                        resource._lock.release()
-                    return original(*args)
-                setattr(lib, "quantfunc_resource_" + name, checked)
-                getattr(resource, name)(*([512] if name.startswith("set_") else []))
-                self.assertEqual(observed, [False])
-                resource.close()
-                self.assertEqual(lib.destroyed, [18 if device_grant else 19])
-
-    def test_concurrent_close_waits_for_grant_success_and_failure(self):
-        operations = (("enroll_host", False), ("query_grant", False), ("set_grant", False),
-                      ("query_device_grant", True), ("set_device_grant", True))
-        for name, device_grant in operations:
-            for status in (0, 1):
-                with self.subTest(operation=name, status=status):
-                    lib = self.grant_library()
-                    resource = (qfe.NativeResource.shared if device_grant else qfe.NativeResource.prepare)(lib, 2)
-                    lib.status = status
-                    entered, finish, contended = (threading.Event() for _ in range(3))
-                    lock = resource._lock
-                    class ObservedLock:
-                        def __enter__(self):
-                            if not lock.acquire(blocking=False):
-                                contended.set()
-                                lock.acquire()
-                            return self
-                        def __exit__(self, *_):
-                            lock.release()
-                    resource._lock = ObservedLock()
-                    original = getattr(lib, "quantfunc_resource_" + name)
-                    def waiting(*args):
-                        entered.set()
-                        if not finish.wait(3):
-                            raise AssertionError("grant call barrier timed out")
-                        if lib.destroyed:
-                            raise AssertionError("view destroyed during native grant call")
-                        return original(*args)
-                    setattr(lib, "quantfunc_resource_" + name, waiting)
-                    errors = []
-                    def calling():
-                        try:
-                            getattr(resource, name)(*([512] if name.startswith("set_") else []))
-                        except BaseException as error:
-                            errors.append(error)
-                    caller = threading.Thread(target=calling)
-                    closer = threading.Thread(target=resource.close)
-                    caller.start()
-                    reached = entered.wait(3)
-                    closer.start()
-                    blocked = contended.wait(2)
-                    destroyed_early = bool(lib.destroyed)
-                    finish.set()
-                    caller.join(3); closer.join(3)
-                    self.assertTrue(reached and blocked)
-                    self.assertFalse(caller.is_alive() or closer.is_alive() or destroyed_early)
-                    self.assertEqual(len(errors), status)
-                    if status:
-                        self.assertIsInstance(errors[0], RuntimeError)
-                        self.assertIn("native resource failure", str(errors[0]))
-                    self.assertEqual(lib.destroyed, [18 if device_grant else 19])
+    def test_no_grant_verb_is_bound(self):
+        for name in ("query_grant", "set_grant", "query_device_grant", "set_device_grant", "set_domain_grants"):
+            self.assertFalse(hasattr(qfe.NativeResource, name), name)
+        for name in ("_ResourceGrant", "_ResourceDomainGrants", "_ResourceDomainGrantsResult", "ResourceGrant",
+                     "QUANTFUNC_RESOURCE_GRANT_ABI_VERSION", "QUANTFUNC_RESOURCE_GRANT_OWNER"):
+            self.assertFalse(hasattr(qfe, name), name)
 
 
 class FrozenCapacityDomainContract(unittest.TestCase):
@@ -438,9 +278,6 @@ class FrozenCapacityDomainContract(unittest.TestCase):
         lib.domain_state = qfe.QUANTFUNC_RESOURCE_READY
         lib.domain_bytes = (1 << 62) + 2048
         lib.domain_status = qfe.QUANTFUNC_OK
-        lib.domain_grant_state = qfe.QUANTFUNC_RESOURCE_READY
-        lib.domain_grant_status = qfe.QUANTFUNC_OK
-        lib.domain_grant_calls = []
 
         def capacity(handle, out):
             value = out._obj
@@ -457,34 +294,20 @@ class FrozenCapacityDomainContract(unittest.TestCase):
             value.resident_bytes = lib.domain_bytes
             return lib.domain_status
 
-        def domain_grants(shared, owned, command, out):
-            request, result = command._obj, out._obj
-            assert (request.struct_size, request.abi_version) == (40, 1)
-            assert (result.struct_size, result.abi_version) == (16, 1)
-            lib.domain_grant_calls.append(
-                (shared.value, owned.value if owned else None, request.mask,
-                 request.owner_limit_bytes, request.shared_limit_bytes,
-                 request.device_limit_bytes))
-            result.state = lib.domain_grant_state
-            result.applied_mask = request.mask if result.state == qfe.QUANTFUNC_RESOURCE_READY else 0
-            return lib.domain_grant_status
-
         lib.quantfunc_resource_query_capacity = capacity
         lib.quantfunc_resource_query_domain_residency = domain
-        lib.quantfunc_resource_set_domain_grants = domain_grants
         return lib
 
     def test_frozen_ctypes_layouts_match_the_header(self):
         self.assertEqual(ctypes.sizeof(qfe._ResourceCapacity), 24)
         self.assertEqual(ctypes.sizeof(qfe._ResourceDomain), 24)
-        self.assertEqual(ctypes.sizeof(qfe._ResourceDomainGrants), 40)
-        self.assertEqual(ctypes.sizeof(qfe._ResourceDomainGrantsResult), 16)
+        self.assertEqual(ctypes.sizeof(qfe._ResourceResidency), 48)
+        self.assertEqual(qfe.QUANTFUNC_RESOURCE_RESIDENCY_ABI_VERSION, 2)
         self.assertEqual(qfe._ResourceCapacity.required_persistent_bytes.offset, 16)
         self.assertEqual(qfe._ResourceDomain.resident_bytes.offset, 16)
-        self.assertEqual(qfe._ResourceDomainGrants.owner_limit_bytes.offset, 16)
-        self.assertEqual(qfe._ResourceDomainGrants.shared_limit_bytes.offset, 24)
-        self.assertEqual(qfe._ResourceDomainGrants.device_limit_bytes.offset, 32)
-        self.assertEqual(qfe._ResourceDomainGrantsResult.applied_mask.offset, 12)
+        self.assertEqual([getattr(qfe._ResourceResidency, name).offset for name in
+                          ("resident_bytes", "streamed_blocks", "watermark_drops", "recycled_pages")],
+                         [16, 24, 32, 40])
 
     def test_capacity_is_ready_positive_and_never_calls_create(self):
         lib = self.authority_library()
@@ -553,110 +376,6 @@ class FrozenCapacityDomainContract(unittest.TestCase):
         del lib.quantfunc_resource_query_domain_residency
         with self.assertRaises(qfe.NativeContractUnavailable):
             shared.query_domain_residency()
-        shared.close()
-
-    def test_atomic_domain_grants_forward_mask_and_limits_in_one_call(self):
-        lib = self.authority_library()
-        with qfe.NativeResource.shared(lib, 2) as shared, qfe.NativeResource.prepare(lib, 2) as owner:
-            result = shared.set_domain_grants(
-                owner, qfe.QUANTFUNC_RESOURCE_GRANT_OWNER |
-                qfe.QUANTFUNC_RESOURCE_GRANT_SHARED |
-                qfe.QUANTFUNC_RESOURCE_GRANT_DEVICE,
-                owner_limit_bytes=101, shared_limit_bytes=202, device_limit_bytes=303)
-            self.assertEqual((result.state, result.applied_mask), (qfe.QUANTFUNC_RESOURCE_READY, 7))
-            shared.set_domain_grants(None,
-                                     qfe.QUANTFUNC_RESOURCE_GRANT_SHARED |
-                                     qfe.QUANTFUNC_RESOURCE_GRANT_DEVICE,
-                                     shared_limit_bytes=11, device_limit_bytes=22)
-        self.assertEqual(lib.domain_grant_calls,
-                         [(18, 19, 7, 101, 202, 303), (18, None, 6, 0, 11, 22)])
-
-    def test_atomic_domain_grants_nonready_error_and_invalid_inputs_never_succeed(self):
-        lib = self.authority_library()
-        with qfe.NativeResource.shared(lib, 2) as shared, qfe.NativeResource.prepare(lib, 2) as owner:
-            for state in (qfe.QUANTFUNC_RESOURCE_BUSY, qfe.QUANTFUNC_RESOURCE_UNKNOWN,
-                          qfe.QUANTFUNC_RESOURCE_CLOSED):
-                lib.domain_grant_state = state  # issue #704: soft (nothing applied), so a BUSY can be re-issued
-                self.assertEqual(shared.set_domain_grants(owner, 7, owner_limit_bytes=1,
-                                                          shared_limit_bytes=2, device_limit_bytes=3),
-                                 qfe.ResourceDomainGrantsResult(state, None))
-            lib.domain_grant_state, lib.domain_grant_status = qfe.QUANTFUNC_RESOURCE_READY, 1
-            with self.assertRaisesRegex(RuntimeError, "native resource failure"):
-                shared.set_domain_grants(owner, 7, owner_limit_bytes=1,
-                                         shared_limit_bytes=2, device_limit_bytes=3)
-            for mask, owned, owner_limit, shared_limit, device_limit in (
-                (0, None, 0, 0, 0), (8, None, 0, 0, 0),
-                (7, None, 1, 2, 3), (6, owner, 0, 2, 3),
-                (6, None, 1, 2, 3), (1, owner, 1, 2, 0),
-            ):
-                with self.assertRaises((TypeError, ValueError)):
-                    shared.set_domain_grants(owned, mask, owner_limit_bytes=owner_limit,
-                                             shared_limit_bytes=shared_limit,
-                                             device_limit_bytes=device_limit)
-
-    def test_atomic_domain_call_holds_both_views_against_close(self):
-        lib = self.authority_library()
-        shared = qfe.NativeResource.shared(lib, 2)
-        owner = qfe.NativeResource.prepare(lib, 2)
-        original = lib.quantfunc_resource_set_domain_grants
-        observed = []
-
-        def checked(*args):
-            acquired = []
-            for resource in (shared, owner):
-                got = resource._lock.acquire(blocking=False)
-                acquired.append(got)
-                if got:
-                    resource._lock.release()
-            observed.append(tuple(acquired))
-            return original(*args)
-
-        lib.quantfunc_resource_set_domain_grants = checked
-        shared.set_domain_grants(owner, 7, owner_limit_bytes=1,
-                                 shared_limit_bytes=2, device_limit_bytes=3)
-        self.assertEqual(observed, [(False, False)])
-        owner.close()
-        with self.assertRaisesRegex(RuntimeError, "closed"):
-            shared.set_domain_grants(owner, 7, owner_limit_bytes=1,
-                                     shared_limit_bytes=2, device_limit_bytes=3)
-        shared.close()
-
-    def test_atomic_domain_call_serializes_concurrent_owner_close(self):
-        lib = self.authority_library()
-        shared = qfe.NativeResource.shared(lib, 2)
-        owner = qfe.NativeResource.prepare(lib, 2)
-        entered, finish = threading.Event(), threading.Event()
-        original = lib.quantfunc_resource_set_domain_grants
-
-        def waiting(*args):
-            entered.set()
-            if not finish.wait(3):
-                raise AssertionError("atomic grant barrier timed out")
-            self.assertNotIn(19, lib.destroyed)
-            return original(*args)
-
-        lib.quantfunc_resource_set_domain_grants = waiting
-        errors = []
-
-        def publish():
-            try:
-                shared.set_domain_grants(owner, 7, owner_limit_bytes=1,
-                                         shared_limit_bytes=2, device_limit_bytes=3)
-            except BaseException as error:
-                errors.append(error)
-
-        caller = threading.Thread(target=publish, daemon=True)
-        closer = threading.Thread(target=owner.close, daemon=True)
-        caller.start()
-        self.assertTrue(entered.wait(3))
-        closer.start()
-        self.assertNotIn(19, lib.destroyed)
-        finish.set()
-        caller.join(3)
-        closer.join(3)
-        self.assertFalse(caller.is_alive() or closer.is_alive())
-        self.assertEqual(errors, [])
-        self.assertIn(19, lib.destroyed)
         shared.close()
 
 
@@ -817,19 +536,18 @@ class ResourceContract(unittest.TestCase):
         calls = []
         def residency(handle, out):
             value = out._obj
-            self.assertEqual((value.struct_size, value.abi_version), (24, 1))
+            self.assertEqual((value.struct_size, value.abi_version), (48, 2))
             calls.append(handle.value)
             value.state, value.resident_bytes = lib.state, 123456789
+            value.streamed_blocks, value.watermark_drops, value.recycled_pages = 7, 8, 9
             return lib.status
         lib.quantfunc_resource_query_residency = residency
         lib.quantfunc_resource_query = lambda *_: self.fail("must not sum category snapshots in Python")
         with qfe.NativeResource.shared(lib, 0) as resource:
-            self.assertEqual(resource.residency().resident_bytes, 123456789)
+            self.assertEqual(resource.residency(), qfe.ResourceResidency(0, 123456789, 7, 8, 9))
             for state in (1, 2, 3):
                 lib.state = state
-                result = resource.residency()
-                self.assertEqual(result.state, state)
-                self.assertIsNone(result.resident_bytes)
+                self.assertEqual(resource.residency(), qfe.ResourceResidency(state, None, None, None, None))
             lib.status = 1
             with self.assertRaisesRegex(RuntimeError, "native resource failure"):
                 resource.residency()
@@ -1016,7 +734,7 @@ if __name__ == "__main__":
             assert snapshot.capabilities == 3
             assert all(v == 0 for v in snapshot[4:]), snapshot
             residency = resource.residency()
-            assert residency == qfe.ResourceResidency(0, 0), residency
+            assert residency == qfe.ResourceResidency(0, 0, 0, 0, 0), residency
             released = resource.release_eligible(0)
             assert released == qfe.ResourceRelease(0, 0), released
         try:
@@ -1028,7 +746,7 @@ if __name__ == "__main__":
         with qfe.NativeResource.prepare(lib, 0) as resource:
             snapshot = resource.query()
             assert snapshot.state == 0 and snapshot.device == 0 and snapshot.owner_epoch != 0
-            assert resource.residency() == qfe.ResourceResidency(0, 0)
+            assert resource.residency() == qfe.ResourceResidency(0, 0, 0, 0, 0)
             try:
                 qfe.create_pipeline(lib, model_dir="", device_idx=0, prepared_resource=resource)
             except RuntimeError as error:
@@ -1038,14 +756,13 @@ if __name__ == "__main__":
             assert resource.query().owner_epoch == snapshot.owner_epoch
             assert resource.release_eligible(1) == qfe.ResourceRelease(0, 0)
         with qfe.NativeResource.shared(lib, 0) as shared, qfe.NativeResource.prepare(lib, 0) as owned:
-            assert owned.query_grant() == qfe.ResourceGrant(0, False, None, None)
-            assert shared.enroll_host() == qfe.ResourceGrant(0, True, 0, 0)
-            assert owned.enroll_host() == qfe.ResourceGrant(0, True, 0, 0)
-            assert owned.set_grant((1 << 64) - 1) == qfe.ResourceGrant(0, True, (1 << 64) - 1, 0)
-            assert owned.enroll_host() == qfe.ResourceGrant(0, True, (1 << 64) - 1, 0)
-            assert owned.query_grant() == qfe.ResourceGrant(0, True, (1 << 64) - 1, 0)
-            assert owned.set_grant(0) == qfe.ResourceGrant(0, True, 0, 0)
-            assert owned.residency() == qfe.ResourceResidency(0, 0)
+            assert shared.enroll_host() is None
+            assert owned.enroll_host() is None   # device-scoped and idempotent
+            assert owned.residency() == qfe.ResourceResidency(0, 0, 0, 0, 0)
+            for removed in ("quantfunc_resource_set_grant", "quantfunc_resource_query_grant",
+                            "quantfunc_resource_set_device_grant", "quantfunc_resource_query_device_grant",
+                            "quantfunc_resource_set_domain_grants"):
+                assert not hasattr(lib, removed), removed
         print("NATIVE_RESOURCE_PYTHON_ACTUAL_ABI_PASS")
     else:
         unittest.main()

@@ -50,6 +50,16 @@ class HostLoaderContract(unittest.TestCase):
         self.assertNotIn("._resource.set_grant(", substrate)
         self.assertNotIn("._resource.set_device_grant(", substrate)
 
+    def test_no_grant_call_is_left_in_the_plugin_sources(self):
+        # #751 deleted the host-grant protocol on both sides: ComfyUI arranges room through load_models_gpu/free_memory.
+        sources = [path for path in plugin_root.rglob("*.py")
+                   if "tests" not in path.relative_to(plugin_root).parts]
+        self.assertIn("qf_modelpatcher.py", {path.name for path in sources})
+        for path in sources:
+            text = path.read_text(encoding="utf-8")
+            for banned in ("set_domain_grants(", "_publish_domain_grants("):
+                self.assertNotIn(banned, text, f"{path.relative_to(plugin_root)} still calls {banned}")
+
     def test_cache_selection_does_not_evict_a_live_other_engine(self):
         other_lib, selected_lib = NativeLibrary(), NativeLibrary()
         other = plugin.qfe.QFEngineHandle(other_lib, ctypes.c_void_p(1), 512)

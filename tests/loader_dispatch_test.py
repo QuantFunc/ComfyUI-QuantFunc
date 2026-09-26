@@ -255,9 +255,6 @@ def main():
         fake_cache[ck] = eng
         return eng, ck
     qfn._get_engine = fake_get_engine
-    qfn.qfmp._require_engine_host_grants = lambda engine: (
-        None if getattr(engine, "resource", None) is not None else
-        (_ for _ in ()).throw(AssertionError("prepared/materialized handle lost its resource")))
     # This is a routing/liveness fixture: its 16-byte transformer files are not
     # native-loadable checkpoints. Stub the capacity ABI boundary explicitly,
     # just as creation is stubbed above; never depend on a production fallback
@@ -442,7 +439,7 @@ def main():
     from qfn_test_pkg import qf_modelpatcher as _qmp_q
 
     class _QProbe(_qmp_q.QFSessionModelMixin):
-        device = None   # ComfyUI's BaseModel stores its device argument; this double has no base to do it
+        pass
     _sess = {}
     for _on in (False, True):
         _qp = _QProbe()

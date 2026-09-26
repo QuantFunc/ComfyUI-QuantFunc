@@ -274,11 +274,10 @@ _PIPELINE_MODELS = {}    # ckey -> [weakref.ref(consumer), ...] - ALL live consu
 #                          a ledger that kept reporting the destroyed backup).
 # CONCURRENCY CONTRACT: the three cache dictionaries above are protected by short
 # `_ENGINE_IDENTITY_LOCK` lookup/publication/removal sections.  The lock is NEVER
-# held while constructing QFPreparedEntry, checking native grants, creating or
-# destroying a pipeline, or closing a losing prepared candidate.  Cold creation
-# is single-flight under domain.transaction_lock -> entry._materialize_lock; that
-# path may briefly take this cache lock, and no inverse cache-lock -> domain-lock
-# edge is permitted.
+# held while constructing QFPreparedEntry, creating or destroying a pipeline, or
+# closing a losing prepared candidate.  Cold creation is single-flight under
+# entry._materialize_lock; that path may briefly take this cache lock, and no
+# inverse cache-lock -> entry-lock edge is permitted.
 
 
 def _unpin_pipeline_consumer(ckey, consumer):
@@ -382,7 +381,7 @@ def _retire_handle(ckey, eng, requester=None, *, keep_binding=False, reason=""):
         if candidate is not None and candidate.resource is eng.resource:
             _PREPARED_CACHE.pop(prepared_key, None)
             # Publish non-creatable in the same identity transaction as cache
-            # removal. retire_materialized performs the domain-locked cleanup.
+            # removal. retire_materialized performs the entry-locked cleanup.
             candidate._cache_usable = False
             retired_entry = candidate
         if not keep_binding:
@@ -395,8 +394,8 @@ def _retire_handle(ckey, eng, requester=None, *, keep_binding=False, reason=""):
     except Exception:  # noqa: BLE001 - retire must never mask the caller's continuation
         pass
     # Destroying the pipeline Closed its Owned identity, and Comfy may still list that owner until gc collects it:
-    # say so where it happens, so a partial unload of it writes no grant (INVALID_ARG on a Closed identity) without a
-    # native read that may stay BUSY.
+    # say so where it happens, so a partial unload of it frees nothing (a Closed identity has nothing eligible) without
+    # a native read that may stay BUSY.
     for owner in getattr(eng, "_qf_resource_adapters", ())[:1]:
         owner._closed_identity = True
     return True
@@ -529,7 +528,7 @@ def _get_or_prepare_entry(lib, ckey, prepared_key, model_dir, create_cfg, device
 
 
 def _materialize_engine(entry, lib, ckey):
-    """Single-flight cold create under domain -> prepared-entry lock order."""
+    """Single-flight cold create under the prepared entry's lock."""
     acquisition = qfmp._current_engine_cache_acquisition()
     if acquisition is None:
         raise qfe.NativeContractUnavailable(
@@ -537,41 +536,38 @@ def _materialize_engine(entry, lib, ckey):
     # Validate weak-reference support before native creation; publication itself
     # must not discover an unpinnable consumer after allocating a live handle.
     weakref.ref(acquisition.consumer)
-    with qfmp._domain_transaction(entry._owner_adapter):
-        with entry._materialize_lock:
-            if not entry._cache_usable:
-                raise qfe.NativeContractUnavailable(
-                    "QuantFunc prepared identity was retired before materialization")
-            with _ENGINE_IDENTITY_LOCK:
-                eng = _PIPELINE_CACHE.get(ckey)
-                if eng is not None and eng.pipeline is not None:
-                    if qfe.library_identity(eng.lib) != qfe.library_identity(lib):
-                        raise RuntimeError("QuantFunc cache entry belongs to a different loaded native image")
-                    _pin_pipeline_consumer_locked(ckey)
-                    return eng, ckey
-            # Creation is reachable only after the canonical Comfy dependency has
-            # installed finite Owned/Shared/device grants. A direct factory caller has
-            # no host-admitted capacity and therefore cannot bypass the common seam.
-            if acquisition.consumer not in entry._materializers:
-                raise qfe.NativeContractUnavailable(
-                    "QuantFunc cold creation requires a live ComfyUI materializer binding")
-            qfmp._require_engine_host_grants(entry)
-            _sweep_dead_pipelines(ckey)
-            # The exact configured-Prepared native capacity Comfy admitted is
-            # retained on this identity, never re-estimated from paths at create
-            # time. Its authority is VRAM. It has ONE second, approximate use: the
-            # host-RAM release (_install_host_ram_release) reads a dead pipeline's
-            # capacity as the size of its host copy, which it matches within a few
-            # percent (measured per family in the commit that added that release).
-            eng = qfe.QFEngineHandle.create(lib, create_params=entry.create_params,
-                                           capacity_bytes=int(entry.capacity_bytes),
-                                           prepared_resource=entry.resource)
-            eng._qf_resource_adapters = entry._qf_resource_adapters
-            eng._qf_resource_adapters[0]._prepared = False
-            with _ENGINE_IDENTITY_LOCK:
-                _PIPELINE_CACHE[ckey] = eng
+    with entry._materialize_lock:
+        if not entry._cache_usable:
+            raise qfe.NativeContractUnavailable(
+                "QuantFunc prepared identity was retired before materialization")
+        with _ENGINE_IDENTITY_LOCK:
+            eng = _PIPELINE_CACHE.get(ckey)
+            if eng is not None and eng.pipeline is not None:
+                if qfe.library_identity(eng.lib) != qfe.library_identity(lib):
+                    raise RuntimeError("QuantFunc cache entry belongs to a different loaded native image")
                 _pin_pipeline_consumer_locked(ckey)
-            return eng, ckey
+                return eng, ckey
+        # Creation runs only for a lazy engine bound as this entry's materializer: a direct factory caller
+        # cannot bypass the common seam.
+        if acquisition.consumer not in entry._materializers:
+            raise qfe.NativeContractUnavailable(
+                "QuantFunc cold creation requires a live ComfyUI materializer binding")
+        _sweep_dead_pipelines(ckey)
+        # The exact configured-Prepared native capacity is retained on this
+        # identity, never re-estimated from paths at create time. Its authority
+        # is VRAM. It has ONE second, approximate use: the host-RAM release
+        # (_install_host_ram_release) reads a dead pipeline's capacity as the
+        # size of its host copy, which it matches within a few percent
+        # (measured per family in the commit that added that release).
+        eng = qfe.QFEngineHandle.create(lib, create_params=entry.create_params,
+                                       capacity_bytes=int(entry.capacity_bytes),
+                                       prepared_resource=entry.resource)
+        eng._qf_resource_adapters = entry._qf_resource_adapters
+        eng._qf_resource_adapters[0]._prepared = False
+        with _ENGINE_IDENTITY_LOCK:
+            _PIPELINE_CACHE[ckey] = eng
+            _pin_pipeline_consumer_locked(ckey)
+        return eng, ckey
 
 
 def _get_engine(model_dir, create_cfg=None, device_idx=0):
@@ -585,8 +581,8 @@ def _get_engine(model_dir, create_cfg=None, device_idx=0):
     # [session-knobs] the session-knob-≠-create-key guard is sealed INSIDE
     # qf_engine.create_pipeline (the real quantfunc_create boundary — construction-enforced,
     # unbypassable by a future direct caller), not duplicated here (one truth source).
-    # Cache lookup/publication is atomic; prepare/grant/create use the independent
-    # domain -> prepared-entry order and never run under the global cache lock.
+    # Cache lookup/publication is atomic; prepare and create never run under the
+    # global cache lock (create is single-flight under the prepared entry's lock).
     lib, ckey, prepared_key, create_cfg = _engine_recipe(model_dir, create_cfg, device_idx)
     entry = _get_or_prepare_entry(lib, ckey, prepared_key, model_dir, create_cfg, device_idx)
     if isinstance(entry, qfe.QFEngineHandle):

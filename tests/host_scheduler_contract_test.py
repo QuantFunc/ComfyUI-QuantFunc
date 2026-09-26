@@ -117,12 +117,6 @@ class HostSchedulerContract(unittest.TestCase):
             out._obj.state = qfe.QUANTFUNC_RESOURCE_READY
             out._obj.resident_bytes = sum(counts.values())
             return 0
-        def grant(pointer, out):
-            out._obj.state = qfe.QUANTFUNC_RESOURCE_READY
-            out._obj.enrolled = 1
-            out._obj.limit_bytes = counts.get(pointer.value, sum(counts.values()))
-            out._obj.pending_bytes = 0
-            return 0
         def shared(device, version, out):
             out._obj.value = 33
             return 0
@@ -135,8 +129,6 @@ class HostSchedulerContract(unittest.TestCase):
         self.library.quantfunc_resource_query_lifecycle = lifecycle
         self.library.quantfunc_resource_query_residency = residency
         self.library.quantfunc_resource_query_domain_residency = domain
-        self.library.quantfunc_resource_query_grant = grant
-        self.library.quantfunc_resource_query_device_grant = grant
         self.library.quantfunc_resource_acquire_shared = shared
         self.library.quantfunc_resource_destroy = lambda _: None
         # Validate the full production binder before the intended missing-graph
@@ -190,7 +182,7 @@ class HostSchedulerContract(unittest.TestCase):
 
     def test_common_model_demand_failure_reaches_host(self):
         class Model(qfm.QFSessionModelMixin):
-            device = None   # ComfyUI's BaseModel stores its device argument; this double has no base to do it
+            pass
         model = Model()
         model._qf = self.engine
         def demand(*args):
@@ -344,7 +336,7 @@ class HostSchedulerContract(unittest.TestCase):
 
     def test_ledger_log_does_not_label_failed_residency_query_as_zero(self):
         class Model(qfm.QFSessionModelMixin):
-            device = None   # ComfyUI's BaseModel stores its device argument; this double has no base to do it
+            pass
         model = Model()
         model._qf = self.engine
         self.library.query_status = 1
@@ -401,10 +393,6 @@ class NativeResourceSchedulerContract(unittest.TestCase):
             out._obj.state = lib.state
             out._obj.resident_bytes = lib.held
             return lib.status
-        def grant(pointer, out):
-            out._obj.state, out._obj.enrolled = lib.state, 1
-            out._obj.limit_bytes, out._obj.pending_bytes = lib.held, 0
-            return lib.status
         lib.quantfunc_resource_acquire = acquire
         lib.quantfunc_resource_acquire_shared = shared
         lib.quantfunc_resource_query_residency = residency
@@ -412,8 +400,6 @@ class NativeResourceSchedulerContract(unittest.TestCase):
         lib.quantfunc_resource_release_eligible = release
         lib.quantfunc_resource_query = query
         lib.quantfunc_resource_query_lifecycle = lifecycle
-        lib.quantfunc_resource_query_grant = grant
-        lib.quantfunc_resource_query_device_grant = grant
         lib.quantfunc_resource_destroy = lambda pointer: lib.closed.append(pointer.value)
         lib.quantfunc_last_error = lambda: b"resource contract refused"
         resource = qfe.NativeResource.acquire(lib, ctypes.c_void_p(1))
@@ -422,15 +408,8 @@ class NativeResourceSchedulerContract(unittest.TestCase):
         self.addCleanup(shared_resource.close)
         patcher = qfm.QFNativeResourcePatcher(resource)
         shared_patcher = qfm.QFNativeResourcePatcher(shared_resource)
-        domain_state = qfm._CanonicalResourceDomain(shared_patcher)
-        shared_patcher._domain = domain_state
         shared_patcher._shared_adapter = shared_patcher
-        shared_patcher._domain_key = (qfe.library_identity(lib), device)
-        patcher._domain = domain_state
         patcher._shared_adapter = shared_patcher
-        patcher._domain_key = shared_patcher._domain_key
-        patcher._owner_epoch = 123
-        domain_state.owners[123] = patcher
         return lib, patcher
 
     @contextlib.contextmanager
@@ -564,21 +543,25 @@ class NativeResourceSchedulerContract(unittest.TestCase):
         load_models_gpu, and in unload_all_models behind POST /free and the OOM handler. Each method answers by its
         declared policy (qfm._COMFY_BUSY_POLICY), so nothing escapes:
         - sizing answers the last READY residency, never 0;
-        - no release is issued;
-        - the eviction stops with growth fenced;
-        - the owner is re-admitted formally on its next load."""
+        - no eligible release is issued, and the full release answering BUSY never raises;
+        - ComfyUI drops its record."""
         lib, patcher = self.make_resource()
         lib.capabilities |= qfe.QUANTFUNC_RESOURCE_CAP_RELEASE_ALL  # without it detach refuses on the capability
+        full = []
+        def release_all(pointer, out):
+            full.append(pointer.value)
+            out._obj.state = lib.state
+            return lib.status
+        lib.quantfunc_resource_release_all = release_all
         with self.host_registry(), mock.patch.object(qfm, "_NATIVE_BUSY_DEADLINE_S", 0.05, create=True):
             self.load(patcher)
             requests = list(lib.requests)
-            self.assertFalse(patcher._domain.shared_growth_fenced or patcher._needs_readmission)
             lib.state = qfe.QUANTFUNC_RESOURCE_BUSY
             with mock.patch.object(mm, "get_free_memory", side_effect=self.free_memory(0)):
                 mm.free_memory(4096, patcher.load_device)
             self.assertEqual(mm.current_loaded_models, [])
             self.assertEqual(lib.requests, requests)
-            self.assertTrue(patcher._domain.shared_growth_fenced and patcher._needs_readmission)
+            self.assertEqual(full, [17])
             self.assertEqual(patcher.loaded_size(), 1536)
 
     def test_clone_handoff_does_not_request_physical_release(self):

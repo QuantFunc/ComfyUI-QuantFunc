@@ -73,7 +73,7 @@ FLOOR_MB = 50000                      # comfy's torch estimate stand-in: bigger 
 class _TorchBase:
     """comfy's BaseModel.memory_required stand-in (the next class after the mixin in a real family's MRO)."""
     def __init__(self, model_config=None, model_type=None, device=None):
-        self.device = device   # what BaseModel.__init__ does first: the mixin reads it as the build device
+        self.device = device   # what BaseModel.__init__ does first
 
     def memory_required(self, input_shape, cond_shapes=None):
         _TorchBase.asked.append(list(input_shape))
@@ -240,7 +240,6 @@ if _h3 is not None:
     H3 = _h3.QFH3Model
     h = H3.__new__(H3)                    # memory_required reads only mixin attrs — no comfy ctor needed
     h._qf = _engine(need_mb=12000); h.latent_shapes = [(1, 24, 31, 48, 50), (1, 32, 2, 207)]
-    h._qf_build_device = torch.device("cuda:0")   # the mixin's construction-time attr (the reserve key)
     side_p = h._qf_comfy_side_bytes(PACKED, COND)
     r, _ = _quiet(h.memory_required, PACKED, cond_shapes=COND)
     check(r == side_p + 12000 * MB and h._qf.vram_need_bytes.asked == [[2, 24, 31, 48, 50]],

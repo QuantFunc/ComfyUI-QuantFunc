@@ -123,7 +123,7 @@ Mixin = qfmp.QFSessionModelMixin
 
 
 class _Model(Mixin):
-    device = None   # ComfyUI's BaseModel stores its device argument; this double has no base to do it
+    pass
 
 
 # ---- arm 2: residency_opts sends the engine's switch, never `quality` or a retired key -------------------------------------

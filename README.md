@@ -281,6 +281,15 @@ model until ComfyUI restarts.
 | `QuantFunc-QwenImage21-edit-multi-reference.json` | image edit, two references (the official example) |
 | `QuantFunc-QwenImage21-edit-remove-background.json` | remove the background → transparent PNG |
 
+### 3.4 VRAM
+
+A QuantFunc model takes part in ComfyUI's own memory management like any other model: ComfyUI sees its full size and
+what it holds on the GPU, frees VRAM for it before it loads, and asks it for VRAM back when another model needs room.
+The engine then gives back the memory it is not using and reports what it freed. When ComfyUI itself runs short of VRAM
+during a run, the engine gives up its idle memory the same way. When the card cannot hold all of a model's weights,
+the engine streams the rest from system memory during the run instead of failing; it runs out of memory only when one
+step's working set does not fit on the card.
+
 ## 4. Troubleshooting
 
 | Issue | Solution |
