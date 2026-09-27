@@ -704,9 +704,9 @@ def register(deps):
         model_dir = qfmp.stage_denoise_only_package(bundle_dir, transformer1_path, extra_links=extra)
         return _build_from_package(model_dir, os.path.basename(transformer1_path),
                                    lora_entries=lora_entries,
-                                   # pinned memory is the loaders' pinned_memory switch (user 2026-09-26, default
-                                   # OFF), as for every family; LTX-2.5 no longer forces it on (it did since
-                                   # 2026-08-23, for the two-stage flow's offload round trips)
+                                   # pinned memory is the loaders' pinned_memory switch (user 2026-09-26); the
+                                   # LTX-2.5 loader defaults it ON (every other family OFF), as a recorded temporary
+                                   # exception until the compute/transfer overlap no longer needs it
                                    create_extra={"denoise_only": True}, pinned_memory=pinned_memory)
 
     def _build_from_package(model_dir, model_name, lora_entries=(), create_extra=None, pinned_memory=False):
