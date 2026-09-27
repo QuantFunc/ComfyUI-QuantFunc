@@ -436,7 +436,7 @@ class NativeResource:
             self._check_open()
             function = getattr(self._lib, "quantfunc_resource_enroll_host_v2", None)
             if function is None:
-                raise RuntimeError(ENGINE_PLUGIN_MISMATCH)
+                raise RuntimeError(_engine_mismatch())
             function.restype = ctypes.c_int
             function.argtypes = [ctypes.c_void_p]
             if function(self._pointer) != QUANTFUNC_OK:
@@ -575,12 +575,19 @@ ENGINE_PLUGIN_MISMATCH = (
     "residency ABI 2 (one VRAM entry, #751) and the loaded library is older - update the QuantFunc engine library")
 
 
+def _engine_mismatch():
+    """ENGINE_PLUGIN_MISMATCH, naming the way out when the plugin installed the engine (a marker exists): a restart runs
+    the installer again, which fetches the engine this plugin needs. A library named by QF_NATIVE_SO_PATH or a local
+    build gets no such hint: a restart would load the same file."""
+    return ENGINE_PLUGIN_MISMATCH + ("; restart ComfyUI: the plugin re-checks for the engine at start" if _markers() else "")
+
+
 def _require_residency_abi2(lib):
     """An engine that still exports the host-grant verbs is residency ABI 1: its quantfunc_resource_enroll_host takes a
     grant out-struct this plugin does not pass (undefined behaviour at the C boundary), so it is refused here, at load,
     before any call reaches it. The ABI-2 engine exports quantfunc_resource_enroll_host_v2."""
     if hasattr(lib, "quantfunc_resource_set_domain_grants") or not hasattr(lib, "quantfunc_resource_enroll_host_v2"):
-        raise RuntimeError(ENGINE_PLUGIN_MISMATCH)
+        raise RuntimeError(_engine_mismatch())
 
 
 def _bind(lib):
