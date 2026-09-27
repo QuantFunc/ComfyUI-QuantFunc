@@ -234,6 +234,15 @@ out; a start whose engine is already current prints nothing:
 
 A loader run during the first download stops with "still downloading": queue the prompt again after the `installed` line.
 
+### 2.7 Upgrading from 0.0.05 / 0.0.06
+
+- The old node set is retired: `QuantFuncGenerate`, `QuantFuncModelLoader`, `QuantFuncBuildPipeline` and the
+  format-adapter nodes. Each model family now has its own loader (**QuantFunc MiniMax-H3**, **LTX-2**, **Krea-2** and
+  **Qwen-Image-2.1 Loader**), which feeds ComfyUI's stock **KSampler** and ComfyUI's own text encoder and VAE nodes.
+- A workflow saved with the old nodes opens with those nodes missing: replace them with the loader for its model and a
+  stock KSampler. The workflows in [`example_workflows/`](example_workflows/) show the wiring.
+- The first ComfyUI start after the automatic update can show no QuantFunc nodes at all. Restart ComfyUI once more.
+
 ## 3. Usage
 
 ### Quick Start
