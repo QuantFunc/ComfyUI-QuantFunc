@@ -52,7 +52,7 @@
     "Node name for S&R": "QuantFuncQwenImage21Loader"
    },
    "widgets_values": [
-    "qwen-image-2.1-quantfunc-int4-r128-i8sidecar.qfc.safetensors",
+    "qwen_image_21_base_quantfunc_int4_r128.safetensors",
     "qwen-image-2.1-int4",
     "auto",
     false
