@@ -564,6 +564,26 @@ if _COMFY and (Path(_COMFY) / "comfy/model_management.py").is_file():
             other.ensure()
             self.assertEqual(self.lib.keys, [KEY2, KEY2])
 
+        def test_a_create_refused_once_takes_the_field_key_at_the_next_run(self):
+            # config.json's key is refused at the first create; the key then typed into the field must reach the retried
+            # create (the refused identity is retired), not be replaced by the cached recipe's key again
+            keys = []
+
+            def create(lib, *, capacity_bytes, prepared_resource, create_params):
+                keys.append(json.loads(create_params.config_json)["api_key"])
+                if len(keys) == 1:
+                    raise RuntimeError("QuantFunc create failed (status 7): auth")
+                return qfe.QFEngineHandle(lib, ctypes.c_void_p(90), resource=prepared_resource,
+                                          capacity_bytes=capacity_bytes)
+            with mock.patch.object(qfe.QFEngineHandle, "create", side_effect=create):
+                first = self.consumer(None)                      # the field is empty: config.json's key
+                with self.assertRaises(RuntimeError):
+                    first.ensure()
+                second = self.consumer(KEY)                      # the loader runs again with the field key
+                second.ensure()                                  # (`first` is still alive: no gc in between)
+            self.assertEqual(keys, [DEFAULT_KEY, KEY])
+            self.assertEqual(self.lib.keys, [])                  # created with it, not switched to it
+
         def test_no_field_key_anywhere_reads_config_json_once_and_switches_nothing(self):
             for _ in range(3):
                 self.consumer(None).ensure()

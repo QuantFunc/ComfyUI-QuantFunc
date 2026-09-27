@@ -638,9 +638,19 @@ def _materialize_engine(entry, lib, ckey):
         # (_install_host_ram_release) reads a dead pipeline's capacity as the
         # size of its host copy, which it matches within a few percent
         # (measured per family in the commit that added that release).
-        eng = qfe.QFEngineHandle.create(lib, create_params=entry.create_params,
-                                       capacity_bytes=int(entry.capacity_bytes),
-                                       prepared_resource=entry.resource)
+        try:
+            eng = qfe.QFEngineHandle.create(lib, create_params=entry.create_params,
+                                           capacity_bytes=int(entry.capacity_bytes),
+                                           prepared_resource=entry.resource)
+        except BaseException:
+            # A refused create (its key refused, say) retires this identity, so the next run prepares again with the
+            # key it carries then (the loader field's, or config.json's) instead of sending this recipe's key again.
+            with _ENGINE_IDENTITY_LOCK:
+                prepared_key = (qfe.library_identity(lib), ckey)
+                if _PREPARED_CACHE.get(prepared_key) is entry:
+                    _PREPARED_CACHE.pop(prepared_key, None)
+            entry.retire_materialized()
+            raise
         eng._qf_resource_adapters = entry._qf_resource_adapters
         eng.applied_api_key = entry.api_key   # created with the key its recipe carries
         with _ENGINE_IDENTITY_LOCK:
