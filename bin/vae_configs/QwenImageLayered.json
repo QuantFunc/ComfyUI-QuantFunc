@@ -10,6 +10,7 @@
     4
   ],
   "dropout": 0.0,
+  "input_channels": 4,
   "latents_mean": [
     -0.7571,
     -0.7089,

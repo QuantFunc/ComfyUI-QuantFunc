@@ -1,0 +1,7 @@
+{
+ "_class_name": "AutoencoderKLQwenImage",
+ "in_channels": 3,
+ "out_channels": 3,
+ "latent_channels": 16,
+ "z_dim": 16
+}

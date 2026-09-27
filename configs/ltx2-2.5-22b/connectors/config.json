@@ -1,0 +1,14 @@
+{
+  "caption_channels": 3840,
+  "text_proj_in_factor": 49,
+  "per_modality_text_proj": true,
+  "video_connector_num_layers": 8,
+  "audio_connector_num_layers": 8,
+  "video_connector_num_attention_heads": 32,
+  "audio_connector_num_attention_heads": 32,
+  "video_connector_attention_head_dim": 128,
+  "audio_connector_attention_head_dim": 64,
+  "video_connector_num_learnable_registers": 128,
+  "audio_connector_num_learnable_registers": 128,
+  "rope_type": "split"
+}

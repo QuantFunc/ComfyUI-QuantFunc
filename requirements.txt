@@ -1,0 +1,10 @@
+# QuantFunc ComfyUI plugin — runtime dependencies.
+#
+# These are declared here so they are installed at INSTALL time by ComfyUI-Manager
+# (or `pip install -r requirements.txt`), NOT installed at runtime by the node.
+# Runtime `pip install` via subprocess is prohibited by the ComfyUI registry
+# security policy; if a dependency below is missing, the plugin fails gracefully
+# with an actionable message instead of installing anything itself.
+#
+# Nothing beyond ComfyUI's own environment: the engine installer (qf_engine.install_engine) uses the Python
+# standard library only.

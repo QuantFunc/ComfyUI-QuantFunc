@@ -1,0 +1,6 @@
+{
+  "_class_name": "FlowMatchEulerDiscreteScheduler",
+  "num_train_timesteps": 1000,
+  "use_dynamic_shifting": false,
+  "shift": 3.0
+}

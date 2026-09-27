@@ -1,0 +1,32 @@
+{
+  "_class_name": "LTX2Pipeline",
+  "_diffusers_version": "0.37.0.dev0",
+  "connectors": [
+    "ltx2",
+    "LTX2TextConnectors"
+  ],
+  "scheduler": [
+    "diffusers",
+    "FlowMatchEulerDiscreteScheduler"
+  ],
+  "text_encoder": [
+    "transformers",
+    "Gemma4UnifiedForConditionalGeneration"
+  ],
+  "tokenizer": [
+    "transformers",
+    "GemmaTokenizerFast"
+  ],
+  "transformer": [
+    "diffusers",
+    "AVTransformer3DModel"
+  ],
+  "vae": [
+    "diffusers",
+    "AutoencoderKLLTX2Video"
+  ],
+  "audio_vae": [
+    "diffusers",
+    "AutoencoderKLLTX2Audio"
+  ]
+}

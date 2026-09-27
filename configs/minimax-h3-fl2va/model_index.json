@@ -1,0 +1,24 @@
+{
+ "_class_name": "MiniMaxH3Pipeline",
+ "image_model": "minimax_h3",
+ "transformer": [
+  "diffusers",
+  "MiniMaxH3Transformer3DModel"
+ ],
+ "text_encoder": [
+  "transformers",
+  "Qwen3VLForConditionalGeneration"
+ ],
+ "vae": [
+  "diffusers",
+  "AutoencoderKLMiniMaxH3"
+ ],
+ "scheduler": [
+  "diffusers",
+  "FlowMatchEulerDiscreteScheduler"
+ ],
+ "tokenizer": [
+  "transformers",
+  "Qwen2TokenizerFast"
+ ]
+}

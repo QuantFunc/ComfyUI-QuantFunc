@@ -1,0 +1,54 @@
+QuantFunc ComfyUI Plugin — License
+==================================
+
+This repository is DUAL-LICENSED. It contains two distinct kinds of artifact, each
+under a different license:
+
+------------------------------------------------------------------------------
+1. PLUGIN SOURCE  (open)
+------------------------------------------------------------------------------
+All Python and JavaScript SOURCE in this repository — the ComfyUI node layer,
+format adapters, auto-updater, model loaders, web assets, scripts, and tutorials —
+is open: it may be read, audited, and modified.
+
+The authoritative terms for the open plugin source are those published for the
+QuantFunc plugin at:
+
+    https://www.modelscope.cn/models/QuantFunc/Plugin
+
+[PENDING MAINTAINER CONFIRMATION: insert the canonical SPDX open-source license
+ identifier and full license text for the plugin source here (e.g. MIT / Apache-2.0
+ / GPL-3.0). The README currently references the published terms above without an
+ SPDX identifier; this file should be updated once the maintainer confirms the exact
+ open-source license and the copyright-holding legal entity.]
+
+The open source is provided deliberately: everything in this plugin that touches
+your machine, your files, and the network is auditable Python. See doc/NETWORK.md
+for exactly what the engine sends over the network and how to verify it yourself.
+
+------------------------------------------------------------------------------
+2. ENGINE BINARIES  (proprietary — separate EULA)
+------------------------------------------------------------------------------
+The compiled QuantFunc inference engine distributed with, or downloaded by, this
+plugin is PROPRIETARY and closed-source. This includes (non-exhaustively):
+
+    bin/linux/libquantfunc.so      bin/linux/libquantfunc-12.so
+    bin/windows/quantfunc.dll      (and the corresponding CLI executables)
+
+These binaries are NOT covered by the open-source terms in section 1. They are
+licensed separately under the QuantFunc End User License Agreement (EULA), and
+their use requires a valid QuantFunc license key (api_key). You may not
+reverse-engineer, decompile, disassemble, or redistribute the engine binaries
+except to the extent expressly permitted by the EULA or by applicable law.
+
+    QuantFunc EULA: [PENDING MAINTAINER CONFIRMATION — insert the canonical EULA
+    URL. Until then, the published terms at the ModelScope link above govern.]
+
+------------------------------------------------------------------------------
+Copyright
+------------------------------------------------------------------------------
+Copyright (c) the QuantFunc project. All rights in the proprietary engine binaries
+are reserved.
+
+[PENDING MAINTAINER CONFIRMATION: set the copyright-holding legal entity
+ (e.g. "MYNDEER LLC") on the line above.]

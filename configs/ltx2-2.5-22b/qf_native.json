@@ -1,0 +1,12 @@
+{
+  "family": "ltx2",
+  "display": "LTX-2.5 22B (single-expert, INT4, ComfyUI single-file or transformer-only + connectors)",
+  "notes": "official LTX-2.5 22B configs (staged-shared provenance); the transformer may be an ALL-IN single file (connector blocks + text_embedding_projection packed inside, official-comfy-single-file mirror, #565 mapping) OR a transformer-only export accompanied by a same-dir *connector*.safetensors completion file (user 2026-08-31; the loader resolves the connectors source: the transformer file itself when it packs BOTH {video,audio}_embeddings_connector blocks, else a same-dir qualifying sibling, else refused loud). text_embedding_projection is NOT required from the model file — the with-proj CLIP applies it TE-side and the engine loads it opportunistically. engine denoise_only skips TE/VAE weights — comfy owns conditioning + video AND audio decode (the workflow's own CLIPLoader/VAELoaders); AV capability detected from the packed audio_embeddings_connector in the resolved source; i2v rides the workflow's own Inplace latent path.",
+  "file_hints": {
+    "transformer1": [
+      "*ltx*2.5*quantfunc*4bit*",
+      "*ltx*2.5*quantfunc*int4*",
+      "*ltx25*quantfunc*"
+    ]
+  }
+}

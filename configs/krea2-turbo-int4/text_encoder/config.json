@@ -1,0 +1,5 @@
+{
+ "_class_name": "Qwen3VLForConditionalGeneration",
+ "model_type": "qwen3_vl",
+ "hidden_size": 2560
+}
