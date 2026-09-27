@@ -893,9 +893,12 @@ def console_safe_nodes(mapping):
 #   bin/<platform>/<version>-<set>-cu<major>/{host[, kernel]}
 #   bin/<platform>/.engine-<set>-cu<major>.json          its marker: names the loadable files, records their SHA-256s
 # The marker is written LAST (an atomic rename), so a folder becomes loadable only once its files are verified and in
-# place, and a marked folder is never modified (a same-version re-install drops the marker first). A new release always
-# goes into a NEW folder: a loaded Windows DLL cannot be replaced, and a folder whose DLL another process still has loaded
-# cannot be deleted either (it stays, ignored, until the next install removes it). Two ComfyUI instances of different GPU
+# place, and a marked folder is never modified (a same-version re-install drops the marker first). A new release goes
+# into a NEW folder: a loaded Windows DLL cannot be replaced, and a folder whose DLL another process still has loaded
+# cannot be deleted either (it stays, ignored, until the next install removes it). A release republished under the same
+# version is the exception: it re-downloads into the SAME folder (marker dropped first) and replaces the files there, so
+# on Windows, while another running ComfyUI still has that DLL loaded, the replace fails and this instance has no engine
+# until that instance exits and the next start installs again. Two ComfyUI instances of different GPU
 # classes (or CUDA majors) sharing this folder keep separate folders and markers. resolve_so_path loads only a marked
 # folder whose files still hash to its marker (R5: a failed or unverified library never runs). The installer keeps out
 # entirely when QF_NATIVE_SO_PATH names the library or bin/<platform>/.dev_lib_lock marks a local build there.

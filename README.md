@@ -200,7 +200,9 @@ background, it:
    of your architecture; on Windows one DLL;
 3. downloads it, checks each file's SHA-256 against the release's `verify.json` (on Linux also that host and kernel come
    from one build), and installs it into `bin/<linux|windows>/<version>-<architecture>-cu<major>/` — all or nothing.
-   A new version goes into a new folder, so an engine in use is never overwritten.
+   A new version goes into a new folder. A version republished under the same number is downloaded again into
+   the same folder and replaces the files there; on Windows, while a second running ComfyUI still has that DLL
+   loaded, the replacement has to wait until that instance exits.
 
 Before every load the plugin hashes the installed files again: a file that changed on disk is not loaded, and it is
 downloaded again. Offline, the installed engine stays in use. Several ComfyUI instances with different GPUs can share one
