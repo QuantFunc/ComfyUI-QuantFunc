@@ -512,7 +512,6 @@ _loader_namespace = {
     "_SOL_TAU_INPUT": ("FLOAT", {"default": 1.0}),
     "_QUALITY_ENHANCE_INPUT": ("BOOLEAN", {"default": False}),
     "_QUALITY_LEGACY_HIDDEN": {"quality": ("STRING", {})},
-    "_API_KEY_HIDDEN": {"api_key": ("STRING", {})},
     "_quality_enhance_on": lambda *_args: False,
     "_AUDIO_ENHANCE_INPUT": ("BOOLEAN", {"default": False}),
     "_STEP_CACHE_INPUT": ("FLOAT", {"default": 0.0}),

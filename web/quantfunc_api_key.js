@@ -1,5 +1,6 @@
-// The API key field of the four QuantFunc loaders (user 2026-09-27): a valid key typed here wins, and config.json is
-// then not read. An empty field leaves the key to config.json, as before.
+// The API key field of the QuantFunc loaders (user 2026-09-27): a valid key typed here wins, and config.json is then
+// not read. An empty field leaves the key to config.json, as before. The field goes on exactly the QuantFunc nodes that
+// declare the hidden `api_key` input (qf_api_key.add_api_key_input), so a field never exists that the loader ignores.
 //
 // ComfyUI saves every widget value into the workflow and every prompt input into each image and video it saves, and it
 // has no secret widget for custom nodes. So this field keeps the key out of both:
@@ -7,18 +8,21 @@
 //    copy and paste, the browser's autosave and the workflow inside every image carry no key;
 //  * a queued prompt carries only a reference: the key is POSTed to /quantfunc/api_key and stays in the ComfyUI
 //    process (qf_api_key.py), so the prompt inside every image, the history and "Export (API)" carry no key either.
-// The key is remembered in this browser, as ComfyUI keeps its own comfy.org API key, and never on the server's disk.
+// The key is remembered in this browser only (localStorage), never on the server's disk.
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 
-const LOADERS = new Set(["QuantFuncLTXLoader", "QuantFuncH3Loader", "QuantFuncKrea2Loader", "QuantFuncQwenImage21Loader"]);
+const WITH_FIELD = new Set();             // node classes that get the field (beforeRegisterNodeDef fills it)
 const REMEMBERED = "QuantFunc.api_key";   // localStorage item
 const FIELD_HEIGHT = 26;                  // px: one text line (the canvas adds the widget's margin around it)
 
 app.registerExtension({
   name: "QuantFunc.ApiKey",
+  beforeRegisterNodeDef(nodeType, nodeData) {
+    if (nodeData?.name?.startsWith("QuantFunc") && nodeData?.input?.hidden?.api_key) WITH_FIELD.add(nodeData.name);
+  },
   nodeCreated(node) {
-    if (!LOADERS.has(node.comfyClass)) return;
+    if (!WITH_FIELD.has(node.comfyClass)) return;
     const input = document.createElement("input");
     input.type = "password";
     input.autocomplete = "off";

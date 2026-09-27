@@ -704,15 +704,12 @@ if _IMPORT_OK:
 
 
 
-    def _run_family_load(expect_family, transformer1, model_config=None, pinned_memory=False, api_key=""):
+    def _run_family_load(expect_family, transformer1, model_config=None, pinned_memory=False):
         """The SHARED loader core behind the per-family nodes (user 2026-08-21 pivot). The loaders show no
         model_config choice (each family ships ONE preset: _family_preset); `model_config` is only a saved workflow's
         value of the retired widget (a hidden input). It is honoured when it names this family's preset and refused
         otherwise, naming what the plugin ships. The family guard below is defense-in-depth against a preset dir whose
-        manifest family changed between the listing and the read. `api_key` is what the prompt carries for the
-        loader's API key field: a reference (qf_api_key), or "" for none. An unusable one fails the loader here, before
-        anything is staged. Returns the family builder's result AS-IS."""
-        ui_key = qf_api_key.field_key(api_key)
+        manifest family changed between the listing and the read. Returns the family builder's result AS-IS."""
         sig = _loader_sig(expect_family, transformer1, model_config, pinned_memory)   # before model_config resolves
         if model_config is None:
             model_config = _family_preset(expect_family)
@@ -767,11 +764,9 @@ if _IMPORT_OK:
         # 能复用pipeline"). OFF values (0.0 / 1.0) omit the begin keys entirely →
         # the engine paths are byte-identical.
         token = qfmp.LOADER_SIG.set(sig)   # family_build stamps it on every model it makes (_PIPELINE_SIGS)
-        key_token = qfmp.LOADER_API_KEY.set(ui_key)   # ... and hands this key to each of their lazy engines
         try:
             out = builder(transformer1_path=xfm1, bundle_dir=bundle_dir, pinned_memory=bool(pinned_memory))
         finally:
-            qfmp.LOADER_API_KEY.reset(key_token)
             qfmp.LOADER_SIG.reset(token)
         # [cache/sparse surface REMOVED, user 2026-08-29 「移除所有loader的cache以及
         # 稀疏入口 整体默认不生效」] The per-model set_step_cache/set_block_cache/
@@ -834,11 +829,6 @@ if _IMPORT_OK:
     # any other value -> OFF. A UI workflow stores widget values by POSITION, so its dropdown string lands in this switch's slot,
     # where ComfyUI's BOOLEAN conversion (bool(value)) turns it ON before any node code runs.
     _QUALITY_LEGACY_HIDDEN = {"quality": ("STRING", {})}
-    # [api_key — user 2026-09-27] The four loaders' API key field: a valid key there wins and config.json is then not
-    # read (_read_auth). HIDDEN, so ComfyUI never makes a plain widget for it: a widget value is saved into every workflow
-    # and image. web/quantfunc_api_key.js draws the field (masked, never saved) and queues only a reference to the key
-    # (qf_api_key); without that script there is no field and the prompt carries nothing.
-    _API_KEY_HIDDEN = {"api_key": ("STRING", {})}
 
     def _quality_enhance_on(quality_enhance=None, quality=None):
         """This run's switch. It wins when the prompt has it; else a legacy dropdown value (best_quality -> ON, anything else ->
@@ -951,7 +941,7 @@ if _IMPORT_OK:
                 "step_cache": _STEP_CACHE_INPUT,
                 "block_cache": _BLOCK_CACHE_INPUT,
                 "pinned_memory": _PINNED_MEMORY_INPUT_LTX,
-            }, "hidden": {**_QUALITY_LEGACY_HIDDEN, **_API_KEY_HIDDEN}}
+            }, "hidden": dict(_QUALITY_LEGACY_HIDDEN)}
 
         RETURN_TYPES = ("MODEL",)
         FUNCTION = "load"
@@ -962,11 +952,11 @@ if _IMPORT_OK:
 
         def load(self, transformer, model_config=None,
                  attention_backend="auto", sol_tau=1.0, quality_enhance=None, step_cache=0.0, block_cache=0.0, quality=None,
-                 pinned_memory=True, api_key=""):   # LTX-2.5: ON by default (_PINNED_MEMORY_INPUT_LTX)
+                 pinned_memory=True):   # LTX-2.5: ON by default (_PINNED_MEMORY_INPUT_LTX)
             # NO aux file widgets and NO image socket (user 2026-08-22 "只保留
             # transformer/block/model_config … 只关注latent"): i2v is the workflow's own latent
             # conditioning (LTXVImgToVideoInplace).
-            _p = _run_family_load(self.QF_FAMILY, transformer, model_config, pinned_memory, api_key)
+            _p = _run_family_load(self.QF_FAMILY, transformer, model_config, pinned_memory)
             _mm = getattr(_p, "model", None)
             if _mm is not None and hasattr(_mm, "set_attn_backend"):
                 _mm.set_attn_backend(_attn_backend_to_engine(attention_backend))
@@ -993,7 +983,7 @@ if _IMPORT_OK:
                 "attention_backend": _attn_backend_input(),
                 "quality_enhance": _QUALITY_ENHANCE_INPUT,
                 "pinned_memory": _PINNED_MEMORY_INPUT,
-            }, "hidden": {**_QUALITY_LEGACY_HIDDEN, **_API_KEY_HIDDEN}}
+            }, "hidden": dict(_QUALITY_LEGACY_HIDDEN)}
 
         RETURN_TYPES = ("MODEL",)
         FUNCTION = "load"
@@ -1002,10 +992,10 @@ if _IMPORT_OK:
                        "place of the usual diffusion-model loader. " + _COMMON_LIMITS)
 
         def load(self, transformer, model_config=None, attention_backend="auto",
-                 quality_enhance=None, quality=None, pinned_memory=False, api_key=""):
+                 quality_enhance=None, quality=None, pinned_memory=False):
             # [runtime dials] backend + quality_enhance are SESSION knobs (NOT create keys — a widget change never re-keys the
             # engine = no rebuild).
-            _p = _run_family_load(self.QF_FAMILY, transformer, model_config, pinned_memory, api_key)
+            _p = _run_family_load(self.QF_FAMILY, transformer, model_config, pinned_memory)
             _mm = getattr(_p, "model", None)
             if _mm is not None and hasattr(_mm, "set_attn_backend"):
                 _mm.set_attn_backend(_attn_backend_to_engine(attention_backend))
@@ -1030,7 +1020,7 @@ if _IMPORT_OK:
                 "attention_backend": _attn_backend_input(),
                 "quality_enhance": _QUALITY_ENHANCE_INPUT,
                 "pinned_memory": _PINNED_MEMORY_INPUT,
-            }, "hidden": {**_QUALITY_LEGACY_HIDDEN, **_API_KEY_HIDDEN}}
+            }, "hidden": dict(_QUALITY_LEGACY_HIDDEN)}
 
         RETURN_TYPES = ("MODEL",)
         FUNCTION = "load"
@@ -1040,10 +1030,10 @@ if _IMPORT_OK:
                        "Save Image keep the transparency. " + _COMMON_LIMITS)
 
         def load(self, transformer, model_config=None, attention_backend="auto", quality_enhance=None, quality=None,
-                 pinned_memory=False, api_key=""):
+                 pinned_memory=False):
             # [runtime dials] backend + quality_enhance are SESSION knobs (NOT create keys — a widget change never re-keys the engine =
             # no rebuild), exactly like the Krea2 node.
-            _p = _run_family_load(self.QF_FAMILY, transformer, model_config, pinned_memory, api_key)
+            _p = _run_family_load(self.QF_FAMILY, transformer, model_config, pinned_memory)
             _mm = getattr(_p, "model", None)
             if _mm is not None and hasattr(_mm, "set_attn_backend"):
                 _mm.set_attn_backend(_attn_backend_to_engine(attention_backend))
@@ -1080,7 +1070,7 @@ if _IMPORT_OK:
                     "tooltip": "Opt in to split/trimmed sigma schedules for intentional H3 double-sampling workflows.",
                 }),
                 "pinned_memory": _PINNED_MEMORY_INPUT,
-            }, "hidden": {**_QUALITY_LEGACY_HIDDEN, **_API_KEY_HIDDEN}}
+            }, "hidden": dict(_QUALITY_LEGACY_HIDDEN)}
 
         RETURN_TYPES = ("MODEL",)
         FUNCTION = "load"
@@ -1091,8 +1081,8 @@ if _IMPORT_OK:
         def load(self, transformer, model_config=None,
                  attention_backend="flash", sol_tau=1.0, quality_enhance=None, audio_enhance=False,
                  step_cache=0.0, block_cache=0.0, allow_partial_denoise=False, quality=None,
-                 pinned_memory=False, api_key=""):  # H3: flash default (auto->sage is broken)
-            _p = _run_family_load(self.QF_FAMILY, transformer, model_config, pinned_memory, api_key)
+                 pinned_memory=False):  # H3: flash default (auto->sage is broken)
+            _p = _run_family_load(self.QF_FAMILY, transformer, model_config, pinned_memory)
             _mm = getattr(_p, "model", None)
             if _mm is not None and hasattr(_mm, "set_attn_backend"):
                 _mm.set_attn_backend(_attn_backend_to_engine(attention_backend))
@@ -1276,18 +1266,22 @@ except Exception as _qf_ltx_afix_exc:  # noqa: BLE001
     _log.warning("[qf_native] LTX-2.5 AV audio fix not installed: %s", ascii(_qf_ltx_afix_exc))
 
 
-# ── Engine log detail ─────────────────────────────────────────────────────────
+# ── Engine log detail, and the API key field ──────────────────────────────────
 # One HIDDEN `log_level` input on EVERY QuantFunc loader: never
 # shown, so users do not choose it; a prompt that carries it (the test harness's) still sets it. Default warning
 # (warnings and errors only). The value is handed to qf_engine before the loader runs and applied to the
-# engine library as soon as it is (or once it gets) loaded; asking never loads it. Process-wide. This runs LAST,
-# after every NODE_CLASS_MAPPINGS registration above, so no loader is missed (tests/log_level_input_test.py
+# engine library as soon as it is (or once it gets) loaded; asking never loads it. Process-wide.
+# One HIDDEN `api_key` input on every QuantFunc loader too (user 2026-09-27: a valid key in the loader's field wins, and
+# config.json is then not read): web/quantfunc_api_key.js draws the field on exactly the QuantFunc nodes that declare it,
+# and qf_api_key.add_api_key_input resolves it and publishes the key (qfmp.LOADER_API_KEY) while the loader runs.
+# This runs LAST, after every NODE_CLASS_MAPPINGS registration above, so no loader is missed (tests/log_level_input_test.py
 # checks that no registration comes after it). Fully guarded: it must never break plugin import.
 try:
     from . import qf_engine as _qf_ll_engine
     from .qf_log_level import add_log_level_input as _qf_add_log_level
     for _qf_name, _qf_cls in list(NODE_CLASS_MAPPINGS.items()):
         if _qf_name.startswith("QuantFunc") and _qf_name.endswith("Loader"):
+            qf_api_key.add_api_key_input(_qf_cls, qfmp.LOADER_API_KEY)
             _qf_add_log_level(_qf_cls, _qf_ll_engine.set_log_level)
 except Exception as _qf_ll_exc:  # noqa: BLE001
     _log.warning("[qf_native] log-level input not attached: %s", ascii(_qf_ll_exc))

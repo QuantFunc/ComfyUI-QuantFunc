@@ -93,8 +93,9 @@ _QF_ENGINE_CACHE_ACQUISITION = ContextVar("quantfunc_engine_cache_acquisition", 
 # The create inputs of the loader running now (set by the package's loader core). family_build stamps them on every model
 # its build makes, LoRA rebuilds included, so the pipeline those models bind records which loader inputs make it.
 LOADER_SIG = ContextVar("quantfunc_loader_sig", default=None)
-# The API key of that loader's own field (qf_api_key.field_key; None = QUANTFUNC_API_KEY / config.json), published the
-# same way: family_build hands it to every lazy engine its build makes, LoRA rebuilds included.
+# The API key of the running loader's own field (None = QUANTFUNC_API_KEY / config.json), published while the loader
+# node runs (qf_api_key.add_api_key_input): family_build hands it to every lazy engine its build makes, LoRA rebuilds
+# included.
 LOADER_API_KEY = ContextVar("quantfunc_loader_api_key", default=None)
 
 

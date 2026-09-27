@@ -10,9 +10,13 @@ two comfy.org keys (execution.SENSITIVE_EXTRA_DATA_KEYS). So the key is never a 
     queued it POSTs the key to /quantfunc/api_key and queues only the reference it gets back;
   * this module keeps the key in this ComfyUI process, behind that reference, and turns the reference back into the key
     for the loader (field_key). A reference means nothing to another process, or after a restart.
+Every QuantFunc loader gets the hidden `api_key` input from add_api_key_input, in the same post-registration loop that
+gives it `log_level`; the field's script draws the field on exactly the QuantFunc nodes that declare it.
 """
+import functools
 import hashlib
 import hmac
+import inspect
 import os
 import re
 
@@ -52,7 +56,8 @@ def field_key(value):
     if key is None:
         raise RuntimeError("qf_native: this prompt carries an API key as plain text. A key in a prompt is saved into "
                            "every image and video the prompt makes, so it is not used. Enter the key in the loader's "
-                           "API key field (it is kept out of saved workflows and images), or put it in config.json.")
+                           "API key field (it is kept out of saved workflows and images), or put it in config.json. A "
+                           "script can POST {\"key\": ...} to /quantfunc/api_key and send the reference it returns.")
     if not KEY_FORMAT.fullmatch(key):
         raise RuntimeError("qf_native: the text in this loader's API key field is not a QuantFunc API key (a key is "
                            "qf_ followed by 64 characters 0-9 and a-f). Paste the whole key from your QuantFunc account, "
@@ -72,6 +77,38 @@ async def _post_key(request):
         return web.json_response({"error": 'expected a JSON object {"key": "<the API key>"}'}, status=400)
     key = key.strip()
     return web.json_response({"ref": remember(key) if key else ""})
+
+
+def add_api_key_input(cls, published):
+    """Give a loader node the hidden `api_key` input (hidden: ComfyUI never makes a widget for it, so nothing is saved by
+    position). Running the node resolves the value first (field_key: an unusable value raises before the loader runs),
+    then runs the loader with the key published in `published` (a ContextVar; None = no field key), which the family
+    build hands to every lazy engine it makes. The node function keeps its name, docstring and parameters (plus a
+    keyword-only `api_key`) for anything that inspects it; the node's own spec dicts are never modified."""
+    base_inputs = cls.INPUT_TYPES      # bound to cls
+    run = getattr(cls, cls.FUNCTION)
+
+    def INPUT_TYPES(_cls):
+        spec = dict(base_inputs())
+        spec["hidden"] = {**spec.get("hidden", {}), "api_key": ("STRING", {})}
+        return spec
+
+    @functools.wraps(run)
+    def _run(self, *args, api_key="", **kwargs):
+        token = published.set(field_key(api_key))
+        try:
+            return run(self, *args, **kwargs)
+        finally:
+            published.reset(token)
+
+    sig = inspect.signature(run)
+    params = list(sig.parameters.values())
+    at = next((i for i, p in enumerate(params) if p.kind is inspect.Parameter.VAR_KEYWORD), len(params))
+    params.insert(at, inspect.Parameter("api_key", inspect.Parameter.KEYWORD_ONLY, default=""))
+    _run.__signature__ = sig.replace(parameters=params)
+    cls.INPUT_TYPES = classmethod(INPUT_TYPES)
+    setattr(cls, cls.FUNCTION, _run)
+    return cls
 
 
 def register_route(routes):

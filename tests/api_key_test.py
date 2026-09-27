@@ -17,31 +17,38 @@ has no secret widget a custom node can use. So the key is never a widget value o
        processes
     A6 the route: {"key": k} -> {"ref": r} resolving to k (surrounding whitespace dropped); empty -> ""; anything else
        -> 400 that does not echo the value
+    A7 add_api_key_input gives ANY loader class the hidden input: the key is published only while the loader runs (reset
+       after, also on an exception), the loader never receives the api_key argument, an unusable value fails before
+       the loader runs, the class's own spec dicts are untouched and the signature gains a keyword-only api_key
   B  the plugin (needs COMFY_ROOT)
-    B1 the four loaders take api_key as a HIDDEN input (ComfyUI never makes a plain, saved widget for it), and ComfyUI
-       hands a hidden input's prompt value to the loader
+    B1 every registered QuantFunc*Loader (derived from NODE_CLASS_MAPPINGS, not a list) takes api_key as a HIDDEN input
+       (ComfyUI never makes a plain, saved widget for it), and ComfyUI hands a hidden input's prompt value to it
     B2 precedence: a field key wins, and neither QUANTFUNC_API_KEY nor config.json is read; no field key = today's path
     B3 each loader hands its field key to the models its build makes (a LoRA rebuild too); an unusable field fails the
        loader before its builder runs
     B4 the key reaches the create, never the pipeline cache key: two keys share one prepared pipeline
     B5 another key on a live pipeline switches it in place (quantfunc_set_api_key) once, without a create; an emptied
-       field switches back to the config.json key; with no key there it is refused, never set_api_key("")
+       field switches back to the config.json key; with no key there it is refused, never set_api_key(""); a switch the
+       engine refuses fails the run without the key in the message, and the next run retries it
     B6 no field key anywhere: config.json is read once, at the create, and nothing is ever switched
     B7 no key reaches a log line or an error message
     B8 ComfyUI can serve the field's script (WEB_DIRECTORY), and a serving ComfyUI gets the route
   C  web/quantfunc_api_key.js under Node (skipped without node)
-    C1 exactly the four loaders get one api_key field: a password input, never saved into a workflow
+    C1 exactly the QuantFunc nodes that declare the hidden api_key input (the four loaders, and a loader added later)
+       get one api_key field: a password input, never saved into a workflow; another pack's node never does
     C2 an empty field sends nothing and queues ""; a key is POSTed to /quantfunc/api_key and only the reference is queued
     C3 a refused POST fails the queue; the plain key is never queued
     C4 the key is remembered in this browser (localStorage) and forgotten when the field is emptied
 
 MUTATION (each goes RED): accept any non-empty field key -> A1; read "" as a key -> A2/B3; return the plain key for a
 non-reference -> A3; read an unknown reference as empty -> A4; make the reference the key or a slice of it -> A5; echo
-the value in a 400 -> A6; declare api_key optional -> B1; let QUANTFUNC_API_KEY beat the field key, or read config.json
-with one -> B2; drop the ContextVar hand-off in family_build -> B3; put the key into create_cfg -> B4; drop the switch in
-ensure(), or send set_api_key("") -> B5; read config.json in ensure() for a default consumer -> B6; print the key in the
-switch line -> B7; drop WEB_DIRECTORY -> B8; save the field (serialize true) or queue the plain key -> C1/C2; fall back to
-the plain key on a refused POST -> C3; drop the localStorage write -> C4.
+the value in a 400 -> A6; never reset the published key, or pass api_key on to the loader -> A7; skip the attach for the
+loaders -> B1; let QUANTFUNC_API_KEY beat the field key, or read config.json with one -> B2; drop the ContextVar hand-off
+in family_build -> B3; put the key into create_cfg -> B4; drop the switch in ensure(), send set_api_key(""), or record a
+switch before the engine accepted it -> B5; read config.json in ensure() for a default consumer -> B6; print the key in
+the switch line -> B7; drop WEB_DIRECTORY -> B8; draw the field on every node or on another pack's node, save it
+(serialize true) or queue the plain key -> C1/C2; fall back to the plain key on a refused POST -> C3; drop the
+localStorage write -> C4.
 
 Run:  python tests/api_key_test.py      (B needs COMFY_ROOT; C needs node)
 """
@@ -181,6 +188,61 @@ class Route(unittest.TestCase):
             self.assertNotIn(long, text)
 
 
+class Retrofit(unittest.TestCase):
+    """A7: add_api_key_input on a loader class this plugin has never seen (a loader added later)."""
+    def setUp(self):
+        from contextvars import ContextVar
+        self.published = ContextVar("published_under_test", default=None)
+        self.seen = []
+        published, seen = self.published, self.seen
+        self.spec = {"required": {"transformer": (["a.safetensors"],)}, "hidden": {"quality": ("STRING", {})}}
+        spec = self.spec
+
+        class Loader:
+            FUNCTION = "load"
+
+            @classmethod
+            def INPUT_TYPES(cls):
+                return spec
+
+            def load(self, transformer, pinned_memory=False, **extra):
+                """Load the model."""
+                seen.append((transformer, published.get(), dict(extra)))
+                if transformer == "boom":
+                    raise ValueError("loader failed")
+                return ("model",)
+        self.Loader = ak.add_api_key_input(Loader, published)
+
+    def test_the_hidden_input_is_added_and_the_class_spec_is_untouched(self):
+        hidden = self.Loader.INPUT_TYPES()["hidden"]
+        self.assertEqual(sorted(hidden), ["api_key", "quality"])
+        self.assertEqual(self.spec["hidden"], {"quality": ("STRING", {})})
+
+    def test_the_key_is_published_only_while_the_loader_runs(self):
+        self.assertEqual(self.Loader().load(transformer="a", api_key=ak.remember(KEY)), ("model",))
+        self.assertEqual(self.seen, [("a", KEY, {})])            # published during the run; api_key not passed on
+        self.assertIsNone(self.published.get())
+        self.Loader().load(transformer="a")
+        self.assertEqual(self.seen[-1], ("a", None, {}))
+        with self.assertRaises(ValueError):
+            self.Loader().load(transformer="boom", api_key=ak.remember(KEY))
+        self.assertIsNone(self.published.get())                 # reset on an exception too
+
+    def test_an_unusable_value_fails_before_the_loader_runs(self):
+        for field in (ak.remember(MALFORMED[0]), KEY, "qfk:" + "0" * 32):
+            with self.subTest(field=field[:6]), self.assertRaises(RuntimeError):
+                self.Loader().load(transformer="a", api_key=field)
+        self.assertEqual(self.seen, [])
+
+    def test_the_signature_gains_a_keyword_only_api_key(self):
+        import inspect
+        params = inspect.signature(self.Loader.load).parameters
+        self.assertEqual(list(params), ["self", "transformer", "pinned_memory", "api_key", "extra"])
+        self.assertEqual((params["api_key"].kind, params["api_key"].default), (inspect.Parameter.KEYWORD_ONLY, ""))
+        self.assertIs(params["pinned_memory"].default, False)
+        self.assertEqual((self.Loader.load.__name__, self.Loader.load.__doc__), ("load", "Load the model."))
+
+
 # ── B: the plugin ─────────────────────────────────────────────────────────────────────────────────────────────────────
 _COMFY = os.environ.get("COMFY_ROOT")
 if _COMFY and (Path(_COMFY) / "comfy/model_management.py").is_file():
@@ -190,6 +252,8 @@ if _COMFY and (Path(_COMFY) / "comfy/model_management.py").is_file():
     qfe, qfmp = plugin.qfe, plugin.qfmp
     mm = qfmp.comfy.model_management
     pak = plugin.qf_api_key          # the plugin's own instance: its secret and store are the ones its loaders read
+    # every registered QuantFunc loader, derived from the registry (a loader added later is included by construction)
+    REGISTERED = sorted(n for n in plugin.NODE_CLASS_MAPPINGS if n.startswith("QuantFunc") and n.endswith("Loader"))
 
     def clean_env(**values):
         """os.environ without the plugin's auth variables, plus `values`."""
@@ -199,8 +263,9 @@ if _COMFY and (Path(_COMFY) / "comfy/model_management.py").is_file():
         return mock.patch.dict(os.environ, env, clear=True)
 
     class Surface(unittest.TestCase):
-        def test_the_four_loaders_take_the_key_as_a_hidden_input(self):
-            for name in LOADERS:
+        def test_every_quantfunc_loader_takes_the_key_as_a_hidden_input(self):
+            self.assertTrue(set(LOADERS) <= set(REGISTERED), REGISTERED)
+            for name in REGISTERED:
                 spec = plugin.NODE_CLASS_MAPPINGS[name].INPUT_TYPES()
                 self.assertIn("api_key", spec.get("hidden", {}), name)
                 self.assertNotIn("api_key", spec.get("required", {}), name)
@@ -210,7 +275,7 @@ if _COMFY and (Path(_COMFY) / "comfy/model_management.py").is_file():
 
         def test_comfyui_hands_the_hidden_input_to_the_loader(self):
             import execution    # the ComfyUI executor's own input gathering, the one assumption this design rides on
-            for name in LOADERS:
+            for name in REGISTERED:
                 got = execution.get_input_data({"transformer": "t.safetensors", "api_key": "qfk:x"},
                                                plugin.NODE_CLASS_MAPPINGS[name], "1")
                 self.assertEqual(got[0].get("api_key"), ["qfk:x"], name)
@@ -267,14 +332,14 @@ if _COMFY and (Path(_COMFY) / "comfy/model_management.py").is_file():
             return seen, None
 
         def test_every_loader_hands_its_field_key_to_its_build(self):
-            for name in LOADERS:
+            for name in REGISTERED:
                 with self.subTest(loader=name):
                     self.assertEqual(self.run_loader(name, pak.remember(KEY)), ([KEY], None))
                     self.assertIsNone(qfmp.LOADER_API_KEY.get())      # published only while the build runs
                     self.assertEqual(self.run_loader(name, ""), ([None], None))
 
         def test_an_unusable_field_fails_the_loader_before_its_build(self):
-            for name in LOADERS:
+            for name in REGISTERED:
                 for field in (pak.remember(MALFORMED[0]), KEY, "qfk:" + "0" * 32):
                     with self.subTest(loader=name, field=field[:6]):
                         seen, exc = self.run_loader(name, field)
@@ -300,7 +365,8 @@ if _COMFY and (Path(_COMFY) / "comfy/model_management.py").is_file():
                     mock.patch.object(plugin, "_family_preset", return_value="preset"), \
                     mock.patch.object(plugin, "_load_model_config", return_value=("/bundle", {"family": "krea2"})), \
                     mock.patch.object(plugin, "_resolve_transformer", side_effect=lambda n: "/models/" + n):
-                patcher = plugin._run_family_load("krea2", "k2.safetensors", api_key=pak.remember(KEY))
+                patcher, = plugin.NODE_CLASS_MAPPINGS["QuantFuncKrea2Loader"]().load(transformer="k2.safetensors",
+                                                                                     api_key=pak.remember(KEY))
             rebuilt = qfmp.rebuild_of(patcher)([{"path": "a.safetensors", "scale": 1.0}])   # outside the loader
             patcher.model._qf.ensure()
             rebuilt.model._qf.ensure()
@@ -311,13 +377,13 @@ if _COMFY and (Path(_COMFY) / "comfy/model_management.py").is_file():
         """The native double plus the two runtime mutations a live pipeline takes."""
         def __init__(self):
             super().__init__()
-            self.keys, self.updates = [], []
+            self.keys, self.updates, self.key_status = [], [], []
             self.quantfunc_set_api_key = lambda pipeline, key: self._set_key(key)
             self.quantfunc_pipeline_update = lambda pipeline, payload: self.updates.append(payload) or 0
 
         def _set_key(self, key):
             self.keys.append(key.decode())
-            return 0
+            return self.key_status.pop(0) if self.key_status else 0
 
     class Engines(unittest.TestCase):
         """The real _get_engine / QFLazyEngine over the native double."""
@@ -393,6 +459,17 @@ if _COMFY and (Path(_COMFY) / "comfy/model_management.py").is_file():
                 lonely.ensure()
             self.assertEqual(self.lib.keys, [])                  # never set_api_key(""): that turns the key checks off
             self.assertIn("config.json", str(cm.exception))
+
+        def test_a_refused_switch_fails_the_run_and_the_next_run_retries(self):
+            self.consumer(KEY).ensure()
+            other = self.consumer(KEY2)
+            self.lib.key_status = [5]                            # the engine refuses the switch once
+            with self.assertRaises(RuntimeError) as cm:
+                other.ensure()
+            self.assertNotIn(KEY2, str(cm.exception))
+            other.ensure()                                       # not recorded as switched: the next run tries again
+            other.ensure()
+            self.assertEqual(self.lib.keys, [KEY2, KEY2])
 
         def test_no_field_key_anywhere_reads_config_json_once_and_switches_nothing(self):
             for _ in range(3):
@@ -485,13 +562,19 @@ async function created(comfyClass) {
   for (const e of app.extensions) await e.nodeCreated?.(n);
   return n;
 }
+// what /object_info declares: the loaders' hidden inputs, a QuantFunc loader added later, and nodes that must not get one
 const LOADERS = %s;
+const withKey = { api_key: ["STRING", {}] };
+const defs = [...LOADERS, "QuantFuncFutureLoader"].map(name => ({ name, input: { required: {}, hidden: { ...withKey, log_level: ["STRING", {}] } } }))
+  .concat([{ name: "QuantFuncNativeLoRA", input: { required: {} } }, { name: "KSampler", input: { required: {} } },
+           { name: "OtherPackApiNode", input: { required: {}, hidden: withKey } }]);
+for (const d of defs) for (const e of app.extensions) await e.beforeRegisterNodeDef?.(function () {}, d, app);
 const out = { loaders: {}, others: {} };
-for (const c of LOADERS) {
+for (const c of [...LOADERS, "QuantFuncFutureLoader"]) {
   const n = await created(c);
   out.loaders[c] = n.widgets.map(w => ({ name: w.name, input: w.element.type, serialize: w.serialize }));
 }
-for (const c of ["KSampler", "QuantFuncNativeLoRA"]) out.others[c] = (await created(c)).widgets.length;
+for (const c of ["KSampler", "QuantFuncNativeLoRA", "OtherPackApiNode"]) out.others[c] = (await created(c)).widgets.length;
 const w = (await created(LOADERS[0])).widgets[0];
 w.element.value = "  \\t";
 out.empty = { queued: await w.serializeValue(), calls: api.calls.length };
@@ -537,10 +620,10 @@ class FieldScript(unittest.TestCase):
         if self.out is None:
             skip(self, "node is not installed")
 
-    def test_exactly_the_four_loaders_get_one_masked_field_that_is_never_saved(self):
-        for c in LOADERS:
+    def test_exactly_the_declaring_quantfunc_nodes_get_one_masked_field_that_is_never_saved(self):
+        for c in (*LOADERS, "QuantFuncFutureLoader"):
             self.assertEqual(self.out["loaders"][c], [{"name": "api_key", "input": "password", "serialize": False}], c)
-        self.assertEqual(self.out["others"], {"KSampler": 0, "QuantFuncNativeLoRA": 0})
+        self.assertEqual(self.out["others"], {"KSampler": 0, "QuantFuncNativeLoRA": 0, "OtherPackApiNode": 0})
 
     def test_only_a_reference_is_queued(self):
         self.assertEqual(self.out["empty"], {"queued": "", "calls": 0})
