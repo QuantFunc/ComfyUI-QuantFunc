@@ -21,14 +21,22 @@ except Exception as _qfe_exc:  # noqa: BLE001 - never break registration
     import logging
     qfe, _log = None, logging.getLogger(__name__)
     _log.warning("[qf_native] disabled - qf_engine failed to import: %s", ascii(_qfe_exc))
+# qf_api_key (the loaders' API key field) is stdlib only too. Without it no loader registers (the block below), so a key
+# typed into a field is never dropped silently in favour of config.json.
+try:
+    from . import qf_api_key
+except Exception as _qak_exc:  # noqa: BLE001 - never break registration
+    qf_api_key = None
+    _log.warning("[qf_native] disabled - qf_api_key failed to import: %s", ascii(_qak_exc))
 
 # GUARDED imports (mirror the real plugin __init__.py) — a broken comfy-internals import must NOT
 # take down node registration on a ComfyUI upgrade; degrade to zero nodes + a loud warning.
 NODE_CLASS_MAPPINGS = {}
 NODE_DISPLAY_NAME_MAPPINGS = {}
+WEB_DIRECTORY = "./web"   # ComfyUI serves it to the browser: the loaders' API key field (web/quantfunc_api_key.js)
 try:
-    if qfe is None:
-        raise ImportError("qf_engine did not import (see the warning above)")
+    if qfe is None or qf_api_key is None:
+        raise ImportError("qf_engine or qf_api_key did not import (see the warning above)")
     import comfy.model_management
     import comfy.supported_models
     from . import qf_modelpatcher as qfmp
@@ -212,11 +220,12 @@ def _resolve_lora(name):
     return _folder_paths.get_full_path_or_raise("loras", name)
 
 
-# Auth resolves from the PROCESS ENVIRONMENT + the package-bundled keyfile ONLY — never a node
-# widget. `keyfile` was previously a workflow STRING widget: same class as `so_path` (a shared
-# workflow.json could point it at an arbitrary file the ComfyUI server then opens/parses). A
-# workflow.json cannot set an env var, so the dev override QF_NATIVE_KEYFILE is safe; the shipped
-# default is the package-bundled bin/<platform>/config.json.
+# Auth resolves from a loader's API key field (user 2026-09-27), the PROCESS ENVIRONMENT and the package-bundled
+# keyfile. The field is never a widget value or a prompt value: the prompt carries a reference that only this process
+# resolves (qf_api_key). The keyfile PATH is never a node input: `keyfile` was previously a workflow STRING widget, same
+# class as `so_path` (a shared workflow.json could point it at an arbitrary file the ComfyUI server then opens/parses). A
+# workflow.json cannot set an env var, so the dev override QF_NATIVE_KEYFILE is safe; the shipped default is the
+# package-bundled bin/<platform>/config.json.
 def _resolve_keyfile():
     override = os.environ.get(qfe._ENV_KEYFILE_OVERRIDE, "").strip()
     if override:
@@ -225,11 +234,14 @@ def _resolve_keyfile():
     return os.path.join(pkg, "bin", qfe._BIN_SUBDIR, qfe._KEYFILE_BASENAME)
 
 
-def _read_auth():
-    # The API key is preferentially an env var (QUANTFUNC_API_KEY) — the harness/plugin convention;
-    # only if absent do we read the bundled/overridden keyfile.
-    key = os.environ.get("QUANTFUNC_API_KEY", "") or os.environ.get("QF_API_KEY", "")
+def _read_auth(ui_key=None):
+    # `ui_key`: the key of the loader's API key field (qf_api_key.field_key checked it). It wins, and then neither
+    # QUANTFUNC_API_KEY nor the keyfile is read. Without one the API key is preferentially an env var (QUANTFUNC_API_KEY)
+    # — the harness/plugin convention; only if absent do we read the bundled/overridden keyfile.
     surl = os.environ.get("QF_SERVER_URL", "https://service.quantfunc.com")
+    if ui_key:
+        return ui_key, surl
+    key = os.environ.get("QUANTFUNC_API_KEY", "") or os.environ.get("QF_API_KEY", "")
     keyfile = _resolve_keyfile()
     if not key and keyfile and os.path.exists(keyfile):
         # A keyfile that is there but unreadable is an error, never "no key": swallowing it hid a Windows cp936 decode
@@ -532,9 +544,9 @@ def _engine_recipe(model_dir, create_cfg=None, device_idx=0):
     return lib, ckey, (qfe.library_identity(lib), ckey), create_cfg
 
 
-def _prepare_params(model_dir, create_cfg, device_idx):
-    """Build retained create params only after both engine caches miss."""
-    key, surl = _read_auth()
+def _prepare_params(model_dir, create_cfg, device_idx, api_key=None):
+    """Build retained create params only after both engine caches miss. api_key: the loader field's key, or None."""
+    key, surl = _read_auth(api_key)
     cfg = dict(create_cfg or {})
     if key:
         cfg["api_key"] = key
@@ -543,7 +555,7 @@ def _prepare_params(model_dir, create_cfg, device_idx):
                                   device_idx=int(device_idx), config_json=cfg or None)
 
 
-def _get_or_prepare_entry(lib, ckey, prepared_key, model_dir, create_cfg, device_idx):
+def _get_or_prepare_entry(lib, ckey, prepared_key, model_dir, create_cfg, device_idx, api_key=None):
     """Return the cached handle/entry, constructing a publish candidate outside the cache lock."""
     with _ENGINE_IDENTITY_LOCK:
         eng = _PIPELINE_CACHE.get(ckey)
@@ -559,8 +571,8 @@ def _get_or_prepare_entry(lib, ckey, prepared_key, model_dir, create_cfg, device
     if entry is not None:
         return entry
 
-    params = _prepare_params(model_dir, create_cfg, device_idx)
-    candidate = qfmp.QFPreparedEntry(lib, int(params.device_idx), create_params=params)
+    params = _prepare_params(model_dir, create_cfg, device_idx, api_key)
+    candidate = qfmp.QFPreparedEntry(lib, int(params.device_idx), create_params=params, api_key=api_key)
     winner = None
     mismatch = False
     with _ENGINE_IDENTITY_LOCK:
@@ -623,27 +635,29 @@ def _materialize_engine(entry, lib, ckey):
                                        prepared_resource=entry.resource)
         eng._qf_resource_adapters = entry._qf_resource_adapters
         eng._qf_resource_adapters[0]._prepared = False
+        eng.applied_api_key = entry.api_key   # created with the key its recipe carries
         with _ENGINE_IDENTITY_LOCK:
             _PIPELINE_CACHE[ckey] = eng
             _pin_pipeline_consumer_locked(ckey)
         return eng, ckey
 
 
-def _get_engine(model_dir, create_cfg=None, device_idx=0):
+def _get_engine(model_dir, create_cfg=None, device_idx=0, api_key=None):
     """Create (or reuse) the engine for a model PACKAGE dir. The native library path is
     resolved internally (resolve_so_path — NEVER a node input, #vuln). Create is MINIMAL:
     a PREQUANT svdq package carries its own layout/precision in its metadata; anything
     supplied on top competes with it and loses. The transformer weights live INSIDE the
     package (engine loads model_dir/transformer[_2]/ directly — no path override).
     create_cfg carries the per-family create keys only: never a LoRA set or a session setting, so
-    every setting of one model's weights shares one cached pipeline."""
+    every setting of one model's weights shares one cached pipeline. api_key (the loader field's key, or None) is not a
+    create key either: it signs in the create of a missed pipeline, and QFLazyEngine switches a cached one in place."""
     # [session-knobs] the session-knob-≠-create-key guard is sealed INSIDE
     # qf_engine.create_pipeline (the real quantfunc_create boundary — construction-enforced,
     # unbypassable by a future direct caller), not duplicated here (one truth source).
     # Cache lookup/publication is atomic; prepare and create never run under the
     # global cache lock (create is single-flight under the prepared entry's lock).
     lib, ckey, prepared_key, create_cfg = _engine_recipe(model_dir, create_cfg, device_idx)
-    entry = _get_or_prepare_entry(lib, ckey, prepared_key, model_dir, create_cfg, device_idx)
+    entry = _get_or_prepare_entry(lib, ckey, prepared_key, model_dir, create_cfg, device_idx, api_key)
     if isinstance(entry, qfe.QFEngineHandle):
         return entry, ckey
     if qfe.FACTORY_PREPARE_ONLY.get():
@@ -677,7 +691,7 @@ if _IMPORT_OK:
         import is SKIPPED WITH A LOUD WARNING (its models then say 'no registered native seam')
         — one broken family must not take the whole plugin's registration down."""
         import importlib
-        deps = {"get_engine": _get_engine, "bind_pipeline_model": _bind_pipeline_model}
+        deps = {"get_engine": _get_engine, "bind_pipeline_model": _bind_pipeline_model, "read_auth": _read_auth}
         for mod_name in _FAMILY_MODULES:
             try:
                 mod = importlib.import_module("." + mod_name, __name__)
@@ -690,12 +704,15 @@ if _IMPORT_OK:
 
 
 
-    def _run_family_load(expect_family, transformer1, model_config=None, pinned_memory=False):
+    def _run_family_load(expect_family, transformer1, model_config=None, pinned_memory=False, api_key=""):
         """The SHARED loader core behind the per-family nodes (user 2026-08-21 pivot). The loaders show no
         model_config choice (each family ships ONE preset: _family_preset); `model_config` is only a saved workflow's
         value of the retired widget (a hidden input). It is honoured when it names this family's preset and refused
         otherwise, naming what the plugin ships. The family guard below is defense-in-depth against a preset dir whose
-        manifest family changed between the listing and the read. Returns the family builder's result AS-IS."""
+        manifest family changed between the listing and the read. `api_key` is what the prompt carries for the
+        loader's API key field: a reference (qf_api_key), or "" for none. An unusable one fails the loader here, before
+        anything is staged. Returns the family builder's result AS-IS."""
+        ui_key = qf_api_key.field_key(api_key)
         sig = _loader_sig(expect_family, transformer1, model_config, pinned_memory)   # before model_config resolves
         if model_config is None:
             model_config = _family_preset(expect_family)
@@ -750,9 +767,11 @@ if _IMPORT_OK:
         # 能复用pipeline"). OFF values (0.0 / 1.0) omit the begin keys entirely →
         # the engine paths are byte-identical.
         token = qfmp.LOADER_SIG.set(sig)   # family_build stamps it on every model it makes (_PIPELINE_SIGS)
+        key_token = qfmp.LOADER_API_KEY.set(ui_key)   # ... and hands this key to each of their lazy engines
         try:
             out = builder(transformer1_path=xfm1, bundle_dir=bundle_dir, pinned_memory=bool(pinned_memory))
         finally:
+            qfmp.LOADER_API_KEY.reset(key_token)
             qfmp.LOADER_SIG.reset(token)
         # [cache/sparse surface REMOVED, user 2026-08-29 「移除所有loader的cache以及
         # 稀疏入口 整体默认不生效」] The per-model set_step_cache/set_block_cache/
@@ -815,6 +834,11 @@ if _IMPORT_OK:
     # any other value -> OFF. A UI workflow stores widget values by POSITION, so its dropdown string lands in this switch's slot,
     # where ComfyUI's BOOLEAN conversion (bool(value)) turns it ON before any node code runs.
     _QUALITY_LEGACY_HIDDEN = {"quality": ("STRING", {})}
+    # [api_key — user 2026-09-27] The four loaders' API key field: a valid key there wins and config.json is then not
+    # read (_read_auth). HIDDEN, so ComfyUI never makes a plain widget for it: a widget value is saved into every workflow
+    # and image. web/quantfunc_api_key.js draws the field (masked, never saved) and queues only a reference to the key
+    # (qf_api_key); without that script there is no field and the prompt carries nothing.
+    _API_KEY_HIDDEN = {"api_key": ("STRING", {})}
 
     def _quality_enhance_on(quality_enhance=None, quality=None):
         """This run's switch. It wins when the prompt has it; else a legacy dropdown value (best_quality -> ON, anything else ->
@@ -927,7 +951,7 @@ if _IMPORT_OK:
                 "step_cache": _STEP_CACHE_INPUT,
                 "block_cache": _BLOCK_CACHE_INPUT,
                 "pinned_memory": _PINNED_MEMORY_INPUT_LTX,
-            }, "hidden": dict(_QUALITY_LEGACY_HIDDEN)}
+            }, "hidden": {**_QUALITY_LEGACY_HIDDEN, **_API_KEY_HIDDEN}}
 
         RETURN_TYPES = ("MODEL",)
         FUNCTION = "load"
@@ -938,11 +962,11 @@ if _IMPORT_OK:
 
         def load(self, transformer, model_config=None,
                  attention_backend="auto", sol_tau=1.0, quality_enhance=None, step_cache=0.0, block_cache=0.0, quality=None,
-                 pinned_memory=True):   # LTX-2.5: ON by default (_PINNED_MEMORY_INPUT_LTX)
+                 pinned_memory=True, api_key=""):   # LTX-2.5: ON by default (_PINNED_MEMORY_INPUT_LTX)
             # NO aux file widgets and NO image socket (user 2026-08-22 "只保留
             # transformer/block/model_config … 只关注latent"): i2v is the workflow's own latent
             # conditioning (LTXVImgToVideoInplace).
-            _p = _run_family_load(self.QF_FAMILY, transformer, model_config, pinned_memory)
+            _p = _run_family_load(self.QF_FAMILY, transformer, model_config, pinned_memory, api_key)
             _mm = getattr(_p, "model", None)
             if _mm is not None and hasattr(_mm, "set_attn_backend"):
                 _mm.set_attn_backend(_attn_backend_to_engine(attention_backend))
@@ -969,7 +993,7 @@ if _IMPORT_OK:
                 "attention_backend": _attn_backend_input(),
                 "quality_enhance": _QUALITY_ENHANCE_INPUT,
                 "pinned_memory": _PINNED_MEMORY_INPUT,
-            }, "hidden": dict(_QUALITY_LEGACY_HIDDEN)}
+            }, "hidden": {**_QUALITY_LEGACY_HIDDEN, **_API_KEY_HIDDEN}}
 
         RETURN_TYPES = ("MODEL",)
         FUNCTION = "load"
@@ -978,10 +1002,10 @@ if _IMPORT_OK:
                        "place of the usual diffusion-model loader. " + _COMMON_LIMITS)
 
         def load(self, transformer, model_config=None, attention_backend="auto",
-                 quality_enhance=None, quality=None, pinned_memory=False):
+                 quality_enhance=None, quality=None, pinned_memory=False, api_key=""):
             # [runtime dials] backend + quality_enhance are SESSION knobs (NOT create keys — a widget change never re-keys the
             # engine = no rebuild).
-            _p = _run_family_load(self.QF_FAMILY, transformer, model_config, pinned_memory)
+            _p = _run_family_load(self.QF_FAMILY, transformer, model_config, pinned_memory, api_key)
             _mm = getattr(_p, "model", None)
             if _mm is not None and hasattr(_mm, "set_attn_backend"):
                 _mm.set_attn_backend(_attn_backend_to_engine(attention_backend))
@@ -1006,7 +1030,7 @@ if _IMPORT_OK:
                 "attention_backend": _attn_backend_input(),
                 "quality_enhance": _QUALITY_ENHANCE_INPUT,
                 "pinned_memory": _PINNED_MEMORY_INPUT,
-            }, "hidden": dict(_QUALITY_LEGACY_HIDDEN)}
+            }, "hidden": {**_QUALITY_LEGACY_HIDDEN, **_API_KEY_HIDDEN}}
 
         RETURN_TYPES = ("MODEL",)
         FUNCTION = "load"
@@ -1016,10 +1040,10 @@ if _IMPORT_OK:
                        "Save Image keep the transparency. " + _COMMON_LIMITS)
 
         def load(self, transformer, model_config=None, attention_backend="auto", quality_enhance=None, quality=None,
-                 pinned_memory=False):
+                 pinned_memory=False, api_key=""):
             # [runtime dials] backend + quality_enhance are SESSION knobs (NOT create keys — a widget change never re-keys the engine =
             # no rebuild), exactly like the Krea2 node.
-            _p = _run_family_load(self.QF_FAMILY, transformer, model_config, pinned_memory)
+            _p = _run_family_load(self.QF_FAMILY, transformer, model_config, pinned_memory, api_key)
             _mm = getattr(_p, "model", None)
             if _mm is not None and hasattr(_mm, "set_attn_backend"):
                 _mm.set_attn_backend(_attn_backend_to_engine(attention_backend))
@@ -1056,7 +1080,7 @@ if _IMPORT_OK:
                     "tooltip": "Opt in to split/trimmed sigma schedules for intentional H3 double-sampling workflows.",
                 }),
                 "pinned_memory": _PINNED_MEMORY_INPUT,
-            }, "hidden": dict(_QUALITY_LEGACY_HIDDEN)}
+            }, "hidden": {**_QUALITY_LEGACY_HIDDEN, **_API_KEY_HIDDEN}}
 
         RETURN_TYPES = ("MODEL",)
         FUNCTION = "load"
@@ -1067,8 +1091,8 @@ if _IMPORT_OK:
         def load(self, transformer, model_config=None,
                  attention_backend="flash", sol_tau=1.0, quality_enhance=None, audio_enhance=False,
                  step_cache=0.0, block_cache=0.0, allow_partial_denoise=False, quality=None,
-                 pinned_memory=False):  # H3: flash default (auto->sage is broken)
-            _p = _run_family_load(self.QF_FAMILY, transformer, model_config, pinned_memory)
+                 pinned_memory=False, api_key=""):  # H3: flash default (auto->sage is broken)
+            _p = _run_family_load(self.QF_FAMILY, transformer, model_config, pinned_memory, api_key)
             _mm = getattr(_p, "model", None)
             if _mm is not None and hasattr(_mm, "set_attn_backend"):
                 _mm.set_attn_backend(_attn_backend_to_engine(attention_backend))
@@ -1202,6 +1226,20 @@ if _IMPORT_OK:
     # a display mapping for an unregistered class is dead weight; the three per-family loaders
     # register their display names beside their class mappings above.)
     NODE_DISPLAY_NAME_MAPPINGS.update({"QuantFuncNativeLoRA": "QuantFunc Native LoRA"})
+
+    def _serve_api_key_route():
+        """On a SERVING ComfyUI (its PromptServer exists while custom nodes load), add the route the loaders' API key
+        field hands its key to (qf_api_key). Without the route the field fails the queue loudly: it never falls back to
+        queuing the key itself."""
+        srv = getattr(getattr(sys.modules.get("server"), "PromptServer", None), "instance", None)
+        if srv is not None:
+            qf_api_key.register_route(srv.routes)
+
+    try:
+        _serve_api_key_route()
+    except Exception as _qf_route_exc:  # noqa: BLE001 - never break plugin import
+        _log.warning("[qf_native] API key route not added (a loader's API key field then refuses to queue): %s",
+                     ascii(_qf_route_exc))
 
     # Engine library install / update (option C): on a daemon thread, so node registration never waits. A loader
     # run before it finishes says plainly "still downloading" or why it failed (qf_engine.engine_install_status).

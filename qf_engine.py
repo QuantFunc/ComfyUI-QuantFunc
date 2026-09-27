@@ -2205,6 +2205,24 @@ class QFEngineHandle:
         # The LoRA set this pipeline currently runs, as QFLazyEngine._lora_sig() spells it. A pipeline is created with
         # NO LoRA (the cache key is the weights only), so it starts at the base; pipeline_update swaps it in place.
         self.applied_lora_sig = "[]"
+        # The loader-field API key this pipeline is signed in with; None = the key of QUANTFUNC_API_KEY / config.json.
+        # The key is not in the cache key either: set_api_key swaps it in place (QFLazyEngine._apply_runtime_api_key).
+        self.applied_api_key = None
+
+    def set_api_key(self, api_key):
+        """ONE quantfunc_set_api_key on this live pipeline: it signs in with `api_key` in place (no rebuild, no reload);
+        the engine checks the new key at the next run's start. A refusal raises with the engine's own message, which
+        never holds the key."""
+        if self.pipeline is None:
+            raise RuntimeError("QuantFunc set_api_key: no live pipeline")
+        fn = getattr(self.lib, "quantfunc_set_api_key", None)
+        if fn is None:
+            raise RuntimeError("QuantFunc library lacks quantfunc_set_api_key; update the native library")
+        fn.restype = ctypes.c_int
+        fn.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+        st = fn(self.pipeline, api_key.encode("utf-8"))
+        if st != QUANTFUNC_OK:
+            raise RuntimeError(f"QuantFunc could not switch the API key (status {st}): {last_err(self.lib)}")
 
     def pipeline_update(self, update):
         """ONE quantfunc_pipeline_update on this live pipeline (a runtime mutation between generations: no rebuild,

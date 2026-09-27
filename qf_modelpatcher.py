@@ -93,6 +93,9 @@ _QF_ENGINE_CACHE_ACQUISITION = ContextVar("quantfunc_engine_cache_acquisition", 
 # The create inputs of the loader running now (set by the package's loader core). family_build stamps them on every model
 # its build makes, LoRA rebuilds included, so the pipeline those models bind records which loader inputs make it.
 LOADER_SIG = ContextVar("quantfunc_loader_sig", default=None)
+# The API key of that loader's own field (qf_api_key.field_key; None = QUANTFUNC_API_KEY / config.json), published the
+# same way: family_build hands it to every lazy engine its build makes, LoRA rebuilds included.
+LOADER_API_KEY = ContextVar("quantfunc_loader_api_key", default=None)
 
 
 def _current_engine_cache_acquisition():
@@ -782,7 +785,7 @@ class QFLazyEngine:
     __getattr__ magic: a typo must fail loud, not silently forward.
     """
 
-    def __init__(self, factory):
+    def __init__(self, factory, api_key=None, read_auth=None):
         self._factory = factory          # () -> (QFEngineHandle, ckey)
         self._real = None
         self._prepared_entry = None
@@ -790,6 +793,10 @@ class QFLazyEngine:
         # This consumer's declarative LoRA set, set by tag_lora_rebuild: each chained LoRA node builds a fresh lazy
         # engine with its whole cumulative stack, so a raw loader output holds [] and deleting a LoRA node needs no cleanup.
         self._lora = []
+        # This consumer's API key: its loader field's key, or None for the key of QUANTFUNC_API_KEY / config.json, which
+        # read_auth() (the package's _read_auth) reads only when a pipeline signed in with a field key must switch back.
+        self._api_key = api_key
+        self._read_auth = read_auth
         # Persistent VRAM capacity comes only from the configured Prepared
         # resource. CPU-backup bytes are a separate, currently unknown ledger.
         self.capacity_bytes = None
@@ -865,10 +872,33 @@ class QFLazyEngine:
                 entry.materialize(preferred=self)
             else:
                 self._adopt_real(entry, ckey)
-        # The ONE materialization chokepoint also puts this consumer's LoRA set on the shared pipeline, so no family
-        # needs a per-begin hook it could forget.
+        # The ONE materialization chokepoint also puts this consumer's API key and LoRA set on the shared pipeline, so
+        # no family needs a per-begin hook it could forget. The key first: a LoRA update may fetch with it.
+        self._apply_runtime_api_key()
         self._apply_runtime_lora()
         return self._real
+
+    def _apply_runtime_api_key(self):
+        """Sign the shared pipeline in with THIS consumer's API key before its run: one quantfunc_set_api_key, only
+        when it differs from the key the pipeline runs on (a setting that is not the weights never rebuilds); the engine
+        checks the key when the run begins. An emptied field goes back to the key of QUANTFUNC_API_KEY / config.json.
+        With no key there the run is refused: an empty key would turn the engine's key checks off. Returns True when a
+        switch ran."""
+        real, want = self._real, self._api_key
+        if getattr(real, "applied_api_key", None) == want:
+            return False
+        key = want if want is not None else self._read_auth()[0]
+        if not key:
+            raise RuntimeError(
+                "qf_native: this model is signed in with the key from a loader's API key field. This loader's field is "
+                "empty and there is no key in config.json or QUANTFUNC_API_KEY to switch to: enter a key in this "
+                "loader's API key field, or restore the key in config.json.")
+        real.set_api_key(key)      # a refusal leaves the pipeline on its key, so the next run retries
+        real.applied_api_key = want
+        qfe.info("[qf_native] API key switched in place (no reload): now "
+                 + ("this loader's field key" if want is not None else "the key of QUANTFUNC_API_KEY / config.json"),
+                 flush=True)
+        return True
 
     def _apply_runtime_lora(self):
         """Put THIS consumer's LoRA set on the shared pipeline before its run: ONE declarative
@@ -1118,18 +1148,22 @@ def family_build(deps, model_dir, create_extra, supported_model, unet_config, ma
     engine factory holds the model only weakly (make_engine_factory: a strong capture was a model -> engine -> factory ->
     model cycle, comfy's "Potential memory leak" warning). make_model(model_config, engine, device) returns the family's
     model (a model class fits). pinned_memory (the loaders' switch, default OFF) adds the engine's use_pinned_memory create
-    key, so its two states are two pipelines: changing it reloads the model; OFF leaves the create config as it was."""
-    get_engine, bind_pipeline_model = deps["get_engine"], deps["bind_pipeline_model"]
+    key, so its two states are two pipelines: changing it reloads the model; OFF leaves the create config as it was. The
+    loader field's API key (LOADER_API_KEY) goes to the create and to each lazy engine, never into the create config: every
+    key shares the one pipeline, and the lazy engine switches its key in place."""
+    get_engine, bind_pipeline_model, read_auth = deps["get_engine"], deps["bind_pipeline_model"], deps["read_auth"]
     loader_sig = LOADER_SIG.get()
+    api_key = LOADER_API_KEY.get()
 
     def build(lora_entries):
         create_cfg = dict(create_extra or {}, **({"use_pinned_memory": True} if pinned_memory else {})) or None
         device, device_idx = current_torch_device()
         factory, register_model = make_engine_factory(
-            lambda: get_engine(model_dir, create_cfg=create_cfg, device_idx=device_idx), bind_pipeline_model)
+            lambda: get_engine(model_dir, create_cfg=create_cfg, device_idx=device_idx, api_key=api_key),
+            bind_pipeline_model)
         model_config = supported_model(dict(unet_config))
         ensure_model_config_attrs(model_config)
-        model = make_model(model_config, QFLazyEngine(factory), device)
+        model = make_model(model_config, QFLazyEngine(factory, api_key=api_key, read_auth=read_auth), device)
         model._qf_loader_sig = loader_sig
         register_model(model)
         patcher = QFModelPatcher(model, load_device=device, offload_device=comfy.model_management.unet_offload_device())
@@ -1356,9 +1390,12 @@ def canonical_resource_adapters(engine):
 
 class QFPreparedEntry:
     """Configured cold identity plus a host-bound materialization chokepoint."""
-    def __init__(self, lib, device, *, create_params=None):
+    def __init__(self, lib, device, *, create_params=None, api_key=None):
         self.lib = lib
         self.create_params = create_params
+        # The loader-field API key create_params carry (None: the key of QUANTFUNC_API_KEY / config.json). The engine
+        # creates with exactly the configured inputs, so the pipeline starts on this key (QFEngineHandle.applied_api_key).
+        self.api_key = api_key
         self.capacity_bytes = None
         self.component_count = None
         self.cache_key = None

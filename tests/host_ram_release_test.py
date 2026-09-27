@@ -257,7 +257,7 @@ class HostRamRelease(unittest.TestCase):
         import comfy.supported_models as supported
         qfmp = plugin.qfmp
         krea2 = sys.modules[plugin.__name__ + ".qf_krea2_modelpatcher"]
-        deps = {"get_engine": lambda *a, **k: None, "bind_pipeline_model": lambda *a: None}
+        deps = {"get_engine": lambda *a, **k: None, "bind_pipeline_model": lambda *a: None, "read_auth": None}
         built = []
 
         def builder(transformer1_path, bundle_dir, pinned_memory):

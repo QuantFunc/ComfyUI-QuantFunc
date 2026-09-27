@@ -240,7 +240,7 @@ def main():
             self.pipeline = None
             self.current_session = None
 
-    def fake_get_engine(model_dir, create_cfg=None, device_idx=0):
+    def fake_get_engine(model_dir, create_cfg=None, device_idx=0, api_key=None):
         # Mirrors the real Prepared -> first-touch materialization contract.
         ck = (model_dir, int(device_idx), json.dumps(create_cfg or {}, sort_keys=True))
         eng = fake_cache.get(ck)
