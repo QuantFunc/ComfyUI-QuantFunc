@@ -4,17 +4,16 @@
 WHY THIS EXISTS: Python decodes a text file with the OS preferred encoding unless the caller names one. On Windows that
 is the ANSI code page (cp936 on Chinese Windows). The Windows E2E on 远程-windows-4090 failed every native loader:
 `json.load(open(mf))` read a shipped qf_native.json (UTF-8, with an em dash) as GBK and raised "'gbk' codec can't
-decode byte 0x94". The keyfile (_read_auth) and the LTX connectors config (_connector_config_heads) read files the same
-way, and SWALLOWED the error: no API key, or no head count, with nothing said.
+decode byte 0x94". The keyfile (_read_auth) read files the same way, and SWALLOWED the error: no API key, with
+nothing said.
 
 ARMS. Each runs in a child Python whose preferred encoding is FORCED, and the child runs the REAL plugin code:
   static      every text-mode open / read_text / write_text / text subprocess in the repo names its encoding
   manifest    every shipped configs/*/qf_native.json loads through _load_model_config
   family      every shipped family resolves its one preset through _family_preset
   keyfile     every shipped bin/*/config.default.json yields an API key through _read_auth (the key is never printed)
-  connectors  every shipped configs/*/connectors/config.json yields its head count through _connector_config_heads
-  malformed   a manifest / keyfile / connectors config that is invalid JSON, not UTF-8, not a JSON object, or (connectors)
-              declares an unusable head count raises a RuntimeError that names the file. A family whose only manifest
+  malformed   a manifest / keyfile that is invalid JSON, not UTF-8 or not a JSON object raises a RuntimeError that
+              names the file. A family whose only manifest
               is broken names that manifest instead of reporting "no model config shipped", and so does a saved
               workflow that names it (the real _run_family_load). Never a silent default.
 MODES (the forced preferred encoding):
@@ -775,8 +774,7 @@ def _import_plugin(root):
 def _extract(path, name, ns, consts=()):
     """The function `name` from the REAL source file, defined in `ns` (with the module constants named in `consts`), or
     None when the source lacks it. For code that cannot be imported light: qf_ltx_modelpatcher imports torch + comfy
-    (connector_arch_derivation_test.py drives _derive_connector_arch the same way), and __init__ defines
-    _run_family_load only once comfy imported."""
+    and __init__ defines _run_family_load only once comfy imported."""
     with open(path, encoding="utf-8") as f:
         src = f.read()
     fn = None
@@ -811,11 +809,6 @@ def _child(job):
     for rel in job["keyfiles"]:
         os.environ[mod.qfe._ENV_KEYFILE_OVERRIDE] = os.path.join(job["root"], rel)
         out[f"keyfile {rel}"] = _outcome(lambda: bool(mod._read_auth()[0]))   # the key itself never leaves the child
-    heads = _extract(os.path.join(job["root"], "qf_ltx_modelpatcher.py"), "_connector_config_heads",
-                     {"os": os, "json": json}, consts=("_MAX_CONNECTOR_HEADS",))
-    for label, model_dir in job["connectors"]:
-        out[f"connectors {label}"] = (_outcome(heads, model_dir) if heads
-                                      else ["error", "Missing", "no _connector_config_heads in qf_ltx_modelpatcher.py"])
     mod._CONFIGS_DIR = job["mal_configs"]
     for d in job["mal_presets"]:
         out[f"malformed-manifest {d}"] = _outcome(lambda n: mod._load_model_config(n)[1]["family"], d)
@@ -831,7 +824,7 @@ def _child(job):
 
 # ---------------------------------------------------------------------------------------------------- the parent --
 def _shipped(root):
-    presets, families, keyfiles, connector_dirs = [], {}, [], []
+    presets, families, keyfiles = [], {}, []
     cfg = os.path.join(root, "configs")
     for d in sorted(os.listdir(cfg)):
         mp = os.path.join(cfg, d, "qf_native.json")
@@ -839,17 +832,13 @@ def _shipped(root):
             presets.append(d)
             with open(mp, encoding="utf-8") as f:
                 families[d] = json.load(f)["family"]
-        cc = os.path.join(cfg, d, "connectors", "config.json")
-        if os.path.isfile(cc):
-            with open(cc, encoding="utf-8") as f:
-                connector_dirs.append((f"configs/{d}", json.load(f).get("video_connector_num_attention_heads")))
     for plat in sorted(os.listdir(os.path.join(root, "bin"))):
         kf = os.path.join(root, "bin", plat, "config.default.json")
         if os.path.isfile(kf):
             with open(kf, encoding="utf-8") as f:
                 if json.load(f).get("api_key"):
                     keyfiles.append(f"bin/{plat}/config.default.json")
-    return presets, families, keyfiles, connector_dirs
+    return presets, families, keyfiles
 
 
 _BROKEN = {  # name -> bytes: each is malformed in its own way
@@ -857,9 +846,6 @@ _BROKEN = {  # name -> bytes: each is malformed in its own way
     "notutf8": '{"family": "ltx2", "_note": "编码"}'.encode("gbk"),
     "notobject": b'["ltx2"]',
 }
-_BROKEN_HEADS = {"strheads": b'{"video_connector_num_attention_heads": "32"}',
-                 "zeroheads": b'{"video_connector_num_attention_heads": 0}',
-                 "boolheads": b'{"video_connector_num_attention_heads": true}'}
 
 
 def _write(path, data):
@@ -870,8 +856,8 @@ def _write(path, data):
 
 def _malformed(tmp):
     """The broken fixtures + what each must do. Returns (job fields, expectations)."""
-    mal_configs, keys, conn = (os.path.join(tmp, n) for n in ("configs", "keys", "conn"))
-    job = {"mal_configs": mal_configs, "mal_presets": [], "mal_keyfiles": [], "connectors": []}
+    mal_configs, keys = (os.path.join(tmp, n) for n in ("configs", "keys"))
+    job = {"mal_configs": mal_configs, "mal_presets": [], "mal_keyfiles": []}
     expect = {}
     for name, data in _BROKEN.items():
         _write(os.path.join(mal_configs, name, "qf_native.json"), data)
@@ -880,17 +866,6 @@ def _malformed(tmp):
         _write(os.path.join(keys, f"{name}.json"), data)
         job["mal_keyfiles"].append(os.path.join(keys, f"{name}.json"))
         expect[f"malformed-keyfile {name}.json"] = ("raises", (f"{name}.json", "QUANTFUNC_API_KEY", "reinstall"))
-        _write(os.path.join(conn, name, "connectors", "config.json"), data)
-    for name, data in _BROKEN_HEADS.items():
-        _write(os.path.join(conn, name, "connectors", "config.json"), data)
-    for name in list(_BROKEN) + list(_BROKEN_HEADS):
-        job["connectors"].append([f"conn/{name}", os.path.join(conn, name)])
-        expect[f"connectors conn/{name}"] = ("raises", (os.path.join(name, "connectors", "config.json"), "download"))
-    _write(os.path.join(conn, "keyless", "connectors", "config.json"), b"{}")   # gated checkpoints declare no heads
-    os.makedirs(os.path.join(conn, "absent"))                                    # no connectors/ at all
-    for name in ("keyless", "absent"):
-        job["connectors"].append([f"conn/{name}", os.path.join(conn, name)])
-        expect[f"connectors conn/{name}"] = ("ok", None)
     # a family whose manifest is broken: the refusal names EVERY broken manifest (it cannot tell whose each one was)
     # and the family it was resolving - never "no model config shipped"
     expect["malformed-family ltx2"] = ("raises", ("ltx2", "'badjson'", "'notutf8'", "'notobject'", "reinstall"))
@@ -955,7 +930,7 @@ def _show(got):
 
 
 def main():
-    presets, families, keyfiles, connector_dirs = _shipped(_ROOT)
+    presets, families, keyfiles = _shipped(_ROOT)
     fails, rows, skipped = [], [], []
     sites = _static_sites(_ROOT)
     rows.append(("static", "-", "0 encoding-less text-I/O sites", f"{len(sites)} site(s)", not sites))
@@ -978,9 +953,6 @@ def main():
         expect = {f"manifest {d}": ("ok", families[d]) for d in presets}
         expect.update({f"family {f}": ("ok", next(d for d in presets if families[d] == f)) for f in job["families"]})
         expect.update({f"keyfile {k}": ("ok", True) for k in keyfiles})
-        for rel, heads in connector_dirs:
-            job["connectors"].append([rel, os.path.join(_ROOT, rel)])
-            expect[f"connectors {rel}"] = ("ok", heads)
         expect.update(mal_expect)
         modes, skipped = _modes(tmp)
         for label, flags, overrides, need in modes:

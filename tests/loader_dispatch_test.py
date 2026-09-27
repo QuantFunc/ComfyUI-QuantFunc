@@ -586,31 +586,13 @@ def main():
     _device_calls = [0]
     _original_get_torch_device = qfn.qfmp.comfy.model_management.get_torch_device
     _original_unet_offload_device = qfn.qfmp.comfy.model_management.unet_offload_device
-    _ltx_mod = sys.modules["qfn_test_pkg.qf_ltx_modelpatcher"]
-    _original_connector_loader = _ltx_mod._load_ltx_video_connector
-    _checkpoints = os.path.join(tmp, "checkpoints")
-    os.makedirs(_checkpoints)
-    _video_connector = "fx-ltx-video-connector.safetensors"
-    with open(os.path.join(_checkpoints, _video_connector), "wb") as _fh:
-        _fh.write(b"\0" * 16)
-    folder_paths.add_model_folder_path("checkpoints", _checkpoints)
-    _video_pkg = os.path.join(tmp, "ltx-video-package")
-    os.makedirs(_video_pkg)
 
     def _device2_once():
         _device_calls[0] += 1
         return _device2
 
-    def _ltx_video_build():
-        _builder = qfn._FAMILY_BUILDERS["ltx2"]
-        _closure = dict(zip(_builder.__code__.co_freevars,
-                            (cell.cell_contents for cell in _builder.__closure__)))
-        return _closure["_build_from_package"](
-            _video_pkg, "ltx-video-device-2", connector_ckpt=_video_connector)
-
     qfn.qfmp.comfy.model_management.get_torch_device = _device2_once
     qfn.qfmp.comfy.model_management.unet_offload_device = lambda: qfn.qfmp.torch.device("cpu")
-    _ltx_mod._load_ltx_video_connector = lambda *_args, **_kwargs: qfn.qfmp.torch.nn.Identity()
     try:
         _device_cases = (
             ("h3", lambda: H3L.load(
@@ -618,7 +600,6 @@ def main():
             ("krea2", lambda: KreaL.load(
                 "fx-krea2-turbo-quantfunc-int4.safetensors", "krea2-turbo-int4")[0]),
             ("ltx-av", lambda: LtxL.load(_allin_name, "ltx2-2.5-22b")[0]),
-            ("ltx-video", _ltx_video_build),
         )
         for _label, _build_device_case in _device_cases:
             _calls_before = _device_calls[0]
@@ -635,7 +616,6 @@ def main():
     finally:
         qfn.qfmp.comfy.model_management.get_torch_device = _original_get_torch_device
         qfn.qfmp.comfy.model_management.unet_offload_device = _original_unet_offload_device
-        _ltx_mod._load_ltx_video_connector = _original_connector_loader
 
     # ── positive path: the all-in file alone loads (AV via the packed audio connector) ──
     out_ltx = LtxL.load(_allin_name, "ltx2-2.5-22b")[0]
@@ -905,7 +885,7 @@ def main():
                 check(f"shared guard passes a noised latent for {_tag}", False, f"-> {_e!r}")
         # structural: each family module calls the guard BEFORE it opens the session (self._begin).
         import os as _os
-        for _mod, _tags in (("qf_ltx_modelpatcher.py", 2), ("qf_h3_modelpatcher.py", 1)):
+        for _mod, _tags in (("qf_ltx_modelpatcher.py", 1), ("qf_h3_modelpatcher.py", 1)):
             _src = open(_os.path.join(_PLUGIN, _mod), encoding="utf-8").read()
             _n_guard = _src.count("refuse_all_zero_initial_latent(")
             # every guard call must be followed (in source) by a self._begin( before the next guard

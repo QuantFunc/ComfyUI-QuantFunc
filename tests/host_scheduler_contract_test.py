@@ -197,7 +197,6 @@ class HostSchedulerContract(unittest.TestCase):
         cases = (
             ("qf_h3_modelpatcher", "QFH3Model", "MiniMaxH3", "minimax_h3", {}),
             ("qf_krea2_modelpatcher", "QFKrea2Model", "Krea2", "krea2", {}),
-            ("qf_ltx_modelpatcher", "QFLTXModel", "LTXV", "ltxv", {"connector": None}),
             ("qf_ltx_modelpatcher", "QFLTXAVModel", "LTXAV", "ltxav", {}),
         )
         for module_name, class_name, config_name, image_model, kwargs in cases:

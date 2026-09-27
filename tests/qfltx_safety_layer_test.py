@@ -7,7 +7,7 @@ the ported methods — extra_conds / _derive_geometry (+ the scale_latent_inpain
 guard. "4/4 pass" read as if the safety layer was exercised when it was not. This file closes that: it drives
 the REAL on-disk method bodies and asserts raise / no-raise on both directions.
 
-HOW (mirrors connector_arch_derivation_test.py's rigor): the plugin uses relative imports + comfy, so a plain
+HOW: the plugin uses relative imports + comfy, so a plain
 import fails on this box (comfy's torchvision/torchaudio ABI). So we AST-EXTRACT each real method body from
 qf_ltx_modelpatcher.py and exec it with a mock `self` + a tiny comfy stub (real torch — it imports fine here).
 No comfy, no engine, no GPU. QF_LTXSAFETY_TEST_SRC lets a reviewer point this at a MUTATED copy to prove the
@@ -27,14 +27,6 @@ import torch  # available on this box (torchvision/torchaudio are ABI-broken, bu
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _SRC = os.environ.get("QF_LTXSAFETY_TEST_SRC") or os.path.join(_HERE, "..", "qf_ltx_modelpatcher.py")
 
-
-
-def _comfy_cpu_args():
-    """comfy parses its CLI args once, at its first import; with CUDA hidden (the CPU suite) the import then raises
-    "No CUDA GPUs are available" unless --cpu is set. Force that parse, as the other contract tests do."""
-    import comfy.options
-    sys.argv = [sys.argv[0], "--cpu"]
-    comfy.options.enable_args_parsing()
 
 
 def _src_text():
@@ -236,81 +228,6 @@ def _t_max_ctx_seq(src):
     return bad
 
 
-def _t_post_connector_seq(src):
-    """§6.5 correctness NO-GO closure — REAL-CONNECTOR arms (not mock arithmetic): comfy's
-    Embeddings1DConnector does NOT preserve the seq dim (its forward tail-pads with tiled
-    learnable_registers to n_reg*ceil(max(1024, S)/n_reg)), so the accumulator must carry the
-    POST-connector length. Proves: (1) _post_connector_seq == the REAL module's actual output seq across
-    the boundary (≤1024 / non-multiple >1024 / exact multiple), for TWO register configs — n_reg=64 kills a
-    hardcoded-128 transcription; (2) the reviewer's concrete failure: a raw-1200 group accumulates 1280
-    (its true post length), so a later short group's _begin ceiling covers it — on the PRE-FIX raw
-    accumulation this arm reads 1200 and FAILS (able-to-fail direction); (3) registers-off connector →
-    identity; (4) the per-length cache holds the measured value. ENV-GATED per the suite convention: needs
-    the real comfy package (QF_NATIVE_COMFY_PATH or the box default); unimportable → a DISCLOSED [SKIP]
-    (run_plugin_tests counts it; --strict fails it — run in the full comfy env to execute)."""
-    comfy_path = os.environ.get("QF_NATIVE_COMFY_PATH", "/media/jonathan/Data/ComfyUI")
-    try:
-        if comfy_path not in sys.path:
-            sys.path.insert(0, comfy_path)
-        _comfy_cpu_args()
-        from comfy.ldm.lightricks.embeddings_connector import Embeddings1DConnector
-    except Exception as e:   # noqa: BLE001 — env-gated arm, suite [SKIP] convention
-        print(f"  [SKIP] post_connector_seq real-connector arms (comfy unimportable from {comfy_path}: "
-              f"{type(e).__name__}: {e}; set QF_NATIVE_COMFY_PATH to a ComfyUI checkout)")
-        return 0
-    def build(n_reg, inner=32, heads=2, layers=1):
-        return Embeddings1DConnector(
-            in_channels=inner, cross_attention_dim=64, attention_head_dim=inner // heads,
-            num_attention_heads=heads, num_layers=layers, num_learnable_registers=n_reg,
-            split_rope=True, double_precision_rope=True, apply_gated_attention=True,
-            dtype=torch.float32, device="cpu", operations=torch.nn).eval()
-    pfn, _ = _bind(src, "_post_connector_seq", {"torch": torch})
-    bad = 0
-    # (1) probe == the REAL module's output seq, two register configs, boundary grid.
-    for n_reg in (128, 64):
-        conn = build(n_reg)
-        me = _mock_self(_connector=conn, _post_seq_cache={})
-        for S in (100, 1024, 1200, 2000):
-            with torch.no_grad():
-                real = int(conn(torch.zeros(1, S, 32))[0].shape[1])
-            got = pfn(me, S)
-            if got != real:
-                print(f"  [FAIL] n_reg={n_reg} S={S}: _post_connector_seq={got} but the REAL connector "
-                      f"outputs {real}"); bad += 1
-    # hard numbers (kill a transcription drift): reviewer's case + the n_reg-rounding discriminator.
-    me128 = _mock_self(_connector=build(128), _post_seq_cache={})
-    if pfn(me128, 1200) != 1280:
-        print(f"  [FAIL] n_reg=128 raw 1200 → {pfn(me128, 1200)}, expected 1280 (reviewer's case)"); bad += 1
-    me64 = _mock_self(_connector=build(64), _post_seq_cache={})
-    if pfn(me64, 1200) != 1216:
-        print(f"  [FAIL] n_reg=64 raw 1200 → {pfn(me64, 1200)}, expected 1216 (rounds by n_reg, not 128)"); bad += 1
-    # (2) INTEGRATION — the reviewer's failure scenario through the REAL extra_conds + REAL probe:
-    # long neg raw=1200 accumulates its POST length 1280; a later short pos must not shrink it. PRE-FIX
-    # (raw accumulation) reads 1200 here → FAIL (the able-to-fail direction of this death rule).
-    comfy_stub = _make_comfy()
-    efn, _ = _bind(src, "extra_conds", {"comfy": comfy_stub, "qfe": _QFE_STUB})
-    keys = _extract_class_attr(src, "QFLTXModel", "_ENGINE_IGNORED_COND_KEYS")
-    me2 = _mock_self(_qf=_MockEngine(), _ENGINE_IGNORED_COND_KEYS=keys, _max_ctx_seq=0,
-                     _connector=build(128), _post_seq_cache={})
-    me2._post_connector_seq = lambda s: pfn(me2, s)
-    efn(me2, cross_attn=torch.zeros(1, 1200, 8)); efn(me2, cross_attn=torch.zeros(1, 20, 8))
-    if me2._max_ctx_seq != 1280:
-        print(f"  [FAIL] neg(raw 1200)+pos(raw 20) → _max_ctx_seq={me2._max_ctx_seq}, expected 1280 "
-              "(the POST-connector length; raw accumulation under-sizes the _begin ceiling)"); bad += 1
-    # (3) registers-off connector (num_learnable_registers=0) → comfy keeps S unchanged → identity probe.
-    me0 = _mock_self(_connector=build(0), _post_seq_cache={})
-    with torch.no_grad():
-        real0 = int(build(0)(torch.zeros(1, 37, 32))[0].shape[1])
-    if pfn(me0, 37) != real0 or pfn(me0, 37) != 37:
-        print(f"  [FAIL] registers-off raw 37 → {pfn(me0, 37)} (real {real0}), expected identity 37"); bad += 1
-    # (4) cache: the measured value is stored + a repeat returns it.
-    if me128._post_seq_cache.get(1200) != 1280 or pfn(me128, 1200) != 1280:
-        print(f"  [FAIL] cache miss/mismatch: {me128._post_seq_cache}"); bad += 1
-    print(f"  post_connector_seq: {'OK' if bad == 0 else 'FAIL'} (probe==real module across n_reg 128/64 + "
-          "boundary grid; raw-1200 accumulates 1280; registers-off identity; cached)")
-    return bad
-
-
 def _t_shared_interrupt_helper(src):
     """§6.5 simplicity: ONE shared interrupt guard for EVERY family. STRUCTURAL: the raw
     comfy.model_management.throw_exception_if_processing_interrupted() call appears on exactly ONE
@@ -450,51 +367,12 @@ def _t_derive_geometry(src):
     return bad
 
 
-def _t_interrupt(src):
-    """The Interrupt poll must be INSIDE a guard that ends the session + re-raises (CR #2). Since the §6.5
-    simplicity fix the guard mechanics live in the SHARED module-level helper in qf_modelpatcher.py
-    (_interrupt_poll_end_session_on_raise) — so this arm execs the REAL helper source and injects it into
-    _apply_model's namespace: it now exercises the real call site AND the real shared guard together."""
-    comfy = _make_comfy(interrupt_raises=True)
-    helper = _bind_shared_helper(comfy)
-    fn, _ = _bind(src, "_apply_model", {"comfy": comfy, "torch": torch,
-                                        "_interrupt_poll_end_session_on_raise": helper})
-    eng = _MockEngine(open_session=object())   # a session is OPEN when the interrupt fires
-    me = _mock_self(
-        _qf=eng, _num_frames=9, _width=64, _height=64, _num_steps=4,
-        _derive_geometry=lambda *a, **k: None,                     # geometry not under test here
-        _run_connector=lambda ca, *a, **k: torch.zeros(1, 3, 4096),   # skip the real connector
-        _sigma_step_index=lambda *a, **k: 0,                       # consulted before the poll
-        _ctx_key_assigner=types.SimpleNamespace(key_for=lambda *a, **k: 0, reset=lambda: None),
-        #                    ^ the real call passes attention_mask — accept-anything keeps this
-        #                      mock from drifting again when the seam grows another kwarg.
-        _out=None, _step_i=0,
-    )
-    x = torch.zeros(1, 128, 2, 2, 2)
-    bad = 0
-    try:
-        fn(me, x, 0.5, c_crossattn=torch.zeros(1, 3, 6144), transformer_options={})
-        print("  [FAIL] _apply_model did NOT propagate the interrupt"); bad += 1
-    except _InterruptExc:
-        # the guard must have ENDED the session and re-raised (this only works if it caught BaseException —
-        # a guard written `except Exception` would let _InterruptExc pass THROUGH uncaught, end_calls==0).
-        if eng.end_calls < 1:
-            print("  [FAIL] interrupt did not call end_session_if_open (guard likely `except Exception`, "
-                  "which misses comfy's BaseException-derived InterruptProcessingException)"); bad += 1
-        if eng.current_session is not None:
-            print("  [FAIL] interrupt left current_session non-None (stranded)"); bad += 1
-    except BaseException as e:   # noqa: BLE001
-        print(f"  [FAIL] _apply_model raised the wrong type on interrupt: {type(e).__name__}: {e}"); bad += 1
-    print(f"  interrupt guard: {'OK' if bad == 0 else 'FAIL'} (interrupt re-raised + session cleared, not stranded)")
-    return bad
-
-
 def main():
     src = _src_text()
     print(f"=== QFLTXModel safety-layer behavioral test (src={os.path.relpath(_SRC, _HERE)}) ===")
     bad = 0
-    for t in (_t_extra_conds, _t_max_ctx_seq, _t_post_connector_seq, _t_scale_latent_inpaint,
-              _t_derive_geometry, _t_interrupt, _t_shared_interrupt_helper):
+    for t in (_t_extra_conds, _t_max_ctx_seq, _t_scale_latent_inpaint,
+              _t_derive_geometry, _t_shared_interrupt_helper):
         try:
             bad += t(src)
         except Exception as e:   # noqa: BLE001 — a harness error is a FAIL, not a crash-through
