@@ -579,7 +579,8 @@ def _engine_mismatch():
     """ENGINE_PLUGIN_MISMATCH, naming the way out when the plugin installed the engine (a marker exists): a restart runs
     the installer again, which fetches the engine this plugin needs. A library named by QF_NATIVE_SO_PATH or a local
     build gets no such hint: a restart would load the same file."""
-    return ENGINE_PLUGIN_MISMATCH + ("; restart ComfyUI: the plugin re-checks for the engine at start" if _markers() else "")
+    installed = _markers() and not _engine_local_choice()
+    return ENGINE_PLUGIN_MISMATCH + ("; restart ComfyUI: the plugin re-checks for the engine at start" if installed else "")
 
 
 def _require_residency_abi2(lib):

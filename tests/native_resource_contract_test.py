@@ -271,14 +271,17 @@ class EnginePluginPairing(unittest.TestCase):
 
     def test_an_installed_engine_names_the_restart_that_heals_it(self):
         old = self.abi("quantfunc_resource_enroll_host", "quantfunc_resource_set_domain_grants")
-        with patch.object(qfe, "_markers", lambda: [("marker", {})]):   # the installer put this engine there
+        with patch.object(qfe, "_markers", lambda: [("marker", {})]), \
+                patch.object(qfe, "_engine_local_choice", lambda: None):  # the installer put this engine there
             with self.assertRaisesRegex(RuntimeError, "update the QuantFunc engine library; restart ComfyUI: the plugin "
                                                       "re-checks for the engine at start"):
                 qfe._require_residency_abi2(old)
-        with patch.object(qfe, "_markers", lambda: []):                 # QF_NATIVE_SO_PATH / a local build
-            with self.assertRaises(RuntimeError) as refused:
-                qfe._require_residency_abi2(old)
-            self.assertNotIn("restart ComfyUI", str(refused.exception))
+        for markers, local in (([], None),                              # nothing installed
+                               ([("marker", {})], "QF_NATIVE_SO_PATH names the engine library")):   # a dev override
+            with patch.object(qfe, "_markers", lambda: markers), patch.object(qfe, "_engine_local_choice", lambda: local):
+                with self.assertRaises(RuntimeError) as refused:
+                    qfe._require_residency_abi2(old)
+                self.assertNotIn("restart ComfyUI", str(refused.exception))
 
     def test_grant_verb_alone_is_refused_even_beside_v2(self):
         both = self.abi("quantfunc_resource_enroll_host_v2", "quantfunc_resource_set_domain_grants")
