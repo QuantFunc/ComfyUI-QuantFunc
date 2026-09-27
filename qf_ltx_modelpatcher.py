@@ -751,12 +751,6 @@ def register(deps):
         # supplied on top (auto_optimize / height / width / a precision map) competes with it and the
         # engine resolves to the 19b default (connector 3840 / transformer 6-mod — the E2E run-1..8
         # create mis-size). The harness's whole svdq entry is {backend:svdq, model_dir}; mirror that.
-        # RESIDUAL (tracked, §6.5 wan text_precision round): an EMPTY config also means the engine's
-        # resolve-at-entry text-precision falls to its SM-DEFAULT tier (est::smDefaultTextPrecision:
-        # fp4 on SM120+, int4 below). That default is what BROKE the wan loader (UMT5 rejects 4-bit);
-        # it currently WORKS here because LTX's TE tiers accept the default — but if an LTX TE arch
-        # without a wired 4-bit tier ever routes through this minimal create, it hits the same class.
-        # No fix now (adding keys back defeats minimal=True's purpose); this note is the tripwire.
         if _is_av:
             return qfmp.family_build(
                 deps, model_dir, create_extra, comfy.supported_models.LTXAV,
