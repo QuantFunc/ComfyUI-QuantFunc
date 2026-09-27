@@ -35,10 +35,13 @@ has no secret widget a custom node can use. So the key is never a widget value o
     B8 ComfyUI can serve the field's script (WEB_DIRECTORY), and a serving ComfyUI gets the route
   C  web/quantfunc_api_key.js under Node (skipped without node)
     C1 exactly the QuantFunc nodes that declare the hidden api_key input (the four loaders, and a loader added later)
-       get one api_key field: a password input, never saved into a workflow; another pack's node never does
-    C2 an empty field sends nothing and queues ""; a key is POSTed to /quantfunc/api_key and only the reference is queued
+       get one api_key field, never saved into a workflow; another pack's node never does
+    C2 an empty field sends nothing and queues ""; a key is POSTed to /quantfunc/api_key and only the reference is queued,
+       also when the prompt is queued while the field is still being edited
     C3 a refused POST fails the queue; the plain key is never queued
-    C4 the key is remembered in this browser (localStorage) and forgotten when the field is emptied
+    C4 the key is remembered in this browser (localStorage) and shown again in every new field; emptying the field forgets it
+    C5 (user 2026-09-27: 部分明文) a field not being edited shows the key shortened, qf_ + its first and last 4 characters,
+       never more (short text shows only the prefix); being edited, it holds the whole key masked
 
 MUTATION (each goes RED): accept any non-empty field key -> A1; read "" as a key -> A2/B3; return the plain key for a
 non-reference -> A3; read an unknown reference as empty -> A4; make the reference the key or a slice of it -> A5; echo
@@ -47,8 +50,9 @@ loaders -> B1; let QUANTFUNC_API_KEY beat the field key, or read config.json wit
 in family_build -> B3; put the key into create_cfg -> B4; drop the switch in ensure(), send set_api_key(""), or record a
 switch before the engine accepted it -> B5; read config.json in ensure() for a default consumer -> B6; print the key in
 the switch line -> B7; drop WEB_DIRECTORY -> B8; draw the field on every node or on another pack's node, save it
-(serialize true) or queue the plain key -> C1/C2; fall back to the plain key on a refused POST -> C3; drop the
-localStorage write -> C4.
+(serialize true) or queue the plain key, or queue a stale key while the field is edited -> C1/C2; fall back to the plain
+key on a refused POST -> C3; drop the localStorage write -> C4; show the whole key while not edited, or unmasked while
+edited -> C5.
 
 Run:  python tests/api_key_test.py      (B needs COMFY_ROOT; C needs node)
 """
@@ -78,6 +82,7 @@ HEX = "0123456789abcdef"
 KEY = "qf_" + HEX * 4                  # well formed; built at run time, never a real key
 KEY2 = "qf_" + HEX[::-1] * 4
 DEFAULT_KEY = "qf_" + "7" * 64         # stands in for the key of config.json
+SHORT = "qf_0123…cdef"                 # KEY shortened: qf_ + its first and last 4 characters
 DEFAULT_URL = "https://service.quantfunc.com"
 MALFORMED = ("qf_" + "a" * 63, "qf_" + "a" * 65, "QF_" + "a" * 64, "qf_" + "A" * 64, "qf-" + "a" * 64,
              "qf_" + "a" * 62 + "zz", "a" * 67, "qf_" + "a" * 32 + " " + "a" * 31)
@@ -541,9 +546,9 @@ _DRIVER = """const store = new Map();
 globalThis.localStorage = { getItem: k => (store.has(k) ? store.get(k) : null), setItem: (k, v) => store.set(k, String(v)),
                             removeItem: k => store.delete(k) };
 globalThis.document = { createElement(tag) {
-  return { tagName: tag.toUpperCase(), type: "text", value: "", listeners: {},
+  return { tagName: tag.toUpperCase(), type: "text", value: "", listeners: {}, selected: false,
            addEventListener(ev, fn) { (this.listeners[ev] ??= []).push(fn); }, setAttribute(k, v) { this[k] = v; },
-           fire(ev) { for (const fn of this.listeners[ev] ?? []) fn({ target: this }); } };
+           select() { this.selected = true; }, fire(ev) { for (const fn of this.listeners[ev] ?? []) fn({ target: this }); } };
 } };
 const { app } = await import("./scripts/app.js");
 const { api } = await import("./scripts/api.js");
@@ -572,21 +577,36 @@ for (const d of defs) for (const e of app.extensions) await e.beforeRegisterNode
 const out = { loaders: {}, others: {} };
 for (const c of [...LOADERS, "QuantFuncFutureLoader"]) {
   const n = await created(c);
-  out.loaders[c] = n.widgets.map(w => ({ name: w.name, input: w.element.type, serialize: w.serialize }));
+  out.loaders[c] = n.widgets.map(w => ({ name: w.name, serialize: w.serialize }));
 }
+// a user typing into the field: focus (the whole key, masked, all selected), type, and later leave it
+function type(w, text) { w.element.fire("focus"); w.element.value = text; w.element.fire("input"); }
+function leave(w) { w.element.fire("blur"); }
+const look = w => ({ type: w.element.type, shows: w.element.value, key: w.value });
 for (const c of ["KSampler", "QuantFuncNativeLoRA", "OtherPackApiNode"]) out.others[c] = (await created(c)).widgets.length;
 const w = (await created(LOADERS[0])).widgets[0];
-w.element.value = "  \\t";
+out.fresh = look(w);
+type(w, "  \\t"); leave(w);
 out.empty = { queued: await w.serializeValue(), calls: api.calls.length };
-w.element.value = "  %s\\n";
+type(w, "  %s\\n");
+out.editing = { ...look(w), selected: w.element.selected };
+leave(w);
+out.idle = look(w);
 out.key = { queued: await w.serializeValue(), calls: api.calls.slice() };
+w.element.fire("focus");
+out.refocused = look(w);
+type(w, "%s");                                   // queued while still being edited (e.g. Ctrl+Enter): the typed key goes
+out.queuedWhileEditing = { queued: await w.serializeValue(), sent: api.calls.at(-1).body.key };
+leave(w);
+out.short = {};
+for (const text of ["abc", "qf_1234", "qf_" + "9".repeat(8), "qf_" + "9".repeat(9)]) { type(w, text); leave(w); out.short[text] = w.element.value; }
+type(w, "%s"); leave(w);
 api.reply = { ok: false, status: 404, body: {} };
 try { out.refused = { queued: await w.serializeValue() }; } catch (e) { out.refused = { threw: true }; }
-w.element.fire("change");
-out.remembered = (await created(LOADERS[1])).widgets[0].element.value;
-w.element.value = "";
-w.element.fire("change");
-out.forgotten = (await created(LOADERS[2])).widgets[0].element.value;
+out.remembered = look((await created(LOADERS[1])).widgets[0]);
+type(w, ""); leave(w);
+out.forgotten = look((await created(LOADERS[2])).widgets[0]);
+out.stored = localStorage.getItem("QuantFunc.api_key");
 console.log(JSON.stringify(out));
 """
 
@@ -608,7 +628,7 @@ class FieldScript(unittest.TestCase):
             ext = Path(d) / "extensions" / "ComfyUI-QuantFunc"
             ext.mkdir(parents=True)
             shutil.copy(PLUGIN / "web" / "quantfunc_api_key.js", ext)
-            (Path(d) / "driver.mjs").write_text(_DRIVER % (json.dumps(list(LOADERS)), KEY), encoding="utf-8")
+            (Path(d) / "driver.mjs").write_text(_DRIVER % (json.dumps(list(LOADERS)), KEY, KEY2, KEY), encoding="utf-8")
             r = subprocess.run([node, "driver.mjs"], cwd=d, capture_output=True, encoding="utf-8", timeout=60)
             if r.returncode != 0:
                 raise AssertionError(f"node driver failed: {r.stderr[-2000:]}")
@@ -620,21 +640,33 @@ class FieldScript(unittest.TestCase):
         if self.out is None:
             skip(self, "node is not installed")
 
-    def test_exactly_the_declaring_quantfunc_nodes_get_one_masked_field_that_is_never_saved(self):
+    def test_exactly_the_declaring_quantfunc_nodes_get_one_field_that_is_never_saved(self):
         for c in (*LOADERS, "QuantFuncFutureLoader"):
-            self.assertEqual(self.out["loaders"][c], [{"name": "api_key", "input": "password", "serialize": False}], c)
+            self.assertEqual(self.out["loaders"][c], [{"name": "api_key", "serialize": False}], c)
         self.assertEqual(self.out["others"], {"KSampler": 0, "QuantFuncNativeLoRA": 0, "OtherPackApiNode": 0})
 
     def test_only_a_reference_is_queued(self):
         self.assertEqual(self.out["empty"], {"queued": "", "calls": 0})
         self.assertEqual(self.out["key"]["queued"], "qfk:" + "1" * 32)
         self.assertEqual(self.out["key"]["calls"], [{"route": "/quantfunc/api_key", "method": "POST", "body": {"key": KEY}}])
+        self.assertEqual(self.out["queuedWhileEditing"], {"queued": "qfk:" + "1" * 32, "sent": KEY2})
 
     def test_a_refused_post_fails_the_queue(self):
         self.assertEqual(self.out["refused"], {"threw": True})
 
     def test_the_key_is_remembered_in_this_browser_until_the_field_is_emptied(self):
-        self.assertEqual((self.out["remembered"], self.out["forgotten"]), (KEY, ""))
+        self.assertEqual(self.out["remembered"], {"type": "text", "shows": SHORT, "key": KEY})   # visibly set
+        self.assertEqual(self.out["forgotten"], {"type": "text", "shows": "", "key": ""})
+        self.assertIsNone(self.out["stored"])
+
+    def test_the_field_shows_the_key_shortened_unless_it_is_being_edited(self):
+        self.assertEqual(self.out["fresh"], {"type": "text", "shows": "", "key": ""})
+        self.assertEqual(self.out["editing"], {"type": "password", "shows": "  " + KEY + "\n", "key": "  " + KEY + "\n",
+                                              "selected": True})
+        self.assertEqual(self.out["idle"], {"type": "text", "shows": SHORT, "key": KEY})
+        self.assertEqual(self.out["refocused"], {"type": "password", "shows": KEY, "key": KEY})
+        self.assertEqual(self.out["short"], {"abc": "…", "qf_1234": "qf_…", "qf_" + "9" * 8: "qf_…",
+                                             "qf_" + "9" * 9: "qf_9999…9999"})
 
 
 if __name__ == "__main__":
