@@ -378,7 +378,6 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
         if st != qfe.QUANTFUNC_OK:
             raise RuntimeError(f"denoise_begin (H3 t2va) failed: {qfe.last_err(lib)}")
         self._qf.current_session = session
-        self._qf.unloaded = False
         self._kf_keep = []          # engine copy-bound the keyframes/refs at begin; release the pins
         self._step_i = 0
         self._sess_denoise = 0

@@ -241,7 +241,6 @@ class _FakeEngine:
         self.lib = lib
         self.pipeline = ctypes.c_void_p(0xCAFE)
         self.current_session = None
-        self.unloaded = False
         self.step_count = 0
         self.sampler_step_count = 0
 

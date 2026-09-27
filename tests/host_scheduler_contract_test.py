@@ -174,7 +174,6 @@ class HostSchedulerContract(unittest.TestCase):
         torch_bytes = self.model.contract_weight.nbytes
         self.library.held = 8192
         self.library.query_status = 1
-        self.engine.unloaded = True
         self.assertEqual(self.patcher.model_size(), torch_bytes)
         self.assertEqual(self.patcher.loaded_size(), torch_bytes)
         self.assertEqual(mm.LoadedModel(self.patcher).model_loaded_memory(), torch_bytes)

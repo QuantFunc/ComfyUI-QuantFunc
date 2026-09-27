@@ -125,7 +125,6 @@ class _MockEngine:
     """Mock QFEngineHandle: records end_session_if_open + clears current_session (mirrors qf_engine.py)."""
     def __init__(self, open_session=None):
         self.current_session = open_session
-        self.unloaded = False
         self.step_count = 0
         self.sampler_step_count = 0
         self.end_calls = 0

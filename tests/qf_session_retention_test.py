@@ -3,15 +3,13 @@
 
 WHY (delta-CR R7 finding #6): every prior mock of end_session_if_open hardcoded the OLD
 "clear regardless" semantics, so REVERTING the retention fix turned nothing red. This file
-drives the REAL QFEngineHandle.end_session_if_open / partial_unload bodies (qf_engine.py
+drives the REAL QFEngineHandle.end_session_if_open body (qf_engine.py
 imports standalone — no comfy, no GPU) with a stub lib, asserting BOTH directions:
 
   T1  refused end  -> pointer RETAINED + (True, False)      [mutation: revert the `if ok:`
                                                              clear-guard -> T1 goes red]
   T2  ok end       -> pointer CLEARED  + (True, True)
   T3  raising end  -> pointer RETAINED (best-effort branch)
-  T4  partial_unload self-heals a stale-but-endable pointer (proceeds) and still refuses a
-      genuinely-open one (raises without touching the C reclaim)
   T5  static: every family file arms `_qf_needs_begin` in extra_conds AND consumes it in the
       lazy-begin gate (the silent-session-REUSE hole fix; textual death-rule — deleting
       either half of the f5b75e2 edit goes red)
@@ -45,7 +43,6 @@ class _StubLib:
         self.end_rc = end_rc
         self.raise_on_end = raise_on_end
         self.end_calls = 0
-        self.partial_calls = 0
 
     def quantfunc_denoise_end(self, sess):
         self.end_calls += 1
@@ -56,11 +53,6 @@ class _StubLib:
     def quantfunc_last_error(self):
         return b"denoise end refused: session is not in an endable state (stub)"
 
-    def quantfunc_partial_unload(self, pipe, req, freed_ref):
-        self.partial_calls += 1
-        # ctypes.byref(c_int64) — mutate through the wrapped object
-        freed_ref._obj.value = 42
-        return qfe.QUANTFUNC_OK
 
 
 def _handle(lib):
@@ -68,7 +60,6 @@ def _handle(lib):
     h.lib = lib
     h.current_session = ctypes.c_void_p(0xDEAD)
     h.pipeline = ctypes.c_void_p(0xBEEF)
-    h.unloaded = False
     return h
 
 
@@ -94,25 +85,6 @@ h = _handle(lib)
 was_open, ok = h.end_session_if_open()
 check("T3a raising end reports (True, False)", (was_open, ok) == (True, False), f"{(was_open, ok)}")
 check("T3b raising end RETAINS the pointer", h.current_session is not None)
-
-# T4a: partial_unload self-heals a stale-but-endable session (end succeeds) -> reclaim proceeds
-lib = _StubLib(end_rc=0)
-h = _handle(lib)
-freed = h.partial_unload_vram(10 * 1024 * 1024)
-check("T4a partial_unload heals an endable pointer and reclaims", freed == 42 and lib.partial_calls == 1,
-      f"freed={freed} partial_calls={lib.partial_calls}")
-
-# T4b: partial_unload still refuses a genuinely-open session (end keeps refusing)
-lib = _StubLib(end_rc=1)
-h = _handle(lib)
-refused = False
-try:
-    h.partial_unload_vram(10 * 1024 * 1024)
-except RuntimeError as exc:
-    refused = "session" in str(exc)
-check("T4b partial_unload raises for a still-open session", refused and lib.partial_calls == 0,
-      f"refused={refused} partial_calls={lib.partial_calls}")
-check("T4b refused partial reclaim retains the session pointer", h.current_session is not None)
 
 # T5: static death-rule for the needs-begin flag (silent session-REUSE hole)
 for fam in ("qf_h3_modelpatcher.py", "qf_ltx_modelpatcher.py"):

@@ -671,7 +671,6 @@ class QFImageSessionModel(QFSessionModelMixin):
         if st != qfe.QUANTFUNC_OK:
             raise RuntimeError(f"denoise_begin ({self._TAG}) failed: {qfe.last_err(lib)}")
         self._qf.current_session = session
-        self._qf.unloaded = False
         self._step_i = 0
         self._sess_denoise = 0
         self._max_batch = 0
@@ -802,9 +801,6 @@ class QFLazyEngine:
         # resource. CPU-backup bytes are a separate, currently unknown ledger.
         self.capacity_bytes = None
         self.footprint_bytes = 0
-        # Nothing created yet => nothing resident. Reporting "unloaded" keeps comfy's ledger
-        # HONEST (loaded_size -> 0) for a chain link the sampler never touches.
-        self._unloaded = True
         self.step_count = 0
         self.sampler_step_count = 0
 
@@ -971,31 +967,9 @@ class QFLazyEngine:
     def current_session(self, v):
         self.ensure().current_session = v
 
-    @property
-    def unloaded(self):
-        # Nothing created => nothing resident. Honest for comfy's ledger (loaded_size -> 0).
-        return self._unloaded if self._real is None else self._real.unloaded
-
-    @unloaded.setter
-    def unloaded(self, v):
-        if self._real is None:
-            self._unloaded = bool(v)
-        else:
-            self._real.unloaded = bool(v)
-
     # ---- lifecycle: all no-ops while unmaterialized (nothing exists to close/free/destroy) ----
     def end_session_if_open(self):
         return (False, True) if self._real is None else self._real.end_session_if_open()
-
-    def unload_vram(self):
-        return 0 if self._real is None else self._real.unload_vram()
-
-    def partial_unload_vram(self, bytes_requested):
-        # MEASURED (2026-09-05, LTX-2.5 acceptance box): comfy asked for 300–2700 MB at every VAE load, but the
-        # patcher's `hasattr(eng, "partial_unload_vram")` saw THIS wrapper (no forwarder) → False → the full
-        # unload ran every time (vram::releaseAll evicted 16.9 GB, re-paged at the next run: +2.9 s). Forward
-        # it; unmaterialized = nothing to shed (0 → the patcher's full-unload fallback is a no-op too).
-        return 0 if self._real is None else self._real.partial_unload_vram(bytes_requested)
 
     def resident_vram_bytes(self):
         return 0 if self._real is None else self._real.resident_vram_bytes()

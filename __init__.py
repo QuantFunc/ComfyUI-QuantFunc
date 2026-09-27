@@ -275,7 +275,7 @@ def _comfy_device_index():
 #    evict other live handles; their resource adapters execute host reclaim requests.
 #  • HOST RAM (bounded by the set of LIVE patchers): `_sweep_dead_pipelines` DESTROYS a handle only
 #    once its family model has been garbage-collected (comfy dropped the patcher) — a dead model cannot
-#    be use-after-freed, so destroy is safe there. Without this the unload_vram-only design leaks a
+#    be use-after-freed, so destroy is safe there. Without this a cache that only released VRAM leaks a
 #    multi-GB CPU backup per distinct config forever (a resolution/model sweep). `_PIPELINE_MODELS`
 #    holds weakrefs to ALL live consumers: QFLazyEngine acquisition pins plus family models.
 _PIPELINE_CACHE = {}     # ckey -> QFEngineHandle

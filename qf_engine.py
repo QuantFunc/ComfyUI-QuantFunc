@@ -660,20 +660,6 @@ def _bind(lib):
     lib.quantfunc_denoise_finalize.argtypes = [v, ctypes.POINTER(DenoiseFinalizeParams)]
     lib.quantfunc_denoise_end.restype = ctypes.c_int
     lib.quantfunc_denoise_end.argtypes = [v]
-    # co-eviction (quantfunc.h:407-424): offload GPU->CPU freeing VRAM; the pipeline auto-reloads
-    # from its CPU backup on the next generate. _sync blocks until the VRAM is actually released.
-    lib.quantfunc_unload.restype = ctypes.c_int
-    lib.quantfunc_unload.argtypes = [v]
-    lib.quantfunc_unload_sync.restype = ctypes.c_int
-    lib.quantfunc_unload_sync.argtypes = [v]
-    if hasattr(lib, "quantfunc_unload_sync_ex"):
-        lib.quantfunc_unload_sync_ex.restype = ctypes.c_int
-        lib.quantfunc_unload_sync_ex.argtypes = [v, ctypes.POINTER(ctypes.c_uint64)]
-    # partial VRAM shed (inter-stage eviction fix; absent on older .so -> hasattr-guarded)
-    if hasattr(lib, "quantfunc_partial_unload"):
-        lib.quantfunc_partial_unload.restype = ctypes.c_int
-        lib.quantfunc_partial_unload.argtypes = [v, ctypes.c_uint64,
-                                                 ctypes.POINTER(ctypes.c_int64)]
     # Optional symbol binding permits loading older libraries for diagnostics.
     # Residency/reclaim consumers reject missing capabilities explicitly; the
     # separate legacy future-demand reader is not yet a precise request planner.
@@ -2201,7 +2187,6 @@ class QFEngineHandle:
         self.current_session = None          # ctypes.c_void_p of the open session, or None
         self.step_count = 0                  # total denoise_step calls (instrument)
         self.sampler_step_count = 0          # distinct sampler steps (instrument)
-        self.unloaded = False                # co-eviction: True after unload_vram() freed VRAM (auto-reloads on next generate)
         # The LoRA set this pipeline currently runs, as QFLazyEngine._lora_sig() spells it. A pipeline is created with
         # NO LoRA (the cache key is the weights only), so it starts at the base; pipeline_update swaps it in place.
         self.applied_lora_sig = "[]"
@@ -2277,43 +2262,10 @@ class QFEngineHandle:
             self.current_session = None
         return (True, ok)
 
-    def partial_unload_vram(self, bytes_requested):
-        """Return confirmed native release bytes; failure is not a zero result.
-
-        The legacy native primitive is device-scoped. A shortfall is returned
-        to the host, which decides whether to request complete eviction.
-        """
-        if self.pipeline is None or bytes_requested <= 0:
-            return 0
-        if not hasattr(self.lib, "quantfunc_partial_unload"):
-            raise RuntimeError("QuantFunc library lacks quantfunc_partial_unload; update the native library")
-        # Y vuln fix: comfy's free_memory sweep passes a HUGE "free everything" sentinel
-        # (measured 1e32 as float) — int(1e32) overflows c_uint64 (OverflowError swallowed
-        # -> silent 0 -> full-unload fallback worked only by coincidence). Clamp into the
-        # engine's saturating range explicitly (the engine treats >= total weight bytes as
-        # "shed all sheddable").
-        bytes_requested = min(int(bytes_requested), (1 << 63) - 1)
-        if self.current_session is not None:
-            # Retention (2026-08-24): a retained stale pointer must not permanently refuse
-            # VRAM reclaim — try the end first; a genuinely open session keeps refusing.
-            self.end_session_if_open()
-        if self.current_session is not None:
-            raise RuntimeError("QuantFunc cannot unload VRAM while a session is still active")
-        freed = ctypes.c_int64(0)
-        st = self.lib.quantfunc_partial_unload(self.pipeline,
-                                               ctypes.c_uint64(bytes_requested),
-                                               ctypes.byref(freed))
-        if st != QUANTFUNC_OK:
-            raise RuntimeError(f"QuantFunc partial VRAM unload failed: {last_err(self.lib)}")
-        if freed.value < 0:
-            raise RuntimeError("QuantFunc partial VRAM unload returned negative released bytes")
-        return int(freed.value)
-
     def resident_vram_bytes(self):
         """Query the native device-scoped residency counter; failure is not zero.
 
-        A missing pipeline is known to hold nothing. An unload flag is not a
-        measurement: native full release may leave live or pinned allocations.
+        A missing pipeline is known to hold nothing.
         The current ABI selects a device, not an individual pipeline owner;
         callers must not sum this value once per shared model/engine.
         """
@@ -2335,7 +2287,7 @@ class QFEngineHandle:
         allocator's cached pool it already holds. This legacy estimate is not a
         complete cold-request peak bound. A successful zero remains ambiguous
         (covered or not measured); an ABI error/missing query is never that zero."""
-        if self.pipeline is None or self.unloaded:
+        if self.pipeline is None:
             return 0
         if not hasattr(self.lib, "quantfunc_vram_need_bytes"):
             raise RuntimeError("QuantFunc library lacks quantfunc_vram_need_bytes; update the native library")
@@ -2348,41 +2300,6 @@ class QFEngineHandle:
         if st != QUANTFUNC_OK:
             raise RuntimeError(f"QuantFunc demand query failed: {last_err(self.lib)}")
         return int(out.value)
-
-    def unload_vram(self):
-        """Synchronously reclaim and return native confirmed bytes, never file size.
-
-        Repeated calls still ask native: an earlier release may have left live
-        allocations or pages that have since become reclaimable. This ABI's
-        count is device-scoped and excludes unowned shared CUDA pool backing.
-        """
-        if self.pipeline is None:
-            return 0
-        if not hasattr(self.lib, "quantfunc_unload_sync_ex"):
-            raise RuntimeError("QuantFunc library lacks quantfunc_unload_sync_ex; update the native library")
-        import os as _os
-        if _os.environ.get("QF_NATIVE_PROF") == "1":
-            import traceback as _tb
-            frames = _tb.extract_stack(limit=5)[:-1]
-            chain = " <- ".join(f"{_os.path.basename(f.filename)}:{f.lineno}:{f.name}"
-                                for f in reversed(frames))
-            say(f"[qf_prof] unload_vram CALLER: {chain}", flush=True)
-        self.end_session_if_open()          # a live session on unloaded VRAM would be a UAF on reuse
-        if self.current_session is not None:
-            raise RuntimeError("QuantFunc cannot unload VRAM while a session is still active")
-        freed = ctypes.c_uint64(0)
-        st = self.lib.quantfunc_unload_sync_ex(self.pipeline, ctypes.byref(freed))
-        if st != QUANTFUNC_OK:
-            raise RuntimeError(f"QuantFunc VRAM unload failed: {last_err(self.lib)}")
-        if _os.environ.get("QF_NATIVE_PROF") == "1" and self.resource is not None:
-            try:
-                owner = self.resource.query()
-                with NativeResource.shared(self.lib, owner.device) as shared:
-                    _dbg_prof(f"unload resource owner={owner} shared={shared.query()} confirmed_freed={freed.value}")
-            except Exception as diagnostic_error:
-                _dbg_prof(f"unload resource snapshot unavailable ({type(diagnostic_error).__name__})")
-        self.unloaded = True
-        return int(freed.value)
 
     def destroy(self):
         self.end_session_if_open()

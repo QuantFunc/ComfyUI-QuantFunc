@@ -69,14 +69,9 @@ class _DummyEngine:
     def __init__(self):
         self.pipeline = object()
         self.current_session = None
-        self.unloaded = False
 
     def end_session_if_open(self):
         return (False, True)
-
-    def unload_vram(self):
-        self.unloaded = True
-        return self.footprint_bytes
 
     def destroy(self):
         self.pipeline = None
@@ -221,10 +216,6 @@ def main():
 
         def end_session_if_open(self):
             return (False, True)
-
-        def unload_vram(self):
-            self.unloaded = True
-            return self.footprint_bytes
 
         def vram_need_bytes(self, latent_shape):
             # The quantfunc_vram_need_bytes ABI boundary, stubbed like the capacity ABI below: the engine's answer

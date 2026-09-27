@@ -212,25 +212,6 @@ class EngineResourceContract(unittest.TestCase):
             # identity is Closed, not promised reusable for another create.
         self.assertEqual(lib.destroyed, [19])
 
-    def test_unload_diagnostic_reports_native_owner_and_shared_without_changing_freed(self):
-        lib = library()
-        def unload(_pipeline, out):
-            out._obj.value = 4096
-            return 0
-        lib.quantfunc_unload_sync_ex = unload
-        lib.quantfunc_destroy = lambda _: None
-        engine = qfe.QFEngineHandle.create(lib, model_dir="fixture", device_idx=2)
-        output = io.StringIO()
-        with patch.dict(os.environ, {"QF_NATIVE_PROF": "1"}), contextlib.redirect_stdout(output):
-            self.assertEqual(engine.unload_vram(), 4096)
-        self.assertIn("unload resource owner=ResourceSnapshot", output.getvalue())
-        self.assertIn("shared=ResourceSnapshot", output.getvalue())
-        self.assertIn("cca_live=4096", output.getvalue())
-        self.assertIn("arena_backed=8192", output.getvalue())
-        self.assertEqual(lib.destroyed, [18])
-        engine.destroy()
-        self.assertEqual(lib.destroyed, [18, 19])
-
 
 class HostEnrollmentContract(unittest.TestCase):
     """quantfunc_resource_enroll_host_v2 means only "a host framework shares this device": it takes the view and

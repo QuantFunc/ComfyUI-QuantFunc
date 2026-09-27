@@ -762,7 +762,6 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
         if st != qfe.QUANTFUNC_OK:
             raise RuntimeError(f"denoise_begin (LTX) failed: {qfe.last_err(lib)}")
         self._qf.current_session = session
-        self._qf.unloaded = False
         self._step_i = 0
         self._sess_denoise = 0
         qfe.info(f"[qf_native] LTX SESSION OPEN handle={session.value:#x} steps={self._num_steps} "

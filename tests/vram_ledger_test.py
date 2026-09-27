@@ -85,7 +85,7 @@ class _Model(Mixin, _TorchBase):
     pass
 
 
-def _engine(need_mb=None, hold_mb=0, footprint_mb=13694, unloaded=False, raise_need=False):
+def _engine(need_mb=None, hold_mb=0, footprint_mb=13694, raise_need=False):
     def need(shape):
         if raise_need:
             raise RuntimeError("boom")
@@ -93,7 +93,7 @@ def _engine(need_mb=None, hold_mb=0, footprint_mb=13694, unloaded=False, raise_n
         return (need_mb or 0) * MB
     need.asked = []
     return SimpleNamespace(vram_need_bytes=need, resident_vram_bytes=lambda: hold_mb * MB,
-                           footprint_bytes=footprint_mb * MB, unloaded=unloaded, current_session=None)
+                           footprint_bytes=footprint_mb * MB, current_session=None)
 
 
 def _quiet(fn, *a, **k):
@@ -185,7 +185,7 @@ calls = []
 def _fac():
     calls.append(1)
     return SimpleNamespace(pipeline=1, footprint_bytes=14380 * MB, step_count=0, sampler_step_count=0,
-                           unloaded=False, current_session=None, vram_need_bytes=lambda s: 7 * MB), "ckey"
+                           current_session=None, vram_need_bytes=lambda s: 7 * MB), "ckey"
 lz = Lazy(_fac)
 lz.ensure_if_cached = lambda: None
 check(not lz.materialized and lz.vram_need_bytes(SHAPE) == 0 and calls == [],
