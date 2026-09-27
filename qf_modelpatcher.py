@@ -313,9 +313,6 @@ class QFSessionModelMixin:
     def set_block_cache(self, t):
         self._block_cache = float(t)
 
-    def set_sparse(self, s):
-        self._sparse = float(s)
-
     def set_attn_backend(self, v):
         # [runtime dial 2026-08-29] session knob — rides residency_opts() into EVERY
         # denoise_begin; the engine swaps the per-forward dispatch string (no rebuild).
@@ -613,7 +610,6 @@ class QFImageSessionModel(QFSessionModelMixin):
         self._step_i = 0
         self._ctx_key_assigner = _CtxKeyAssigner()
         self._sess_denoise = 0
-        self._max_batch = 0
         self._max_ctx_seq = 0
         self._out = None
 
@@ -664,7 +660,6 @@ class QFImageSessionModel(QFSessionModelMixin):
         self._qf.current_session = session
         self._step_i = 0
         self._sess_denoise = 0
-        self._max_batch = 0
         self._ctx_key_assigner.reset()
         qfe.info(f"[qf_native] {self._TAG.upper()} SESSION OPEN handle={session.value:#x} steps={self._num_steps} "
                  f"latent={tuple(x_group.shape)} cond={tuple(ctx_group.shape)}")
@@ -705,7 +700,6 @@ class QFImageSessionModel(QFSessionModelMixin):
         if self._out is None or self._out.shape != xin.shape or self._out.dtype != xin.dtype \
                 or self._out.device != xin.device:
             self._out = torch.empty_like(xin)
-        self._max_batch = max(self._max_batch, B)
         # comfy carries the per-conditioning uuids as transformer_options["uuids"] (samplers.py:324/511). A wrong key
         # silently yields ctx key 0 = the engine's step caches OFF: Krea-2 read "cond_uuids" until the Qwen-Image-2.1
         # seam, cloned from it, logged cfg_context_key=0 (2026-09-22) — the reason this loop now exists once.
@@ -1363,7 +1357,6 @@ class QFPreparedEntry:
         # creates with exactly the configured inputs, so the pipeline starts on this key (QFEngineHandle.applied_api_key).
         self.api_key = api_key
         self.capacity_bytes = None
-        self.component_count = None
         self.cache_key = None
         self._cache_usable = True
         self._materializers = weakref.WeakSet()
@@ -1378,7 +1371,6 @@ class QFPreparedEntry:
             # A target still Creating answers BUSY for its whole create; past the deadline that is a refusal.
             capacity = _ready_read(self.resource.query_capacity, "resource capacity")
             self.capacity_bytes = int(capacity.required_persistent_bytes)
-            self.component_count = int(capacity.component_count)
             owner, shared = canonical_resource_adapters(self)
             self._owner_adapter, self._shared_adapter = owner, shared
             owner._prepared = True

@@ -523,35 +523,6 @@ class DenoiseStepParams(ctypes.Structure):
     ]
 
 
-class DenoiseBeginEditParams(ctypes.Structure):
-    _fields_ = [
-        ("struct_size", ctypes.c_size_t),
-        ("base", DenoiseBeginParams),
-        ("ref_image_paths", ctypes.POINTER(ctypes.c_char_p)),
-        ("num_ref_images", ctypes.c_int),
-        ("ref_img_resize", ctypes.c_int),
-    ]
-
-
-class DenoiseBeginEditCondParams(ctypes.Structure):
-    # i2v cond-latent ABI (design GO 2026-08-21): begin with the WORKFLOW-supplied fixed
-    # conditioning tail ([1, in−z, Tlat, Hl, Wl], the model's processed latent space — comfy's
-    # WanImageToVideo c_concat verbatim) instead of engine-side ref encode. Field order/types
-    # mirror include/quantfunc.h VERBATIM. base = the PLAIN begin params (structural exclusivity
-    # with the path-based edit surface). Present only in cond-ABI engine builds — bind
-    # defensively (hasattr), exactly like quantfunc_denoise_step_multi.
-    _fields_ = [
-        ("struct_size", ctypes.c_size_t),
-        ("base", DenoiseBeginParams),
-        ("cond_tail", ctypes.c_void_p),
-        ("cond_tail_dims", ctypes.c_int32 * 5),
-        ("cond_tail_dtype", ctypes.c_int),
-        ("cond_tail_bytes", ctypes.c_uint64),   # D1: declared allocation length; engine
-                                                # refuses any mismatch with dims*itemsize
-                                                # AND verifies the real extent covers it
-    ]
-
-
 class DenoiseFinalizeParams(ctypes.Structure):
     _fields_ = [
         ("struct_size", ctypes.c_size_t),
@@ -626,8 +597,6 @@ def _bind(lib):
     # session
     lib.quantfunc_denoise_begin.restype = ctypes.c_int
     lib.quantfunc_denoise_begin.argtypes = [v, ctypes.POINTER(DenoiseBeginParams), ctypes.POINTER(v)]
-    lib.quantfunc_denoise_begin_edit.restype = ctypes.c_int
-    lib.quantfunc_denoise_begin_edit.argtypes = [v, ctypes.POINTER(DenoiseBeginEditParams), ctypes.POINTER(v)]
     lib.quantfunc_denoise_step.restype = ctypes.c_int
     lib.quantfunc_denoise_step.argtypes = [v, ctypes.POINTER(DenoiseStepParams)]
     # D-class joint audio+video step (MiniMax-H3). Present only in AV-capable engine builds; bind
@@ -640,16 +609,6 @@ def _bind(lib):
     if hasattr(lib, "quantfunc_denoise_step_refs"):
         lib.quantfunc_denoise_step_refs.restype = ctypes.c_int
         lib.quantfunc_denoise_step_refs.argtypes = [v, ctypes.POINTER(DenoiseStepRefsParams)]
-    if hasattr(lib, "quantfunc_denoise_cond_tail_supported"):
-        # CR A-1 capability query (per-pipeline): 1 = this pipeline consumes a
-        # begin_edit_cond cond-latent. Probe THIS (presence + answer), not the
-        # begin_edit_cond symbol.
-        lib.quantfunc_denoise_cond_tail_supported.restype = ctypes.c_int
-        lib.quantfunc_denoise_cond_tail_supported.argtypes = [v]
-    if hasattr(lib, "quantfunc_denoise_begin_edit_cond"):
-        lib.quantfunc_denoise_begin_edit_cond.restype = ctypes.c_int
-        lib.quantfunc_denoise_begin_edit_cond.argtypes = [
-            v, ctypes.POINTER(DenoiseBeginEditCondParams), ctypes.POINTER(v)]
     lib.quantfunc_denoise_finalize.restype = ctypes.c_int
     lib.quantfunc_denoise_finalize.argtypes = [v, ctypes.POINTER(DenoiseFinalizeParams)]
     lib.quantfunc_denoise_end.restype = ctypes.c_int
@@ -2103,37 +2062,6 @@ def create_pipeline(lib, *, prepared_resource=None, create_params=None, **create
     if st != QUANTFUNC_OK:
         raise RuntimeError(f"quantfunc_create failed st={st}: {last_err(lib)}")
     return handle
-
-
-class ResidentEstimateParams(ctypes.Structure):
-    """Mirror of quantfunc_resident_estimate_params_t (engine >= 36f4ed2cb)."""
-    _fields_ = [("model_dir", ctypes.c_char_p), ("transformer_weights", ctypes.c_char_p),
-                ("server_url", ctypes.c_char_p), ("api_key", ctypes.c_char_p), ("device_idx", ctypes.c_int)]
-
-
-def estimate_resident_bytes(lib, model_dir, device_idx=0, transformer_path=None, server_url=None, api_key=None):
-    """Query the native pre-load transformer pack law, preserving unsupported/error.
-
-    This is model capacity, not current residency or complete request peak.
-    Coverage is defined by the native ABI's checkpoint/tier contract; never
-    substitute a file size when that contract cannot model the input.
-    """
-    if not model_dir and not transformer_path:
-        raise ValueError("model_dir or transformer_path is required for the capacity estimate")
-    fn = getattr(lib, "quantfunc_estimate_resident_bytes", None)
-    if fn is None:
-        raise RuntimeError("QuantFunc library lacks quantfunc_estimate_resident_bytes; update the native library")
-    fn.restype = ctypes.c_int
-    fn.argtypes = [ctypes.POINTER(ResidentEstimateParams), ctypes.POINTER(ctypes.c_uint64)]
-    p = ResidentEstimateParams(model_dir=_enc(model_dir) if model_dir else None,
-                               transformer_weights=_enc(transformer_path) if transformer_path else None,
-                               server_url=_enc(server_url) if server_url else None,
-                               api_key=_enc(api_key) if api_key else None, device_idx=int(device_idx))
-    out = ctypes.c_uint64(0)
-    st = fn(ctypes.byref(p), ctypes.byref(out))
-    if st != QUANTFUNC_OK:
-        raise RuntimeError(f"QuantFunc capacity estimate failed (status {st}): {last_err(lib)}")
-    return int(out.value)
 
 
 class QFEngineHandle:
