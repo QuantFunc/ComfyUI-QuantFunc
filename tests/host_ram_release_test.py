@@ -211,6 +211,17 @@ class HostRamRelease(unittest.TestCase):
                 self.stage(1 * GiB)
                 self.assertNotIn("ltx", plugin._PIPELINE_CACHE)
 
+    def test_a_queue_of_another_layout_releases_it_and_never_fails_the_create(self):
+        # ComfyUI's queue item is not an API: a changed shape reads as no pending loader (the dead-only sweep)
+        for item in ((0, "p"), (0, "p", "not a prompt", {}, ["9"]), (0, "p", self.prompt({}), {}, None)):
+            with self.subTest(item=item):
+                self.dead_ltx()
+                queue = self.running(self.prompt({}))
+                queue.currently_running[0] = item
+                self.assertEqual(plugin._pending_loader_sigs(), set())
+                plugin._sweep_dead_pipelines("another")   # the cold-create path's sweep does not raise
+                self.assertNotIn("ltx", plugin._PIPELINE_CACHE)
+
     def test_a_loader_the_prompt_does_not_run_releases_it(self):
         self.dead_ltx()
         self.running(self.prompt({}, connected=False))   # in the prompt, but nothing it executes needs it

@@ -458,26 +458,33 @@ def _pending_loader_sigs():
     queue = getattr(getattr(getattr(sys.modules.get("server"), "PromptServer", None), "instance", None), "prompt_queue", None)
     if queue is None:
         return set()
-    with queue.mutex:
-        running = list(queue.currently_running.values())
     sigs = set()
-    for item in running:   # (number, prompt_id, prompt, extra_data, outputs to execute, ...)
-        prompt, todo, seen = item[2], [str(o) for o in item[4]], set()
-        while todo:
-            nid = todo.pop()
-            node = prompt.get(nid)
-            if nid in seen or not isinstance(node, dict):
-                continue
-            seen.add(nid)
-            ins = node.get("inputs") or {}
-            todo += [str(v[0]) for v in ins.values() if isinstance(v, list) and v]
-            cls = NODE_CLASS_MAPPINGS.get(node.get("class_type"))
-            family = getattr(cls, "QF_FAMILY", None)
-            if family is None or any(isinstance(ins.get(k), list) for k in ("transformer", "model_config", "pinned_memory")):
-                continue
-            defaults = inspect.signature(cls.load).parameters   # what load() takes for an input the prompt omits
-            sigs.add(_loader_sig(family, ins.get("transformer"), ins.get("model_config", defaults["model_config"].default),
-                                 ins.get("pinned_memory", defaults["pinned_memory"].default)))
+    try:   # the queue's layout is ComfyUI's, not an API: a changed shape must not fail every cold create
+        with queue.mutex:
+            running = list(queue.currently_running.values())
+        for item in running:   # (number, prompt_id, prompt, extra_data, outputs to execute, ...)
+            prompt, todo, seen = item[2], [str(o) for o in item[4]], set()
+            while todo:
+                nid = todo.pop()
+                node = prompt.get(nid)
+                if nid in seen or not isinstance(node, dict):
+                    continue
+                seen.add(nid)
+                ins = node.get("inputs") or {}
+                todo += [str(v[0]) for v in ins.values() if isinstance(v, list) and v]
+                cls = NODE_CLASS_MAPPINGS.get(node.get("class_type"))
+                family = getattr(cls, "QF_FAMILY", None)
+                if family is None or any(isinstance(ins.get(k), list)
+                                         for k in ("transformer", "model_config", "pinned_memory")):
+                    continue
+                defaults = inspect.signature(cls.load).parameters   # what load() takes for an input the prompt omits
+                sigs.add(_loader_sig(family, ins.get("transformer"),
+                                     ins.get("model_config", defaults["model_config"].default),
+                                     ins.get("pinned_memory", defaults["pinned_memory"].default)))
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("[qf_native] the running prompt could not be read from ComfyUI's queue (%s); a dead pipeline is "
+                     "released as if no loader were waiting for it", ascii(exc))
+        return set()
     return sigs
 
 
