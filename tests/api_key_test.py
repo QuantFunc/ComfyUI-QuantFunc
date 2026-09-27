@@ -596,7 +596,7 @@ out.key = { queued: await w.serializeValue(), calls: api.calls.slice() };
 w.element.fire("focus");
 out.refocused = look(w);
 type(w, "%s");                                   // queued while still being edited (e.g. Ctrl+Enter): the typed key goes
-out.queuedWhileEditing = { queued: await w.serializeValue(), sent: api.calls.at(-1).body.key };
+out.queuedWhileEditing = { queued: await w.serializeValue(), sent: api.calls.at(-1)?.body?.key ?? null };
 leave(w);
 out.short = {};
 for (const text of ["abc", "qf_1234", "qf_" + "9".repeat(8), "qf_" + "9".repeat(9)]) { type(w, text); leave(w); out.short[text] = w.element.value; }
