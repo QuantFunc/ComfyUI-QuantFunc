@@ -6,10 +6,12 @@ ComfyUI saves every widget value into the workflow (saved and exported files, co
 history and "Export (API)". It has no secret widget a custom node can use: its only secret channel is hardcoded to the
 two comfy.org keys (execution.SENSITIVE_EXTRA_DATA_KEYS). So the key is never a widget value or a prompt value:
 
-  * web/quantfunc_api_key.js: the field is a password input that is never saved (serialize = false). When a prompt is
-    queued it POSTs the key to /quantfunc/api_key and queues only the reference it gets back;
+  * web/quantfunc_api_key.js: the field is a password input that is never saved (serialize = false). It POSTs a typed
+    key to /quantfunc/api_key and queues only the reference it gets back;
   * this module keeps the key in this ComfyUI process, behind that reference, and turns the reference back into the key
     for the loader (field_key). A reference means nothing to another process, or after a restart.
+config.json is where the key persists (user 2026-09-27): a well-formed key the field POSTs is saved there, and a field
+with nothing typed shows config.json's key, shortened (GET). The whole key never goes back to the browser.
 Every QuantFunc loader gets the hidden `api_key` input from add_api_key_input, in the same post-registration loop that
 gives it `log_level`; the field's script draws the field on exactly the QuantFunc nodes that declare it.
 """
@@ -17,8 +19,10 @@ import functools
 import hashlib
 import hmac
 import inspect
+import json
 import os
 import re
+import tempfile
 
 # The QuantFunc service mints every key as "qf_" + 64 lowercase hex digits (32 random bytes: quantfunc-server
 # models/api_key.go, generateKey, its only mint path). A field of any other shape is a typo: refused, never sent.
@@ -28,6 +32,10 @@ _REF_HEX = 32          # 128 bits of an HMAC-SHA256: unguessable
 _MAX_FIELD = 1024      # longer than any key: the route refuses it, which also bounds what one request can store
 _SECRET = os.urandom(32)   # per process, so a reference found in an image names nothing another process holds
 _KEYS = {}                 # reference -> the text the field POSTed
+# The plugin ships its defaults (server_url, a starter key) as config.default.json and never ships config.json, the
+# user's file: ComfyUI-Manager's update stashes a modified tracked file and never restores it, which would drop a saved
+# key at every update.
+DEFAULTS_NAME = "config.default.json"
 # ponytail: one entry per distinct text POSTed while this process runs, never evicted. Only someone who can queue
 # prompts on this ComfyUI can grow it; cap it if that ever matters.
 
@@ -65,18 +73,56 @@ def field_key(value):
     return key
 
 
-async def _post_key(request):
-    """POST {"key": text} -> {"ref": reference} ("" for an empty key). Never answers with, or logs, the text."""
-    from aiohttp import web
+def shortened(key):
+    """All of a key the browser may see (user 2026-09-27: 部分明文): qf_ and the first and last 4 characters after it."""
+    head = "qf_" if key.startswith("qf_") else ""
+    body = key[len(head):]
+    return "" if not key else f"{head}{body[:4]}\u2026{body[-4:]}" if len(body) > 8 else f"{head}\u2026"
+
+
+def config_to_read(keyfile):
+    """The user's config.json, or before the first save the shipped defaults beside it."""
+    default = os.path.join(os.path.dirname(keyfile), DEFAULTS_NAME)
+    return default if not os.path.exists(keyfile) and os.path.exists(default) else keyfile
+
+
+def _load(path):
+    """The JSON object in `path`: {} when there is no file, None when it is unreadable or not an object."""
+    if not os.path.exists(path):
+        return {}
     try:
-        body = await request.json()
-    except ValueError:
-        body = None
-    key = body.get("key") if isinstance(body, dict) else None
-    if not isinstance(key, str) or len(key) > _MAX_FIELD:
-        return web.json_response({"error": 'expected a JSON object {"key": "<the API key>"}'}, status=400)
-    key = key.strip()
-    return web.json_response({"ref": remember(key) if key else ""})
+        with open(path, encoding="utf-8") as fh:
+            c = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    return c if isinstance(c, dict) else None
+
+
+def saved_key(keyfile):
+    key = (_load(config_to_read(keyfile)) or {}).get("api_key", "")
+    return key if isinstance(key, str) else ""
+
+
+def save_key(keyfile, key):
+    """Make `key` config.json's api_key, keeping every other field (the shipped defaults' when there is no config.json
+    yet). Atomic: a temp file beside it, then os.replace. False, and nothing written, when the file cannot be read."""
+    c = _load(config_to_read(keyfile))
+    if c is None:
+        return False
+    c["api_key"] = key
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(keyfile) or ".", prefix=".config.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(c, fh, indent=2, ensure_ascii=False)
+            fh.write("\n")
+        os.replace(tmp, keyfile)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+    return True
 
 
 def add_api_key_input(cls, published):
@@ -111,6 +157,33 @@ def add_api_key_input(cls, published):
     return cls
 
 
-def register_route(routes):
-    """Add POST /quantfunc/api_key to ComfyUI's route table (PromptServer.instance.routes)."""
-    routes.post("/quantfunc/api_key")(_post_key)
+def register_route(routes, keyfile):
+    """Add /quantfunc/api_key to ComfyUI's route table (PromptServer.instance.routes); `keyfile()` is config.json's path.
+    GET -> {"shown": config.json's key, shortened}. POST {"key": text} -> {"ref": reference ("" for an empty key),
+    "saved": whether the key went to config.json (only a well-formed one does), "shown": ...}. Neither ever answers
+    with, or logs, the whole key."""
+    from aiohttp import web
+
+    async def get_key(request):
+        return web.json_response({"shown": shortened(saved_key(keyfile()))})
+
+    async def post_key(request):
+        try:
+            body = await request.json()
+        except ValueError:
+            body = None
+        key = body.get("key") if isinstance(body, dict) else None
+        if not isinstance(key, str) or len(key) > _MAX_FIELD:
+            return web.json_response({"error": 'expected a JSON object {"key": "<the API key>"}'}, status=400)
+        key = key.strip()
+        saved = False
+        if KEY_FORMAT.fullmatch(key):
+            try:
+                saved = save_key(keyfile(), key)
+            except OSError:
+                pass            # the field still carries the key for this session; config.json keeps its old one
+        return web.json_response({"ref": remember(key) if key else "", "saved": saved,
+                                  "shown": shortened(saved_key(keyfile()))})
+
+    routes.get("/quantfunc/api_key")(get_key)
+    routes.post("/quantfunc/api_key")(post_key)

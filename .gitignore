@@ -18,7 +18,9 @@ __pycache__/
 *.a
 
 # Keep bin directory structure but ignore libraries
-# config.json and other non-binary files are still tracked
+# other non-binary files are still tracked; config.json is the user's (the API key field saves to it), the
+# shipped defaults are config.default.json
+bin/*/config.json
 
 bin/linux/resource_cache.json
 bin/windows/resource_cache.json

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""The API key field of the four QuantFunc loaders (user 2026-09-27: a valid key typed there wins; config.json is then
-not read).
+"""The API key field of the four QuantFunc loaders (user 2026-09-27: a valid key typed there wins and is saved to
+config.json; a field with nothing typed shows config.json's key, shortened).
 
 ComfyUI saves every widget value into the workflow and every prompt input into each image and video it saves, and it
 has no secret widget a custom node can use. So the key is never a widget value or a prompt value: the field
@@ -16,14 +16,18 @@ has no secret widget a custom node can use. So the key is never a widget value o
     A5 a reference holds no key material; it is stable within a process (ComfyUI's node cache) and differs across
        processes
     A6 the route: {"key": k} -> {"ref": r} resolving to k (surrounding whitespace dropped); empty -> ""; anything else
-       -> 400 that does not echo the value
+       -> 400 that does not echo the value. GET shows config.json's key only shortened (the shipped defaults before the
+       first save); a well-formed POSTed key is saved to config.json keeping every other field (created, from the
+       defaults, when missing); a malformed key, or an unreadable config.json, is never written
     A7 add_api_key_input gives ANY loader class the hidden input: the key is published only while the loader runs (reset
        after, also on an exception), the loader never receives the api_key argument, an unusable value fails before
        the loader runs, the class's own spec dicts are untouched and the signature gains a keyword-only api_key
   B  the plugin (needs COMFY_ROOT)
     B1 every registered QuantFunc*Loader (derived from NODE_CLASS_MAPPINGS, not a list) takes api_key as a HIDDEN input
        (ComfyUI never makes a plain, saved widget for it), and ComfyUI hands a hidden input's prompt value to it
-    B2 precedence: a field key wins, and neither QUANTFUNC_API_KEY nor config.json is read; no field key = today's path
+    B2 precedence: a field key wins, and neither QUANTFUNC_API_KEY nor config.json is read; no field key = today's path,
+       reading the shipped config.default.json until config.json exists; the plugin ships config.default.json and never
+       config.json (a git update would stash a saved key away)
     B3 each loader hands its field key to the models its build makes (a LoRA rebuild too); an unusable field fails the
        loader before its builder runs
     B4 the key reaches the create, never the pipeline cache key: two keys share one prepared pipeline
@@ -39,9 +43,10 @@ has no secret widget a custom node can use. So the key is never a widget value o
     C2 an empty field sends nothing and queues ""; a key is POSTed to /quantfunc/api_key and only the reference is queued,
        also when the prompt is queued while the field is still being edited
     C3 a refused POST fails the queue; the plain key is never queued
-    C4 the key is remembered in this browser (localStorage) and shown again in every new field; emptying the field forgets it
-    C5 (user 2026-09-27: 部分明文) a field not being edited shows the key shortened, qf_ + its first and last 4 characters,
-       never more (short text shows only the prefix); being edited, it holds the whole key masked
+    C4 a field with nothing typed shows config.json's key as the server sends it (shortened); leaving the field POSTs a
+       typed key (the server saves it to config.json), and a new field then shows it; the browser keeps no copy
+    C5 (user 2026-09-27: 部分明文) a field not being edited shows a typed key shortened, qf_ + its first and last 4
+       characters, never more (short text shows only the prefix); focus gives an empty masked input for a new key
 
 MUTATION (each goes RED): accept any non-empty field key -> A1; read "" as a key -> A2/B3; return the plain key for a
 non-reference -> A3; read an unknown reference as empty -> A4; make the reference the key or a slice of it -> A5; echo
@@ -51,8 +56,9 @@ in family_build -> B3; put the key into create_cfg -> B4; drop the switch in ens
 switch before the engine accepted it -> B5; read config.json in ensure() for a default consumer -> B6; print the key in
 the switch line -> B7; drop WEB_DIRECTORY -> B8; draw the field on every node or on another pack's node, save it
 (serialize true) or queue the plain key, or queue a stale key while the field is edited -> C1/C2; fall back to the plain
-key on a refused POST -> C3; drop the localStorage write -> C4; show the whole key while not edited, or unmasked while
-edited -> C5.
+key on a refused POST -> C3; skip the GET or the POST on leaving, or keep a copy in localStorage -> C4; show the whole
+key while not edited, or unmasked while edited -> C5; save a malformed key, drop config.json's other fields, or
+write it in place -> A6.
 
 Run:  python tests/api_key_test.py      (B needs COMFY_ROOT; C needs node)
 """
@@ -83,6 +89,8 @@ KEY = "qf_" + HEX * 4                  # well formed; built at run time, never a
 KEY2 = "qf_" + HEX[::-1] * 4
 DEFAULT_KEY = "qf_" + "7" * 64         # stands in for the key of config.json
 SHORT = "qf_0123…cdef"                 # KEY shortened: qf_ + its first and last 4 characters
+SHORT2 = "qf_fedc…3210"                # KEY2 shortened
+DEFAULT_SHORT = "qf_7777…7777"         # DEFAULT_KEY shortened
 DEFAULT_URL = "https://service.quantfunc.com"
 MALFORMED = ("qf_" + "a" * 63, "qf_" + "a" * 65, "QF_" + "a" * 64, "qf_" + "A" * 64, "qf-" + "a" * 64,
              "qf_" + "a" * 62 + "zz", "a" * 67, "qf_" + "a" * 32 + " " + "a" * 31)
@@ -162,15 +170,25 @@ class Route(unittest.TestCase):
             from aiohttp import web
         except ImportError:
             skip(self, "aiohttp is not installed")
+        self.dir = tempfile.mkdtemp(prefix="qf_apikey_cfg_")
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.keyfile = os.path.join(self.dir, "config.json")
         routes = web.RouteTableDef()
-        ak.register_route(routes)
-        posts = [r for r in routes if r.method == "POST" and r.path == "/quantfunc/api_key"]
-        self.assertEqual(len(posts), 1, [(r.method, r.path) for r in routes])
-        self.handler = posts[0].handler
+        ak.register_route(routes, lambda: self.keyfile)
+        self.handlers = {r.method: r.handler for r in routes if r.path == "/quantfunc/api_key"}
+        self.assertEqual(sorted(self.handlers), ["GET", "POST"], [(r.method, r.path) for r in routes])
 
-    def call(self, request):
-        response = asyncio.run(self.handler(request))
+    def call(self, request, method="POST"):
+        response = asyncio.run(self.handlers[method](request))
         return response.status, response.text
+
+    def write(self, name, data):
+        with open(os.path.join(self.dir, name), "wb") as fh:
+            fh.write(data if isinstance(data, bytes) else json.dumps(data).encode())
+
+    def read(self, name="config.json"):
+        with open(os.path.join(self.dir, name), "rb") as fh:
+            return fh.read()
 
     def test_a_key_comes_back_as_a_reference_to_it(self):
         status, text = self.call(Request({"key": "  " + KEY + "\n"}))
@@ -181,7 +199,52 @@ class Route(unittest.TestCase):
     def test_an_empty_key_comes_back_empty(self):
         for empty in ("", "  \t"):
             status, text = self.call(Request({"key": empty}))
-            self.assertEqual((status, json.loads(text)), (200, {"ref": ""}))
+            self.assertEqual((status, json.loads(text)), (200, {"ref": "", "saved": False, "shown": ""}))
+        self.assertEqual(os.listdir(self.dir), [])
+
+    def test_get_shows_only_the_saved_key_shortened(self):
+        self.assertEqual(json.loads(self.call(Request(), "GET")[1]), {"shown": ""})              # no config at all
+        self.write(ak.DEFAULTS_NAME, {"server_url": DEFAULT_URL, "api_key": DEFAULT_KEY})
+        status, text = self.call(Request(), "GET")                                                # before the first save
+        self.assertEqual((status, json.loads(text)), (200, {"shown": DEFAULT_SHORT}))
+        self.write("config.json", {"api_key": KEY})
+        status, text = self.call(Request(), "GET")
+        self.assertEqual(json.loads(text), {"shown": SHORT})
+        self.assertNotIn(KEY, text)
+
+    def test_a_valid_key_is_saved_to_config_json_keeping_every_other_field(self):
+        self.write("config.json", {"server_url": "https://x.invalid", "api_key": DEFAULT_KEY, "other": {"a": 1}})
+        status, text = self.call(Request({"key": " " + KEY}))
+        self.assertEqual((status, json.loads(text)["saved"], json.loads(text)["shown"]), (200, True, SHORT))
+        self.assertEqual(json.loads(self.read()), {"server_url": "https://x.invalid", "api_key": KEY, "other": {"a": 1}})
+        self.assertEqual(os.listdir(self.dir), ["config.json"])                                  # no temp file left
+
+    def test_a_missing_config_json_is_created(self):
+        self.write(ak.DEFAULTS_NAME, {"server_url": DEFAULT_URL, "api_key": DEFAULT_KEY})
+        defaults = self.read(ak.DEFAULTS_NAME)
+        self.assertTrue(json.loads(self.call(Request({"key": KEY}))[1])["saved"])
+        self.assertEqual(json.loads(self.read()), {"server_url": DEFAULT_URL, "api_key": KEY})  # from the defaults
+        self.assertEqual(self.read(ak.DEFAULTS_NAME), defaults)                                  # never written
+        os.remove(os.path.join(self.dir, "config.json"))
+        os.remove(os.path.join(self.dir, ak.DEFAULTS_NAME))
+        self.assertTrue(json.loads(self.call(Request({"key": KEY}))[1])["saved"])
+        self.assertEqual(json.loads(self.read()), {"api_key": KEY})
+
+    def test_a_malformed_key_is_never_written(self):
+        self.write("config.json", {"server_url": DEFAULT_URL, "api_key": DEFAULT_KEY})
+        before = self.read()
+        for bad in MALFORMED:
+            status, text = self.call(Request({"key": bad}))
+            answer = json.loads(text)
+            self.assertEqual((status, answer["saved"], answer["shown"]), (200, False, DEFAULT_SHORT), bad)
+            self.assertEqual(self.read(), before, bad)
+            with self.assertRaises(RuntimeError):          # the loader still refuses it loud
+                ak.field_key(answer["ref"])
+
+    def test_an_unreadable_config_json_is_left_as_it_is(self):
+        self.write("config.json", b"{ not json")
+        self.assertFalse(json.loads(self.call(Request({"key": KEY}))[1])["saved"])
+        self.assertEqual(self.read(), b"{ not json")
 
     def test_anything_else_is_a_400_that_does_not_echo_it(self):
         long = "qf_" + "a" * 5000
@@ -300,6 +363,31 @@ if _COMFY and (Path(_COMFY) / "comfy/model_management.py").is_file():
                 self.assertEqual(plugin._read_auth(KEY), (KEY, DEFAULT_URL))
             with clean_env(QF_SERVER_URL="https://example.invalid", **{qfe._ENV_KEYFILE_OVERRIDE: unreadable}):
                 self.assertEqual(plugin._read_auth(KEY), (KEY, "https://example.invalid"))
+
+        def test_before_the_first_save_the_shipped_defaults_are_read(self):
+            d = tempfile.mkdtemp(prefix="qf_apikey_")
+            self.addCleanup(shutil.rmtree, d)
+            keyfile = os.path.join(d, "config.json")
+            with open(os.path.join(d, "config.default.json"), "w", encoding="utf-8") as fh:
+                json.dump({"api_key": DEFAULT_KEY, "server_url": "https://defaults.invalid"}, fh)
+            with clean_env(**{qfe._ENV_KEYFILE_OVERRIDE: keyfile}):
+                self.assertEqual(plugin._read_auth(), (DEFAULT_KEY, "https://defaults.invalid"))
+                with open(keyfile, "w", encoding="utf-8") as fh:
+                    json.dump({"api_key": KEY, "server_url": "https://defaults.invalid"}, fh)
+                self.assertEqual(plugin._read_auth(), (KEY, "https://defaults.invalid"))
+
+        def test_the_plugin_ships_defaults_and_never_config_json(self):
+            # ComfyUI-Manager's update stashes a modified tracked file and never restores it: a tracked config.json would
+            # lose the saved key at every update.
+            r = subprocess.run(["git", "-C", str(PLUGIN), "ls-files", "bin"], capture_output=True, encoding="utf-8")
+            if r.returncode != 0:
+                skip(self, "the plugin is not a git checkout")
+            tracked = r.stdout.split()
+            for plat in ("linux", "windows"):
+                self.assertIn(f"bin/{plat}/config.default.json", tracked)
+                self.assertNotIn(f"bin/{plat}/config.json", tracked)
+            r = subprocess.run(["git", "-C", str(PLUGIN), "check-ignore", "-q", "bin/linux/config.json"])
+            self.assertEqual(r.returncode, 0)
 
         def test_no_field_key_is_todays_path(self):
             good = self.keyfile(json.dumps({"api_key": DEFAULT_KEY, "server_url": "https://from-config.invalid"}))
@@ -526,7 +614,8 @@ if _COMFY and (Path(_COMFY) / "comfy/model_management.py").is_file():
                 instance=types.SimpleNamespace(routes=routes)))
             with mock.patch.dict(sys.modules, {"server": server}):
                 plugin._serve_api_key_route()
-            self.assertEqual([(r.method, r.path) for r in routes], [("POST", "/quantfunc/api_key")])
+            self.assertEqual([(r.method, r.path) for r in routes],
+                             [("GET", "/quantfunc/api_key"), ("POST", "/quantfunc/api_key")])
 else:
     print("[SKIP] api_key_test part B (plugin wiring): set COMFY_ROOT to a ComfyUI checkout")
 
@@ -534,24 +623,30 @@ else:
 # ── C: the field script under Node ────────────────────────────────────────────────────────────────────────────────────
 _APP_STUB = "export const app = { extensions: [], registerExtension(e) { this.extensions.push(e); } };\n"
 _API_STUB = """export const api = {
-  calls: [], reply: { ok: true, status: 200, body: { ref: "qfk:" + "1".repeat(32) } },
-  async fetchApi(route, options) {
-    this.calls.push({ route, method: options.method, body: JSON.parse(options.body) });
-    const r = this.reply;
-    return { ok: r.ok, status: r.status, json: async () => r.body, text: async () => JSON.stringify(r.body) };
+  calls: [], shown: "", shownFor: {}, post: { ok: true, status: 200 },
+  async fetchApi(route, options = {}) {       // what /quantfunc/api_key answers (qf_api_key.register_route)
+    const method = options.method ?? "GET", body = options.body ? JSON.parse(options.body) : null;
+    this.calls.push({ route, method, body });
+    if (method === "GET") return { ok: true, status: 200, json: async () => ({ shown: this.shown }) };
+    if (!this.post.ok) return { ok: false, status: this.post.status, json: async () => ({}) };
+    const saved = body.key in this.shownFor;    // a well-formed key goes to config.json
+    if (saved) this.shown = this.shownFor[body.key];
+    return { ok: true, status: 200, json: async () => ({ ref: "qfk:" + "1".repeat(32), saved, shown: this.shown }) };
   },
 };
 """
-_DRIVER = """const store = new Map();
-globalThis.localStorage = { getItem: k => (store.has(k) ? store.get(k) : null), setItem: (k, v) => store.set(k, String(v)),
-                            removeItem: k => store.delete(k) };
+_DRIVER = """const out = { loaders: {}, others: {} };
+globalThis.localStorage = new Proxy({}, { get() { out.storage = true; return () => null; } });   // must stay untouched
 globalThis.document = { createElement(tag) {
-  return { tagName: tag.toUpperCase(), type: "text", value: "", listeners: {}, selected: false,
+  return { tagName: tag.toUpperCase(), type: "text", value: "", listeners: {},
            addEventListener(ev, fn) { (this.listeners[ev] ??= []).push(fn); }, setAttribute(k, v) { this[k] = v; },
-           select() { this.selected = true; }, fire(ev) { for (const fn of this.listeners[ev] ?? []) fn({ target: this }); } };
+           fire(ev) { for (const fn of this.listeners[ev] ?? []) fn({ target: this }); } };
 } };
+const tick = () => new Promise(r => setTimeout(r, 0));
 const { app } = await import("./scripts/app.js");
 const { api } = await import("./scripts/api.js");
+api.shown = "%s";                                 // config.json's key, as the server shows it
+api.shownFor = %s;
 await import("./extensions/ComfyUI-QuantFunc/quantfunc_api_key.js");
 // the frontend's addDOMWidget(name, type, element, options): the value is options.getValue()/setValue()
 function node(comfyClass) {
@@ -565,6 +660,7 @@ function node(comfyClass) {
 async function created(comfyClass) {
   const n = node(comfyClass);
   for (const e of app.extensions) await e.nodeCreated?.(n);
+  await tick();                                   // its GET of the saved key lands
   return n;
 }
 // what /object_info declares: the loaders' hidden inputs, a QuantFunc loader added later, and nodes that must not get one
@@ -574,39 +670,38 @@ const defs = [...LOADERS, "QuantFuncFutureLoader"].map(name => ({ name, input: {
   .concat([{ name: "QuantFuncNativeLoRA", input: { required: {} } }, { name: "KSampler", input: { required: {} } },
            { name: "OtherPackApiNode", input: { required: {}, hidden: withKey } }]);
 for (const d of defs) for (const e of app.extensions) await e.beforeRegisterNodeDef?.(function () {}, d, app);
-const out = { loaders: {}, others: {} };
 for (const c of [...LOADERS, "QuantFuncFutureLoader"]) {
   const n = await created(c);
   out.loaders[c] = n.widgets.map(w => ({ name: w.name, serialize: w.serialize }));
 }
-// a user typing into the field: focus (the whole key, masked, all selected), type, and later leave it
+out.firstCall = api.calls[0];
+// a user typing into the field: focus (an empty masked input), type, and later leave it
 function type(w, text) { w.element.fire("focus"); w.element.value = text; w.element.fire("input"); }
-function leave(w) { w.element.fire("blur"); }
+async function leave(w) { w.element.fire("blur"); await tick(); await tick(); }
 const look = w => ({ type: w.element.type, shows: w.element.value, key: w.value });
+const posts = () => api.calls.filter(c => c.method === "POST");
 for (const c of ["KSampler", "QuantFuncNativeLoRA", "OtherPackApiNode"]) out.others[c] = (await created(c)).widgets.length;
 const w = (await created(LOADERS[0])).widgets[0];
 out.fresh = look(w);
-type(w, "  \\t"); leave(w);
-out.empty = { queued: await w.serializeValue(), calls: api.calls.length };
+type(w, "  \\t"); await leave(w);
+out.empty = { queued: await w.serializeValue(), posts: posts().length };
 type(w, "  %s\\n");
-out.editing = { ...look(w), selected: w.element.selected };
-leave(w);
+out.editing = look(w);
+await leave(w);
 out.idle = look(w);
-out.key = { queued: await w.serializeValue(), calls: api.calls.slice() };
+out.savedOnBlur = posts().at(-1)?.body ?? null;
+out.key = { queued: await w.serializeValue(), sent: posts().at(-1)?.body ?? null };
 w.element.fire("focus");
 out.refocused = look(w);
 type(w, "%s");                                   // queued while still being edited (e.g. Ctrl+Enter): the typed key goes
-out.queuedWhileEditing = { queued: await w.serializeValue(), sent: api.calls.at(-1)?.body?.key ?? null };
-leave(w);
+out.queuedWhileEditing = { queued: await w.serializeValue(), sent: posts().at(-1)?.body?.key ?? null };
+await leave(w);
 out.short = {};
-for (const text of ["abc", "qf_1234", "qf_" + "9".repeat(8), "qf_" + "9".repeat(9)]) { type(w, text); leave(w); out.short[text] = w.element.value; }
-type(w, "%s"); leave(w);
-api.reply = { ok: false, status: 404, body: {} };
+for (const text of ["abc", "qf_1234", "qf_" + "9".repeat(8), "qf_" + "9".repeat(9)]) { type(w, text); await leave(w); out.short[text] = w.element.value; }
+type(w, "%s"); await leave(w);
+api.post = { ok: false, status: 404 };
 try { out.refused = { queued: await w.serializeValue() }; } catch (e) { out.refused = { threw: true }; }
-out.remembered = look((await created(LOADERS[1])).widgets[0]);
-type(w, ""); leave(w);
-out.forgotten = look((await created(LOADERS[2])).widgets[0]);
-out.stored = localStorage.getItem("QuantFunc.api_key");
+out.newField = look((await created(LOADERS[1])).widgets[0]);
 console.log(JSON.stringify(out));
 """
 
@@ -628,7 +723,8 @@ class FieldScript(unittest.TestCase):
             ext = Path(d) / "extensions" / "ComfyUI-QuantFunc"
             ext.mkdir(parents=True)
             shutil.copy(PLUGIN / "web" / "quantfunc_api_key.js", ext)
-            (Path(d) / "driver.mjs").write_text(_DRIVER % (json.dumps(list(LOADERS)), KEY, KEY2, KEY), encoding="utf-8")
+            (Path(d) / "driver.mjs").write_text(_DRIVER % (DEFAULT_SHORT, json.dumps({KEY: SHORT, KEY2: SHORT2}),
+                                                           json.dumps(list(LOADERS)), KEY, KEY2, KEY), encoding="utf-8")
             r = subprocess.run([node, "driver.mjs"], cwd=d, capture_output=True, encoding="utf-8", timeout=60)
             if r.returncode != 0:
                 raise AssertionError(f"node driver failed: {r.stderr[-2000:]}")
@@ -646,25 +742,24 @@ class FieldScript(unittest.TestCase):
         self.assertEqual(self.out["others"], {"KSampler": 0, "QuantFuncNativeLoRA": 0, "OtherPackApiNode": 0})
 
     def test_only_a_reference_is_queued(self):
-        self.assertEqual(self.out["empty"], {"queued": "", "calls": 0})
-        self.assertEqual(self.out["key"]["queued"], "qfk:" + "1" * 32)
-        self.assertEqual(self.out["key"]["calls"], [{"route": "/quantfunc/api_key", "method": "POST", "body": {"key": KEY}}])
+        self.assertEqual(self.out["empty"], {"queued": "", "posts": 0})
+        self.assertEqual(self.out["key"], {"queued": "qfk:" + "1" * 32, "sent": {"key": KEY}})
         self.assertEqual(self.out["queuedWhileEditing"], {"queued": "qfk:" + "1" * 32, "sent": KEY2})
 
     def test_a_refused_post_fails_the_queue(self):
         self.assertEqual(self.out["refused"], {"threw": True})
 
-    def test_the_key_is_remembered_in_this_browser_until_the_field_is_emptied(self):
-        self.assertEqual(self.out["remembered"], {"type": "text", "shows": SHORT, "key": KEY})   # visibly set
-        self.assertEqual(self.out["forgotten"], {"type": "text", "shows": "", "key": ""})
-        self.assertIsNone(self.out["stored"])
+    def test_the_field_shows_config_json_key_and_saves_a_typed_one_there(self):
+        self.assertEqual(self.out["firstCall"], {"route": "/quantfunc/api_key", "method": "GET", "body": None})
+        self.assertEqual(self.out["fresh"], {"type": "text", "shows": DEFAULT_SHORT, "key": ""})   # nothing typed
+        self.assertEqual(self.out["savedOnBlur"], {"key": KEY})                                    # leaving saves it
+        self.assertEqual(self.out["newField"], {"type": "text", "shows": SHORT, "key": ""})        # config.json's now
+        self.assertNotIn("storage", self.out)                                                     # no browser copy
 
-    def test_the_field_shows_the_key_shortened_unless_it_is_being_edited(self):
-        self.assertEqual(self.out["fresh"], {"type": "text", "shows": "", "key": ""})
-        self.assertEqual(self.out["editing"], {"type": "password", "shows": "  " + KEY + "\n", "key": "  " + KEY + "\n",
-                                              "selected": True})
+    def test_the_field_shows_a_typed_key_shortened_unless_it_is_being_edited(self):
+        self.assertEqual(self.out["editing"], {"type": "password", "shows": "  " + KEY + "\n", "key": KEY})
         self.assertEqual(self.out["idle"], {"type": "text", "shows": SHORT, "key": KEY})
-        self.assertEqual(self.out["refocused"], {"type": "password", "shows": KEY, "key": KEY})
+        self.assertEqual(self.out["refocused"], {"type": "password", "shows": "", "key": ""})    # empty, for a new key
         self.assertEqual(self.out["short"], {"abc": "…", "qf_1234": "qf_…", "qf_" + "9" * 8: "qf_…",
                                              "qf_" + "9" * 9: "qf_9999…9999"})
 

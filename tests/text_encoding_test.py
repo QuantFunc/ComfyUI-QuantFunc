@@ -11,7 +11,7 @@ ARMS. Each runs in a child Python whose preferred encoding is FORCED, and the ch
   static      every text-mode open / read_text / write_text / text subprocess in the repo names its encoding
   manifest    every shipped configs/*/qf_native.json loads through _load_model_config
   family      every shipped family resolves its one preset through _family_preset
-  keyfile     every shipped bin/*/config.json yields an API key through _read_auth (the key is never printed)
+  keyfile     every shipped bin/*/config.default.json yields an API key through _read_auth (the key is never printed)
   connectors  every shipped configs/*/connectors/config.json yields its head count through _connector_config_heads
   malformed   a manifest / keyfile / connectors config that is invalid JSON, not UTF-8, not a JSON object, or (connectors)
               declares an unusable head count raises a RuntimeError that names the file. A family whose only manifest
@@ -844,11 +844,11 @@ def _shipped(root):
             with open(cc, encoding="utf-8") as f:
                 connector_dirs.append((f"configs/{d}", json.load(f).get("video_connector_num_attention_heads")))
     for plat in sorted(os.listdir(os.path.join(root, "bin"))):
-        kf = os.path.join(root, "bin", plat, "config.json")
+        kf = os.path.join(root, "bin", plat, "config.default.json")
         if os.path.isfile(kf):
             with open(kf, encoding="utf-8") as f:
                 if json.load(f).get("api_key"):
-                    keyfiles.append(f"bin/{plat}/config.json")
+                    keyfiles.append(f"bin/{plat}/config.default.json")
     return presets, families, keyfiles, connector_dirs
 
 

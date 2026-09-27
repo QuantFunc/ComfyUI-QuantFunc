@@ -224,8 +224,9 @@ def _resolve_lora(name):
 # keyfile. The field is never a widget value or a prompt value: the prompt carries a reference that only this process
 # resolves (qf_api_key). The keyfile PATH is never a node input: `keyfile` was previously a workflow STRING widget, same
 # class as `so_path` (a shared workflow.json could point it at an arbitrary file the ComfyUI server then opens/parses). A
-# workflow.json cannot set an env var, so the dev override QF_NATIVE_KEYFILE is safe; the shipped default is the
-# package-bundled bin/<platform>/config.json.
+# workflow.json cannot set an env var, so the dev override QF_NATIVE_KEYFILE is safe; the default is the user's
+# bin/<platform>/config.json, read as the shipped bin/<platform>/config.default.json until the first save
+# (qf_api_key.config_to_read: the plugin never ships config.json, so an update never drops a saved key).
 def _resolve_keyfile():
     override = os.environ.get(qfe._ENV_KEYFILE_OVERRIDE, "").strip()
     if override:
@@ -242,7 +243,7 @@ def _read_auth(ui_key=None):
     if ui_key:
         return ui_key, surl
     key = os.environ.get("QUANTFUNC_API_KEY", "") or os.environ.get("QF_API_KEY", "")
-    keyfile = _resolve_keyfile()
+    keyfile = qf_api_key.config_to_read(_resolve_keyfile())
     if not key and keyfile and os.path.exists(keyfile):
         # A keyfile that is there but unreadable is an error, never "no key": swallowing it hid a Windows cp936 decode
         # failure (#738) behind a later auth failure.
@@ -1223,7 +1224,7 @@ if _IMPORT_OK:
         queuing the key itself."""
         srv = getattr(getattr(sys.modules.get("server"), "PromptServer", None), "instance", None)
         if srv is not None:
-            qf_api_key.register_route(srv.routes)
+            qf_api_key.register_route(srv.routes, _resolve_keyfile)
 
     try:
         _serve_api_key_route()
