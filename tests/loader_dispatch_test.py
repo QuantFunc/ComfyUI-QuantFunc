@@ -513,9 +513,10 @@ def main():
                                      and t.startswith("ON (default for LTX-2.5" if w.split(".")[0] in _PM_DEFAULT_ON
                                                       else "OFF (default)") for w, t in _pm_tips.items()),
           f"-> {_pm_tips}")
-    # qfa REMOVED as a user-facing attention_backend choice (2026-09-13)
-    check("attention_backend choices drop qfa (SM80+ and SM75)",
-          "qfa" not in qfn._ATTN_BACKEND_SM80PLUS and "qfa" not in qfn._ATTN_BACKEND_SM75,
+    # the backend REMOVED as a user-facing attention_backend choice (2026-09-13): no choice is a banned term
+    import _banned_terms as _bt
+    check("attention_backend choices drop the removed backend (SM80+ and SM75)",
+          not any(_bt.h(c) in _bt.WORDS for c in qfn._ATTN_BACKEND_SM80PLUS + qfn._ATTN_BACKEND_SM75),
           f"-> sm80+={qfn._ATTN_BACKEND_SM80PLUS} sm75={qfn._ATTN_BACKEND_SM75}")
     # the ALL-IN single file: projections + BOTH modality connector blocks packed (the audio
     # one is ALSO the AV discriminant — no audio_vae staging, comfy owns audio decode).

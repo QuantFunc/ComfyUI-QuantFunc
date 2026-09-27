@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """Death-rule for the seq-219 / #B3 cfg_context_key contract (src/gemm/lighting/CLAUDE.md #B3).
 
-The engine keys THREE per-step caches off the ABI cfg_context_key: the L2 memoization caches (ctx_cache_,
-cross_kv_cache_) AND the STATEFUL L3 First-Block/TeaCache trajectory cache (fbcache_). The key must be
-(a) DISTINCT per distinct conditioning (else L2 emits one branch's text for another — the seq-219 defect,
+The engine keys its per-step caches off the ABI cfg_context_key, including a STATEFUL one (fbcache_). The key must
+be (a) DISTINCT per distinct conditioning (else a cache emits one branch's text for another — the seq-219 defect,
 a 0/1 role index colliding two DIFFERENT-content conds a stock ConditioningCombine puts in one bucket);
 (b) DISTINCT per branch even for IDENTICAL content (else the STATEFUL fbcache_ slot is shared → #B3, why a
 CONTENT HASH is forbidden); and (c) STABLE for a conditioning across steps INCLUDING under a within-generation
 COMPOSITION CHANGE (ConditioningSetTimestepRange drops a cond mid-run → a POSITION-derived key renumbers the
-survivors → a later step HITs an earlier step's DIFFERENT-branch cross-KV = stale wrong reuse, since the L2
+survivors → a later step HITs an earlier step's DIFFERENT-branch cached state = stale wrong reuse, since the
 caches don't re-verify content on a hit).
 
 The production key is `_CtxKeyAssigner`: it maps comfy's per-conditioning UUID (`transformer_options["uuids"]
@@ -269,7 +268,7 @@ def main():
         print(f"  [OK ] composition-change: survivors keep stable keys across a drop "
               f"(uB {prod2[0][uB]}=={prod2[1][uB]}, uN {prod2[0][uN]}=={prod2[1][uN]})")
     else:
-        print(f"  [FAIL] composition-change: a survivor's key SHIFTED ({prod2}) -> stale cross-KV reuse"); bad += 1
+        print(f"  [FAIL] composition-change: a survivor's key SHIFTED ({prod2}) -> stale cached reuse"); bad += 1
     mp = _drive_pos(_PosOnlyMutant(), [[uA, uB, uN], [uB, uN]])
     if mp[0][uB] != mp[1][uB]:
         print(f"  [OK ] mutation: a position-only key SHIFTS a survivor on a drop (uB {mp[0][uB]}->{mp[1][uB]})"

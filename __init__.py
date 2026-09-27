@@ -779,13 +779,12 @@ if _IMPORT_OK:
         return out
 
     # [cache surface RE-ENABLED, user 2026-08-31 「step cache 以及 fbcache 的开关重新开启」]
-    # The step_cache (EasyCache) + block_cache (First-Block Cache = "fbcache") widgets
+    # The step_cache + block_cache widgets
     # restored to the video loaders (LTX/H3) — the two loader widgets + their arming
     # loop that the 2026-08-29 removal dropped. SPARSE is deliberately NOT re-enabled
     # (the user named only the two caches). Both are RUNTIME SESSION knobs (mixin
     # set_step_cache/set_block_cache → residency_opts begin keys; 0.0 = OFF = byte-identical,
-    # no create key, no pipeline rebuild on a widget change). Engine EasyCache/FBCache
-    # (lighting_step_cache.h) is untouched on main.
+    # no create key, no pipeline rebuild on a widget change).
     _STEP_CACHE_INPUT = ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.005,
                          "tooltip": "Speed-up that reuses earlier work while the result is barely changing. 0 (default) = off. "
                                     "Higher values are faster but can move the result away from the full render; "
@@ -861,9 +860,9 @@ if _IMPORT_OK:
                                 "sound clearer and sharper; the video itself is unchanged. Off (default): no extra time. "
                                 "Most useful with fast turbo settings; it has no effect at long, high-quality settings."})
 
-    # [sol-tau dial 2026-08-31] the ONE user-facing Sol-Attn knob (user "就一个就好"). Applies to
-    # the flash/sage backends — the engine's applySolTauDial engages the Sol-Attn threshold per
-    # block regardless of attention_backend (it is NOT tied to the removed qfa choice). Same
+    # [sol-tau dial 2026-08-31] the ONE user-facing attention dial (user "就一个就好"). Applies to
+    # the flash/sage backends — the engine applies it regardless of attention_backend (it is NOT
+    # tied to a removed backend choice). Same
     # runtime-session-knob class as step_cache/sparse: re-sent each run, no rebuild; 1.0 default is
     # omitted (older engines refuse unknown keys loud) and the engine resets an absent key to 1.0.
     _SOL_TAU_INPUT = ("FLOAT", {"default": 1.0, "min": 0.02, "max": 1.0, "step": 0.01,
@@ -872,7 +871,7 @@ if _IMPORT_OK:
                                 "keeps more quality. Takes effect on the next run."})
 
     def _arm_session_caches(_mm, step_cache, block_cache):
-        """Arm the EasyCache (step) + FBCache (block) session knobs on a loaded model.
+        """Arm the step-cache and block-cache session knobs on a loaded model.
         Both are runtime session knobs (never create keys); 0.0 = OFF = byte-identical.
         The mixin setters + residency_opts threading are on qf_modelpatcher.py (intact
         through the 2026-08-29 removal — only the loader widgets + this arming were dropped)."""
@@ -888,14 +887,14 @@ if _IMPORT_OK:
         "explains the fix.")
 
     # [attention backend selector, user 2026-08-27] one user-facing dropdown per loader.
-    # SM-GATED: SM80+ offers the full set; SM75 (Turing) has NO int8-QK sage and NO
+    # SM-GATED: SM80+ offers the full set; SM75 (Turing) has NO sage backend and NO
     # flash_attn build, so only fp16_native is valid there. The widget VALUE is a
     # display name; _attn_backend_to_engine maps it to the engine's comp_opts string
     # ("fp16_native" -> "native"). "auto" = the engine's per-SM resolution (default), and
     # is passed through so the user's choice is always the single source of truth.
-    # [qfa REMOVED as a user-facing choice — user 2026-09-13] the qfa (int8-QK + Hadamard /
-    # sol) backend is no longer offered in the dropdown. "auto" is unaffected (the engine may
-    # still resolve to qfa internally per-SM); only the explicit user choice is gone.
+    # [a backend REMOVED as a user-facing choice — user 2026-09-13] one engine-internal backend is
+    # no longer offered in the dropdown. "auto" is unaffected (the engine may still pick it
+    # internally per-SM); only the explicit user choice is gone.
     _ATTN_BACKEND_SM80PLUS = ["auto", "flash", "sage", "fp16_native"]
     _ATTN_BACKEND_SM75 = ["fp16_native"]
 
@@ -905,7 +904,7 @@ if _IMPORT_OK:
             import torch
             if torch.cuda.is_available():
                 maj, _min = torch.cuda.get_device_capability(0)
-                if maj < 8:  # SM75 Turing (sm_7x): no sage int8-QK, no flash_attn
+                if maj < 8:  # SM75 Turing (sm_7x): no sage, no flash_attn
                     choices = _ATTN_BACKEND_SM75
         except Exception:  # noqa: BLE001 - no torch/CUDA at import -> assume modern; engine validates
             pass
@@ -1055,8 +1054,8 @@ if _IMPORT_OK:
             }, "optional": {
                 "model_config": _model_config_input("minimax-h3"),   # hidden; widget index 1 (see _model_config_input)
                 # [sparse, user 2026-08-25 ONE-number dial; #659 session knob — no rebuild]
-                # H3 default = flash: this model's auto resolves to sage2 int8-QK, which is
-                # BROKEN on H3's post-qk-RMSNorm γ-outliers at high-res (blank/NaN — measured
+                # H3 default = flash: on this model auto picks a backend that is
+                # BROKEN at high resolution (blank/NaN — measured
                 # 928²/S=31538: attn out absmax 0 → step-1 all-NaN → audio avcodec crash +
                 # video blur). flash (fp16) is the verified-clean default; user can still pick
                 # auto/sage/native. (Wan/LTX → auto is fine → they keep 'auto'.)

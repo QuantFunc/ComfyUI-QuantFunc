@@ -5,7 +5,7 @@ wan seam uses — reused from qf_engine.py).
 
 WHY this is DIFFERENT from the wan seam (design findings, dossier seq-229..234):
 - cfg_context_key: seq-229 established the LTX-2 lighting transformer engages NONE of the
-  key-trusting step caches (ctx_cache_/cross_kv_cache_/the engine's block-cache state slot ) — historically every step passed
+  key-trusting step caches — historically every step passed
   cfg_context_key=0 (kNoCtxKey). SINCE the step-cache session gate (merge 516a6d78) the key IS
   consumed (one EcEntry per cond branch; key=0 force-computes), so BOTH step loops (t2v + AV) now
   derive uuid-symbolic keys via the shared _CtxKeyAssigner (wan #B3 pattern) — see [step-cache-key]

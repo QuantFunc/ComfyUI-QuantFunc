@@ -14,7 +14,7 @@ Design (measured from comfy 0.27.0 + include/quantfunc.h + the proven native_ses
   cfg_context_key = a SYMBOLIC key from comfy's per-conditioning uuid (_CtxKeyAssigner), NOT a content hash
   and NOT the 0/1 cond_or_uncond ROLE index. comfy batches by SHAPE only, so a stock
   ConditioningCombine/SetArea can put DIFFERENT content in ONE role bucket — a role key would collide them
-  in the engine's cross-KV cache; a CONTENT hash is equally wrong (it collides two branches with identical
+  in the engine's per-step caches; a CONTENT hash is equally wrong (it collides two branches with identical
   content into the engine's STATEFUL block-cache state slot — src/gemm/lighting/CLAUDE.md #B3). comfy's uuid is
   distinct per conditioning entry, content-independent, stable across steps, and position-independent
   (robust to a mid-run composition change) — see _CtxKeyAssigner.
@@ -28,7 +28,7 @@ Design (measured from comfy 0.27.0 + include/quantfunc.h + the proven native_ses
 - Session lifecycle: LAZY denoise_begin on the FIRST step of a run; finalize+end at
   process_latent_out (normal end); extra_conds closes at RUN START any session STRANDED by an
   Interrupt (comfy skips process_latent_in for empty/denoise=1.0 latents + caches+reuses this
-  instance across requeues), so the next run never continues an aborted one (its KV cache);
+  instance across requeues), so the next run never continues an aborted one (its cached state);
   end-on-failure per step.
 - Co-eviction: the native resource adapters (QFNativeResourcePatcher) are ordinary ComfyUI models. When comfy needs
   the VRAM for a sibling model it asks them back (release_eligible / release_all: the engine's own walk) and they report
@@ -161,10 +161,9 @@ class _CtxKeyAssigner:
 
     WHY A UUID, AND WHY NOT A CONTENT HASH / ROLE INDEX / BATCH POSITION
     (src/gemm/lighting/CLAUDE.md #B3 — the hard death-rule this class exists to satisfy):
-    The engine keys THREE per-step caches off this ABI value — the L2 memoization caches (`ctx_cache_`,
-    `cross_kv_cache_`) AND the STATEFUL L3 block-level trajectory cache (`the engine's block-cache state slot `; running
-    `accum`/`prev_blk0`). The key MUST be:
-      (a) DISTINCT per distinct conditioning — else the L2 cross-KV cache emits one branch's projected text
+    The engine keys its per-step caches off this ABI value, including a STATEFUL one that carries state from
+    step to step. The key MUST be:
+      (a) DISTINCT per distinct conditioning — else a cache emits one branch's projected text
           for another. The 0/1 cond_or_uncond ROLE INDEX is NOT unique: comfy batches by SHAPE only
           (comfy/conds.py CONDRegular.can_concat), so a stock ConditioningCombine/SetArea puts two
           DIFFERENT-content conditionings in ONE role bucket → same key → wrong text reuse (the seq-219
@@ -176,8 +175,8 @@ class _CtxKeyAssigner:
           COMPOSITION CHANGE. `ConditioningSetTimestepRange` makes comfy's `get_area_and_mult` return None
           for a cond outside its timestep window (`_calc_cond_batch` drops it from that step's batch), so a
           POSITION-derived key would renumber the survivors → a later step's key would HIT an earlier step's
-          DIFFERENT-branch cross-KV = stale wrong-content reuse (the same defect class as (a), triggered by
-          reordering; the L2 caches never re-verify content on a key hit).
+          DIFFERENT-branch cached state = stale wrong-content reuse (the same defect class as (a), triggered by
+          reordering; the caches never re-verify content on a key hit).
     comfy's per-conditioning `uuid` — assigned once per generation in `sampler_helpers.convert_cond` via
     `uuid.uuid4()` (a FRESH uuid PER ENTRY, so even two identical-content conds a ConditioningCombine
     produces get DIFFERENT uuids), then carried each step in `transformer_options["uuids"]` — satisfies ALL
@@ -303,7 +302,7 @@ class QFSessionModelMixin:
     # knob never enters create_cfg/ckey). 0.0 = OFF: the keys are OMITTED entirely, the
     # engine spec stays cache_mode=0/thresh=0 → the step path is BYTE-IDENTICAL (the
     # engine-side off-path guarantee, the engine's cache layer the engine's step-cache wrapper). >0 arms
-    # lighting::CacheMode::the step cache with this mean_abs_diff skip budget. ──
+    # the step cache with this threshold. ──
     _step_cache = 0.0             # class default; loaders set the widget value (step_cache)
     _block_cache = 0.0            # class default; loaders set the widget value (block_cache)
     _sparse = 1.0                 # class default; 1.0 = dense (loaders set the sparse widget)
@@ -323,9 +322,8 @@ class QFSessionModelMixin:
         self._attn_backend = str(v or "auto")
 
     def set_sol_tau(self, v):
-        # [sol-tau dial 2026-08-31] the ONE user-facing Sol-Attn knob (user "就一个
-        # 就好"): the sol route's z-score keep threshold. LOWER = more exact blocks
-        # (denser/slower; <= -8 = true DENSE), HIGHER = sparser/faster. Same
+        # [sol-tau dial 2026-08-31] the ONE user-facing attention dial (user "就一个
+        # 就好"). LOWER = closer to exact (<= -8 = exact), HIGHER = faster. Same
         # rides-residency_opts session-knob class as set_attn_backend.
         try:
             self._sol_tau = float(v)
@@ -1079,17 +1077,17 @@ def stage_denoise_only_package(bundle_dir, transformer1_path, extra_links=None):
 def refuse_all_zero_initial_latent(xin, tag):
     """ALL-ZERO INITIAL LATENT GUARD — SHARED across every family seam (wan/LTX/LTX-AV/H3;
     one mechanism, N users). An Empty latent whose first sampler stage has add_noise=disable
-    hands the engine a pure-zero tensor at sigma_max: int4 per-token quantization divides by
-    amax=0 (0/0 = NaN), the NaN propagates silently through every step, and VAEDecode writes
+    hands the engine a pure-zero tensor at sigma_max: the engine's arithmetic divides zero by
+    zero (0/0 = NaN), the NaN propagates silently through every step, and VAEDecode writes
     an EXACT-BLACK video with zero errors anywhere — the worst failure shape (measured on the
-    user's wan run 2026-08-21; the class is family-independent, any int4 transformer NaNs the
+    user's wan run 2026-08-21; the class is family-independent, any of our transformers NaNs the
     same way). Denoising pure zeros is never meaningful, so refuse LOUD at session begin,
     BEFORE any engine call, with the actual fix named. A noised latent / any i2v or
     latent-input flow is nonzero and never trips this."""
     if float(xin.abs().max()) == 0.0:
         raise RuntimeError(
             f"qf_native {tag}: the initial latent is ALL ZEROS - denoising pure zeros "
-            f"produces NaN through int4 quantization (amax=0) and renders a BLACK video. "
+            f"cannot produce an image (it renders a BLACK video). "
             f"Almost always this means the FIRST sampler stage has add_noise=disable on an "
             f"Empty latent: set add_noise=enable on the first stage (official templates ship "
             f"it enabled; later stages keep disable - they receive the leftover-noise latent).")

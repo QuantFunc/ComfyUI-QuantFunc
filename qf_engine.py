@@ -1873,7 +1873,7 @@ def load_lib():
         # Only the engine's own DT_NEEDED closure over that folder is loaded (_sidecar_preloads): once every lib*.so
         # there was, which mapped 17 engine builds into one ComfyUI, and three builds of libquantfunc_attention.so
         # that aborted it at exit ("double free or corruption", their static destructors colliding). A generic retry
-        # loop finds dependency order. Modes: libquantfunc_attention.so RTLD_GLOBAL (qfa symbol export — the proven
+        # loop finds dependency order. Modes: libquantfunc_attention.so RTLD_GLOBAL (its symbol export — the proven
         # in-ComfyUI arm); everything else RTLD_LOCAL, so a GLOBAL OpenCV cannot hijack symbol binding of ComfyUI's own
         # bundled cv2. A sidecar that never loads is skipped silently here: the engine dlopen below then fails LOUD with
         # the true unresolved soname.
