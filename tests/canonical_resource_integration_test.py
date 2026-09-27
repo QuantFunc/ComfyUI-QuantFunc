@@ -67,7 +67,7 @@ class Library:
     def query_domain_residency(self, pointer, out):
         self.events.append(("domain_residency", pointer.value))
         out._obj.state = self.domain_state
-        out._obj.resident_bytes = sum(resource["held"] for resource in self.resources.values())
+        out._obj.resident_bytes = sum(resource["held"] + resource.get("cached", 0) for resource in self.resources.values())
         return 0
 
     def query(self, pointer, out):
@@ -77,12 +77,16 @@ class Library:
         out._obj.owner_epoch = r["epoch"]
         out._obj.capabilities = self.capabilities
         out._obj.cca_live = r["held"]
+        out._obj.cca_cached = r.get("cached", 0)   # the device pool's dead memory: only the Shared view (key 1) holds it
         return 0
 
     def query_residency(self, pointer, out):
         r = self.resources[pointer.value]
         out._obj.state = r["state"]
-        out._obj.resident_bytes = r["held"]
+        # The engine's aggregate (#751 HostMemory.cpp queryReclaimable): an Owned view answers what its release can free,
+        # its backing plus the device pool's dead memory, which the owner walk takes first; the Shared view, its own.
+        pool = self.resources[1].get("cached", 0) if r["epoch"] else r.get("cached", 0)
+        out._obj.resident_bytes = r["held"] + pool
         return 0
 
     def query_lifecycle(self, pointer, out):
@@ -104,9 +108,14 @@ class Library:
         self.events.append(("release", pointer.value, requested))
         out._obj.state = r["state"]
         if not r["state"]:
-            freed = min(requested, r["held"])
-            r["held"] -= freed
-            out._obj.freed_bytes = freed
+            # The engine's owner walk (Room.cpp releaseOwner): the device pool's dead memory first, then its own backing.
+            pool = self.resources[1] if r["epoch"] else {}
+            taken = min(requested, pool.get("cached", 0))
+            if taken:
+                pool["cached"] -= taken
+            own = min(requested - taken, r["held"])
+            r["held"] -= own
+            out._obj.freed_bytes = taken + own
         return 0
 
     def release_all(self, pointer, out):
@@ -114,7 +123,9 @@ class Library:
         r = self.resources[pointer.value]
         out._obj.state = self.full_state
         if self.full_state == 0:
-            out._obj.freed_bytes, r["held"] = r["held"], 0
+            pool = self.resources[1] if r["epoch"] else {}
+            taken, pool["cached"] = pool.get("cached", 0), 0
+            out._obj.freed_bytes, r["held"] = r["held"] + taken, 0
         return 0
 
 
@@ -1338,6 +1349,44 @@ class CanonicalIntegration(unittest.TestCase):
         self.assertEqual(reported, [held - want])  # the READY retry's bytes only, never the BUSY attempt's
         self.assertEqual(self.lib.resources[key]["held"], 0)
         self.assertIn(("full", key), self.lib.events)
+
+    def test_751_owner_loaded_size_counts_the_pool_its_release_takes_first(self):
+        """#751 (MEASURED on −c, Krea-2 6.1 GB): a freed engine block goes to the device pool as Shared, yet the Owned
+        release takes that pool FIRST. The engine's Owned residency aggregate therefore counts the pool, and the adapter
+        forwards it unchanged as loaded_size (one native aggregate, never a Python category sum): otherwise ComfyUI's
+        model_unload (memory_to_free < loaded_size, model_management.py:837) fully detaches a model it only had to trim,
+        and the next generation re-faults it whole. Y = Owned backing, X = the pool: Y < memory_to_free <= X + Y takes
+        the partial path and frees the request, not everything; memory_to_free > X + Y is a full detach."""
+        self.lib.capabilities = 7  # CAP_RELEASE_ALL for the full-detach arm
+        for label, beyond in (("partial", -512), ("full", 1)):
+            with self.subTest(arm=label):
+                _patcher, owner, shared = self.warm_native_model("751-pool-" + label)
+                key = owner._resource._pointer.value
+                y, x = self.lib.resources[key]["held"], 2048
+                self.lib.resources[1]["cached"] = x
+                self.assertEqual(owner.loaded_size(), y + x)
+                self.assertEqual(shared.loaded_size(), self.lib.resources[1]["held"] + x)   # the Shared view: its own
+                want = y + x + beyond
+                self.assertGreater(want, y)   # the residency alone would have made ComfyUI detach fully
+                loaded, freed, real = self.official_loaded_model(owner), [], owner.partially_unload
+
+                def partially_unload(*args, **kwargs):
+                    freed.append(real(*args, **kwargs))
+                    return freed[-1]
+
+                with mock.patch.object(owner, "partially_unload", side_effect=partially_unload):
+                    fully = loaded.model_unload(memory_to_free=want)
+                if label == "partial":
+                    self.assertFalse(fully)
+                    self.assertEqual(freed, [want])                            # the request, pool first
+                    self.assertEqual(self.lib.resources[1]["cached"], 0)
+                    self.assertEqual(self.lib.resources[key]["held"], y + x - want)   # NOT everything
+                    self.assertNotIn(("full", key), self.lib.events)
+                else:
+                    self.assertTrue(fully)
+                    self.assertEqual(freed, [])                                # ComfyUI skipped the partial path
+                    self.assertIn(("full", key), self.lib.events)
+                    self.assertEqual((self.lib.resources[key]["held"], self.lib.resources[1]["cached"]), (0, 0))
 
     def test_704_release_busy_past_the_deadline_returns_zero_with_a_logged_busy(self):
         """partially_unload runs inside Comfy's unload path (no failure channel): a persistent BUSY vouches for no
