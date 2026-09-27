@@ -71,7 +71,6 @@ ComfyUI plugin for **QuantFunc** — the fastest diffusion model inference engin
 **⚡ Engine improvements (0.0.12 vs 0.0.11)**
 - **VRAM workspace budget** — run large models on tight cards by planning to a fixed budget.
 - **Wider low-VRAM & RTX 20 (Turing) support** — Ideogram4 and layered generation now run on 8 GB and SM75.
-- **RTX 50 (Blackwell) FP4 fast lane** for the new pipelines.
 
 > The plugin auto-pulls the matching engine on startup: bumping `comfy` to **0.0.06** lets the updater fetch engine **0.0.12** from ModelScope.
 
@@ -89,7 +88,6 @@ ComfyUI plugin for **QuantFunc** — the fastest diffusion model inference engin
 
 **⚡ Performance**
 - **Consumer GPUs run native SASS** — *no first-run JIT compile stall* on 20/30/40/50-series (datacenter/workstation cards JIT once, then cache).
-- Native **FP4 (NVFP4)** on Blackwell (SM120) — the fastest 4-bit path.
 - **QFRAW raw staging** for reference images & masks skips the PNG/BMP encode (~80 ms saved per ref).
 - **Multi-pipeline CPU↔GPU coexistence** — swap pipelines without a full reload; idle workers auto-free VRAM.
 
