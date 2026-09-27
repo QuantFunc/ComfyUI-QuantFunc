@@ -489,7 +489,7 @@ def main():
         okM6_reversed = (m6r_0 == m6r_1)
         okM6 = okM6_collapse and okM6_fwd and okM6_reversed
         # M7) STEP-INDEX INDEPENDENCE (Finding #2): step_index (DenoiseStepParams.step_index, sigma-derived) is
-        #     IN SCOPE at the derivation site (the QF_NATIVE_DEBUG_CTXKEY debug print reads it) but is NOT a
+        #     IN SCOPE at the derivation site (the step params carry it) but is NOT a
         #     cfg_context_key input: the key is per-uuid + step-STABLE (the engine composes (ctx_key, step) itself;
         #     a step-VARYING ctx_key would defeat that step cache). A `key((cuid, step_index))` retrofit is REACHABLE
         #     (step_index sits right there in the same loop) and would make the SAME cond's key vary per step; the

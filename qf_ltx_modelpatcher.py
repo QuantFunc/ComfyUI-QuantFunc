@@ -312,11 +312,6 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
         # ONE begin path (wan-align 2026-08-22): the session is ALWAYS a plain t2v-shape begin.
         # i2v conditioning is entirely comfy-side (LTXVImgToVideoInplace latent + noise_mask via
         # KSamplerX0Inpaint) — the engine never sees an image or a cond latent.
-        import os as _os
-        _prof = _os.environ.get("QF_NATIVE_PROF") == "1"
-        if _prof:
-            import time as _time
-            _t0 = _time.perf_counter()
         st = lib.quantfunc_denoise_begin(self._qf.pipeline, ctypes.byref(bpx), ctypes.byref(session))
         if st != qfe.QUANTFUNC_OK and "busy" in (qfe.last_err(lib) or ""):
             # ONE bounded recovery (2026-08-24 busy incident): a just-interrupted run's final
@@ -325,8 +320,6 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
             time.sleep(2.0)
             self._qf.end_session_if_open()
             st = lib.quantfunc_denoise_begin(self._qf.pipeline, ctypes.byref(bpx), ctypes.byref(session))
-        if _prof:
-            qfe.say(f"[qf_prof] begin_call {(_time.perf_counter()-_t0)*1000:.0f} ms", flush=True)
         self._begin_keep = bpx
         if st != qfe.QUANTFUNC_OK:
             raise RuntimeError(f"denoise_begin (LTX) failed: {qfe.last_err(lib)}")
@@ -414,22 +407,9 @@ class QFLTXAVModel(QFLTXModel):
 
     def _apply_model(self, x, t, c_concat=None, c_crossattn=None, control=None,
                      transformer_options={}, **kwargs):
-        # [qf_prof] per-step wall probe (diagnostic, QF_NATIVE_PROF=1 gated print only —
-        # not a production-path switch): total wall per sampler step incl. all comfy-side
-        # conversion; the engine-internal share rides the engine's own logs.
-        import os as _os
-        if _os.environ.get("QF_NATIVE_PROF") != "1":
-            return self._apply_model_timed(x, t, c_concat=c_concat, c_crossattn=c_crossattn,
-                                           control=control, transformer_options=transformer_options,
-                                           **kwargs)
-        import time as _time
-        _t0 = _time.perf_counter()
-        try:
-            return self._apply_model_timed(x, t, c_concat=c_concat, c_crossattn=c_crossattn,
-                                           control=control, transformer_options=transformer_options,
-                                           **kwargs)
-        finally:
-            qfe.say(f"[qf_prof] step wall {(_time.perf_counter()-_t0)*1000:.0f} ms", flush=True)
+        return self._apply_model_timed(x, t, c_concat=c_concat, c_crossattn=c_crossattn,
+                                       control=control, transformer_options=transformer_options,
+                                       **kwargs)
 
     def _apply_model_timed(self, x, t, c_concat=None, c_crossattn=None, control=None,
                      transformer_options={}, **kwargs):
@@ -520,10 +500,6 @@ class QFLTXAVModel(QFLTXModel):
             # gate force-computes at 0 — the AV loop was the measured miss, see loop head).
             cuid = cuuids[i] if (cuuids is not None and i < len(cuuids)) else None
             p.cfg_context_key = self._ctx_key_assigner.key(cuid)
-            if os.environ.get("QF_NATIVE_DEBUG_CTXKEY"):
-                qfe.say(f"[qf_native] LTX-AV CTXKEY step={step_index} grp={i} "
-                        f"cuuids_none={cuuids is None} cuid={str(cuid)[:8]} key={p.cfg_context_key}",
-                        flush=True)
             mp = qfe.DenoiseStepMultiParams()
             ctypes.memset(ctypes.byref(mp), 0, ctypes.sizeof(mp))
             mp.struct_size = ctypes.sizeof(mp)

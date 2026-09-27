@@ -50,12 +50,6 @@ QUANTFUNC_RESOURCE_PHASE_CLOSED = 4
 QF_FP32, QF_FP16, QF_BF16 = 0, 1, 2
 
 
-def _dbg_prof(msg):
-    """QF_NATIVE_PROF-gated diagnostic line (the [qf_prof] channel the perf probes use)."""
-    import os as _os
-    if _os.environ.get("QF_NATIVE_PROF") == "1":
-        say(f"[qf_prof] {msg}", flush=True)
-
 # Platform dispatch — the bundled native library lives in bin/<subdir>/<basename>, so a Windows install
 # finds bin/windows/quantfunc.dll and a Linux install finds bin/linux/libquantfunc.so. The Windows/Linux
 # split follows the production plugin's lib_setup.py (_IS_WINDOWS / bin/<subdir>/); the Darwin branch

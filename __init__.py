@@ -242,7 +242,7 @@ def _read_auth(ui_key=None):
     surl = os.environ.get("QF_SERVER_URL", "https://service.quantfunc.com")
     if ui_key:
         return ui_key, surl
-    key = os.environ.get("QUANTFUNC_API_KEY", "") or os.environ.get("QF_API_KEY", "")
+    key = os.environ.get("QUANTFUNC_API_KEY", "")
     keyfile = qf_api_key.config_to_read(_resolve_keyfile())
     if not key and keyfile and os.path.exists(keyfile):
         # A keyfile that is there but unreadable is an error, never "no key": swallowing it hid a Windows cp936 decode

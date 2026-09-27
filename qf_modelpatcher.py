@@ -580,18 +580,11 @@ class QFSessionModelMixin:
             raise RuntimeError(f"{fail_prefix}: the loaded engine .so has no "
                                "quantfunc_denoise_step_multi (D-class AV step) - rebuild/point "
                                "the engine lib at an AV-capable build.")
-        import os as _os
-        _prof = _os.environ.get("QF_NATIVE_PROF") == "1"
-        if _prof:
-            import time as _time
-            _t0 = _time.perf_counter()
         try:
             st = lib.quantfunc_denoise_step_multi(self._qf.current_session, ctypes.byref(mp))
         except Exception:
             self._qf.end_session_if_open()
             raise
-        if _prof:
-            qfe.say(f"[qf_prof] engine_call {(_time.perf_counter()-_t0)*1000:.0f} ms", flush=True)
         if st != qfe.QUANTFUNC_OK:
             err = qfe.last_err(lib)
             self._qf.end_session_if_open()
