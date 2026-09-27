@@ -465,7 +465,7 @@ globalThis.localStorage = { getItem: k => (store.has(k) ? store.get(k) : null), 
                             removeItem: k => store.delete(k) };
 globalThis.document = { createElement(tag) {
   return { tagName: tag.toUpperCase(), type: "text", value: "", listeners: {},
-           addEventListener(ev, fn) { (this.listeners[ev] ??= []).push(fn); },
+           addEventListener(ev, fn) { (this.listeners[ev] ??= []).push(fn); }, setAttribute(k, v) { this[k] = v; },
            fire(ev) { for (const fn of this.listeners[ev] ?? []) fn({ target: this }); } };
 } };
 const { app } = await import("./scripts/app.js");

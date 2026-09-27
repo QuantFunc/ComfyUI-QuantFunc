@@ -13,7 +13,7 @@ import { api } from "../../scripts/api.js";
 
 const LOADERS = new Set(["QuantFuncLTXLoader", "QuantFuncH3Loader", "QuantFuncKrea2Loader", "QuantFuncQwenImage21Loader"]);
 const REMEMBERED = "QuantFunc.api_key";   // localStorage item
-const FIELD_HEIGHT = 26;                  // px: one text line
+const FIELD_HEIGHT = 26;                  // px: one text line (the canvas adds the widget's margin around it)
 
 app.registerExtension({
   name: "QuantFunc.ApiKey",
@@ -24,17 +24,23 @@ app.registerExtension({
     input.autocomplete = "off";
     input.spellcheck = false;
     input.placeholder = "API key (empty: the key in config.json)";
+    input.title = "QuantFunc API key. Remembered in this browser, never saved into a workflow or an image. " +
+                  "Empty: the key in config.json.";
+    input.setAttribute("aria-label", "QuantFunc API key");
     input.value = localStorage.getItem(REMEMBERED) ?? "";
     input.addEventListener("change", () => {
       const key = input.value.trim();
       if (key) localStorage.setItem(REMEMBERED, key);
       else localStorage.removeItem(REMEMBERED);
     });
-    const widget = node.addDOMWidget("api_key", "password", input, {
+    let widget;
+    // The canvas draws a DOM widget's element inside the widget's margin on each side, so the row is the field plus both.
+    const rowHeight = () => FIELD_HEIGHT + 2 * (widget?.margin ?? 0);
+    widget = node.addDOMWidget("api_key", "password", input, {
       getValue: () => input.value,
       setValue: (value) => { input.value = value ?? ""; },
-      getMinHeight: () => FIELD_HEIGHT,
-      getMaxHeight: () => FIELD_HEIGHT,
+      getMinHeight: rowHeight,
+      getMaxHeight: rowHeight,
     });
     widget.serialize = false;   // never in a saved workflow
     widget.serializeValue = async () => {   // what a queued prompt carries: "" or a reference, never the key
