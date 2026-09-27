@@ -1284,7 +1284,7 @@ try:
             qf_api_key.add_api_key_input(_qf_cls, qfmp.LOADER_API_KEY)
             _qf_add_log_level(_qf_cls, _qf_ll_engine.set_log_level)
 except Exception as _qf_ll_exc:  # noqa: BLE001
-    _log.warning("[qf_native] log-level input not attached: %s", ascii(_qf_ll_exc))
+    _log.warning("[qf_native] hidden loader inputs (api_key, log_level) not attached: %s", ascii(_qf_ll_exc))
 
 
 # -- The console-safe boundary (#738) ---------------------------------------------------------------------------------
