@@ -642,7 +642,6 @@ def _materialize_engine(entry, lib, ckey):
                                        capacity_bytes=int(entry.capacity_bytes),
                                        prepared_resource=entry.resource)
         eng._qf_resource_adapters = entry._qf_resource_adapters
-        eng._qf_resource_adapters[0]._prepared = False
         eng.applied_api_key = entry.api_key   # created with the key its recipe carries
         with _ENGINE_IDENTITY_LOCK:
             _PIPELINE_CACHE[ckey] = eng

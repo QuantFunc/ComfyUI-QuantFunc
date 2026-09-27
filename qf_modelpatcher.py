@@ -1373,7 +1373,6 @@ class QFPreparedEntry:
             self.capacity_bytes = int(capacity.required_persistent_bytes)
             owner, shared = canonical_resource_adapters(self)
             self._owner_adapter, self._shared_adapter = owner, shared
-            owner._prepared = True
             owner.bind_prepared(self, self.capacity_bytes)
         except BaseException:
             if hasattr(self, "_owner_adapter"):
@@ -1467,7 +1466,6 @@ class QFNativeResourcePatcher(comfy.model_patcher.ModelPatcher):
         model.device = load_device
         super().__init__(model, load_device, torch.device("cpu"))
         self._resource = resource
-        self._prepared = False
         self._closed_identity = False
         self._owner_epoch = identity.owner_epoch  # 0 for the device's Shared view
         self._shared_adapter = None
@@ -1568,7 +1566,6 @@ class QFNativeResourcePatcher(comfy.model_patcher.ModelPatcher):
             lifecycle = _ready_read(self._resource.lifecycle, "admission lifecycle")
             if lifecycle.phase == qfe.QUANTFUNC_RESOURCE_PHASE_PREPARED:
                 self._prepared_entry.materialize()
-        self._prepared = False
         return max(0, _domain_loaded_size(self) - before_domain)
 
     def _closed_now(self):
