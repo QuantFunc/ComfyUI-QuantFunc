@@ -106,9 +106,27 @@ class _InterruptExc(BaseException):
     which this test then flags."""
 
 
+# comfy's own frame-rate default, as the stub's model_base.LTXV.extra_conds applies it. Deliberately NOT 25 (comfy's
+# real value today): the seam must return whatever COMFY resolves, so a local literal cannot pass this test.
+_COMFY_STUB_FRAME_RATE = 17.5
+
+
+class _StubLTXV:
+    """comfy.model_base.LTXV as far as the frame_rate channel goes: its extra_conds emits the conditioning's frame_rate,
+    else comfy's own default (model_base.py: CONDConstant(kwargs.get("frame_rate", <default>)))."""
+    fail = False
+
+    @staticmethod
+    def extra_conds(self, **kwargs):
+        if _StubLTXV.fail:
+            raise AttributeError("comfy internals moved (test)")
+        return {"frame_rate": _CONDConstant(kwargs.get("frame_rate", _COMFY_STUB_FRAME_RATE))}
+
+
 def _make_comfy(interrupt_raises=False):
     comfy = types.ModuleType("comfy")
     comfy.conds = types.SimpleNamespace(CONDRegular=_CONDRegular, CONDConstant=_CONDConstant)
+    comfy.model_base = types.SimpleNamespace(LTXV=_StubLTXV)
 
     def _throw():
         if interrupt_raises:
@@ -152,18 +170,29 @@ def _mock_self(**attrs):
 _QFE_STUB = types.SimpleNamespace(info=lambda *a, **k: None)
 
 
+def _ltx_mock_factory(src, comfy):
+    """A mock-`self` maker for extra_conds: the REAL _native_frame_rate body is bound on it (extra_conds calls it)."""
+    nfr, _ = _bind(src, "_native_frame_rate", {"comfy": comfy})
+
+    def mk(**attrs):
+        me = _mock_self(**attrs)
+        me._native_frame_rate = types.MethodType(nfr, me)
+        return me
+    return mk
+
+
 # ── tests ─────────────────────────────────────────────────────────────────────────────────────────────────
 def _t_extra_conds(src):
     comfy = _make_comfy()
-    fn, _ = _bind(src, "extra_conds", {"comfy": comfy, "qfe": _QFE_STUB,
-                                       "_LTX_DEFAULT_FPS": _extract_const(src, "_LTX_DEFAULT_FPS")})
+    fn, _ = _bind(src, "extra_conds", {"comfy": comfy, "qfe": _QFE_STUB})
+    mk = _ltx_mock_factory(src, comfy)
     keys = _extract_class_attr(src, "QFLTXModel", "_ENGINE_IGNORED_COND_KEYS")
     assert len(keys) >= 7, f"reject-list shrank unexpectedly: {keys}"
     bad = 0
     # (1) EACH reject-listed key, wired individually, must RAISE.
     for k in keys:
         eng = _MockEngine()
-        me = _mock_self(_qf=eng, _ENGINE_IGNORED_COND_KEYS=keys, _max_ctx_seq=0)
+        me = mk(_qf=eng, _ENGINE_IGNORED_COND_KEYS=keys, _max_ctx_seq=0)
         try:
             fn(me, **{k: object()})
             print(f"  [FAIL] extra_conds({k}=..) did NOT raise"); bad += 1
@@ -171,7 +200,7 @@ def _t_extra_conds(src):
             pass
     # (2) a non-reject key (cross_attn only) must NOT raise and must emit c_crossattn.
     eng = _MockEngine()
-    me = _mock_self(_qf=eng, _ENGINE_IGNORED_COND_KEYS=keys, _max_ctx_seq=0,
+    me = mk(_qf=eng, _ENGINE_IGNORED_COND_KEYS=keys, _max_ctx_seq=0,
                     _post_connector_seq=lambda s: int(s))
     out = fn(me, cross_attn=torch.zeros(1, 3, 8))
     if "c_crossattn" not in out or not isinstance(out["c_crossattn"], _CONDRegular):
@@ -179,7 +208,7 @@ def _t_extra_conds(src):
     # (3) documented-accepted keys (frame_rate / attention_mask / latent_image) must NOT raise.
     for k in ("frame_rate", "attention_mask", "latent_image"):
         eng = _MockEngine()
-        me = _mock_self(_qf=eng, _ENGINE_IGNORED_COND_KEYS=keys, _max_ctx_seq=0,
+        me = mk(_qf=eng, _ENGINE_IGNORED_COND_KEYS=keys, _max_ctx_seq=0,
                         _post_connector_seq=lambda s: int(s))
         try:
             fn(me, **{k: object(), "cross_attn": torch.zeros(1, 3, 8)})
@@ -187,22 +216,36 @@ def _t_extra_conds(src):
             print(f"  [FAIL] extra_conds({k}=..) wrongly raised (accepted infra)"); bad += 1
     # (4) run-start session close is invoked (idempotent no-op when nothing open).
     eng = _MockEngine(open_session=object())
-    me = _mock_self(_qf=eng, _ENGINE_IGNORED_COND_KEYS=keys, _max_ctx_seq=0,
+    me = mk(_qf=eng, _ENGINE_IGNORED_COND_KEYS=keys, _max_ctx_seq=0,
                     _post_connector_seq=lambda s: int(s))
     fn(me, cross_attn=torch.zeros(1, 3, 8))
     if eng.end_calls != 1 or eng.current_session is not None:
         print(f"  [FAIL] extra_conds did not close a stale session (calls={eng.end_calls})"); bad += 1
-    # (5) frame_rate is CONSUMED: re-emitted as comfy's LTXV/LTXAV do — the cond's value, else comfy's default (25).
-    #     It is the engine session's fps (_call_fps); dropping it drove every 24-fps graph at 25 (dead audio).
-    for kw, want in (({"frame_rate": 24.0}, 24.0), ({}, 25.0)):
-        me = _mock_self(_qf=_MockEngine(), _ENGINE_IGNORED_COND_KEYS=keys, _max_ctx_seq=0,
-                        _post_connector_seq=lambda s: int(s))
+    # (5) frame_rate is CONSUMED, and resolved by COMFY's own model code (the stub's LTXV.extra_conds): the cond's
+    #     value passes through unchanged, a graph without one gets comfy's value (the stub's sentinel, not a local 25).
+    #     It is the engine session's fps (_call_fps); the old local 25 drove every 24-fps graph off (dead audio).
+    for kw, want in (({"frame_rate": 24.0}, 24.0), ({"frame_rate": 30.0}, 30.0), ({}, _COMFY_STUB_FRAME_RATE)):
+        me = mk(_qf=_MockEngine(), _ENGINE_IGNORED_COND_KEYS=keys, _max_ctx_seq=0,
+                _post_connector_seq=lambda s: int(s))
         fr = fn(me, cross_attn=torch.zeros(1, 3, 8), **kw).get("frame_rate")
         if not isinstance(fr, _CONDConstant) or fr.cond != want:
             print(f"  [FAIL] extra_conds({kw}) emitted frame_rate={getattr(fr, 'cond', fr)!r}, want CONDConstant({want})")
             bad += 1
+    # (6) comfy cannot resolve it (internals moved) -> REFUSED, never a local default.
+    _StubLTXV.fail = True
+    try:
+        me = mk(_qf=_MockEngine(), _ENGINE_IGNORED_COND_KEYS=keys, _max_ctx_seq=0,
+                _post_connector_seq=lambda s: int(s))
+        try:
+            out = fn(me, cross_attn=torch.zeros(1, 3, 8))
+            print(f"  [FAIL] unresolvable comfy frame_rate was NOT refused (emitted {out.get('frame_rate')!r})"); bad += 1
+        except RuntimeError:
+            pass
+    finally:
+        _StubLTXV.fail = False
     print(f"  extra_conds: {'OK' if bad == 0 else 'FAIL'} ({len(keys)} reject keys raise; cross_attn emits; "
-          "frame_rate/attention_mask/latent_image accepted; stale session closed; frame_rate re-emitted, default 25)")
+          "frame_rate/attention_mask/latent_image accepted; stale session closed; frame_rate = comfy's own "
+          "resolution (24/30 pass, none -> comfy's value); unresolvable -> refused)")
     return bad
 
 
@@ -210,10 +253,13 @@ def _t_call_fps(src):
     """The engine session's fps is the conditioning's frame_rate (the engine's video + video<->audio RoPE time grid;
     a 24-fps graph driven at the old hardcoded 25 had dead audio). Opening adopts it, an open session keeps it and
     refuses another, and the AV step calls it BEFORE _begin (which puts self._fps into the session options)."""
-    default_fps = _extract_const(src, "_LTX_DEFAULT_FPS")
-    fn, _ = _bind(src, "_call_fps", {"_LTX_DEFAULT_FPS": default_fps})
+    fn, _ = _bind(src, "_call_fps", {})
     bad = 0
-    me = _mock_self(_fps=default_fps)
+    me = _mock_self(_fps=None)
+    for fr in (24.0, 25.0, 30.0):                     # each reaches the session unchanged
+        fn(me, {"frame_rate": fr}, True)
+        if me._fps != fr:
+            print(f"  [FAIL] opening a session with frame_rate {fr} set fps {me._fps}"); bad += 1
     fn(me, {"frame_rate": 24.0}, True)
     if me._fps != 24.0:
         print(f"  [FAIL] opening a session did not adopt frame_rate 24 (fps={me._fps})"); bad += 1
@@ -226,17 +272,31 @@ def _t_call_fps(src):
         print("  [FAIL] a different frame_rate on an open session was NOT refused"); bad += 1
     except RuntimeError:
         pass
-    fn(me, {}, True)                                  # a new run without frame_rate: comfy's default
-    if me._fps != default_fps or default_fps != 25.0:
-        print(f"  [FAIL] no frame_rate -> fps {me._fps} (default {default_fps}), want comfy's 25"); bad += 1
+    for opening in (True, False):                     # a call without frame_rate: refused, never a default
+        try:
+            fn(_mock_self(_fps=24.0), {}, opening)
+            print(f"  [FAIL] a call without frame_rate was NOT refused (opening={opening})"); bad += 1
+        except RuntimeError:
+            pass
     # order in the AV step: _call_fps before _begin (the session options read self._fps)
     body = _extract_method(src, "QFLTXAVModel", "_apply_model_timed")
     i_fps, i_begin = body.find("self._call_fps("), body.find("self._begin(")
     if i_fps < 0 or i_begin < 0 or i_fps > i_begin:
         print(f"  [FAIL] QFLTXAVModel._apply_model_timed does not call _call_fps before _begin "
               f"(at {i_fps} / {i_begin})"); bad += 1
-    print(f"  _call_fps: {'OK' if bad == 0 else 'FAIL'} (opening adopts frame_rate; open session keeps it and refuses "
-          "another; default 25; called before _begin)")
+    # _begin hands the engine exactly self._fps (options_json "fps") - where the old code put its local 25
+    beg = ast.parse(_extract_method(src, "QFLTXModel", "_begin"))
+    fps_vals = [v for d in ast.walk(beg) if isinstance(d, ast.Dict)
+                for k, v in zip(d.keys, d.values) if isinstance(k, ast.Constant) and k.value == "fps"]
+    if not (len(fps_vals) == 1
+            and any(isinstance(n, ast.Attribute) and n.attr == "_fps" and isinstance(n.value, ast.Name)
+                    and n.value.id == "self" for n in ast.walk(fps_vals[0]))
+            and not any(isinstance(n, ast.Constant) and isinstance(n.value, (int, float))
+                        for n in ast.walk(fps_vals[0]))):
+        print("  [FAIL] QFLTXModel._begin does not send exactly self._fps as the session fps "
+              f"({[ast.unparse(v) for v in fps_vals]})"); bad += 1
+    print(f"  _call_fps: {'OK' if bad == 0 else 'FAIL'} (opening adopts 24/25/30 unchanged; open session keeps it and "
+          "refuses another; no frame_rate -> refused; called before _begin, which sends self._fps)")
     return bad
 
 
@@ -249,25 +309,25 @@ def _t_max_ctx_seq(src):
     length semantics (the quantity accumulated) are proven against the REAL comfy connector in
     _t_post_connector_seq."""
     comfy = _make_comfy()
-    fn, _ = _bind(src, "extra_conds", {"comfy": comfy, "qfe": _QFE_STUB,
-                                       "_LTX_DEFAULT_FPS": _extract_const(src, "_LTX_DEFAULT_FPS")})
+    fn, _ = _bind(src, "extra_conds", {"comfy": comfy, "qfe": _QFE_STUB})
+    mk = _ltx_mock_factory(src, comfy)
     keys = _extract_class_attr(src, "QFLTXModel", "_ENGINE_IGNORED_COND_KEYS")
     _ident = lambda s: int(s)   # identity probe: isolates the max/order/untouched arithmetic  # noqa: E731
     bad = 0
     # (a) pos S=10 then neg S=20 → accumulator == 20 (max, not the last value).
-    eng = _MockEngine(); me = _mock_self(_qf=eng, _ENGINE_IGNORED_COND_KEYS=keys, _max_ctx_seq=0,
+    eng = _MockEngine(); me = mk(_qf=eng, _ENGINE_IGNORED_COND_KEYS=keys, _max_ctx_seq=0,
                                          _post_connector_seq=_ident)
     fn(me, cross_attn=torch.zeros(1, 10, 8)); fn(me, cross_attn=torch.zeros(1, 20, 8))
     if me._max_ctx_seq != 20:
         print(f"  [FAIL] pos(10)+neg(20) → _max_ctx_seq={me._max_ctx_seq}, expected 20"); bad += 1
     # (b) reverse order neg S=20 then pos S=10 → still 20 (a smaller later must NOT shrink it).
-    eng = _MockEngine(); me = _mock_self(_qf=eng, _ENGINE_IGNORED_COND_KEYS=keys, _max_ctx_seq=0,
+    eng = _MockEngine(); me = mk(_qf=eng, _ENGINE_IGNORED_COND_KEYS=keys, _max_ctx_seq=0,
                                          _post_connector_seq=_ident)
     fn(me, cross_attn=torch.zeros(1, 20, 8)); fn(me, cross_attn=torch.zeros(1, 10, 8))
     if me._max_ctx_seq != 20:
         print(f"  [FAIL] neg(20)+pos(10) → _max_ctx_seq={me._max_ctx_seq}, expected 20 (order-independent)"); bad += 1
     # (c) a cross_attn-less call must leave the accumulator UNTOUCHED (the _begin safe-fallback path).
-    eng = _MockEngine(); me = _mock_self(_qf=eng, _ENGINE_IGNORED_COND_KEYS=keys, _max_ctx_seq=7,
+    eng = _MockEngine(); me = mk(_qf=eng, _ENGINE_IGNORED_COND_KEYS=keys, _max_ctx_seq=7,
                                          _post_connector_seq=_ident)
     fn(me)
     if me._max_ctx_seq != 7:

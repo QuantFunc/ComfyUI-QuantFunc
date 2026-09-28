@@ -45,8 +45,8 @@ from .qf_modelpatcher import (_qf_dtype, _QFStub,
 # LTX VAE scale factors (engine kS=32 spatial, kT=8 temporal, kC=128 channels — LTX2VideoPipeline).
 _LTX_SPATIAL = 32
 _LTX_TEMPORAL = 8
-# The frame rate when the conditioning carries none: comfy's own LTXV/LTXAV extra_conds default (model_base.py).
-_LTX_DEFAULT_FPS = 25.0
+# The frame rate is NOT a constant here: it is the conditioning's, resolved by comfy's own model code
+# (_native_frame_rate); a hardcoded 25 once drove every 24-fps graph off its audio (2026-09-28).
 
 
 @qfe.console_safe_methods   # an exception leaving it is console-safe (#738)
@@ -70,7 +70,7 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
         self._audio_connector = audio_connector  # comfy audio_embeddings_connector (2048); None -> video-only 4096
         self._num_steps = 0                  # DERIVED per run from sample_sigmas (len-1) at _begin
         self._num_frames = 0                 # DERIVED per run from the latent: (Tlat-1)*8 + 1
-        self._fps = _LTX_DEFAULT_FPS         # the session's fps: the conditioning's frame_rate (_call_fps)
+        self._fps = None                     # the session's fps: this run's frame_rate conditioning (_call_fps)
         self._step_i = 0
         self._sess_denoise = 0
         self._out = None                     # reused packed velocity_out buffer [1,N,128]
@@ -162,9 +162,9 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
         # BaseModel.concat_cond is concat_keys-gated and never touches diffusion_model — so calling super() would
         # not crash here; building by hand keeps the emitted set minimal and explicit.) attention_mask IS consumed
         # (the connector mask — 19B mask fix), and so is frame_rate: see _call_fps.
-        # frame_rate (LTXVConditioning), re-emitted exactly as comfy's LTXV/LTXAV extra_conds do (same key, same
-        # default): it reaches _apply_model with every call and sets the engine session's fps (_call_fps).
-        out = {"frame_rate": comfy.conds.CONDConstant(kwargs.get("frame_rate", _LTX_DEFAULT_FPS))}
+        # frame_rate: comfy's own conditioning of it (_native_frame_rate), which reaches _apply_model with every call
+        # and sets the engine session's fps (_call_fps).
+        out = {"frame_rate": self._native_frame_rate(kwargs)}
         cross_attn = kwargs.get("cross_attn", None)
         if cross_attn is not None:
             out["c_crossattn"] = comfy.conds.CONDRegular(cross_attn)
@@ -262,14 +262,34 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
         self._num_frames = (Tlat - 1) * _LTX_TEMPORAL + 1
         self._stage_schedule(transformer_options, "LTX")
 
+    def _native_frame_rate(self, kwargs):
+        """ComfyUI's own conditioning of the frame rate, EXECUTED rather than copied: comfy.model_base.LTXV.extra_conds
+        (the native class this model derives from; model_base.LTXAV resolves frame_rate the same way) run on this
+        model for the frame_rate channel only. So the conditioning's value (LTXVConditioning), or comfy's own
+        default when the graph has none, is native behaviour byte for byte and follows comfy if it ever changes.
+        This seam holds no frame-rate value of its own: when comfy cannot answer, the run is refused."""
+        try:
+            fr = comfy.model_base.LTXV.extra_conds(
+                self, **({"frame_rate": kwargs["frame_rate"]} if "frame_rate" in kwargs else {}))["frame_rate"]
+        except Exception as e:  # noqa: BLE001 - any failure to resolve is a refusal, never a local default
+            raise RuntimeError(
+                "qf_native LTX: ComfyUI's LTX model code did not resolve a frame_rate for this conditioning "
+                f"({type(e).__name__}: {e}). Wire LTXVConditioning: its frame_rate sets the video<->audio "
+                "timing.") from e
+        return fr
+
     def _call_fps(self, kwargs, opening):
-        """The session's fps = this call's conditioning frame_rate (extra_conds re-emits it; comfy's default when
-        absent). The engine builds the video self-RoPE and the video<->audio cross-RoPE time grid as frame_time/fps,
-        exactly as comfy's LTXAV does with frame_rate, while the audio grid is hop/sample-rate time — a wrong fps
-        skews the two lanes apart, more with every second of clip (measured: 24-fps official graph driven at 25 =
-        dead audio at 97 frames). Opening a session adopts it; an open session has one time grid, so a call with
-        another frame_rate is refused."""
-        fps = float(kwargs.get("frame_rate", _LTX_DEFAULT_FPS))
+        """The session's fps = this call's frame_rate conditioning (extra_conds emits comfy's own, see
+        _native_frame_rate). The engine builds the video self-RoPE and the video<->audio cross-RoPE time grid as
+        frame_time/fps, exactly as comfy's LTXAV does with frame_rate, while the audio grid is hop/sample-rate time —
+        a wrong fps skews the two lanes apart, more with every second of clip (measured: a 24-fps official graph
+        driven at the old hardcoded 25 = dead audio at 97 frames). Opening a session adopts it; an open session has
+        one time grid, so a call with another frame_rate is refused, and so is a call that carries none."""
+        fr = kwargs.get("frame_rate")
+        if fr is None:
+            raise RuntimeError("qf_native LTX: this model call carries no frame_rate conditioning (extra_conds emits "
+                               "it), so the video<->audio timing is unknown - refused rather than guessed.")
+        fps = float(fr)
         if opening:
             self._fps = fps
         elif fps != self._fps:
