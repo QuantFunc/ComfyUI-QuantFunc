@@ -42,9 +42,7 @@ from .qf_modelpatcher import (_qf_dtype, _QFStub,
                               QFSessionModelMixin)
 
 
-# LTX VAE scale factors (engine kS=32 spatial, kT=8 temporal, kC=128 channels — LTX2VideoPipeline).
-_LTX_SPATIAL = 32
-_LTX_TEMPORAL = 8
+# The VAE scale factors are the model's comfy latent_format (latent_formats.LTXV / LTXAV), read per run.
 # The frame rate is NOT a constant here: it is the conditioning's, resolved by comfy's own model code
 # (_native_frame_rate); a hardcoded 25 once drove every 24-fps graph off its audio (2026-09-28).
 
@@ -248,7 +246,7 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
 
     def _derive_geometry(self, xin, transformer_options):
         """DERIVE the session geometry from the graph (official-loader shape — the loader has no
-        geometry widgets). xin: [B,128,F_lat,H_lat,W_lat]; LTX VAE scale temporal 8 / spatial 32.
+        geometry widgets). xin: [B,C,F_lat,H_lat,W_lat]; the VAE scales are self.latent_format's.
         Step count from the sampler's own sigma schedule. PARTIAL / TRIMMED ranges are
         ACCEPTED (two-stage official workflows: stage-A 1.0->0.975 low-res, stage-B
         0.85->0 refine after the x2 latent upsample): the external session is PURELY
@@ -259,7 +257,7 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
         INTERNAL generate_video loop, not this seam. Only pathological schedules
         (fewer than 2 sigmas / non-decreasing) are refused: the mixin's _stage_schedule, shared with H3."""
         Tlat = int(xin.shape[2])
-        self._num_frames = (Tlat - 1) * _LTX_TEMPORAL + 1
+        self._num_frames = (Tlat - 1) * int(self.latent_format.temporal_downscale_ratio) + 1
         self._stage_schedule(transformer_options, "LTX")
 
     def _native_frame_rate(self, kwargs):
@@ -308,9 +306,10 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
         bpx = qfe.DenoiseBeginParams()
         ctypes.memset(ctypes.byref(bpx), 0, ctypes.sizeof(bpx))
         bpx.struct_size = ctypes.sizeof(bpx)
-        # latent is [1, 128, F_lat, H_lat, W_lat]; target pixels = latent * VAE scale (spatial 32).
-        bpx.width = int(x_group.shape[-1]) * _LTX_SPATIAL
-        bpx.height = int(x_group.shape[-2]) * _LTX_SPATIAL
+        # latent is [1, C, F_lat, H_lat, W_lat]; target pixels = latent * the model's latent_format spatial scale.
+        _s = int(self.latent_format.spacial_downscale_ratio)
+        bpx.width = int(x_group.shape[-1]) * _s
+        bpx.height = int(x_group.shape[-2]) * _s
         bpx.num_steps = self._num_steps
         # Size the context MAXIMA to the LARGEST POST-CONNECTOR vemb seq across this run's cond groups
         # (accumulated in extra_conds for pos+neg via _post_connector_seq — same quantity as this group's
@@ -355,12 +354,14 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
 
 
 # ── LTX-2.5 joint audio+video (c5.8b) ────────────────────────────────────────────────
-# Packed audio latent row width: comfy audio latent [B,8,L,16] ↔ engine rows [1,L,128]
-# with d = c*16 + f (engine diffusers _unpack_audio_latents: packed[b,l,d] →
-# unpacked[b, d/16, l, d%16]) — i.e. permute(0,2,1,3).reshape.
+# Audio packing: comfy audio latent [B,C,L,F] <-> engine rows [1,L,C*F] with d = c*F + f (engine diffusers
+# _unpack_audio_latents order), i.e. permute(0,2,1,3).reshape. Every shape comes from the latent itself.
+# The layout below is used ONLY to refuse a mis-wired latent: it is the LTX-2 audio lane's input layout as ComfyUI's
+# own LTXAVModel writes it (comfy/ldm/lightricks/av_model.py num_audio_channels / audio_frequency_bins; no comfy
+# object hands it to a model patcher). The engine checks the packed width C*F at begin but cannot see the split,
+# so a latent with the right width and the wrong split would otherwise pass as wrong audio.
 _LTXAV_AUDIO_CH = 8
 _LTXAV_AUDIO_MEL = 16
-_LTXAV_AUDIO_PACK = _LTXAV_AUDIO_CH * _LTXAV_AUDIO_MEL   # 128
 
 
 @qfe.console_safe_methods   # an exception leaving it is console-safe (#738)
@@ -396,6 +397,7 @@ class QFLTXAVModel(QFLTXModel):
         self._out_audio = None            # reused packed audio velocity buffer [1,L,128] fp32
         self._ctx_unprocessed = False     # set per run by extra_conds from the TE's marker
         self._audio_rows = 0              # L, set from the actual audio latent at _apply_model
+        self._audio_pack = 0              # C*F, the packed row width, set from the same latent
 
     def _post_connector_seq(self, raw_s):
         # The ENGINE connector tail preserves S (registers REPLACE pad rows — no comfy-style
@@ -426,7 +428,7 @@ class QFLTXAVModel(QFLTXModel):
                 "the video-only QuantFuncNativeLoader path.")
         if self._audio_rows <= 0:
             raise RuntimeError("qf_native LTX-AV: audio latent rows unset at begin - wiring error")
-        return {"audio_dims": [1, int(self._audio_rows), _LTXAV_AUDIO_PACK],
+        return {"audio_dims": [1, int(self._audio_rows), int(self._audio_pack)],
                 "av_unprocessed_ctx": True}
 
     def _apply_model(self, x, t, c_concat=None, c_crossattn=None, control=None,
@@ -472,8 +474,9 @@ class QFLTXAVModel(QFLTXModel):
             raise RuntimeError(f"qf_native LTX-AV: engine forward is B==1 per cond group but got "
                                f"batch={B} with cond_or_uncond={cou}")
         self._derive_geometry(xin, transformer_options)
-        La = int(x_audio.shape[2])
+        _, Ca, La, Fa = (int(d) for d in x_audio.shape)
         self._audio_rows = La
+        self._audio_pack = Ca * Fa
         # RAW dual-proj ctx (no plugin connector — see _run_connector).
         vemb = self._run_connector(c_crossattn, attention_mask=kwargs.get("attention_mask")
                                    ).to(dev, dtype=torch.bfloat16).contiguous()
@@ -488,8 +491,8 @@ class QFLTXAVModel(QFLTXModel):
         N = F * H * W
         if self._out is None or self._out.shape != (1, N, C):
             self._out = torch.empty((1, N, C), dtype=xin.dtype, device=dev)
-        if self._out_audio is None or self._out_audio.shape != (1, La, _LTXAV_AUDIO_PACK):
-            self._out_audio = torch.empty((1, La, _LTXAV_AUDIO_PACK), dtype=torch.float32, device=dev)
+        if self._out_audio is None or self._out_audio.shape != (1, La, Ca * Fa):
+            self._out_audio = torch.empty((1, La, Ca * Fa), dtype=torch.float32, device=dev)
         sig_all = sigma.reshape(-1) if torch.is_tensor(sigma) else None
         step_index = self._sigma_step_index(sigma, sig_all, transformer_options)
         # [step-cache-key] the AV class has its OWN step loop (this one), so the base t2v
@@ -502,9 +505,9 @@ class QFLTXAVModel(QFLTXModel):
             _interrupt_poll_end_session_on_raise(self._qf)
             xi = xin[i:i + 1].contiguous()
             tokens = xi.reshape(1, C, N).transpose(1, 2).contiguous()          # [1,N,128]
-            # pack audio [1,8,L,16] → rows [1,L,128] (d = c*16 + f — engine unpack order)
+            # pack audio [1,C,L,F] -> rows [1,L,C*F] (d = c*F + f - engine unpack order)
             arows = (x_audio[i:i + 1].float().permute(0, 2, 1, 3)
-                     .reshape(1, La, _LTXAV_AUDIO_PACK).contiguous())
+                     .reshape(1, La, Ca * Fa).contiguous())
             vi = vemb[i:i + 1].contiguous()
             sig_i = float(sig_all[i].item()) if (sig_all is not None and sig_all.numel() >= B) else \
                 (float(sig_all[0].item()) if sig_all is not None else float(sigma))
@@ -533,13 +536,13 @@ class QFLTXAVModel(QFLTXModel):
             mp.audio_latent_in = arows.data_ptr()
             mp.audio_velocity_out = self._out_audio.data_ptr()
             mp.audio_velocity_out_capacity = self._out_audio.numel() * self._out_audio.element_size()
-            mp.audio_dims = (ctypes.c_int * 4)(1, La, _LTXAV_AUDIO_PACK, 0)
+            mp.audio_dims = (ctypes.c_int * 4)(1, La, Ca * Fa, 0)
             mp.audio_dtype = _qf_dtype(arows.dtype)
             mp.audio_scale = 1.0            # LTX co-denoise: same-sigma, no carried variable
             self._call_denoise_step_multi(mp, f"LTX-AV denoise_step_multi[step={step_index},group={i}]")
             out5d[i:i + 1] = self._out.transpose(1, 2).reshape(1, C, F, H, W).to(xin.dtype)
-            # unpack audio velocity rows [1,L,128] → [1,8,L,16] (exact inverse of the pack)
-            out_audio[i:i + 1] = (self._out_audio.reshape(1, La, _LTXAV_AUDIO_CH, _LTXAV_AUDIO_MEL)
+            # unpack audio velocity rows [1,L,C*F] -> [1,C,L,F] (exact inverse of the pack)
+            out_audio[i:i + 1] = (self._out_audio.reshape(1, La, Ca, Fa)
                                   .permute(0, 2, 1, 3).to(out_audio.dtype))
             self._qf.step_count += 1
             self._sess_denoise += 1

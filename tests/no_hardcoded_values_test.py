@@ -57,13 +57,9 @@ ALLOWED = {
     ("qf_modelpatcher.py", "_QF_COMFY_SIDE_LATENT_COPIES"): "estimate of ComfyUI's own sampler buffers (vram_ledger_test pins it)",
     ("qf_modelpatcher.py", "_QF_COMFY_SIDE_COND_COPIES"): "estimate of ComfyUI's own sampler buffers (vram_ledger_test pins it)",
     ("qf_modelpatcher.py", "_QF_COMFY_SIDE_ITEMSIZE"): "estimate of ComfyUI's own sampler buffers (vram_ledger_test pins it)",
-    # PENDING, not justified: these LTX values move to latent_format / the graph's audio latent once the LTX frame-rate
-    # fix (fix/ltx-av-frame-rate, the same code region) is folded in. Remove each entry with its constant.
-    ("qf_ltx_modelpatcher.py", "_LTX_SPATIAL"): "PENDING: latent_format.spacial_downscale_ratio after the LTX fps fix",
-    ("qf_ltx_modelpatcher.py", "_LTX_TEMPORAL"): "PENDING: latent_format.temporal_downscale_ratio after the LTX fps fix",
-    ("qf_ltx_modelpatcher.py", "_LTX_DEFAULT_FPS"): "PENDING: owned by the LTX fps fix (the graph's frame_rate)",
-    ("qf_ltx_modelpatcher.py", "_LTXAV_AUDIO_CH"): "PENDING: the graph's audio latent shape after the LTX fps fix",
-    ("qf_ltx_modelpatcher.py", "_LTXAV_AUDIO_MEL"): "PENDING: the graph's audio latent shape after the LTX fps fix",
+    **{("qf_ltx_modelpatcher.py", n): "refusal only: the LTX-2 audio lane's input layout as comfy's LTXAVModel writes "
+       "it; the engine checks the packed width but not the split, data shapes come from the latent"
+       for n in ("_LTXAV_AUDIO_CH", "_LTXAV_AUDIO_MEL")},
 }
 
 
@@ -144,8 +140,8 @@ def main():
     for rel, name in stale:
         print(f"  FAIL R1 {rel} {name}: listed in ALLOWED but no longer in the code - remove the entry")
     bad += len(unlisted) + len(stale)
-    print(f"  {'PASS' if not unlisted and not stale else 'FAIL'} R1 {len(found)} named numeric constants, all listed "
-          f"with a reason ({sum(1 for v in ALLOWED.values() if v.startswith('PENDING'))} PENDING)")
+    print(f"  {'PASS' if not unlisted and not stale else 'FAIL'} R1 {len(found)} named numeric constants, each must be "
+          f"listed with a reason ({sum(1 for v in ALLOWED.values() if v.startswith('PENDING'))} PENDING)")
     factors = written_down_factors()
     for h in factors:
         print(f"  FAIL R2 {h}: a written-down factor in model arithmetic; read it from the model or the tensors")

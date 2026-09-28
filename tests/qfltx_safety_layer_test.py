@@ -420,10 +420,15 @@ def _t_scale_latent_inpaint(src):
 def _t_derive_geometry(src):
     """The loader carries NO geometry widgets any more (official-loader shape), so the seam DERIVES
     the session geometry from the graph. This pins the derivation and the schedule rule the mixin shares
-    with H3: no / short / non-decreasing schedules are refused, trimmed ranges are accepted."""
-    kT = _extract_const(src, "_LTX_TEMPORAL")
-    kS = _extract_const(src, "_LTX_SPATIAL")
-    fn, _ = _bind(src, "_derive_geometry", {"_LTX_TEMPORAL": kT, "_LTX_SPATIAL": kS})
+    with H3: no / short / non-decreasing schedules are refused, trimmed ranges are accepted. The frame count follows the
+    model's comfy latent_format (arm 1b feeds a different temporal scale, so a written-down scale cannot pass)."""
+    try:   # the model's latent_format: ComfyUI's own LTXV when COMFY_ROOT is set, else a stub with comfy's values
+        from comfy.latent_formats import LTXV as _LTXVFormat
+        lf = _LTXVFormat()
+    except ImportError:
+        lf = types.SimpleNamespace(temporal_downscale_ratio=8, spacial_downscale_ratio=32)
+    kT = int(lf.temporal_downscale_ratio)
+    fn, _ = _bind(src, "_derive_geometry")
     # the schedule rule is the mixin's _stage_schedule, shared with H3 (qf_modelpatcher.py): bound from its real source
     shared = {}
     exec(_extract_method(_shared_src_text(), "QFSessionModelMixin", "_stage_schedule"), shared)  # noqa: S102
@@ -432,8 +437,8 @@ def _t_derive_geometry(src):
     x = torch.zeros(1, 128, Flat, 2, 2)
     ms = types.SimpleNamespace(sigma_max=1.0)
 
-    def _mock_self(**attrs):   # a model with the shared rule as its method
-        m = types.SimpleNamespace(**attrs)
+    def _mock_self(**attrs):   # a model with the shared rule as its method and the LTX latent_format
+        m = types.SimpleNamespace(**{"latent_format": lf, **attrs})
         m._stage_schedule = types.MethodType(shared["_stage_schedule"], m)
         return m
 
@@ -449,6 +454,13 @@ def _t_derive_geometry(src):
             print(f"  [FAIL] _derive_geometry: num_steps {me._num_steps} != {steps}"); bad += 1
     except RuntimeError as e:
         print(f"  [FAIL] _derive_geometry raised on a FULL-range schedule: {e}"); bad += 1
+    # 1b) another temporal scale: the frame count must follow the model's latent_format, not a number in the seam.
+    lf4 = types.SimpleNamespace(temporal_downscale_ratio=kT // 2, spacial_downscale_ratio=lf.spacial_downscale_ratio)
+    me4 = _mock_self(_num_frames=0, _num_steps=0, model_sampling=ms, latent_format=lf4)
+    fn(me4, x, {"sample_sigmas": full})
+    if me4._num_frames != (Flat - 1) * (kT // 2) + 1:
+        print(f"  [FAIL] _derive_geometry ignored the model's latent_format: num_frames {me4._num_frames} at "
+              f"temporal scale {kT // 2}"); bad += 1
 
     # 2) no schedule at all -> refuse (the seam cannot invent a step count).
     for name, to in (("missing", {}), ("too-short", {"sample_sigmas": [1.0]})):
