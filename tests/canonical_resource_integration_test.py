@@ -1532,5 +1532,58 @@ class CanonicalIntegration(unittest.TestCase):
         self.assertEqual(len(plugin._PIPELINE_CACHE), 2)
 
 
+    def pinned_flip_model(self, package, pinned, created):
+        """A loader's model on `package`: pinned_memory is a create key (family_build adds use_pinned_memory), so ON and
+        OFF are two cache entries. Its first use (the owner's load) cold-creates through the real cache; `created`
+        records each create's resource key with the destroys the native double had seen by then."""
+        cfg = {"use_pinned_memory": True} if pinned else None
+        patcher = self.wrapper(engine=qfm.QFLazyEngine(lambda: plugin._get_engine(package, cfg)))
+        owner, _ = patcher.model_patches_models()
+
+        def create(lib, *, capacity_bytes, prepared_resource, create_params):
+            key = prepared_resource._pointer.value
+            created.append((key, [e for e in self.lib.events if e[0] == "destroy"]))
+            self.lib.resources[key].update(held=3072, phase=qfe.QUANTFUNC_RESOURCE_PHASE_ATTACHED)
+            return qfe.QFEngineHandle(lib, ctypes.c_void_p(70 + key), resource=prepared_resource,
+                                      capacity_bytes=capacity_bytes)
+
+        with mock.patch.object(qfe.QFEngineHandle, "create", side_effect=create):
+            owner.partially_load(owner.load_device, 4096)
+        return patcher, owner
+
+    def test_a_pinned_memory_flip_rebuilds_that_loaders_pipeline_and_no_other(self):
+        """User 2026-09-29: changing a loader's pinned_memory rebuilds that loader's pipeline; other pipelines stay.
+        The flipped loader's model is new (ComfyUI re-ran the loader and dropped the old model), so its first use
+        cold-creates the new pipeline, and that create's sweep destroys the old one BEFORE it creates. A pipeline
+        another live model uses is untouched, and the old pipeline is never destroyed while its own model lives."""
+        self.destroy_closes_owner()
+        created = []
+        other_patcher, other_owner = self.pinned_flip_model("other", True, created)   # another loader, live throughout
+        key_other = other_owner._owner_epoch
+        on_patcher, on_owner = self.pinned_flip_model("krea", True, created)          # the loader, pinned ON
+        key_on = on_owner._owner_epoch
+        del on_patcher, on_owner
+        gc.collect()   # ComfyUI dropped the ON model: the loader re-ran with pinned_memory OFF
+        created.clear()
+        off_patcher, off_owner = self.pinned_flip_model("krea", False, created)       # its first use: the OFF pipeline
+        key_off = off_owner._owner_epoch
+        self.assertNotEqual(key_off, key_on)                                   # rebuilt, not the old one reused
+        self.assertEqual([key for key, _ in created], [key_off])               # exactly one create: the new pipeline
+        self.assertIn(("destroy", key_on), created[0][1])                      # the old one was gone before it
+        self.assertNotIn(("destroy", key_other), self.lib.events)              # another live model's pipeline stays
+        with plugin._ENGINE_IDENTITY_LOCK:
+            live = sum(1 for handle in plugin._PIPELINE_CACHE.values() if handle.pipeline is not None)
+        self.assertEqual(live, 2)                                              # the OFF pipeline and the other one
+
+        # Flip back while the OFF model is still alive (ComfyUI has not dropped it): a new ON pipeline, and the OFF one
+        # is never destroyed under its live model.
+        self.lib.events.clear()
+        back_patcher, back_owner = self.pinned_flip_model("krea", True, created)
+        self.assertNotEqual(back_owner._owner_epoch, key_off)
+        self.assertNotIn(("destroy", key_off), self.lib.events)
+        self.assertNotIn(("destroy", key_other), self.lib.events)
+        del back_patcher, back_owner, off_patcher, off_owner, other_patcher, other_owner
+        gc.collect()
+
 if __name__ == "__main__":
     unittest.main(argv=[sys.argv[0]])
