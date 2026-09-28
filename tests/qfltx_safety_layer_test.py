@@ -310,15 +310,23 @@ def _t_scale_latent_inpaint(src):
 
 def _t_derive_geometry(src):
     """The loader carries NO geometry widgets any more (official-loader shape), so the seam DERIVES
-    the session geometry from the graph. This pins the derivation + the ONE refusal that is a real
-    incompatibility (a trimmed sigma range mis-times the engine's internal schedule)."""
+    the session geometry from the graph. This pins the derivation and the schedule rule the mixin shares
+    with H3: no / short / non-decreasing schedules are refused, trimmed ranges are accepted."""
     kT = _extract_const(src, "_LTX_TEMPORAL")
     kS = _extract_const(src, "_LTX_SPATIAL")
     fn, _ = _bind(src, "_derive_geometry", {"_LTX_TEMPORAL": kT, "_LTX_SPATIAL": kS})
+    # the schedule rule is the mixin's _stage_schedule, shared with H3 (qf_modelpatcher.py): bound from its real source
+    shared = {}
+    exec(_extract_method(_shared_src_text(), "QFSessionModelMixin", "_stage_schedule"), shared)  # noqa: S102
     bad = 0
     Flat, steps = 4, 6
     x = torch.zeros(1, 128, Flat, 2, 2)
     ms = types.SimpleNamespace(sigma_max=1.0)
+
+    def _mock_self(**attrs):   # a model with the shared rule as its method
+        m = types.SimpleNamespace(**attrs)
+        m._stage_schedule = types.MethodType(shared["_stage_schedule"], m)
+        return m
 
     # 1) a FULL-range schedule derives BOTH quantities from the graph (no widgets involved).
     me = _mock_self(_num_frames=0, _num_steps=0, model_sampling=ms)

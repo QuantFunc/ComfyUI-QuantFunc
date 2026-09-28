@@ -281,6 +281,8 @@ loaders. When enough RAM is free, the model is kept in locked system memory, whi
 the model is loaded; on a PC with little RAM this can make the system unstable. Changing it reloads the model. It applies
 to the whole ComfyUI session: once any loader has turned it on (the LTX-2.5 loader does by default), it stays on for every
 model until ComfyUI restarts.
+The MiniMax-H3 and LTX-2.5 loaders accept two-stage (double-sampling) workflows as they are. The MiniMax-H3
+`audio_enhance` switch is not supported in two-stage (double-sampling) workflows: it is ignored there.
 
 | File | Use Case |
 |------|----------|

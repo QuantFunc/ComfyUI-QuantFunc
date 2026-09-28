@@ -46,10 +46,16 @@ from .qf_modelpatcher import (_qf_dtype, _QFStub,
                               _interrupt_poll_end_session_on_raise,
                               QFSessionModelMixin)
 
+_log = qfe.logger(__name__)   # console-safe (#738)
+
 
 # ── H3 geometry constants (comfy comfy_extras/nodes_minimax_h3.py + ldm/minimax/model.py) ──
 _H3_SPATIAL = 16          # video latent -> pixels (width = W_lat * 16)
 _H3_FPS = 24.0            # the H3 frame grid is defined at 24 fps (comfy_extras/nodes_minimax_h3.FPS)
+_H3_DENOISED_SIGMA = 1e-3  # a sampler stage whose last sigma is above this stops before the denoise ends
+_H3_FULL_START = 0.98      # a stage starting below this fraction of the model's sigma_max starts part-way
+_AUDIO_ENHANCE_TWO_STAGE = ("[qf_native] H3: audio_enhance is not supported with two-stage (double-sampling) "
+                            "workflows; it is ignored for this run.")
 
 
 def _h3_frames_from_latent_t(latent_t):
@@ -81,7 +87,7 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
     """MiniMax-H3 svdq joint-AV pipeline exposed as a native comfy MODEL (native-KSampler seam), t2va."""
 
     # H3's own loader dials, carried across a LoRA rebuild like the mixin's (see QFSessionModelMixin._SESSION_DIALS).
-    _SESSION_DIALS = QFSessionModelMixin._SESSION_DIALS + ("_audio_enhance", "_allow_partial_denoise")
+    _SESSION_DIALS = QFSessionModelMixin._SESSION_DIALS + ("_audio_enhance",)
 
     def __init__(self, model_config, engine, device=None):
         super().__init__(model_config, device=device)     # disable_unet honored in BaseModel.__init__
@@ -91,7 +97,7 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
         self._num_frames = 0              # DERIVED per run from the video latent's T (see _derive_geometry)
         self._fps = _H3_FPS               # the H3 grid is defined AT 24 fps (comfy nodes_minimax_h3.FPS)
         self._audio_enhance = False       # [audio_enhance] top up extra audio-only steps to total 16 (see _begin)
-        self._allow_partial_denoise = False  # explicit workflow opt-in; full-range remains the safe default
+        self._stage_partial = False       # DERIVED per session at _derive_geometry: a stage of a two-stage workflow
         # The AV flow shifts come from the model_sampling object — the stock
         # ModelSamplingMiniMaxH3 (MiniMaxH3SigmaShift) patches it, and model_config supplies the
         # defaults otherwise. They are read at _begin (getattr(ms, "shift"/"audio_shift")), so this
@@ -113,15 +119,6 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
         no audio lane, already-long schedules) is ENGINE law behind the begin option `audio_enhance` — this
         plugin carries no number for it. OFF (default) → byte-identical to no knob. Runtime session knob."""
         self._audio_enhance = bool(on)
-
-    def set_allow_partial_denoise(self, on):
-        """Allow split/trimmed sampler schedules for explicit double-sampling workflows.
-
-        The external H3 seam receives the actual sigma, step index, and stage-local total step
-        count on every call.  Keep the historical full-range refusal as the default because a
-        partial schedule is only meaningful when the workflow deliberately manages both stages.
-        """
-        self._allow_partial_denoise = bool(on)
 
     # memory_required: NO override — the base QFSessionModelMixin reports the ENGINE's own measured working set
     # (quantfunc_vram_need_bytes) for every family. The former H3-only heuristic here (2026-08-24 "brim fix":
@@ -222,31 +219,21 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
     def _derive_geometry(self, x_video, transformer_options):
         """DERIVE the session geometry from the graph (official-loader shape — the loader has no
         geometry/step/shift widgets). x_video=[1,24,T,H,W] from the stock empty-AV-latent /
-        MiniMaxH3ImageToVideo; the step count from the sampler's own sigma schedule."""
+        MiniMaxH3ImageToVideo; the step count and the schedule rule from the mixin's _stage_schedule (shared with
+        LTX): a partial or trimmed stage of a two-stage / double-sampling workflow is accepted, with no switch."""
         self._num_frames = _h3_frames_from_latent_t(int(x_video.shape[2]))
-        sigmas = transformer_options.get("sample_sigmas") if isinstance(transformer_options, dict) else None
-        if sigmas is None or len(sigmas) < 2:
-            raise RuntimeError(
-                "qf_native H3: the sampler did not publish a sigma schedule "
-                "(transformer_options['sample_sigmas']) - the engine session needs the step count. "
-                "Use a stock KSampler / SamplerCustom on this model.")
-        self._num_steps = len(sigmas) - 1
-        try:
-            s_first, s_last = float(sigmas[0]), float(sigmas[-1])
-        except Exception:  # noqa: BLE001
-            return
+        stage = self._stage_schedule(transformer_options, "H3")
         ms = getattr(self, "model_sampling", None)
-        s_max = float(getattr(ms, "sigma_max", s_first)) if ms is not None else s_first
-        partial = s_last > 1e-3 or (s_max > 0 and s_first < 0.98 * s_max)
-        if partial and not self._allow_partial_denoise:
-            raise RuntimeError(
-                f"qf_native H3: partial / trimmed denoise is disabled (sigmas run "
-                f"{s_first:.4f}->{s_last:.4f}, full range would be {s_max:.4f}->0). Enable "
-                f"'allow_partial_denoise' on QuantFuncH3Loader only for an intentional split-sigma "
-                f"or double-sampling workflow; otherwise use one full-range sampler.")
-        if partial:
-            qfe.info(f"[qf_native] H3: partial denoise explicitly enabled: "
-                  f"{s_first:.4f}->{s_last:.4f}, stage_steps={self._num_steps}", flush=True)
+        s_max = float(getattr(ms, "sigma_max", 0.0) or 0.0) if ms is not None else 0.0
+        self._stage_partial = stage is not None and (stage[1] > _H3_DENOISED_SIGMA
+                                                     or (s_max > 0 and stage[0] < _H3_FULL_START * s_max))
+        # audio_enhance does not support two-stage (double-sampling) workflows (user 2026-09-28 「audio_enhance不支持双采」):
+        # either stage of one runs without it, and one warning says so. Why: the engine's extra audio pass fires at a
+        # session's final step and refines the audio down to sigma 0 over a video it treats as finished
+        # (MiniMaxH3Pipeline.cpp: extra_audio_steps = 16 - this session's num_steps; the is_final_step gate). The engine
+        # item that gates that pass on sigma 0 (post-release #4) does not change this rule: the plugin decides support.
+        if self._stage_partial and self._audio_enhance:
+            _log.warning(_AUDIO_ENHANCE_TWO_STAGE)
 
     def _begin(self, x_video, x_audio, vemb, av_payload=None):
         """Open the joint-AV external denoise session. x_video=[1,24,T,H,W], x_audio=[1,32,2,audio_t],
@@ -297,7 +284,7 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
         # [enhance switch] the product switch only; the engine computes the extra audio sub-steps from
         # num_steps and disarms itself under CFG / without an audio lane (MiniMaxH3Pipeline). Sent only
         # when ON (OFF = byte-identical to no knob; the raw extra_audio_steps key is never built here).
-        if self._audio_enhance:
+        if self._audio_enhance and not self._stage_partial:   # not in a two-stage workflow (see _derive_geometry)
             _opts["audio_enhance"] = True
         # [fl2va/ref2va bridge] forward the pre-encoded keyframe/reference latents from the
         # per-group conditioning payload (official minimax_payload mechanism) as begin options

@@ -6,8 +6,8 @@ ComfyUI saves every widget value into the workflow (saved and exported files, co
 history and "Export (API)". It has no secret widget a custom node can use: its only secret channel is hardcoded to the
 two comfy.org keys (execution.SENSITIVE_EXTRA_DATA_KEYS). So the key is never a widget value or a prompt value:
 
-  * web/quantfunc_api_key.js: the field is a password input that is never saved (serialize = false). It POSTs a typed
-    key to /quantfunc/api_key and queues only the reference it gets back;
+  * web/quantfunc_api_key.js: the field is ComfyUI's native text row, never saved (serialize = false) and showing only
+    the shortened key. It POSTs a typed key to /quantfunc/api_key and queues only the reference it gets back;
   * this module keeps the key in this ComfyUI process, behind that reference, and turns the reference back into the key
     for the loader (field_key). A reference means nothing to another process, or after a restart.
 config.json is where the key persists (user 2026-09-27): a well-formed key the field POSTs is saved there, and a field

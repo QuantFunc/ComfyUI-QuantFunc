@@ -380,17 +380,17 @@ def main():
     _lit = LtxL.INPUT_TYPES()
     check("ltx node surface = transformer required + hidden model_config + session-dial optionals (no sparse)",
           list(_lit["required"].keys()) == ["transformer"]
-          and list(_lit.get("optional", {}).keys()) == ["model_config", "attention_backend", "sol_tau", "quality_enhance",
-                                                        "step_cache", "block_cache", "pinned_memory"]
+          and list(_lit.get("optional", {}).keys()) == ["model_config", "attention_backend", "sol_tau", "step_cache",
+                                                        "block_cache", "quality_enhance", "pinned_memory"]
           and "sparse" not in _lit.get("optional", {}),
           f"-> req={list(_lit['required'].keys())} opt={list(_lit.get('optional', {}).keys())}")
     # h3 node surface (same latent-duo + session dials shape as ltx; block-count removed 2026-09)
     _h3it = H3L.INPUT_TYPES()
     check("h3 node surface = transformer required + hidden model_config + session-dial optionals",
           list(_h3it["required"].keys()) == ["transformer"]
-          and list(_h3it.get("optional", {}).keys()) == ["model_config", "attention_backend", "sol_tau",
-                                                          "quality_enhance", "audio_enhance", "step_cache", "block_cache",
-                                                          "allow_partial_denoise", "pinned_memory"],
+          and list(_h3it.get("optional", {}).keys()) == ["model_config", "attention_backend", "sol_tau", "step_cache",
+                                                          "block_cache", "quality_enhance", "audio_enhance",
+                                                          "pinned_memory"],
           f"-> req={list(_h3it['required'].keys())} opt={list(_h3it.get('optional', {}).keys())}")
     # (B) quality_enhance (user 2026-09-25): ONE switch on the four loaders, the same on every GPU. DEATH RULES: the switch sits
     #     in the widget slot of the earlier `quality` input (where the published loaders had it); the session sends only the
@@ -401,16 +401,21 @@ def main():
     import _banned_terms as _bt
     _FOUR = ("QuantFuncLTXLoader", "QuantFuncH3Loader", "QuantFuncKrea2Loader", "QuantFuncQwenImage21Loader")
     _sw = {n: qfn.NODE_CLASS_MAPPINGS[n].INPUT_TYPES() for n in _FOUR}
-    _SLOT = {"QuantFuncLTXLoader": 4, "QuantFuncH3Loader": 4, "QuantFuncKrea2Loader": 3, "QuantFuncQwenImage21Loader": 3}
-    _sw_bad = {n: (list(it["required"]) + list(it.get("optional", {})))[:6] for n, it in _sw.items()
-               if (list(it["required"]) + list(it.get("optional", {})))[_SLOT[n]] != "quality_enhance"
-               or it["optional"]["quality_enhance"][0] != "BOOLEAN"
+    _sw_bad = {n: list(it.get("optional", {})) for n, it in _sw.items()
+               if it["optional"]["quality_enhance"][0] != "BOOLEAN"
                or it["optional"]["quality_enhance"][1].get("default") is not False
                or "quality" in it["optional"] or it.get("hidden", {}).get("quality") != ("STRING", {})}
-    check("every loader: quality_enhance is a BOOLEAN, default OFF, in the widget slot the dropdown had (the published "
-          "switch's: 4 after sol_tau on LTX / H3, 3 on Krea-2 / QI-2.1); the withdrawn "
-          "dropdown is no input, its name is declared hidden as a (type, options) spec (an old API prompt reaches load())",
+    check("every loader: quality_enhance is a BOOLEAN, default OFF; the withdrawn dropdown is no input, its name is declared "
+          "hidden as a (type, options) spec (an old API prompt reaches load())",
           not _sw_bad, f"-> {_sw_bad}")
+    # _LOADER_LAYOUT (user 2026-09-28): on every loader the value inputs come first and the switches last (a workflow saved
+    # with an earlier order is remapped on load by web/quantfunc_loader_layout.js).
+    _order = {n: [(k, v[0]) for k, v in list(it["required"].items()) + list(it.get("optional", {}).items())]
+              for n, it in _sw.items()}
+    _late = {n: o for n, o in _order.items()
+             if any(t != "BOOLEAN" for _, t in o[next((i for i, (_, t) in enumerate(o) if t == "BOOLEAN"), len(o)):])}
+    check("every loader: every switch (BOOLEAN) comes after every value input",
+          not _late and all(any(t == "BOOLEAN" for _, t in o) for o in _order.values()), f"-> {_late}")
     E = qfn._quality_enhance_on
     _row = (E(), E(False), E(True), E(None, "best_quality"), [E(None, q) for q in ("balance", "other", "")],
             E(True, "balance"), E(False, "best_quality"))
@@ -1234,9 +1239,9 @@ def main():
         del _ContractEngine.quantfunc_last_error
 
     # ── 5c) a LoRA rebuild keeps the loader's session dials ──
-    # The loader sets its widgets (attention backend, quality_enhance, caches, H3's audio / partial-denoise opt-ins) on the MODEL;
-    # a QuantFuncNativeLoRA rebuild hands back a NEW model. Without the carry, a LoRA'd H3 silently ran "auto" attention
-    # instead of its flash default, dropped allow_partial_denoise (a double-sample workflow then refuses) and the switch.
+    # The loader sets its widgets (attention backend, quality_enhance, caches, H3's audio switch) on the MODEL; a
+    # QuantFuncNativeLoRA rebuild hands back a NEW model. Without the carry, a LoRA'd H3 silently ran "auto" attention
+    # instead of its flash default and dropped the switches.
     import ast as _dast
     _saved_resolve = qfn._resolve_lora
     try:
@@ -1248,15 +1253,15 @@ def main():
         qfn._resolve_lora = lambda n: os.path.join(dl_dir, n)
         _h3 = H3L.load("fx-minimax-h3-quantfunc-int4.safetensors", "minimax-h3-fl2va",
                        attention_backend="flash", sol_tau=0.5, quality_enhance=True, audio_enhance=True,
-                       step_cache=0.1, block_cache=0.2, allow_partial_denoise=True)[0]
+                       step_cache=0.1, block_cache=0.2)[0]
         _h3l = qfn.NODE_CLASS_MAPPINGS["QuantFuncNativeLoRA"]().apply(_h3, "dial.safetensors", 0.5)[0]
         _src, _dst = _h3.model, _h3l.model
-        _want = (_src.residency_opts(), _src._audio_enhance, _src._allow_partial_denoise)
-        _got = (_dst.residency_opts(), _dst._audio_enhance, _dst._allow_partial_denoise)
-        check("a LoRA rebuild keeps the loader's session dials (H3: backend, sol_tau, quality_enhance, caches, audio, partial)",
+        _want = (_src.residency_opts(), _src._audio_enhance)
+        _got = (_dst.residency_opts(), _dst._audio_enhance)
+        check("a LoRA rebuild keeps the loader's session dials (H3: backend, sol_tau, quality_enhance, caches, audio)",
               _dst is not _src and _got == _want and _want[0].get("attention_backend") == "flash"
               and _want[0].get("video_enhance") is True
-              and _want[1] is True and _want[2] is True,
+              and _want[1] is True,
               f"-> rebuilt={_dst is not _src} want={_want} got={_got}")
         # DEATH RULE: every set_* on the session mixin or a family model writes only attributes its class carries in
         # _SESSION_DIALS, so a new dial cannot be forgotten by the carry.
@@ -1284,7 +1289,7 @@ def main():
                                         and _t.value.id == "self" and _t.attr not in _cls._SESSION_DIALS):
                                     _dviol.append(f"{_mn}.{_cn.name}.{_fn.name} writes {_t.attr}")
         check("every session-dial setter's attribute is carried across a LoRA rebuild (AST, family modules derived)",
-              _dseen >= 7 and not _dviol, f"-> setters={_dseen} uncarried={_dviol}")
+              _dseen >= 6 and not _dviol, f"-> setters={_dseen} uncarried={_dviol}")   # 6: H3's partial switch is gone
         # DEATH RULE: the begin dials are emitted in ONE place, dial_opts — no other function reads them, so no family
         # can drift from the always-send rule (the image families once built their own copies that omitted "auto").
         _eviol, _ereads = [], 0

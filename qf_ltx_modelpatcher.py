@@ -253,25 +253,10 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
         source sweep + c5.8 legC bit-identical under a full external Euler drive). The
         old refusal's rationale ("engine runs its OWN internal schedule") described the
         INTERNAL generate_video loop, not this seam. Only pathological schedules
-        (fewer than 2 sigmas / non-decreasing) are refused."""
+        (fewer than 2 sigmas / non-decreasing) are refused: the mixin's _stage_schedule, shared with H3."""
         Tlat = int(xin.shape[2])
         self._num_frames = (Tlat - 1) * _LTX_TEMPORAL + 1
-        sigmas = transformer_options.get("sample_sigmas") if isinstance(transformer_options, dict) else None
-        if sigmas is None or len(sigmas) < 2:
-            raise RuntimeError(
-                "qf_native LTX: the sampler did not publish a sigma schedule "
-                "(transformer_options['sample_sigmas']) - the engine session needs the step count. "
-                "Use a stock KSampler / SamplerCustom on this model.")
-        self._num_steps = len(sigmas) - 1
-        try:
-            s_first, s_last = float(sigmas[0]), float(sigmas[-1])
-        except Exception:  # noqa: BLE001 - non-tensor sigmas: keep the count, skip the range check
-            return
-        if s_first <= s_last:
-            raise RuntimeError(
-                f"qf_native LTX: sigma schedule must be strictly DECREASING (got "
-                f"{s_first:.4f}->{s_last:.4f}) - a non-decreasing schedule would drive the "
-                f"session backwards.")
+        self._stage_schedule(transformer_options, "LTX")
 
     def _begin(self, x_group, vemb_group):
         """Open the t2v external denoise session. x_group = [1,128,F,H,W] latent; vemb_group =

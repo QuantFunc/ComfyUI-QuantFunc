@@ -4,7 +4,8 @@ config.json; a field with nothing typed shows config.json's key, shortened).
 
 ComfyUI saves every widget value into the workflow and every prompt input into each image and video it saves, and it
 has no secret widget a custom node can use. So the key is never a widget value or a prompt value: the field
-(web/quantfunc_api_key.js) is a password input that is never saved, and a queued prompt carries a reference
+(web/quantfunc_api_key.js) is a native text row that is never saved and only ever holds the shortened key, and a
+queued prompt carries a reference
 (POST /quantfunc/api_key) that only this ComfyUI process turns back into the key.
 
   A  qf_api_key, pure Python
@@ -39,14 +40,20 @@ has no secret widget a custom node can use. So the key is never a widget value o
     B8 ComfyUI can serve the field's script (WEB_DIRECTORY), and a serving ComfyUI gets the route
   C  web/quantfunc_api_key.js under Node (skipped without node)
     C1 exactly the QuantFunc nodes that declare the hidden api_key input (the four loaders, and a loader added later)
-       get one api_key field, never saved into a workflow; another pack's node never does
+       get one native text row named api_key, never saved into a workflow, placed with the value inputs just above the
+       first switch (last when the node has none); another pack's node never does
     C2 an empty field sends nothing and queues ""; a key is POSTed to /quantfunc/api_key and only the reference is queued,
        also when the prompt is queued while the field is still being edited
     C3 a refused POST fails the queue; the plain key is never queued
     C4 a field with nothing typed shows config.json's key as the server sends it (shortened); leaving the field POSTs a
-       typed key (the server saves it to config.json), and a new field then shows it; the browser keeps no copy
-    C5 (user 2026-09-27: 部分明文) a field not being edited shows a typed key shortened, qf_ + its first and last 4
-       characters, never more (short text shows only the prefix); focus gives an empty masked input for a new key
+       typed key (the server saves it to config.json), and every live row with nothing typed (and a new one) then shows
+       it, while a removed node's row is dropped; the browser keeps no copy
+    C5 (user 2026-09-27: 部分明文) the row shows a typed key shortened, qf_ + its first and last 4 characters, never
+       more (short text shows only the prefix); on the canvas, a click opens ComfyUI's value dialog EMPTY and masked,
+       and the script never puts the whole key on the widget; a cancelled dialog changes nothing
+    C6 the Vue node view's inline input (the frontend writes each keystroke to the widget and calls its callback) is
+       masked while typed and committed when it loses focus, then shows the key shortened, unmasked; the shortened form
+       itself, submitted unchanged, is no new key
 
 MUTATION (each goes RED): accept any non-empty field key -> A1; read "" as a key -> A2/B3; return the plain key for a
 non-reference -> A3; read an unknown reference as empty -> A4; make the reference the key or a slice of it -> A5; echo
@@ -56,9 +63,12 @@ in family_build -> B3; put the key into create_cfg -> B4; drop the switch in ens
 switch before the engine accepted it -> B5; read config.json in ensure() for a default consumer -> B6; print the key in
 the switch line -> B7; drop WEB_DIRECTORY -> B8; draw the field on every node or on another pack's node, save it
 (serialize true) or queue the plain key, or queue a stale key while the field is edited -> C1/C2; fall back to the plain
-key on a refused POST -> C3; skip the GET or the POST on leaving, or keep a copy in localStorage -> C4; show the whole
-key while not edited, or unmasked while edited -> C5; save a malformed key, drop config.json's other fields, or
-write it in place -> A6.
+key on a refused POST -> C3; skip the GET or the POST on leaving, refresh no other row or keep a removed one, or keep
+a copy in localStorage -> C4; show the whole
+key, open the dialog with the widget's value or unmasked, or read a cancel as an empty key -> C5; commit the Vue
+input on every keystroke or never, leave it unmasked while typed or masked after, or take the shortened form for a key
+-> C6; save a malformed key, drop config.json's other fields,
+or write it in place -> A6.
 
 Run:  python tests/api_key_test.py      (B needs COMFY_ROOT; C needs node)
 """
@@ -655,34 +665,46 @@ _API_STUB = """export const api = {
   },
 };
 """
-_DRIVER = """const out = { loaders: {}, others: {} };
+_DRIVER = """const out = { loaders: {}, others: {}, placed: {} };
 globalThis.localStorage = new Proxy({}, { get() { out.storage = true; return () => null; } });   // must stay untouched
-globalThis.document = { createElement(tag) {
-  return { tagName: tag.toUpperCase(), type: "text", value: "", listeners: {},
-           addEventListener(ev, fn) { (this.listeners[ev] ??= []).push(fn); }, setAttribute(k, v) { this[k] = v; },
-           fire(ev) { for (const fn of this.listeners[ev] ?? []) fn({ target: this }); } };
-} };
+// the Vue node view's inline input (what document.activeElement is while a row is edited there)
+globalThis.HTMLInputElement = class {
+  constructor(nodeId) { this.nodeId = nodeId; this.type = "text"; this.value = ""; this.dataset = {}; this.listeners = {}; }
+  closest(sel) { return sel === `[data-node-id="${this.nodeId}"]` ? {} : null; }
+  addEventListener(ev, fn, opts) { (this.listeners[ev] ??= []).push({ fn, once: !!opts?.once }); }
+  fire(ev) { const l = this.listeners[ev] ?? []; this.listeners[ev] = l.filter(x => !x.once); for (const x of l) x.fn({ target: this }); }
+};
+globalThis.document = { activeElement: null };
 const tick = () => new Promise(r => setTimeout(r, 0));
 const { app } = await import("./scripts/app.js");
 const { api } = await import("./scripts/api.js");
 api.shown = "%s";                                 // config.json's key, as the server shows it
 api.shownFor = %s;
 await import("./extensions/ComfyUI-QuantFunc/quantfunc_api_key.js");
-// the frontend's addDOMWidget(name, type, element, options): the value is options.getValue()/setValue()
-function node(comfyClass) {
-  return { comfyClass, widgets: [], addDOMWidget(name, type, element, options) {
-    const w = { name, type, element, options };
-    Object.defineProperty(w, "value", { get() { return options.getValue(); }, set(v) { options.setValue(v); } });
-    this.widgets.push(w);
-    return w;
-  } };
+// the frontend's node: its own widgets first (combo / number rows, then the switches), then addWidget(type, name, value,
+// callback, options). Every value the SCRIPT puts on a widget is recorded; the Vue input writes through frontendSet.
+let nextId = 1;
+function node(comfyClass, own) {
+  const n = { id: nextId++, comfyClass, widgets: own.map(([name, type]) => ({ name, type })), assigned: [],
+              setDirtyCanvas() {}, onRemoved() { this.removedByNode = true; },
+              addWidget(type, name, value, callback, options) {
+                let v = value;
+                const w = { type, name, callback, options, frontendSet(x) { v = x; } };
+                Object.defineProperty(w, "value", { get() { return v; }, set(x) { n.assigned.push(x); v = x; } });
+                this.widgets.push(w);
+                return w;
+              } };
+  return n;
 }
-async function created(comfyClass) {
-  const n = node(comfyClass);
+const OWN = [["transformer", "combo"], ["attention_backend", "combo"], ["sol_tau", "number"], ["quality_enhance", "toggle"],
+             ["pinned_memory", "toggle"]];
+async function created(comfyClass, own = OWN) {
+  const n = node(comfyClass, own);
   for (const e of app.extensions) await e.nodeCreated?.(n);
   await tick();                                   // its GET of the saved key lands
   return n;
 }
+const row = n => n.widgets.find(w => w.name === "api_key");
 // what /object_info declares: the loaders' hidden inputs, a QuantFunc loader added later, and nodes that must not get one
 const LOADERS = %s;
 const withKey = { api_key: ["STRING", {}] };
@@ -692,42 +714,92 @@ const defs = [...LOADERS, "QuantFuncFutureLoader"].map(name => ({ name, input: {
 for (const d of defs) for (const e of app.extensions) await e.beforeRegisterNodeDef?.(function () {}, d, app);
 for (const c of [...LOADERS, "QuantFuncFutureLoader"]) {
   const n = await created(c);
-  out.loaders[c] = n.widgets.map(w => ({ name: w.name, serialize: w.serialize }));
+  out.loaders[c] = n.widgets.filter(w => w.name === "api_key").map(w => ({ type: w.type, serialize: w.serialize }));
+  out.placed[c] = n.widgets.map(w => w.name);
 }
+out.placedNoSwitch = (await created(LOADERS[0], [["transformer", "combo"], ["sol_tau", "number"]])).widgets.map(w => w.name);
 out.firstCall = api.calls[0];
-// a user typing into the field: focus (an empty masked input), type, and later leave it
-function type(w, text) { w.element.fire("focus"); w.element.value = text; w.element.fire("input"); }
-async function leave(w) { w.element.fire("blur"); await tick(); await tick(); }
-const look = w => ({ type: w.element.type, shows: w.element.value, key: w.value });
 const posts = () => api.calls.filter(c => c.method === "POST");
-for (const c of ["KSampler", "QuantFuncNativeLoRA", "OtherPackApiNode"]) out.others[c] = (await created(c)).widgets.length;
-const w = (await created(LOADERS[0])).widgets[0];
-out.fresh = look(w);
-type(w, "  \\t"); await leave(w);
-out.empty = { queued: await w.serializeValue(), posts: posts().length };
-type(w, "  %s\\n");
-out.editing = look(w);
-await leave(w);
-out.idle = look(w);
-out.savedOnBlur = posts().at(-1)?.body ?? null;
+for (const c of ["KSampler", "QuantFuncNativeLoRA", "OtherPackApiNode"]) {
+  const n = await created(c);
+  out.others[c] = n.widgets.length - OWN.length;
+}
+// another loader already on the canvas, with nothing typed, and one that is removed before the key is saved
+const bystander = await created(LOADERS[1]);
+const removed = await created(LOADERS[2]);
+removed.onRemoved();
+const removedBefore = row(removed).value;
+// the canvas: a click on the row opens ComfyUI's value dialog (canvas.prompt), the typed text comes back to its callback
+const n = await created(LOADERS[0]);
+const w = row(n);
+const dialogs = [];
+// canvas.prompt returns its dialog element; the value input is its "input.value"
+const canvas = { prompt(title, value, callback, e) {
+  const input = { type: "text", setAttribute(k, v) { this[k] = v; } };
+  dialogs.push({ title, value, input });
+  this.answer = callback;
+  return { querySelector: sel => (sel === "input.value" ? input : null) };
+} };
+const enter = text => { w.onClick({ e: {}, node: n, canvas }); canvas.answer(text); };
+out.fresh = w.value;                             // nothing typed: config.json's key, shortened
+enter(null); await tick();                       // cancelled
+out.cancelled = { shows: w.value, posts: posts().length };
+enter("  \\t"); await tick();
+out.empty = { shows: w.value, queued: await w.serializeValue(), posts: posts().length };
+enter("  %s\\n"); await tick(); await tick();
+out.entered = { shows: w.value, saved: posts().at(-1)?.body ?? null };
+out.bystander = row(bystander).value;             // config.json's key is now the saved one
+out.removed = { shows: row(removed).value, unchanged: row(removed).value === removedBefore, chained: !!removed.removedByNode };
 out.key = { queued: await w.serializeValue(), sent: posts().at(-1)?.body ?? null };
-w.element.fire("focus");
-out.refocused = look(w);
-type(w, "%s");                                   // queued while still being edited (e.g. Ctrl+Enter): the typed key goes
-out.queuedWhileEditing = { queued: await w.serializeValue(), sent: posts().at(-1)?.body?.key ?? null };
-await leave(w);
+const beforeCancel = posts().length;
+enter(null); await tick();                       // cancelled with a key typed: it stays
+out.cancelledWithKey = { shows: w.value, queued: await w.serializeValue(), sent: posts().at(-1)?.body ?? null,
+                         posts: posts().length - beforeCancel - 1 };
+out.dialogs = dialogs.slice(0, 2).map(d => ({ title: d.title, value: d.value, type: d.input.type }));
+const before = posts().length;
+enter(w.value); await tick();                    // the shortened form submitted as it was: no new key
+out.shortSubmitted = { shows: w.value, posts: posts().length - before, queued: await w.serializeValue() };
 out.short = {};
-for (const text of ["abc", "qf_1234", "qf_" + "9".repeat(8), "qf_" + "9".repeat(9)]) { type(w, text); await leave(w); out.short[text] = w.element.value; }
-type(w, "%s"); await leave(w);
+for (const text of ["abc", "qf_1234", "qf_" + "9".repeat(8), "qf_" + "9".repeat(9)]) { enter(text); await tick(); out.short[text] = w.value; }
+out.canvasAssigned = n.assigned.slice();
+// the Vue node view: the frontend writes every keystroke to the widget and calls its callback; leaving the input commits
+const v = await created(LOADERS[2]);
+const vw = row(v);
+const input = new HTMLInputElement(v.id);
+document.activeElement = input;
+const keystroke = text => { input.value = text; vw.frontendSet(text); vw.callback(text); };
+const vueBefore = posts().length;
+for (let i = 1; i <= 8; i++) keystroke(" %s".slice(0, i));
+keystroke(" %s ");
+await tick();
+out.vueTyping = { posts: posts().length - vueBefore, listeners: (input.listeners.blur ?? []).length, type: input.type };
+out.vueQueuedWhileEditing = { queued: await vw.serializeValue(), sent: posts().at(-1)?.body?.key ?? null };
+const afterQueue = posts().length;
+input.fire("blur"); document.activeElement = null; await tick(); await tick();
+out.vueLeft = { shows: vw.value, posts: posts().length - afterQueue, saved: posts().at(-1)?.body ?? null,
+                listeners: (input.listeners.blur ?? []).length, type: input.type };
+document.activeElement = input;                  // edited again, back to the shortened form, then left
+input.value = vw.value;
+keystroke(vw.value + "x"); keystroke(vw.value.slice(0, -1));
+const vueAgain = posts().length;
+input.fire("blur"); document.activeElement = null; await tick();
+out.vueShortLeft = { shows: vw.value, posts: posts().length - vueAgain };
+out.vueAssigned = v.assigned.slice();
+// no inline input focused (any other caller of the callback): the value is committed at once
+const o = await created(LOADERS[3]);
+const ow = row(o);
+ow.callback("%s"); await tick(); await tick();
+out.direct = { shows: ow.value, saved: posts().at(-1)?.body ?? null };
 api.post = { ok: false, status: 404 };
+enter("%s"); await tick();
 try { out.refused = { queued: await w.serializeValue() }; } catch (e) { out.refused = { threw: true }; }
-out.newField = look((await created(LOADERS[1])).widgets[0]);
+out.newField = row(await created(LOADERS[1])).value;
 console.log(JSON.stringify(out));
 """
 
 
 class FieldScript(unittest.TestCase):
-    """C1-C4: the real web/quantfunc_api_key.js against the frontend surface it uses (stubbed)."""
+    """C1-C6: the real web/quantfunc_api_key.js against the frontend surface it uses (stubbed)."""
     @classmethod
     def setUpClass(cls):
         cls.out = None
@@ -744,7 +816,8 @@ class FieldScript(unittest.TestCase):
             ext.mkdir(parents=True)
             shutil.copy(PLUGIN / "web" / "quantfunc_api_key.js", ext)
             (Path(d) / "driver.mjs").write_text(_DRIVER % (DEFAULT_SHORT, json.dumps({KEY: SHORT, KEY2: SHORT2}),
-                                                           json.dumps(list(LOADERS)), KEY, KEY2, KEY), encoding="utf-8")
+                                                           json.dumps(list(LOADERS)), KEY, KEY2, KEY2, KEY, KEY),
+                                                encoding="utf-8")
             r = subprocess.run([node, "driver.mjs"], cwd=d, capture_output=True, encoding="utf-8", timeout=60)
             if r.returncode != 0:
                 raise AssertionError(f"node driver failed: {r.stderr[-2000:]}")
@@ -756,32 +829,58 @@ class FieldScript(unittest.TestCase):
         if self.out is None:
             skip(self, "node is not installed")
 
-    def test_exactly_the_declaring_quantfunc_nodes_get_one_field_that_is_never_saved(self):
+    def test_exactly_the_declaring_quantfunc_nodes_get_one_native_row_that_is_never_saved(self):
         for c in (*LOADERS, "QuantFuncFutureLoader"):
-            self.assertEqual(self.out["loaders"][c], [{"name": "api_key", "serialize": False}], c)
+            self.assertEqual(self.out["loaders"][c], [{"type": "text", "serialize": False}], c)
         self.assertEqual(self.out["others"], {"KSampler": 0, "QuantFuncNativeLoRA": 0, "OtherPackApiNode": 0})
 
+    def test_the_row_sits_with_the_value_inputs_above_the_switches(self):
+        for c in (*LOADERS, "QuantFuncFutureLoader"):
+            self.assertEqual(self.out["placed"][c], ["transformer", "attention_backend", "sol_tau", "api_key",
+                                                     "quality_enhance", "pinned_memory"], c)
+        self.assertEqual(self.out["placedNoSwitch"], ["transformer", "sol_tau", "api_key"])
+
     def test_only_a_reference_is_queued(self):
-        self.assertEqual(self.out["empty"], {"queued": "", "posts": 0})
+        self.assertEqual(self.out["empty"], {"shows": DEFAULT_SHORT, "queued": "", "posts": 0})
         self.assertEqual(self.out["key"], {"queued": "qfk:" + "1" * 32, "sent": {"key": KEY}})
-        self.assertEqual(self.out["queuedWhileEditing"], {"queued": "qfk:" + "1" * 32, "sent": KEY2})
+        self.assertEqual(self.out["vueQueuedWhileEditing"], {"queued": "qfk:" + "1" * 32, "sent": KEY2})
 
     def test_a_refused_post_fails_the_queue(self):
         self.assertEqual(self.out["refused"], {"threw": True})
 
-    def test_the_field_shows_config_json_key_and_saves_a_typed_one_there(self):
+    def test_the_row_shows_config_json_key_and_saves_a_typed_one_there(self):
         self.assertEqual(self.out["firstCall"], {"route": "/quantfunc/api_key", "method": "GET", "body": None})
-        self.assertEqual(self.out["fresh"], {"type": "text", "shows": DEFAULT_SHORT, "key": ""})   # nothing typed
-        self.assertEqual(self.out["savedOnBlur"], {"key": KEY})                                    # leaving saves it
-        self.assertEqual(self.out["newField"], {"type": "text", "shows": SHORT, "key": ""})        # config.json's now
-        self.assertNotIn("storage", self.out)                                                     # no browser copy
+        self.assertEqual(self.out["fresh"], DEFAULT_SHORT)                                      # nothing typed
+        self.assertEqual(self.out["entered"], {"shows": SHORT, "saved": {"key": KEY}})          # the dialog's key saved
+        self.assertEqual(self.out["direct"], {"shows": SHORT, "saved": {"key": KEY}})
+        self.assertEqual(self.out["newField"], SHORT)                                          # config.json's now
+        self.assertEqual(self.out["bystander"], SHORT)                                         # every live row too
+        self.assertEqual(self.out["removed"], {"shows": DEFAULT_SHORT, "unchanged": True, "chained": True})
+        self.assertNotIn("storage", self.out)                                                  # no browser copy
 
-    def test_the_field_shows_a_typed_key_shortened_unless_it_is_being_edited(self):
-        self.assertEqual(self.out["editing"], {"type": "password", "shows": "  " + KEY + "\n", "key": KEY})
-        self.assertEqual(self.out["idle"], {"type": "text", "shows": SHORT, "key": KEY})
-        self.assertEqual(self.out["refocused"], {"type": "password", "shows": "", "key": ""})    # empty, for a new key
+    def test_the_canvas_row_never_holds_the_whole_key(self):
+        self.assertEqual(self.out["dialogs"], [{"title": "API key", "value": "", "type": "password"}] * 2)   # EMPTY
+        self.assertEqual(self.out["cancelled"], {"shows": DEFAULT_SHORT, "posts": 0})
+        self.assertEqual(self.out["cancelledWithKey"], {"shows": SHORT, "queued": "qfk:" + "1" * 32,
+                                                        "sent": {"key": KEY}, "posts": 0})
         self.assertEqual(self.out["short"], {"abc": "…", "qf_1234": "qf_…", "qf_" + "9" * 8: "qf_…",
                                              "qf_" + "9" * 9: "qf_9999…9999"})
+        self.assertTrue(self.out["canvasAssigned"])
+        for value in self.out["canvasAssigned"]:
+            self.assertNotIn(KEY[3:], value)
+            self.assertNotIn(KEY2[3:], value)
+            self.assertLessEqual(len(value), len(SHORT))
+
+    def test_the_vue_input_is_committed_when_it_loses_focus(self):
+        self.assertEqual(self.out["vueTyping"], {"posts": 0, "listeners": 1, "type": "password"})   # nothing sent yet
+        self.assertEqual(self.out["vueLeft"], {"shows": SHORT2, "posts": 1, "saved": {"key": KEY2}, "listeners": 0,
+                                               "type": "text"})
+        for value in self.out["vueAssigned"]:                                                   # the script shortens it
+            self.assertNotIn(KEY2[3:], value)
+
+    def test_the_shortened_form_is_no_new_key(self):
+        self.assertEqual(self.out["shortSubmitted"], {"shows": SHORT, "posts": 0, "queued": "qfk:" + "1" * 32})
+        self.assertEqual(self.out["vueShortLeft"], {"shows": SHORT2, "posts": 0})
 
 
 if __name__ == "__main__":

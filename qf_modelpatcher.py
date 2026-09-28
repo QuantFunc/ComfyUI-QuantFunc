@@ -338,6 +338,30 @@ class QFSessionModelMixin:
     # run that dial's default without a word.
     _SESSION_DIALS = ("_step_cache", "_block_cache", "_sparse", "_attn_backend", "_sol_tau", "_video_enhance")
 
+    def _stage_schedule(self, transformer_options, tag):
+        """The ONE sampler-schedule rule of the video families (LTX, H3). Their external session is driven one sampler
+        stage at a time, by the sigma the sampler passes each step: its step count is the stage's own (len - 1), and a
+        partial or trimmed range is accepted, so two-stage and double-sampling workflows run with no switch. Refused:
+        no schedule, fewer than 2 sigmas, or a schedule that is not strictly decreasing (it would drive the session
+        backwards). Returns the (first, last) sigma, or None when they are not numbers (the count is still set)."""
+        sigmas = transformer_options.get("sample_sigmas") if isinstance(transformer_options, dict) else None
+        if sigmas is None or len(sigmas) < 2:
+            raise RuntimeError(
+                f"qf_native {tag}: the sampler did not publish a sigma schedule "
+                "(transformer_options['sample_sigmas']) - the engine session needs the step count. "
+                "Use a stock KSampler / SamplerCustom on this model.")
+        self._num_steps = len(sigmas) - 1
+        try:
+            first, last = float(sigmas[0]), float(sigmas[-1])
+        except Exception:  # noqa: BLE001 - non-tensor sigmas: keep the count, skip the range check
+            return None
+        if first <= last:
+            raise RuntimeError(
+                f"qf_native {tag}: sigma schedule must be strictly DECREASING (got "
+                f"{first:.4f}->{last:.4f}) - a non-decreasing schedule would drive the "
+                f"session backwards.")
+        return first, last
+
     def adopt_session_dials_from(self, src):
         """Copy the dials the loader set on SRC (the model a LoRA rebuild replaces) onto this model."""
         for name in type(self)._SESSION_DIALS:

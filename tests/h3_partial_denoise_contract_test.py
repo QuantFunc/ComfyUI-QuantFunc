@@ -1,5 +1,24 @@
 #!/usr/bin/env python3
-"""CPU-only behavioral contract for H3 partial-denoise sessions (P1-P8)."""
+"""CPU-only behavioral contract for H3 two-stage (double-sampling) sessions (P1-P8, L1-L2).
+
+User 2026-09-28: double sampling works with no switch, as on LTX (「双采样的开关后 我要还能支持双采样啊 好像LTX一样」), and
+audio_enhance does not support it (「audio_enhance不支持双采」).
+
+  P1 a full-range stage runs with its own step count and sigmas; audio_enhance ON is sent, with no warning
+  P2 an end-trimmed stage and P3 a start-trimmed stage run with their stage-local schedule, verbatim
+  P4 in either partial stage audio_enhance ON is not sent: one warning per session, and the begin, the step trace and
+     the output equal the audio_enhance OFF run
+  P5 the full-range tolerance: a start at >= 0.98 sigma_max and an end at <= 1e-3 are full range
+  P6 no schedule, or fewer than 2 sigmas, and P7 a schedule that is not strictly decreasing fail loud, before any
+     native begin (the rule the mixin shares with LTX)
+  P8 two stages: the first closes before the second begins with its own geometry and stage-local counters
+  L1 the loader has no allow_partial_denoise input or parameter; L2 (COMFY_ROOT) ComfyUI drops that input from an old
+     API prompt before the loader runs, and the registered loader builds the real QFH3Model
+
+MUTATION (each goes RED): refuse a partial stage again -> P2/P3/P8; send audio_enhance in a partial stage, or warn
+per step / never -> P4; tighten or drop the full-range tolerance -> P5; drop the schedule checks -> P6/P7; re-add the
+input -> L1.
+"""
 import ast
 import copy
 import ctypes
@@ -292,12 +311,27 @@ for _name in ("_H3_SPATIAL", "_H3_FPS", "_H3_VIDEO_CHANNELS", "_H3_AUDIO_CHANNEL
 _h3_namespace["_h3_frames_from_latent_t"] = _module_function(
     H3_SOURCE, "_h3_frames_from_latent_t", _h3_namespace)
 
+class _Log:
+    def __init__(self):
+        self.warnings = []
+
+    def warning(self, message, *args):
+        self.warnings.append(message % args if args else message)
+
+
+_HarnessBase._stage_schedule = _standalone_method(
+    MIXIN_SOURCE, "QFSessionModelMixin", "_stage_schedule", _mixin_namespace)
+for _name in ("_H3_DENOISED_SIGMA", "_H3_FULL_START", "_AUDIO_ENHANCE_TWO_STAGE"):
+    _h3_namespace[_name] = _literal_assignment(H3_SOURCE, _name)
+_h3_namespace["_log"] = _Log()
+WARNING = _h3_namespace["_AUDIO_ENHANCE_TWO_STAGE"]
+
 H3ContractModel = _subset_class(
     H3_SOURCE,
     "QFH3Model",
     "H3ContractModel",
     "_HarnessBase",
-    ("set_allow_partial_denoise", "_derive_geometry", "_begin", "_apply_model", "process_latent_out"),
+    ("_derive_geometry", "_begin", "_apply_model", "process_latent_out"),
     _h3_namespace,
 )
 
@@ -313,7 +347,7 @@ class _Sampling:
         return velocity
 
 
-def _new_model(allow_partial):
+def _new_model(audio_enhance=False):
     lib = _FakeLib()
     model = H3ContractModel.__new__(H3ContractModel)
     model._qf = _FakeEngine(lib)
@@ -323,8 +357,8 @@ def _new_model(allow_partial):
     model._num_steps = 0
     model._num_frames = 0
     model._fps = _h3_namespace["_H3_FPS"]
-    model._audio_enhance = False
-    model._allow_partial_denoise = False
+    model._audio_enhance = audio_enhance
+    model._stage_partial = False
     model._step_i = 0
     model._sess_denoise = 0
     model._out_video = None
@@ -332,7 +366,7 @@ def _new_model(allow_partial):
     model._max_ctx_seq = 0
     model._base_process_calls = 0
     model._qf_needs_begin = False
-    model.set_allow_partial_denoise(allow_partial)
+    _h3_namespace["_log"].warnings.clear()
     return model, lib
 
 
@@ -365,7 +399,16 @@ def _events(lib, kind):
     return [payload for event_kind, payload in lib.events if event_kind == kind]
 
 
-class H3PartialDenoiseContract(unittest.TestCase):
+def _warnings():
+    return list(_h3_namespace["_log"].warnings)
+
+
+FULL = [1.0, 0.7, 0.2, 0.0]
+END_TRIM = [1.0, 0.8, 0.4]
+START_TRIM = [0.8, 0.3, 0.0]
+
+
+class H3TwoStageContract(unittest.TestCase):
     def assert_step_trace(self, lib, sigmas):
         steps = _events(lib, "step")
         self.assertEqual([step["step_index"] for step in steps], list(range(len(sigmas) - 1)))
@@ -373,87 +416,86 @@ class H3PartialDenoiseContract(unittest.TestCase):
         for actual, expected in zip((step["sigma"] for step in steps), sigmas[:-1]):
             self.assertAlmostEqual(actual, expected, places=6)
 
-    def test_p1_flag_false_full_range_passes_with_full_step_count(self):
-        sigmas = [1.0, 0.7, 0.2, 0.0]
-        model, lib = _new_model(False)
-        _run_stage(model, sigmas)
-        self.assertEqual(_events(lib, "begin")[0]["num_steps"], len(sigmas) - 1)
-        self.assert_step_trace(lib, sigmas)
+    def test_p1_full_range_runs_with_its_steps_and_sends_audio_enhance(self):
+        for audio in (False, True):
+            with self.subTest(audio_enhance=audio):
+                model, lib = _new_model(audio)
+                _run_stage(model, FULL)
+                begin = _events(lib, "begin")[0]
+                self.assertEqual(begin["num_steps"], len(FULL) - 1)
+                self.assert_step_trace(lib, FULL)
+                self.assertIs(begin["options"].get("audio_enhance"), True if audio else None)
+                self.assertEqual(_warnings(), [])
 
-    def test_p2_flag_true_does_not_change_full_range_trace_or_returned_output(self):
-        sigmas = [1.0, 0.7, 0.2, 0.0]
-        traces, step_outputs, returned_latents = [], [], []
-        for allow_partial in (False, True):
-            model, lib = _new_model(allow_partial)
-            outputs = []
-            packed = _run_stage(model, sigmas, outputs=outputs)
-            returned = model.process_latent_out(packed)
-            traces.append(lib.events)
-            step_outputs.append(outputs)
-            returned_latents.append(returned.detach().clone())
-        self.assertEqual(traces[0], traces[1])
-        self.assertEqual(len(step_outputs[0]), len(sigmas) - 1)
-        for false_output, true_output in zip(step_outputs[0], step_outputs[1]):
-            self.assertTrue(torch.equal(false_output, true_output))
-            self.assertTrue(torch.isfinite(false_output).all())
-        self.assertTrue(torch.equal(returned_latents[0], returned_latents[1]))
-        self.assertTrue(torch.equal(returned_latents[0][..., :192],
-                                    torch.full_like(returned_latents[0][..., :192], 2.25)))
-        self.assertTrue(torch.equal(returned_latents[0][..., 192:],
-                                    torch.full_like(returned_latents[0][..., 192:], 2.75)))
+    def test_p2_p3_a_trimmed_stage_runs_its_own_schedule_verbatim(self):
+        for sigmas in (END_TRIM, START_TRIM):
+            with self.subTest(sigmas=sigmas):
+                model, lib = _new_model()
+                _run_stage(model, sigmas)
+                self.assertEqual(_events(lib, "begin")[0]["num_steps"], len(sigmas) - 1)
+                self.assert_step_trace(lib, sigmas)
+                self.assertEqual(_warnings(), [])
 
-    def test_p3_flag_false_rejects_end_trim_before_native_begin(self):
-        model, lib = _new_model(False)
-        with self.assertRaisesRegex(RuntimeError, "partial / trimmed denoise is disabled"):
-            _run_stage(model, [1.0, 0.8, 0.4])
-        self.assertEqual(lib.begin_calls, 0)
-        self.assertEqual(_events(lib, "step"), [])
+    def test_p4_audio_enhance_is_ignored_in_a_partial_stage_with_one_warning(self):
+        for sigmas in (END_TRIM, START_TRIM):
+            with self.subTest(sigmas=sigmas):
+                runs = []
+                for audio in (False, True):
+                    model, lib = _new_model(audio)
+                    outputs = []
+                    packed = _run_stage(model, sigmas, outputs=outputs)
+                    runs.append((lib.events, outputs, model.process_latent_out(packed), _warnings()))
+                (off_events, off_outputs, off_latent, off_warn), (on_events, on_outputs, on_latent, on_warn) = runs
+                self.assertNotIn("audio_enhance", _events_of(on_events, "begin")[0]["options"])
+                self.assertEqual(on_events, off_events)
+                self.assertEqual(len(on_outputs), len(sigmas) - 1)
+                for off, on in zip(off_outputs, on_outputs):
+                    self.assertTrue(torch.equal(off, on))
+                self.assertTrue(torch.equal(off_latent, on_latent))
+                self.assertEqual(off_warn, [])
+                self.assertEqual(on_warn, [WARNING])            # once per session, not per step
+        self.assertIn("audio_enhance is not supported with two-stage (double-sampling) workflows", WARNING)
 
-    def test_p4_flag_false_rejects_start_trim_before_native_begin(self):
-        model, lib = _new_model(False)
-        with self.assertRaisesRegex(RuntimeError, "partial / trimmed denoise is disabled"):
-            _run_stage(model, [0.8, 0.3, 0.0])
-        self.assertEqual(lib.begin_calls, 0)
-        self.assertEqual(_events(lib, "step"), [])
+    def test_p5_full_range_tolerance(self):
+        cases = ((([0.985, 0.5, 0.0]), True), (([1.0, 0.5, 5e-4]), True),
+                 (([0.97, 0.5, 0.0]), False), (([1.0, 0.5, 2e-3]), False))
+        for sigmas, full in cases:
+            with self.subTest(sigmas=sigmas):
+                model, lib = _new_model(True)
+                _run_stage(model, sigmas)
+                self.assertIs(_events(lib, "begin")[0]["options"].get("audio_enhance"), True if full else None)
+                self.assertEqual(_warnings(), [] if full else [WARNING])
 
-    def test_p5_flag_true_end_trim_uses_stage_local_schedule_verbatim(self):
-        sigmas = [1.0, 0.8, 0.4]
-        model, lib = _new_model(True)
-        _run_stage(model, sigmas)
-        self.assertEqual(_events(lib, "begin")[0]["num_steps"], 2)
-        self.assert_step_trace(lib, sigmas)
+    def test_p6_missing_or_short_schedule_fails_loud_without_native_begin(self):
+        for schedule in (None, [], [1.0]):
+            with self.subTest(schedule=schedule):
+                model, lib = _new_model()
+                packed, context = _stage_inputs(model, (1, 24, 2, 2, 2))
+                options = {} if schedule is None else {"sample_sigmas": torch.tensor(schedule)}
+                with self.assertRaisesRegex(RuntimeError, "qf_native H3: the sampler did not publish a sigma schedule"):
+                    model._apply_model(packed, torch.tensor([1.0]), c_crossattn=context, transformer_options=options)
+                self.assertEqual(lib.begin_calls, 0)
 
-    def test_p6_flag_true_start_trim_uses_stage_local_schedule_verbatim(self):
-        sigmas = [0.8, 0.3, 0.0]
-        model, lib = _new_model(True)
-        _run_stage(model, sigmas)
-        self.assertEqual(_events(lib, "begin")[0]["num_steps"], 2)
-        self.assert_step_trace(lib, sigmas)
-
-    def test_p7_missing_or_short_schedule_fails_loud_without_native_begin(self):
-        for allow_partial in (False, True):
-            for schedule in (None, [], [1.0]):
-                with self.subTest(allow_partial=allow_partial, schedule=schedule):
-                    model, lib = _new_model(allow_partial)
-                    packed, context = _stage_inputs(model, (1, 24, 2, 2, 2))
-                    options = {} if schedule is None else {"sample_sigmas": torch.tensor(schedule)}
-                    with self.assertRaisesRegex(RuntimeError, "did not publish a sigma schedule"):
-                        model._apply_model(
-                            packed,
-                            torch.tensor([1.0]),
-                            c_crossattn=context,
-                            transformer_options=options,
-                        )
-                    self.assertEqual(lib.begin_calls, 0)
+    def test_p7_a_schedule_that_is_not_decreasing_fails_loud_without_native_begin(self):
+        for schedule in ([0.4, 0.8], [0.5, 0.5]):
+            with self.subTest(schedule=schedule):
+                model, lib = _new_model()
+                packed, context = _stage_inputs(model, (1, 24, 2, 2, 2))
+                with self.assertRaisesRegex(RuntimeError, "qf_native H3: sigma schedule must be strictly DECREASING"):
+                    model._apply_model(packed, torch.tensor([schedule[0]]), c_crossattn=context,
+                                       transformer_options={"sample_sigmas": torch.tensor(schedule)})
+                self.assertEqual(lib.begin_calls, 0)
 
     def test_p8_two_stages_close_then_rebegin_with_new_geometry_tokens_and_counters(self):
         model, lib = _new_model(True)
-        stage_a = _run_stage(model, [1.0, 0.8, 0.4], (1, 24, 2, 2, 2))
+        stage_a = _run_stage(model, END_TRIM, (1, 24, 2, 2, 2))
         model.process_latent_out(stage_a)
-        stage_b = _run_stage(model, [0.8, 0.3, 0.0], (1, 24, 2, 4, 6))
+        stage_b = _run_stage(model, START_TRIM, (1, 24, 2, 4, 6))
+        self.assertEqual(_warnings(), [WARNING, WARNING])       # each stage says it once
 
         begins = _events(lib, "begin")
         self.assertEqual([(item["width"], item["height"]) for item in begins], [(32, 32), (96, 64)])
+        self.assertEqual([item["options"].get("audio_enhance") for item in begins], [None, None])
         # These are deterministic fake-issued begin tokens, not evidence about native handles.
         self.assertNotEqual(begins[0]["token"], begins[1]["token"])
 
@@ -471,105 +513,31 @@ class H3PartialDenoiseContract(unittest.TestCase):
         self.assertEqual(model._sess_denoise, 2)
 
         closes = _events(lib, "close")
-        self.assertEqual([item["token"] for item in closes],
-                         [begins[0]["token"], begins[1]["token"]])
-        begin_a = next(i for i, event in enumerate(lib.events)
-                       if event[0] == "begin" and event[1]["token"] == begins[0]["token"])
-        close_b = next(i for i, event in enumerate(lib.events)
-                       if event[0] == "close" and event[1]["token"] == begins[1]["token"])
-        self.assertLess(begin_a, close_a)
-        self.assertLess(begin_b, close_b)
+        self.assertEqual([item["token"] for item in closes], [begins[0]["token"], begins[1]["token"]])
 
 
-class _LoaderModel:
-    def __init__(self):
-        self.partial_values = []
-
-    def set_attn_backend(self, _value):
-        pass
-
-    def set_sol_tau(self, _value):
-        pass
-
-    def set_audio_enhance(self, _value):
-        pass
-
-    def set_video_enhance(self, _value):   # the quality_enhance switch every loader must reach (mandatory, unguarded)
-        pass
-
-    def set_allow_partial_denoise(self, value):
-        self.partial_values.append(value)
+def _events_of(events, kind):
+    return [payload for event_kind, payload in events if event_kind == kind]
 
 
-_loader_model = _LoaderModel()
-_loader_patcher = SimpleNamespace(model=_loader_model)
-_loader_namespace = {
-    "object": object,
-    "_transformer_choices": lambda: ["transformer"],
-    "_model_config_input": lambda _family: (["config"], {"default": "config", "hidden": True, "socketless": True}),
-    "_attn_backend_input": lambda default: ([default], {"default": default}),
-    "_SOL_TAU_INPUT": ("FLOAT", {"default": 1.0}),
-    "_QUALITY_ENHANCE_INPUT": ("BOOLEAN", {"default": False}),
-    "_QUALITY_LEGACY_HIDDEN": {"quality": ("STRING", {})},
-    "_quality_enhance_on": lambda *_args: False,
-    "_AUDIO_ENHANCE_INPUT": ("BOOLEAN", {"default": False}),
-    "_STEP_CACHE_INPUT": ("FLOAT", {"default": 0.0}),
-    "_BLOCK_CACHE_INPUT": ("FLOAT", {"default": 0.0}),
-    "_PINNED_MEMORY_INPUT": ("BOOLEAN", {"default": False}),
-    "_run_family_load": lambda *_args, **_kwargs: _loader_patcher,
-    "_attn_backend_to_engine": lambda value: value,
-    "_arm_session_caches": lambda *_args: None,
-}
-QuantFuncH3LoaderContract = _subset_class(
-    LOADER_SOURCE,
-    "QuantFuncH3Loader",
-    "QuantFuncH3LoaderContract",
-    "object",
-    ("QF_FAMILY", "INPUT_TYPES", "load"),
-    _loader_namespace,
-)
-
-
-class H3LoaderPartialDenoiseContract(unittest.TestCase):
-    def test_extracted_loader_distinguishes_default_false_explicit_false_and_true(self):
-        schema = QuantFuncH3LoaderContract.INPUT_TYPES()
-        field_type, field_options = schema["optional"]["allow_partial_denoise"]
-        self.assertEqual(field_type, "BOOLEAN")
-        self.assertIs(field_options["default"], False)
-        self.assertIs(
-            inspect.signature(QuantFuncH3LoaderContract.load)
-            .parameters["allow_partial_denoise"].default,
-            False,
-        )
-
-        loader = QuantFuncH3LoaderContract()
-        cases = (
-            ("omitted", {}, False),
-            ("explicit_false", {"allow_partial_denoise": False}, False),
-            ("explicit_true", {"allow_partial_denoise": True}, True),
-        )
-        for label, kwargs, expected in cases:
-            with self.subTest(label=label):
-                _loader_model.partial_values.clear()
-                result = loader.load("transformer", "config", **kwargs)
-                self.assertEqual(result, (_loader_patcher,))
-                self.assertEqual(_loader_model.partial_values, [expected])
-
-    def test_extracted_loader_fails_loud_when_returned_model_lacks_setter(self):
-        with mock.patch.object(_loader_patcher, "model", SimpleNamespace()):
-            with self.assertRaises(AttributeError):
-                QuantFuncH3LoaderContract().load("transformer", "config")
+class H3LoaderContract(unittest.TestCase):
+    def test_l1_the_loader_has_no_partial_denoise_switch(self):
+        cls = _class_node(LOADER_SOURCE, "QuantFuncH3Loader")
+        load = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "load")
+        self.assertNotIn("allow_partial_denoise", [a.arg for a in load.args.args + load.args.kwonlyargs])
+        self.assertNotIn("allow_partial_denoise", LOADER_SOURCE)
+        self.assertNotIn("allow_partial_denoise", H3_SOURCE)
 
 
 class H3ProductionPathContract(unittest.TestCase):
-    def test_registered_loader_builds_real_qfh3_and_forwards_all_boolean_cases(self):
+    def test_l2_an_old_prompt_input_is_dropped_and_the_real_loader_builds_qfh3(self):
         plugin = _load_real_plugin(self)
         loader_class = plugin.NODE_CLASS_MAPPINGS.get("QuantFuncH3Loader")
         self.assertIs(loader_class, plugin.QuantFuncH3Loader)
-        self.assertIs(
-            inspect.signature(loader_class.load).parameters["allow_partial_denoise"].default,
-            False,
-        )
+        self.assertNotIn("allow_partial_denoise", loader_class.INPUT_TYPES().get("optional", {}))
+        import execution    # ComfyUI's own input gathering: an input the node does not declare never reaches load()
+        got = execution.get_input_data({"transformer": "t.safetensors", "allow_partial_denoise": True}, loader_class, "1")
+        self.assertNotIn("allow_partial_denoise", got[0])
 
         h3_module = sys.modules[f"{plugin.__name__}.qf_h3_modelpatcher"]
         engine_create_attempts = []
@@ -596,22 +564,11 @@ class H3ProductionPathContract(unittest.TestCase):
             builder = plugin._FAMILY_BUILDERS.get("minimax-h3")
             self.assertIsNotNone(builder)
             self.assertEqual(builder.__module__, h3_module.__name__)
-
-            loader = loader_class()
-            cases = (
-                ("omitted", {}, False),
-                ("explicit_false", {"allow_partial_denoise": False}, False),
-                ("explicit_true", {"allow_partial_denoise": True}, True),
-            )
-            for label, kwargs, expected in cases:
-                with self.subTest(label=label):
-                    result = loader.load("contract-transformer", "contract-config", **kwargs)
-                    self.assertEqual(len(result), 1)
-                    patcher = result[0]
-                    self.assertIs(type(patcher), plugin.qfmp.QFModelPatcher)
-                    self.assertIs(type(patcher.model), h3_module.QFH3Model)
-                    self.assertTrue(callable(getattr(patcher.model, "set_allow_partial_denoise", None)))
-                    self.assertIs(patcher.model._allow_partial_denoise, expected)
+            patcher = loader_class().load("contract-transformer", "contract-config", audio_enhance=True)[0]
+            self.assertIs(type(patcher), plugin.qfmp.QFModelPatcher)
+            self.assertIs(type(patcher.model), h3_module.QFH3Model)
+            self.assertIs(patcher.model._audio_enhance, True)
+            self.assertIs(patcher.model._stage_partial, False)
 
         self.assertEqual(engine_create_attempts, [])
 

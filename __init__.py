@@ -874,7 +874,8 @@ if _IMPORT_OK:
     _AUDIO_ENHANCE_INPUT = ("BOOLEAN", {"default": False,
                      "tooltip": "MiniMax-H3 only. On: adds a short extra pass after the video is finished that makes the "
                                 "sound clearer and sharper; the video itself is unchanged. Off (default): no extra time. "
-                                "Most useful with fast turbo settings; it has no effect at long, high-quality settings."})
+                                "Most useful with fast turbo settings; it has no effect at long, high-quality settings. "
+                                "Not supported in two-stage (double-sampling) workflows: ignored there."})
 
     # [sol-tau dial 2026-08-31] the ONE user-facing attention dial (user "就一个就好"). Applies to
     # the flash/sage backends — the engine applies it regardless of attention_backend (it is NOT
@@ -939,6 +940,10 @@ if _IMPORT_OK:
         # widget display name -> engine comp_opts attention_backend string
         return "native" if v == "fp16_native" else (v or "auto")
 
+    # _LOADER_LAYOUT (user 2026-09-28 「要输入的都在上方 开关的统一在下方 所有控件都这样」): on every loader the value inputs come
+    # first and the BOOLEAN switches last (the API key row, drawn by web/quantfunc_api_key.js, joins the value inputs).
+    # ComfyUI restores a saved node's values by position, so web/quantfunc_loader_layout.js remaps a workflow saved with
+    # the previous order once, on load, and stamps the layout version it was saved with.
     class QuantFuncLTXLoader:
         """LTX-2 loader — single MODEL output (single-expert family)."""
 
@@ -953,9 +958,9 @@ if _IMPORT_OK:
                 "model_config": _model_config_input("ltx2"),   # hidden; widget index 1 (see _model_config_input)
                 "attention_backend": _attn_backend_input(),
                 "sol_tau": _SOL_TAU_INPUT,
-                "quality_enhance": _QUALITY_ENHANCE_INPUT,
                 "step_cache": _STEP_CACHE_INPUT,
                 "block_cache": _BLOCK_CACHE_INPUT,
+                "quality_enhance": _QUALITY_ENHANCE_INPUT,   # the switches last (_LOADER_LAYOUT)
                 "pinned_memory": _PINNED_MEMORY_INPUT_LTX,
             }, "hidden": dict(_QUALITY_LEGACY_HIDDEN)}
 
@@ -1077,14 +1082,10 @@ if _IMPORT_OK:
                 # auto/sage/native. (Wan/LTX → auto is fine → they keep 'auto'.)
                 "attention_backend": _attn_backend_input("flash"),
                 "sol_tau": _SOL_TAU_INPUT,
-                "quality_enhance": _QUALITY_ENHANCE_INPUT,
-                "audio_enhance": _AUDIO_ENHANCE_INPUT,
                 "step_cache": _STEP_CACHE_INPUT,
                 "block_cache": _BLOCK_CACHE_INPUT,
-                "allow_partial_denoise": ("BOOLEAN", {
-                    "default": False,
-                    "tooltip": "Opt in to split/trimmed sigma schedules for intentional H3 double-sampling workflows.",
-                }),
+                "quality_enhance": _QUALITY_ENHANCE_INPUT,   # the switches last (_LOADER_LAYOUT)
+                "audio_enhance": _AUDIO_ENHANCE_INPUT,
                 "pinned_memory": _PINNED_MEMORY_INPUT,
             }, "hidden": dict(_QUALITY_LEGACY_HIDDEN)}
 
@@ -1096,7 +1097,7 @@ if _IMPORT_OK:
 
         def load(self, transformer, model_config=None,
                  attention_backend="flash", sol_tau=1.0, quality_enhance=None, audio_enhance=False,
-                 step_cache=0.0, block_cache=0.0, allow_partial_denoise=False, quality=None,
+                 step_cache=0.0, block_cache=0.0, quality=None,
                  pinned_memory=False):  # H3: flash default (auto->sage is broken)
             _p = _run_family_load(self.QF_FAMILY, transformer, model_config, pinned_memory)
             _mm = getattr(_p, "model", None)
@@ -1107,7 +1108,6 @@ if _IMPORT_OK:
             _mm.set_video_enhance(_quality_enhance_on(quality_enhance, quality))   # mandatory + unguarded: a patcher without it is a wiring error
             if _mm is not None and hasattr(_mm, "set_audio_enhance"):
                 _mm.set_audio_enhance(audio_enhance)
-            _mm.set_allow_partial_denoise(bool(allow_partial_denoise))
             _arm_session_caches(_mm, step_cache, block_cache)
             return (_p,)
 
