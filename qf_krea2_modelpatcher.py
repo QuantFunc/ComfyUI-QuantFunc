@@ -30,8 +30,6 @@ def matches(pipeline_class, transformer_class=""):
 @qfe.console_safe_methods   # an exception leaving it is console-safe (#738)
 class QFKrea2Model(qfmp.QFImageSessionModel, comfy.model_base.Krea2):
     _TAG = "krea2"
-    _VAE_S = 8   # AutoencoderKLQwenImage spatial scale; session W/H = latent * 8
-    _LATENT_CHANNELS = 16
     _NO_COND_HINT = "wire a krea2 CLIPTextEncode"
     _REFUSED_HINT = " (reference/edit conditioning is not part of the krea2 t2i seam)"
     # comfy model_base.Krea2.extra_conds consumables this seam cannot honor — refuse LOUD,

@@ -338,6 +338,30 @@ class QFSessionModelMixin:
     # run that dial's default without a word.
     _SESSION_DIALS = ("_step_cache", "_block_cache", "_sparse", "_attn_backend", "_sol_tau", "_video_enhance")
 
+    def _stage_schedule(self, transformer_options, tag):
+        """The ONE sampler-schedule rule of the video families (LTX, H3). Their external session is driven one sampler
+        stage at a time, by the sigma the sampler passes each step: its step count is the stage's own (len - 1), and a
+        partial or trimmed range is accepted, so two-stage and double-sampling workflows run with no switch. Refused:
+        no schedule, fewer than 2 sigmas, or a schedule that is not strictly decreasing (it would drive the session
+        backwards). Returns the (first, last) sigma, or None when they are not numbers (the count is still set)."""
+        sigmas = transformer_options.get("sample_sigmas") if isinstance(transformer_options, dict) else None
+        if sigmas is None or len(sigmas) < 2:
+            raise RuntimeError(
+                f"qf_native {tag}: the sampler did not publish a sigma schedule "
+                "(transformer_options['sample_sigmas']) - the engine session needs the step count. "
+                "Use a stock KSampler / SamplerCustom on this model.")
+        self._num_steps = len(sigmas) - 1
+        try:
+            first, last = float(sigmas[0]), float(sigmas[-1])
+        except Exception:  # noqa: BLE001 - non-tensor sigmas: keep the count, skip the range check
+            return None
+        if first <= last:
+            raise RuntimeError(
+                f"qf_native {tag}: sigma schedule must be strictly DECREASING (got "
+                f"{first:.4f}->{last:.4f}) - a non-decreasing schedule would drive the "
+                f"session backwards.")
+        return first, last
+
     def adopt_session_dials_from(self, src):
         """Copy the dials the loader set on SRC (the model a LoRA rebuild replaces) onto this model."""
         for name in type(self)._SESSION_DIALS:
@@ -590,13 +614,11 @@ class QFSessionModelMixin:
 class QFImageSessionModel(QFSessionModelMixin):
     """The image families' seam (Krea-2, Qwen-Image-2.1), written once: comfy owns the text encoder, the VAE, the sampler
     and CFG; the engine owns only the denoise, through the generic external session (quantfunc_denoise_begin, then one
-    quantfunc_denoise_step per cond group per sampler step). A family sets _TAG (its console / error tag), _VAE_S (latent
-    to pixel scale), _LATENT_CHANNELS, _NO_COND_HINT and _ENGINE_IGNORED_COND_KEYS — the comfy consumables it refuses
+    quantfunc_denoise_step per cond group per sampler step). A family sets _TAG (its console / error tag), _NO_COND_HINT
+    and _ENGINE_IGNORED_COND_KEYS — the comfy consumables it refuses
     LOUD, never drops, audited per family by tests/reject_list_completeness.py — and may override _check_conds (more
     run-start refusals) and _denoise_group (how one cond group's step is called)."""
     _TAG = ""
-    _VAE_S = 8
-    _LATENT_CHANNELS = 16
     _NO_COND_HINT = ""
     _REFUSED_HINT = ""          # appended to a refused-conditioning message
     _ENGINE_IGNORED_COND_KEYS = ()
@@ -604,7 +626,8 @@ class QFImageSessionModel(QFSessionModelMixin):
     def __init__(self, model_config, engine, device=None):
         super().__init__(model_config, device=device)
         self.diffusion_model = _QFStub()
-        self.diffusion_model.arm_concat_shape(self._LATENT_CHANNELS)   # in == latent channels -> extra 0 -> no concat
+        # in == the latent channels of the model's own latent_format -> extra 0 -> no concat
+        self.diffusion_model.arm_concat_shape(int(self.latent_format.latent_channels))
         self._qf = engine
         self._num_steps = 0
         self._step_i = 0
@@ -641,8 +664,9 @@ class QFImageSessionModel(QFSessionModelMixin):
         bpx = qfe.DenoiseBeginParams()
         ctypes.memset(ctypes.byref(bpx), 0, ctypes.sizeof(bpx))
         bpx.struct_size = ctypes.sizeof(bpx)
-        bpx.width = int(x_group.shape[-1]) * self._VAE_S
-        bpx.height = int(x_group.shape[-2]) * self._VAE_S
+        _s = int(self.latent_format.spacial_downscale_ratio)   # latent -> pixels, the model's latent_format
+        bpx.width = int(x_group.shape[-1]) * _s
+        bpx.height = int(x_group.shape[-2]) * _s
         bpx.num_steps = self._num_steps
         _max_seq = max(self._max_ctx_seq, int(ctx_group.shape[1]))
         bpx.max_context_dims = (ctypes.c_int * 3)(
@@ -725,8 +749,7 @@ class QFImageSessionModel(QFSessionModelMixin):
             p.latent_in = xi.data_ptr()
             p.velocity_out = oi.data_ptr()
             p.velocity_out_capacity = oi.numel() * oi.element_size()
-            dims = list(xi.shape) + [0] * (5 - xi.dim())
-            p.dims = (ctypes.c_int * 5)(*dims)
+            p.dims[:xi.dim()] = list(xi.shape)          # unused tail stays 0 (memset above); length = the ABI struct's
             p.dtype = _qf_dtype(xi.dtype)
             p.sigma = sig_i
             p.step_index = step_index
@@ -1159,6 +1182,7 @@ _IDENTITY_STATES = (qfe.QUANTFUNC_RESOURCE_READY, qfe.QUANTFUNC_RESOURCE_BUSY, q
 _NATIVE_BUSY_DEADLINE_S = 2.0
 _NATIVE_BUSY_FIRST_BACKOFF_S = 0.001
 _NATIVE_BUSY_MAX_BACKOFF_S = 0.05
+_MS_PER_S = 1e3                   # seconds -> milliseconds, for the BUSY messages (their ms wording is tested)
 
 
 def _query_identity(resource, *, owner_epoch=None, device=None, allow_closed=False):
@@ -1201,12 +1225,12 @@ def _read_past_busy(read, what):
         if result.state != qfe.QUANTFUNC_RESOURCE_BUSY:
             if busy_reads:
                 _log.debug("[qf_native] %s answered BUSY %d time(s) for %.1f ms, then state=%d (deadline %.0f ms)",
-                           what, busy_reads, waited * 1e3, result.state, _NATIVE_BUSY_DEADLINE_S * 1e3)
+                           what, busy_reads, waited * _MS_PER_S, result.state, _NATIVE_BUSY_DEADLINE_S * _MS_PER_S)
             return result
         busy_reads += 1
         if waited >= _NATIVE_BUSY_DEADLINE_S:
-            raise _NativeStillBusy(f"QuantFunc {what} stayed BUSY for {waited * 1e3:.0f} ms ({busy_reads} reads, "
-                                   f"deadline {_NATIVE_BUSY_DEADLINE_S * 1e3:.0f} ms): another native thread held "
+            raise _NativeStillBusy(f"QuantFunc {what} stayed BUSY for {waited * _MS_PER_S:.0f} ms ({busy_reads} reads, "
+                                   f"deadline {_NATIVE_BUSY_DEADLINE_S * _MS_PER_S:.0f} ms): another native thread held "
                                    "the lock the whole time")
         time.sleep(min(backoff, _NATIVE_BUSY_DEADLINE_S - waited))
         backoff = min(backoff * 2, _NATIVE_BUSY_MAX_BACKOFF_S)

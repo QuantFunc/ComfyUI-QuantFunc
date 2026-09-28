@@ -35,8 +35,6 @@ def matches(pipeline_class, transformer_class=""):
 @qfe.console_safe_methods   # an exception leaving it is console-safe (#738)
 class QFQwenImage21Model(qfmp.QFImageSessionModel, comfy.model_base.QwenImage21):
     _TAG = "qwenimage21"
-    _VAE_S = 16   # latent_formats.QwenImage21 spacial_downscale_ratio; session W/H = latent * 16
-    _LATENT_CHANNELS = 64
     _NO_COND_HINT = "wire TextEncodeQwenImage21"
     # comfy model_base.QwenImage(21).extra_conds consumables — the RULE: a key is accepted only if the engine
     # consumes it or the SAMPLER honours it; every other wired key is refused LOUD, never silently dropped (the
@@ -100,7 +98,8 @@ class QFQwenImage21Model(qfmp.QFImageSessionModel, comfy.model_base.QwenImage21)
         rp.struct_size = ctypes.sizeof(rp)
         rp.base = p
         ptrs = (ctypes.c_void_p * n)(*[t.data_ptr() for t in ref_i])
-        dims = (ctypes.c_int32 * (4 * n))(*[int(v) for t in ref_i for v in t.shape])
+        flat = [int(v) for t in ref_i for v in t.shape]
+        dims = (ctypes.c_int32 * len(flat))(*flat)
         sl = (ctypes.c_int32 * n)(*[int(v) for v in slots])
         rp.num_refs = n
         rp.ref_latents = ctypes.cast(ptrs, ctypes.POINTER(ctypes.c_void_p))

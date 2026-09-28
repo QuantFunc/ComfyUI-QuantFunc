@@ -26,6 +26,7 @@ latent), audio (soundtrack, must pair with a visual ref — official rule), vide
 math, parity+official-value death rules in test_minimax_h3_pack.cpp).
 """
 import os
+import inspect
 import ctypes
 import time
 import json
@@ -46,34 +47,50 @@ from .qf_modelpatcher import (_qf_dtype, _QFStub,
                               _interrupt_poll_end_session_on_raise,
                               QFSessionModelMixin)
 
+_log = qfe.logger(__name__)   # console-safe (#738)
 
-# ── H3 geometry constants (comfy comfy_extras/nodes_minimax_h3.py + ldm/minimax/model.py) ──
-_H3_SPATIAL = 16          # video latent -> pixels (width = W_lat * 16)
-_H3_FPS = 24.0            # the H3 frame grid is defined at 24 fps (comfy_extras/nodes_minimax_h3.FPS)
+
+# No H3 geometry is written down here (user 2026-09-28 「不能有任何写死逻辑」): the latent-to-pixel scale is the model's
+# latent_format (comfy.supported_models.MiniMaxH3), the frame grid and its FPS are ComfyUI's stock H3 nodes
+# (comfy_extras.nodes_minimax_h3), the token patch is comfy's own patchify_video default, and the audio
+# channel/stereo counts are read from the audio latent the graph hands in.
+_H3_DENOISED_SIGMA = 1e-3  # a sampler stage whose last sigma is above this stops before the denoise ends
+_H3_FULL_START = 0.98      # a stage starting below this fraction of the model's sigma_max starts part-way
+_AUDIO_ENHANCE_TWO_STAGE = ("[qf_native] H3: audio_enhance is not supported with two-stage (double-sampling) "
+                            "workflows; it is ignored for this run.")
+
+
+def _h3_nodes():
+    """ComfyUI's stock MiniMax-H3 nodes module: the source of the H3 frame grid and its frame rate."""
+    try:
+        from comfy_extras import nodes_minimax_h3
+    except ImportError as exc:
+        raise RuntimeError("qf_native H3: ComfyUI's comfy_extras.nodes_minimax_h3 is missing - update ComfyUI; the "
+                           "MiniMax-H3 frame grid and frame rate come from it") from exc
+    return nodes_minimax_h3
 
 
 def _h3_frames_from_latent_t(latent_t):
-    """INVERT comfy's own video_latent_t (nodes_minimax_h3): latent_t = 2 for fc<=5, else
-    ((fc-5)//17)*5 + 2 on the 17k+5 frame grid. Ask comfy's module when importable so an
-    upstream grid change cannot silently drift this seam; fall back to the closed form."""
+    """INVERT comfy's own video_latent_t on comfy's own frame grid (align_frame_count): the frame count the stock H3
+    latent node made for this latent length. Nothing about the grid is restated here."""
+    n = _h3_nodes()
     lt = int(latent_t)
-    try:
-        from comfy_extras import nodes_minimax_h3 as _h3n
-        fc = 5
-        while _h3n.video_latent_t(fc) < lt and fc < 100000:
-            fc += 17
-        if _h3n.video_latent_t(fc) == lt:
-            return fc
-    except Exception:  # noqa: BLE001 - fall through to the closed form
-        pass
-    return 5 if lt <= 2 else (lt - 2) // 5 * 17 + 5
-_H3_VIDEO_CHANNELS = 24   # video latent channels
-_H3_AUDIO_CHANNELS = 32   # audio_latents_dim (AutoencoderKLMiniMaxH3Audio) - kMmh3AudioLatentDim
-_H3_AUDIO_STEREO = 2      # K (stereo)
+    fc = n.align_frame_count(1)
+    while n.video_latent_t(fc) < lt:
+        fc = n.align_frame_count(fc + 1)
+    if n.video_latent_t(fc) != lt:
+        raise RuntimeError(f"qf_native H3: no frame count on ComfyUI's H3 grid has a video latent of length {lt} - "
+                           "the latent does not come from the stock MiniMax-H3 latent nodes")
+    return fc
+
+
 
 # The official audio pack/unpack + video patchify/unpatchify — import from comfy so a ComfyUI upgrade
 # can't drift us (the engine's external-denoise seam mirrors these exact transforms).
 from comfy.ldm.minimax.model import pack_audio, unpack_audio, patchify_video, unpatchify_video
+
+# comfy's own token patch (pt, ph, pw): the default of its patchify_video, so the session tokens match it exactly
+_H3_PATCH = tuple(inspect.signature(patchify_video).parameters["patch_size"].default)
 
 
 @qfe.console_safe_methods   # an exception leaving it is console-safe (#738)
@@ -81,7 +98,7 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
     """MiniMax-H3 svdq joint-AV pipeline exposed as a native comfy MODEL (native-KSampler seam), t2va."""
 
     # H3's own loader dials, carried across a LoRA rebuild like the mixin's (see QFSessionModelMixin._SESSION_DIALS).
-    _SESSION_DIALS = QFSessionModelMixin._SESSION_DIALS + ("_audio_enhance", "_allow_partial_denoise")
+    _SESSION_DIALS = QFSessionModelMixin._SESSION_DIALS + ("_audio_enhance",)
 
     def __init__(self, model_config, engine, device=None):
         super().__init__(model_config, device=device)     # disable_unet honored in BaseModel.__init__
@@ -89,9 +106,9 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
         self._qf = engine
         self._num_steps = 0               # DERIVED per run from sample_sigmas (len-1) at _begin
         self._num_frames = 0              # DERIVED per run from the video latent's T (see _derive_geometry)
-        self._fps = _H3_FPS               # the H3 grid is defined AT 24 fps (comfy nodes_minimax_h3.FPS)
+        self._fps = float(_h3_nodes().FPS)   # the H3 frame grid's rate, from ComfyUI's stock H3 nodes
         self._audio_enhance = False       # [audio_enhance] top up extra audio-only steps to total 16 (see _begin)
-        self._allow_partial_denoise = False  # explicit workflow opt-in; full-range remains the safe default
+        self._stage_partial = False       # DERIVED per session at _derive_geometry: a stage of a two-stage workflow
         # The AV flow shifts come from the model_sampling object — the stock
         # ModelSamplingMiniMaxH3 (MiniMaxH3SigmaShift) patches it, and model_config supplies the
         # defaults otherwise. They are read at _begin (getattr(ms, "shift"/"audio_shift")), so this
@@ -113,15 +130,6 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
         no audio lane, already-long schedules) is ENGINE law behind the begin option `audio_enhance` — this
         plugin carries no number for it. OFF (default) → byte-identical to no knob. Runtime session knob."""
         self._audio_enhance = bool(on)
-
-    def set_allow_partial_denoise(self, on):
-        """Allow split/trimmed sampler schedules for explicit double-sampling workflows.
-
-        The external H3 seam receives the actual sigma, step index, and stage-local total step
-        count on every call.  Keep the historical full-range refusal as the default because a
-        partial schedule is only meaningful when the workflow deliberately manages both stages.
-        """
-        self._allow_partial_denoise = bool(on)
 
     # memory_required: NO override — the base QFSessionModelMixin reports the ENGINE's own measured working set
     # (quantfunc_vram_need_bytes) for every family. The former H3-only heuristic here (2026-08-24 "brim fix":
@@ -222,31 +230,21 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
     def _derive_geometry(self, x_video, transformer_options):
         """DERIVE the session geometry from the graph (official-loader shape — the loader has no
         geometry/step/shift widgets). x_video=[1,24,T,H,W] from the stock empty-AV-latent /
-        MiniMaxH3ImageToVideo; the step count from the sampler's own sigma schedule."""
+        MiniMaxH3ImageToVideo; the step count and the schedule rule from the mixin's _stage_schedule (shared with
+        LTX): a partial or trimmed stage of a two-stage / double-sampling workflow is accepted, with no switch."""
         self._num_frames = _h3_frames_from_latent_t(int(x_video.shape[2]))
-        sigmas = transformer_options.get("sample_sigmas") if isinstance(transformer_options, dict) else None
-        if sigmas is None or len(sigmas) < 2:
-            raise RuntimeError(
-                "qf_native H3: the sampler did not publish a sigma schedule "
-                "(transformer_options['sample_sigmas']) - the engine session needs the step count. "
-                "Use a stock KSampler / SamplerCustom on this model.")
-        self._num_steps = len(sigmas) - 1
-        try:
-            s_first, s_last = float(sigmas[0]), float(sigmas[-1])
-        except Exception:  # noqa: BLE001
-            return
+        stage = self._stage_schedule(transformer_options, "H3")
         ms = getattr(self, "model_sampling", None)
-        s_max = float(getattr(ms, "sigma_max", s_first)) if ms is not None else s_first
-        partial = s_last > 1e-3 or (s_max > 0 and s_first < 0.98 * s_max)
-        if partial and not self._allow_partial_denoise:
-            raise RuntimeError(
-                f"qf_native H3: partial / trimmed denoise is disabled (sigmas run "
-                f"{s_first:.4f}->{s_last:.4f}, full range would be {s_max:.4f}->0). Enable "
-                f"'allow_partial_denoise' on QuantFuncH3Loader only for an intentional split-sigma "
-                f"or double-sampling workflow; otherwise use one full-range sampler.")
-        if partial:
-            qfe.info(f"[qf_native] H3: partial denoise explicitly enabled: "
-                  f"{s_first:.4f}->{s_last:.4f}, stage_steps={self._num_steps}", flush=True)
+        s_max = float(getattr(ms, "sigma_max", 0.0) or 0.0) if ms is not None else 0.0
+        self._stage_partial = stage is not None and (stage[1] > _H3_DENOISED_SIGMA
+                                                     or (s_max > 0 and stage[0] < _H3_FULL_START * s_max))
+        # audio_enhance does not support two-stage (double-sampling) workflows (user 2026-09-28 「audio_enhance不支持双采」):
+        # either stage of one runs without it, and one warning says so. Why: the engine's extra audio pass fires at a
+        # session's final step and refines the audio down to sigma 0 over a video it treats as finished
+        # (MiniMaxH3Pipeline.cpp: extra_audio_steps = 16 - this session's num_steps; the is_final_step gate). The engine
+        # item that gates that pass on sigma 0 (post-release #4) does not change this rule: the plugin decides support.
+        if self._stage_partial and self._audio_enhance:
+            _log.warning(_AUDIO_ENHANCE_TWO_STAGE)
 
     def _begin(self, x_video, x_audio, vemb, av_payload=None):
         """Open the joint-AV external denoise session. x_video=[1,24,T,H,W], x_audio=[1,32,2,audio_t],
@@ -261,8 +259,9 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
         bpx = qfe.DenoiseBeginParams()
         ctypes.memset(ctypes.byref(bpx), 0, ctypes.sizeof(bpx))
         bpx.struct_size = ctypes.sizeof(bpx)
-        bpx.width = int(x_video.shape[-1]) * _H3_SPATIAL
-        bpx.height = int(x_video.shape[-2]) * _H3_SPATIAL
+        _s = int(self.latent_format.spacial_downscale_ratio)   # latent -> pixels, the model's latent_format
+        bpx.width = int(x_video.shape[-1]) * _s
+        bpx.height = int(x_video.shape[-2]) * _s
         bpx.num_steps = self._num_steps
         _max_seq = max(self._max_ctx_seq, int(vemb.shape[1]))
         bpx.max_context_dims = (ctypes.c_int * 3)(int(vemb.shape[0]), _max_seq, int(vemb.shape[2]))
@@ -286,18 +285,25 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
                 f"similar) replaced MiniMax-H3's ModelSamplingAV and dropped the AUDIO schedule. Use "
                 f"the stock ModelSamplingMiniMaxH3 node (shift_video + shift_audio) for H3, or wire no "
                 f"sampling node at all to keep the checkpoint defaults.")
+        # comfy's ModelSamplingAV: audio_shift None means the audio follows the video schedule (audio_scale 1.0), which is
+        # an audio shift equal to the video shift - what the engine gets then. Zero, negative or NaN: refused, never replaced.
+        audio_shift = ms.shift if ms.audio_shift is None else ms.audio_shift
+        if not all(isinstance(v, (int, float)) and v > 0 for v in (ms.shift, audio_shift)):
+            raise RuntimeError(
+                f"qf_native H3: the model sampling has shift={ms.shift!r}, audio_shift={ms.audio_shift!r}; both must be "
+                f"positive. Set them on ModelSamplingMiniMaxH3, or wire no sampling node to keep the checkpoint defaults.")
         _opts = {
             **self.residency_opts(),                              # [session-knobs] generic knob
             "audio_dims": audio_dims,
             "av_sigma_shift_video": float(ms.shift),
-            "av_sigma_shift_audio": float(ms.audio_shift or 3.0),
+            "av_sigma_shift_audio": float(audio_shift),
             "num_frames": self._num_frames,
             "fps": float(self._fps),
         }
         # [enhance switch] the product switch only; the engine computes the extra audio sub-steps from
         # num_steps and disarms itself under CFG / without an audio lane (MiniMaxH3Pipeline). Sent only
         # when ON (OFF = byte-identical to no knob; the raw extra_audio_steps key is never built here).
-        if self._audio_enhance:
+        if self._audio_enhance and not self._stage_partial:   # not in a two-stage workflow (see _derive_geometry)
             _opts["audio_enhance"] = True
         # [fl2va/ref2va bridge] forward the pre-encoded keyframe/reference latents from the
         # per-group conditioning payload (official minimax_payload mechanism) as begin options
@@ -448,16 +454,18 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
                 "ConditioningZeroOut), or run without CFG.")
 
         _, Cv, Tv, Hv, Wv = x_video.shape
-        Ta = int(x_audio.shape[-1])
-        n_rows = _H3_AUDIO_STEREO * Ta                       # pack_audio: ch*T rows
-        # the engine session denoises PATCHIFIED video tokens [1, Ntok, C*pt*ph*pw] (2x2 spatial, FP16),
-        # NOT the raw 5D latent — patchify_video/unpatchify_video bridge it (mirrors the official model).
-        ntok = Tv * (Hv // 2) * (Wv // 2)
-        pch = Cv * 4                                          # c*pt*ph*pw = 24*1*2*2 = 96
+        _, Ca, Ka, Ta = (int(d) for d in x_audio.shape)       # the graph's audio latent [B, channels, stereo, T]
+        n_rows = Ka * Ta                                      # pack_audio: ch*T rows
+        # the engine session denoises PATCHIFIED video tokens [1, Ntok, C*pt*ph*pw] (FP32), NOT the raw 5D latent —
+        # comfy's own patchify_video/unpatchify_video bridge it, with comfy's own patch size.
+        pt, ph, pw = _H3_PATCH
+        tt, th, tw = Tv // pt, Hv // ph, Wv // pw
+        ntok = tt * th * tw
+        pch = Cv * pt * ph * pw
         if self._out_video is None or self._out_video.shape != (1, ntok, pch):
             self._out_video = torch.empty((1, ntok, pch), dtype=torch.float32, device=dev)  # engine H3 latent = FP32
-        if self._out_audio is None or self._out_audio.shape != (1, n_rows, _H3_AUDIO_CHANNELS):
-            self._out_audio = torch.empty((1, n_rows, _H3_AUDIO_CHANNELS), dtype=torch.float32, device=dev)
+        if self._out_audio is None or self._out_audio.shape != (1, n_rows, Ca):
+            self._out_audio = torch.empty((1, n_rows, Ca), dtype=torch.float32, device=dev)
 
         sig_all = sigma.reshape(-1) if torch.is_tensor(sigma) else None
         step_index = self._sigma_step_index(sigma, sig_all, transformer_options)
@@ -500,14 +508,13 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
             mp.audio_latent_in = xi_audio.data_ptr()
             mp.audio_velocity_out = self._out_audio.data_ptr()
             mp.audio_velocity_out_capacity = self._out_audio.numel() * self._out_audio.element_size()
-            mp.audio_dims = (ctypes.c_int * 4)(int(x_audio.shape[0]), _H3_AUDIO_CHANNELS,
-                                               _H3_AUDIO_STEREO, Ta)
+            mp.audio_dims = (ctypes.c_int * 4)(int(x_audio.shape[0]), Ca, Ka, Ta)
             mp.audio_dtype = _qf_dtype(xi_audio.dtype)
             mp.audio_scale = audio_scale
             self._call_denoise_step_multi(mp, f"H3 denoise_step_multi[step={step_index},group={i}]")
             # video velocity tokens [1,Ntok,96] (engine already negated) -> raw 5D [1,24,T,H,W]
-            out_video[i:i + 1] = unpatchify_video(self._out_video.reshape(ntok, pch),
-                                                  Tv, Hv // 2, Wv // 2, Cv).to(out_video.dtype)
+            out_video[i:i + 1] = unpatchify_video(self._out_video.reshape(ntok, pch), tt, th, tw, Cv,
+                                                  patch_size=_H3_PATCH).to(out_video.dtype)
             # audio velocity: unpack [1,K*T,32] -> [1,32,2,T]
             out_audio[i:i + 1] = unpack_audio(self._out_audio[0]).to(out_audio.dtype)
             self._qf.step_count += 1
