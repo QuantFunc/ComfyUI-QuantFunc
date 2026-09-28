@@ -1,7 +1,7 @@
 {
-  "id": "08a412c8-57ba-4f41-96f8-095bb7a321af",
+  "id": "4b4345d8-498b-45ee-b817-d5715d5a0484",
   "revision": 0,
-  "last_node_id": 12,
+  "last_node_id": 13,
   "last_link_id": 14,
   "nodes": [
     {
@@ -22,10 +22,10 @@
       "outputs": [],
       "properties": {},
       "widgets_values": [
-        "## QuantFunc Krea-2\n\n- **QuantFunc Krea-2 Loader** replaces the official `Load Diffusion Model` (UNETLoader): the QuantFunc engine runs the Krea-2 Turbo transformer; the text encoder (`CLIPLoader`, type `krea2`), the VAE and the sampler stay stock ComfyUI.\n- `transformer`: `krea2-turbo-quantfunc-int4-r128.safetensors` (or the smaller `krea2-turbo-quantfunc-int4-r32.safetensors`) from ModelScope [QuantFunc/Krea-2-QuantFunc-4bit](https://modelscope.cn/models/QuantFunc/Krea-2-QuantFunc-4bit), in `models/diffusion_models`.\n- Text encoder `qwen3vl_4b_fp8_scaled.safetensors` and VAE `qwen_image_vae.safetensors`: Hugging Face [Comfy-Org/Krea-2](https://huggingface.co/Comfy-Org/Krea-2).\n- `quality_enhance`: OFF (default) is faster; ON gives the highest quality.\n- Krea-2 Turbo is guidance-distilled: 8 steps, CFG 1, euler / simple, and the negative prompt is zeroed (`ConditioningZero Out`).\n\n**Two passes (double sampling).** The first KSampler makes the image at 1024x1024; `Upscale Latent By` enlarges the latent 1.5x and the second KSampler refines it at 1536x1536 (4 steps, denoise 0.4). A lower denoise keeps more of the first image.\n"
+        "## QuantFunc Krea-2\n\n- **QuantFunc Krea-2 Loader** replaces the official `Load Diffusion Model` (UNETLoader): the QuantFunc engine runs the Krea-2 Turbo transformer; the text encoder (`CLIPLoader`, type `krea2`), the VAE and the sampler stay stock ComfyUI.\n- `transformer`: `krea2-turbo-quantfunc-int4-r128.safetensors` (or the smaller `krea2-turbo-quantfunc-int4-r32.safetensors`) from ModelScope [QuantFunc/Krea-2-QuantFunc-4bit](https://modelscope.cn/models/QuantFunc/Krea-2-QuantFunc-4bit), in `models/diffusion_models`.\n- Text encoder `qwen3vl_4b_fp8_scaled.safetensors` and VAE `qwen_image_vae.safetensors`: Hugging Face [Comfy-Org/Krea-2](https://huggingface.co/Comfy-Org/Krea-2).\n- `quality_enhance`: OFF (default) is faster; ON gives the highest quality.\n- Krea-2 Turbo is guidance-distilled: 8 steps, CFG 1, euler / simple, and the negative prompt is zeroed (`ConditioningZero Out`).\n\n**Two passes, two loaders (double sampling).** Both loaders name the same transformer, so they share ONE pipeline in memory. Loader 1 (`quality_enhance` OFF, the fast setting) makes the image at 1024x1024; `Upscale Latent By` enlarges the latent 1.5x and loader 2 (`quality_enhance` ON) refines it at 1536x1536 (3 steps, denoise 0.3). A lower denoise keeps more of the first image. Keep `pinned_memory` the same on both loaders: a different transformer file or `pinned_memory` setting loads a second copy.\n"
       ],
       "widgets_values_named": {
-        "text": "## QuantFunc Krea-2\n\n- **QuantFunc Krea-2 Loader** replaces the official `Load Diffusion Model` (UNETLoader): the QuantFunc engine runs the Krea-2 Turbo transformer; the text encoder (`CLIPLoader`, type `krea2`), the VAE and the sampler stay stock ComfyUI.\n- `transformer`: `krea2-turbo-quantfunc-int4-r128.safetensors` (or the smaller `krea2-turbo-quantfunc-int4-r32.safetensors`) from ModelScope [QuantFunc/Krea-2-QuantFunc-4bit](https://modelscope.cn/models/QuantFunc/Krea-2-QuantFunc-4bit), in `models/diffusion_models`.\n- Text encoder `qwen3vl_4b_fp8_scaled.safetensors` and VAE `qwen_image_vae.safetensors`: Hugging Face [Comfy-Org/Krea-2](https://huggingface.co/Comfy-Org/Krea-2).\n- `quality_enhance`: OFF (default) is faster; ON gives the highest quality.\n- Krea-2 Turbo is guidance-distilled: 8 steps, CFG 1, euler / simple, and the negative prompt is zeroed (`ConditioningZero Out`).\n\n**Two passes (double sampling).** The first KSampler makes the image at 1024x1024; `Upscale Latent By` enlarges the latent 1.5x and the second KSampler refines it at 1536x1536 (4 steps, denoise 0.4). A lower denoise keeps more of the first image.\n"
+        "text": "## QuantFunc Krea-2\n\n- **QuantFunc Krea-2 Loader** replaces the official `Load Diffusion Model` (UNETLoader): the QuantFunc engine runs the Krea-2 Turbo transformer; the text encoder (`CLIPLoader`, type `krea2`), the VAE and the sampler stay stock ComfyUI.\n- `transformer`: `krea2-turbo-quantfunc-int4-r128.safetensors` (or the smaller `krea2-turbo-quantfunc-int4-r32.safetensors`) from ModelScope [QuantFunc/Krea-2-QuantFunc-4bit](https://modelscope.cn/models/QuantFunc/Krea-2-QuantFunc-4bit), in `models/diffusion_models`.\n- Text encoder `qwen3vl_4b_fp8_scaled.safetensors` and VAE `qwen_image_vae.safetensors`: Hugging Face [Comfy-Org/Krea-2](https://huggingface.co/Comfy-Org/Krea-2).\n- `quality_enhance`: OFF (default) is faster; ON gives the highest quality.\n- Krea-2 Turbo is guidance-distilled: 8 steps, CFG 1, euler / simple, and the negative prompt is zeroed (`ConditioningZero Out`).\n\n**Two passes, two loaders (double sampling).** Both loaders name the same transformer, so they share ONE pipeline in memory. Loader 1 (`quality_enhance` OFF, the fast setting) makes the image at 1024x1024; `Upscale Latent By` enlarges the latent 1.5x and loader 2 (`quality_enhance` ON) refines it at 1536x1536 (3 steps, denoise 0.3). A lower denoise keeps more of the first image. Keep `pinned_memory` the same on both loaders: a different transformer file or `pinned_memory` setting loads a second copy.\n"
       },
       "color": "#432",
       "bgcolor": "#653"
@@ -101,11 +101,11 @@
           "name": "MODEL",
           "type": "MODEL",
           "links": [
-            3,
-            8
+            3
           ]
         }
       ],
+      "title": "Loader 1: fast (first pass)",
       "properties": {
         "qf_layout": 2,
         "Node name for S&R": "QuantFuncKrea2Loader"
@@ -523,6 +523,101 @@
     },
     {
       "id": 9,
+      "type": "QuantFuncKrea2Loader",
+      "pos": [
+        0,
+        1058
+      ],
+      "size": [
+        271.2359375,
+        154
+      ],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "transformer",
+          "name": "transformer",
+          "type": "COMBO",
+          "widget": {
+            "name": "transformer"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "model_config",
+          "name": "model_config",
+          "shape": 7,
+          "type": "COMBO",
+          "widget": {
+            "name": "model_config"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "attention_backend",
+          "name": "attention_backend",
+          "shape": 7,
+          "type": "COMBO",
+          "widget": {
+            "name": "attention_backend"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "quality_enhance",
+          "name": "quality_enhance",
+          "shape": 7,
+          "type": "BOOLEAN",
+          "widget": {
+            "name": "quality_enhance"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "pinned_memory",
+          "name": "pinned_memory",
+          "shape": 7,
+          "type": "BOOLEAN",
+          "widget": {
+            "name": "pinned_memory"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "MODEL",
+          "name": "MODEL",
+          "type": "MODEL",
+          "links": [
+            8
+          ]
+        }
+      ],
+      "title": "Loader 2: quality (second pass)",
+      "properties": {
+        "qf_layout": 2,
+        "Node name for S&R": "QuantFuncKrea2Loader"
+      },
+      "widgets_values": [
+        "krea2-turbo-quantfunc-int4-r128.safetensors",
+        "krea2-turbo-int4",
+        "auto",
+        true,
+        false
+      ],
+      "widgets_values_named": {
+        "transformer": "krea2-turbo-quantfunc-int4-r128.safetensors",
+        "model_config": "krea2-turbo-int4",
+        "attention_backend": "auto",
+        "quality_enhance": true,
+        "pinned_memory": false
+      }
+    },
+    {
+      "id": 10,
       "type": "LatentUpscaleBy",
       "pos": [
         1040,
@@ -533,7 +628,7 @@
         82
       ],
       "flags": {},
-      "order": 8,
+      "order": 9,
       "mode": 0,
       "inputs": [
         {
@@ -584,7 +679,7 @@
       }
     },
     {
-      "id": 10,
+      "id": 11,
       "type": "KSampler",
       "pos": [
         1370,
@@ -595,7 +690,7 @@
         262
       ],
       "flags": {},
-      "order": 9,
+      "order": 10,
       "mode": 0,
       "inputs": [
         {
@@ -693,24 +788,24 @@
       "widgets_values": [
         42,
         "fixed",
-        4,
+        3,
         1,
         "euler",
         "simple",
-        0.4
+        0.3
       ],
       "widgets_values_named": {
         "seed": 42,
         "control_after_generate": "fixed",
-        "steps": 4,
+        "steps": 3,
         "cfg": 1,
         "sampler_name": "euler",
         "scheduler": "simple",
-        "denoise": 0.4
+        "denoise": 0.3
       }
     },
     {
-      "id": 11,
+      "id": 12,
       "type": "VAEDecode",
       "pos": [
         1370,
@@ -721,7 +816,7 @@
         46
       ],
       "flags": {},
-      "order": 10,
+      "order": 11,
       "mode": 0,
       "inputs": [
         {
@@ -752,7 +847,7 @@
       }
     },
     {
-      "id": 12,
+      "id": 13,
       "type": "SaveImage",
       "pos": [
         1700,
@@ -763,7 +858,7 @@
         58
       ],
       "flags": {},
-      "order": 11,
+      "order": 12,
       "mode": 0,
       "inputs": [
         {
@@ -852,15 +947,15 @@
       7,
       8,
       0,
-      9,
+      10,
       0,
       "LATENT"
     ],
     [
       8,
-      2,
+      9,
       0,
-      10,
+      11,
       0,
       "MODEL"
     ],
@@ -868,7 +963,7 @@
       9,
       5,
       0,
-      10,
+      11,
       1,
       "CONDITIONING"
     ],
@@ -876,23 +971,23 @@
       10,
       6,
       0,
-      10,
+      11,
       2,
       "CONDITIONING"
     ],
     [
       11,
-      9,
-      0,
       10,
+      0,
+      11,
       3,
       "LATENT"
     ],
     [
       12,
-      10,
-      0,
       11,
+      0,
+      12,
       0,
       "LATENT"
     ],
@@ -900,15 +995,15 @@
       13,
       4,
       0,
-      11,
+      12,
       1,
       "VAE"
     ],
     [
       14,
-      11,
-      0,
       12,
+      0,
+      13,
       0,
       "IMAGE"
     ]

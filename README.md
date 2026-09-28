@@ -283,6 +283,10 @@ to the whole ComfyUI session: once any loader has turned it on (the LTX-2.5 load
 model until ComfyUI restarts.
 The MiniMax-H3 and LTX-2.5 loaders accept two-stage (double-sampling) workflows as they are. The MiniMax-H3
 `audio_enhance` switch is not supported in two-stage (double-sampling) workflows: it is ignored there.
+Several loaders that name the same transformer file share one copy of the model in memory. `quality_enhance`,
+`attention_backend`, `sol_tau`, `step_cache`, `block_cache` and `audio_enhance` apply per loader, at each run, so a
+two-pass workflow can use a fast loader for the first pass and a quality loader for the second without loading the model
+twice. A different transformer file or `pinned_memory` setting loads a second copy.
 
 | File | Use Case |
 |------|----------|
@@ -292,9 +296,8 @@ The MiniMax-H3 and LTX-2.5 loaders accept two-stage (double-sampling) workflows 
 | `QuantFunc-QwenImage21-edit-multi-reference.json` | image edit, two references (the official example) |
 | `QuantFunc-QwenImage21-edit-remove-background.json` | remove the background → transparent PNG |
 | `QuantFunc-Krea2-t2i.json` | Krea-2 text-to-image |
-| `QuantFunc-Krea2-t2i-double-sampling.json` | Krea-2 text-to-image in two passes (1.5x latent upscale + refine) |
-| `QuantFunc-LTX25-t2v.json` | LTX-2.5 text-to-video with audio, one pass |
-| `QuantFunc-LTX25-t2v-two-stage.json` | LTX-2.5 text-to-video with audio, two stages (the official pipeline: half size + 2x latent upsampler) |
+| `QuantFunc-Krea2-t2i-double-sampling.json` | Krea-2 text-to-image in two passes: a fast loader at 1024x1024, then 1.5x latent upscale and a quality loader at 1536x1536 (one shared model) |
+| `QuantFunc-LTX25-t2v.json` | LTX-2.5 text-to-video with audio, the official two-stage pipeline (half size, then 2x latent upsampler and refine) |
 | `QuantFunc-MiniMaxH3-fl2va.json` | MiniMax-H3 first/last frame to video with audio |
 | `QuantFunc-MiniMaxH3-fl2va-double-sampling.json` | the same, with the schedule split over two samplers |
 | `QuantFunc-MiniMaxH3-ref2va.json` | MiniMax-H3 reference images to video with audio |
