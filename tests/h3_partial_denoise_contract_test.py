@@ -12,12 +12,14 @@ audio_enhance does not support it (「audio_enhance不支持双采」).
   P6 no schedule, or fewer than 2 sigmas, and P7 a schedule that is not strictly decreasing fail loud, before any
      native begin (the rule the mixin shares with LTX)
   P8 two stages: the first closes before the second begins with its own geometry and stage-local counters
+  P9 the audio shift follows comfy's ModelSamplingAV: an explicit audio_shift is sent as is; None (comfy: the audio follows
+     the video schedule, audio_scale 1.0) is sent as the video shift; a zero or negative shift is refused before begin
   L1 the loader has no allow_partial_denoise input or parameter; L2 (COMFY_ROOT) ComfyUI drops that input from an old
      API prompt before the loader runs, and the registered loader builds the real QFH3Model
 
 MUTATION (each goes RED): refuse a partial stage again -> P2/P3/P8; send audio_enhance in a partial stage, or warn
 per step / never -> P4; tighten or drop the full-range tolerance -> P5; drop the schedule checks -> P6/P7; re-add the
-input -> L1.
+input -> L1; send a written-down audio shift for None, or refuse None -> P9.
 """
 import ast
 import copy
@@ -496,6 +498,38 @@ class H3TwoStageContract(unittest.TestCase):
                     model._apply_model(packed, torch.tensor([schedule[0]]), c_crossattn=context,
                                        transformer_options={"sample_sigmas": torch.tensor(schedule)})
                 self.assertEqual(lib.begin_calls, 0)
+
+    def test_p9_the_audio_shift_follows_comfys_model_sampling(self):
+        for audio_shift, want in ((3.0, 3.0), (None, _Sampling.shift)):
+            with self.subTest(audio_shift=audio_shift):
+                model, lib = _new_model()
+                model.model_sampling.audio_shift = audio_shift
+                _run_stage(model, FULL)
+                options = _events(lib, "begin")[0]["options"]
+                self.assertEqual(options["av_sigma_shift_video"], _Sampling.shift)
+                self.assertEqual(options["av_sigma_shift_audio"], want)
+        for shift, audio_shift in ((1.2, 0.0), (0.0, 3.0), (1.2, -1.0)):
+            with self.subTest(shift=shift, audio_shift=audio_shift):
+                model, lib = _new_model()
+                model.model_sampling.shift, model.model_sampling.audio_shift = shift, audio_shift
+                packed, context = _stage_inputs(model, (1, 24, 2, 2, 2))
+                with self.assertRaisesRegex(RuntimeError, "qf_native H3: the model sampling has shift="):
+                    model._apply_model(packed, torch.tensor([1.0]), c_crossattn=context,
+                                       transformer_options={"sample_sigmas": torch.tensor(FULL)})
+                self.assertEqual(lib.begin_calls, 0)
+
+    def test_p9b_in_comfy_a_none_audio_shift_is_the_video_schedule(self):
+        try:
+            from comfy.ldm.minimax.model import time_shift_sigma
+            from comfy.model_sampling import ModelSamplingAV
+        except ImportError:
+            self.skipTest("[SKIP] needs COMFY_ROOT (comfy's ModelSamplingAV)")
+        ms = ModelSamplingAV(None)
+        ms.set_parameters(shift=_Sampling.shift)   # a node that sets only the video shift
+        self.assertIsNone(ms.audio_shift)
+        self.assertEqual(ms.audio_scale, 1.0)     # comfy: no audio rescale, the audio rides the video schedule
+        for sigma in (0.9, 0.5, 0.1):             # ...which is exactly an audio shift equal to the video shift
+            self.assertAlmostEqual(time_shift_sigma(sigma, _Sampling.shift, _Sampling.shift), sigma, places=12)
 
     def test_p8_two_stages_close_then_rebegin_with_new_geometry_tokens_and_counters(self):
         model, lib = _new_model(True)

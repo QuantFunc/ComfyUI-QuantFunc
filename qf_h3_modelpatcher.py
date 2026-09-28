@@ -285,7 +285,10 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
                 f"similar) replaced MiniMax-H3's ModelSamplingAV and dropped the AUDIO schedule. Use "
                 f"the stock ModelSamplingMiniMaxH3 node (shift_video + shift_audio) for H3, or wire no "
                 f"sampling node at all to keep the checkpoint defaults.")
-        if not ms.shift or not ms.audio_shift:   # a missing / zero shift: refused, never replaced by a written-down default
+        # comfy's ModelSamplingAV: audio_shift None means the audio follows the video schedule (audio_scale 1.0), which is
+        # an audio shift equal to the video shift - what the engine gets then. Zero, negative or NaN: refused, never replaced.
+        audio_shift = ms.shift if ms.audio_shift is None else ms.audio_shift
+        if not all(isinstance(v, (int, float)) and v > 0 for v in (ms.shift, audio_shift)):
             raise RuntimeError(
                 f"qf_native H3: the model sampling has shift={ms.shift!r}, audio_shift={ms.audio_shift!r}; both must be "
                 f"positive. Set them on ModelSamplingMiniMaxH3, or wire no sampling node to keep the checkpoint defaults.")
@@ -293,7 +296,7 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
             **self.residency_opts(),                              # [session-knobs] generic knob
             "audio_dims": audio_dims,
             "av_sigma_shift_video": float(ms.shift),
-            "av_sigma_shift_audio": float(ms.audio_shift),
+            "av_sigma_shift_audio": float(audio_shift),
             "num_frames": self._num_frames,
             "fps": float(self._fps),
         }
