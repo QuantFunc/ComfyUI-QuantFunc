@@ -14,12 +14,14 @@ audio_enhance does not support it (「audio_enhance不支持双采」).
   P8 two stages: the first closes before the second begins with its own geometry and stage-local counters
   P9 the audio shift follows comfy's ModelSamplingAV: an explicit audio_shift is sent as is; None (comfy: the audio follows
      the video schedule, audio_scale 1.0) is sent as the video shift; a zero or negative shift is refused before begin
+  P10 the begin width/height follow the model's latent_format: a spatial scale ComfyUI never uses (7) must come out, so
+     no written-down scale can pass
   L1 the loader has no allow_partial_denoise input or parameter; L2 (COMFY_ROOT) ComfyUI drops that input from an old
      API prompt before the loader runs, and the registered loader builds the real QFH3Model
 
 MUTATION (each goes RED): refuse a partial stage again -> P2/P3/P8; send audio_enhance in a partial stage, or warn
 per step / never -> P4; tighten or drop the full-range tolerance -> P5; drop the schedule checks -> P6/P7; re-add the
-input -> L1; send a written-down audio shift for None, or refuse None -> P9.
+input -> L1; send a written-down audio shift for None, or refuse None -> P9; write the spatial scale down -> P10.
 """
 import ast
 import copy
@@ -517,6 +519,13 @@ class H3TwoStageContract(unittest.TestCase):
                     model._apply_model(packed, torch.tensor([1.0]), c_crossattn=context,
                                        transformer_options={"sample_sigmas": torch.tensor(FULL)})
                 self.assertEqual(lib.begin_calls, 0)
+
+    def test_p10_the_begin_size_follows_the_models_latent_format(self):
+        model, lib = _new_model()
+        model.latent_format = SimpleNamespace(spacial_downscale_ratio=7, latent_channels=32)   # not a ComfyUI value
+        _run_stage(model, FULL, video_shape=(1, 24, 2, 4, 6))
+        begin = _events(lib, "begin")[0]
+        self.assertEqual((begin["width"], begin["height"]), (6 * 7, 4 * 7))
 
     def test_p9b_in_comfy_a_none_audio_shift_is_the_video_schedule(self):
         try:
