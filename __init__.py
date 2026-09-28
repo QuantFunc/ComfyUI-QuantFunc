@@ -804,10 +804,10 @@ if _IMPORT_OK:
     _STEP_CACHE_INPUT = ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.005,
                          "tooltip": "Speed-up that reuses earlier work while the result is barely changing. 0 (default) = off. "
                                     "Higher values are faster but can move the result away from the full render; "
-                                    "0.02-0.05 is typical. Takes effect on the next run."})
+                                    "0.1-0.3 is typical. Takes effect on the next run."})
     _BLOCK_CACHE_INPUT = ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.005,
                           "tooltip": "A second speed-up that reuses work inside each pass when little changes. 0 (default) = "
-                                     "off. 0.05-0.12 is typical; higher is faster but can lose detail. Can be combined "
+                                     "off. 0.02-0.08 is typical; higher is faster but can lose detail. Can be combined "
                                      "with step_cache. Takes effect on the next run."})
     # [quality_enhance — user 2026-09-25] ONE switch on the four QuantFunc loaders (H3, LTX-2.5, Krea-2, Qwen-Image-2.1), the same
     # on every GPU: OFF (default) = the engine's faster default, ON = maximum quality. Every session sends only the engine's
