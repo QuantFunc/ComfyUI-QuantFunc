@@ -291,6 +291,14 @@ The MiniMax-H3 and LTX-2.5 loaders accept two-stage (double-sampling) workflows 
 | `QuantFunc-QwenImage21-edit.json` | image edit, one reference (`<image1>`) |
 | `QuantFunc-QwenImage21-edit-multi-reference.json` | image edit, two references (the official example) |
 | `QuantFunc-QwenImage21-edit-remove-background.json` | remove the background → transparent PNG |
+| `QuantFunc-Krea2-t2i.json` | Krea-2 text-to-image |
+| `QuantFunc-Krea2-t2i-double-sampling.json` | Krea-2 text-to-image in two passes (1.5x latent upscale + refine) |
+| `QuantFunc-LTX25-t2v.json` | LTX-2.5 text-to-video with audio, one pass |
+| `QuantFunc-LTX25-t2v-two-stage.json` | LTX-2.5 text-to-video with audio, two stages (the official pipeline: half size + 2x latent upsampler) |
+| `QuantFunc-MiniMaxH3-fl2va.json` | MiniMax-H3 first/last frame to video with audio |
+| `QuantFunc-MiniMaxH3-fl2va-double-sampling.json` | the same, with the schedule split over two samplers |
+| `QuantFunc-MiniMaxH3-ref2va.json` | MiniMax-H3 reference images to video with audio |
+| `QuantFunc-MiniMaxH3-ref2va-double-sampling.json` | the same, with the schedule split over two samplers |
 
 ### 3.4 VRAM
 
