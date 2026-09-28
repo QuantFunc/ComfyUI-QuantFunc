@@ -919,8 +919,9 @@ if _IMPORT_OK:
         choices = _ATTN_BACKEND_SM80PLUS
         try:
             import torch
-            if torch.cuda.is_available():
-                maj, _min = torch.cuda.get_device_capability(0)
+            dev = qfmp.comfy.model_management.get_torch_device()   # the GPU ComfyUI computes on, not GPU 0
+            if getattr(dev, "type", None) == "cuda":
+                maj, _min = torch.cuda.get_device_capability(dev)
                 if maj < 8:  # SM75 Turing (sm_7x): no sage, no flash_attn
                     choices = _ATTN_BACKEND_SM75
         except Exception:  # noqa: BLE001 - no torch/CUDA at import -> assume modern; engine validates

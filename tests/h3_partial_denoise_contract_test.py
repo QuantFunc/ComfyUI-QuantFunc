@@ -277,8 +277,9 @@ def _patchify_video(value):
     return value.reshape(-1)
 
 
-def _unpatchify_video(value, time, height, width, channels):
-    return value.reshape(1, channels, time, height * 2, width * 2)
+def _unpatchify_video(value, time, height, width, channels, patch_size=(1, 2, 2)):
+    pt, ph, pw = patch_size
+    return value.reshape(1, channels, time * pt, height * ph, width * pw)
 
 
 def _pack_audio(value):
@@ -306,8 +307,17 @@ _h3_namespace = {
     "pack_audio": _pack_audio,
     "unpack_audio": _unpack_audio,
 }
-for _name in ("_H3_SPATIAL", "_H3_FPS", "_H3_VIDEO_CHANNELS", "_H3_AUDIO_CHANNELS", "_H3_AUDIO_STEREO"):
-    _h3_namespace[_name] = _literal_assignment(H3_SOURCE, _name)
+try:   # ComfyUI's stock H3 nodes: the frame grid and its FPS (the plugin reads them from there, never restates them)
+    from comfy_extras import nodes_minimax_h3 as _H3_NODES
+except ImportError:   # no ComfyUI on this box: a stub with comfy's behaviour, only so the CPU-only arms can run
+    def _align(n):
+        while n % 17 != 5:
+            n += 1
+        return n
+    _H3_NODES = SimpleNamespace(FPS=24, align_frame_count=_align,
+                                video_latent_t=lambda fc: 2 if fc <= 5 else ((fc - 5) // 17) * 5 + 2)
+_h3_namespace["_h3_nodes"] = lambda: _H3_NODES
+_h3_namespace["_H3_PATCH"] = (1, 2, 2)   # comfy's patchify_video default (the plugin reads it from comfy's signature)
 _h3_namespace["_h3_frames_from_latent_t"] = _module_function(
     H3_SOURCE, "_h3_frames_from_latent_t", _h3_namespace)
 
@@ -356,7 +366,8 @@ def _new_model(audio_enhance=False):
     model._ctx_key_assigner.reset()
     model._num_steps = 0
     model._num_frames = 0
-    model._fps = _h3_namespace["_H3_FPS"]
+    model._fps = float(_H3_NODES.FPS)
+    model.latent_format = SimpleNamespace(spacial_downscale_ratio=16, latent_channels=32)   # comfy's MiniMaxH3AV format
     model._audio_enhance = audio_enhance
     model._stage_partial = False
     model._step_i = 0
