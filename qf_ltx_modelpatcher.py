@@ -45,7 +45,8 @@ from .qf_modelpatcher import (_qf_dtype, _QFStub,
 # LTX VAE scale factors (engine kS=32 spatial, kT=8 temporal, kC=128 channels — LTX2VideoPipeline).
 _LTX_SPATIAL = 32
 _LTX_TEMPORAL = 8
-_LTX_DEFAULT_FPS = 25.0   # informational default; the sampler/graph owns real timing
+# The frame rate when the conditioning carries none: comfy's own LTXV/LTXAV extra_conds default (model_base.py).
+_LTX_DEFAULT_FPS = 25.0
 
 
 @qfe.console_safe_methods   # an exception leaving it is console-safe (#738)
@@ -69,7 +70,7 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
         self._audio_connector = audio_connector  # comfy audio_embeddings_connector (2048); None -> video-only 4096
         self._num_steps = 0                  # DERIVED per run from sample_sigmas (len-1) at _begin
         self._num_frames = 0                 # DERIVED per run from the latent: (Tlat-1)*8 + 1
-        self._fps = _LTX_DEFAULT_FPS         # informational (rides options_json); LTX conditions on its own
+        self._fps = _LTX_DEFAULT_FPS         # the session's fps: the conditioning's frame_rate (_call_fps)
         self._step_i = 0
         self._sess_denoise = 0
         self._out = None                     # reused packed velocity_out buffer [1,N,128]
@@ -159,8 +160,11 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
         # and don't re-enter comfy's cond-building (LTXV.extra_conds + its concat_cond/encode_adm callees), which
         # would re-populate the very keys we reject. (LTXV does not override concat_cond — the effective
         # BaseModel.concat_cond is concat_keys-gated and never touches diffusion_model — so calling super() would
-        # not crash here; building by hand keeps the emitted set minimal and explicit.) frame_rate is unused by this seam; attention_mask IS consumed (the connector mask — 19B mask fix).
-        out = {}
+        # not crash here; building by hand keeps the emitted set minimal and explicit.) attention_mask IS consumed
+        # (the connector mask — 19B mask fix), and so is frame_rate: see _call_fps.
+        # frame_rate (LTXVConditioning), re-emitted exactly as comfy's LTXV/LTXAV extra_conds do (same key, same
+        # default): it reaches _apply_model with every call and sets the engine session's fps (_call_fps).
+        out = {"frame_rate": comfy.conds.CONDConstant(kwargs.get("frame_rate", _LTX_DEFAULT_FPS))}
         cross_attn = kwargs.get("cross_attn", None)
         if cross_attn is not None:
             out["c_crossattn"] = comfy.conds.CONDRegular(cross_attn)
@@ -257,6 +261,21 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
         Tlat = int(xin.shape[2])
         self._num_frames = (Tlat - 1) * _LTX_TEMPORAL + 1
         self._stage_schedule(transformer_options, "LTX")
+
+    def _call_fps(self, kwargs, opening):
+        """The session's fps = this call's conditioning frame_rate (extra_conds re-emits it; comfy's default when
+        absent). The engine builds the video self-RoPE and the video<->audio cross-RoPE time grid as frame_time/fps,
+        exactly as comfy's LTXAV does with frame_rate, while the audio grid is hop/sample-rate time — a wrong fps
+        skews the two lanes apart, more with every second of clip (measured: 24-fps official graph driven at 25 =
+        dead audio at 97 frames). Opening a session adopts it; an open session has one time grid, so a call with
+        another frame_rate is refused."""
+        fps = float(kwargs.get("frame_rate", _LTX_DEFAULT_FPS))
+        if opening:
+            self._fps = fps
+        elif fps != self._fps:
+            raise RuntimeError(f"qf_native LTX: this sampling run's conditionings carry different frame rates "
+                               f"({self._fps:g} and {fps:g}); the session has one time grid - give every "
+                               "conditioning the same frame_rate (LTXVConditioning).")
 
     def _begin(self, x_group, vemb_group):
         """Open the t2v external denoise session. x_group = [1,128,F,H,W] latent; vemb_group =
@@ -438,7 +457,9 @@ class QFLTXAVModel(QFLTXModel):
         # RAW dual-proj ctx (no plugin connector — see _run_connector).
         vemb = self._run_connector(c_crossattn, attention_mask=kwargs.get("attention_mask")
                                    ).to(dev, dtype=torch.bfloat16).contiguous()
-        if self._qf.current_session is None or getattr(self, "_qf_needs_begin", False):
+        _opening = self._qf.current_session is None or getattr(self, "_qf_needs_begin", False)
+        self._call_fps(kwargs, _opening)   # before _begin: the session's fps is this run's frame_rate
+        if _opening:
             self._qf_needs_begin = False
             # shared black-video guard (see qf_modelpatcher.refuse_all_zero_initial_latent).
             qfmp.refuse_all_zero_initial_latent(xin, "LTX-AV")

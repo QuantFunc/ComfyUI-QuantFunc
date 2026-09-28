@@ -55,9 +55,10 @@ _AUDITED_MODELS = (
     # LTX-2 t2v (QFLTXModel) — the seam the CR generality NO-GO found was NEVER audited. Its reject-list is a
     # defensive superset (mask/keyframe/guide + noise_concat/cross_attn_controlnet/concat_latent_image). Two
     # keys are documented-ACCEPTED (not hook-handled), each with a VERIFIED reason:
-    #  • frame_rate — the engine takes fps from the loader's fps widget (_begin options_json); comfy's
-    #    frame_rate cond is metadata the external session never reads, and it is ALWAYS emitted (default 25),
-    #    so it must NOT be rejected (that would break every run).
+    #  • frame_rate — CONSUMED: extra_conds re-emits it (comfy's CONDConstant, default 25) and the session begin
+    #    takes the engine fps from it (QFLTXModel._call_fps) — the engine's video + video<->audio RoPE time grid.
+    #    (It was once read as metadata after the loader's fps widget went away; the session then ran every 24-fps
+    #    graph at a hardcoded 25 and the audio died, 2026-09-28.) It is ALWAYS emitted, so it must NOT be rejected.
     #  • attention_mask — the TE PADDING mask. The plugin runs comfy's connector on the FULL cross_attn
     #    sequence (the shipped _run_connector); it is infra present on normal runs, NOT user-wired
     #    conditioning, so rejecting it would break normal generation. HONEST RESIDUAL: if a future validation

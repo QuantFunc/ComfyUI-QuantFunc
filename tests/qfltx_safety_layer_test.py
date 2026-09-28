@@ -95,6 +95,10 @@ class _CONDRegular:
         self.cond = x
 
 
+class _CONDConstant(_CONDRegular):
+    """comfy.conds.CONDConstant (the frame_rate channel): a constant the sampler hands to every model call."""
+
+
 class _InterruptExc(BaseException):
     """Faithful mimic of comfy.model_management.InterruptProcessingException, which subclasses BaseException
     (model_management.py:2003) — NOT Exception. This is load-bearing: it forces the guard to use
@@ -104,7 +108,7 @@ class _InterruptExc(BaseException):
 
 def _make_comfy(interrupt_raises=False):
     comfy = types.ModuleType("comfy")
-    comfy.conds = types.SimpleNamespace(CONDRegular=_CONDRegular)
+    comfy.conds = types.SimpleNamespace(CONDRegular=_CONDRegular, CONDConstant=_CONDConstant)
 
     def _throw():
         if interrupt_raises:
@@ -151,7 +155,8 @@ _QFE_STUB = types.SimpleNamespace(info=lambda *a, **k: None)
 # ── tests ─────────────────────────────────────────────────────────────────────────────────────────────────
 def _t_extra_conds(src):
     comfy = _make_comfy()
-    fn, _ = _bind(src, "extra_conds", {"comfy": comfy, "qfe": _QFE_STUB})
+    fn, _ = _bind(src, "extra_conds", {"comfy": comfy, "qfe": _QFE_STUB,
+                                       "_LTX_DEFAULT_FPS": _extract_const(src, "_LTX_DEFAULT_FPS")})
     keys = _extract_class_attr(src, "QFLTXModel", "_ENGINE_IGNORED_COND_KEYS")
     assert len(keys) >= 7, f"reject-list shrank unexpectedly: {keys}"
     bad = 0
@@ -187,8 +192,51 @@ def _t_extra_conds(src):
     fn(me, cross_attn=torch.zeros(1, 3, 8))
     if eng.end_calls != 1 or eng.current_session is not None:
         print(f"  [FAIL] extra_conds did not close a stale session (calls={eng.end_calls})"); bad += 1
+    # (5) frame_rate is CONSUMED: re-emitted as comfy's LTXV/LTXAV do — the cond's value, else comfy's default (25).
+    #     It is the engine session's fps (_call_fps); dropping it drove every 24-fps graph at 25 (dead audio).
+    for kw, want in (({"frame_rate": 24.0}, 24.0), ({}, 25.0)):
+        me = _mock_self(_qf=_MockEngine(), _ENGINE_IGNORED_COND_KEYS=keys, _max_ctx_seq=0,
+                        _post_connector_seq=lambda s: int(s))
+        fr = fn(me, cross_attn=torch.zeros(1, 3, 8), **kw).get("frame_rate")
+        if not isinstance(fr, _CONDConstant) or fr.cond != want:
+            print(f"  [FAIL] extra_conds({kw}) emitted frame_rate={getattr(fr, 'cond', fr)!r}, want CONDConstant({want})")
+            bad += 1
     print(f"  extra_conds: {'OK' if bad == 0 else 'FAIL'} ({len(keys)} reject keys raise; cross_attn emits; "
-          "frame_rate/attention_mask/latent_image accepted; stale session closed)")
+          "frame_rate/attention_mask/latent_image accepted; stale session closed; frame_rate re-emitted, default 25)")
+    return bad
+
+
+def _t_call_fps(src):
+    """The engine session's fps is the conditioning's frame_rate (the engine's video + video<->audio RoPE time grid;
+    a 24-fps graph driven at the old hardcoded 25 had dead audio). Opening adopts it, an open session keeps it and
+    refuses another, and the AV step calls it BEFORE _begin (which puts self._fps into the session options)."""
+    default_fps = _extract_const(src, "_LTX_DEFAULT_FPS")
+    fn, _ = _bind(src, "_call_fps", {"_LTX_DEFAULT_FPS": default_fps})
+    bad = 0
+    me = _mock_self(_fps=default_fps)
+    fn(me, {"frame_rate": 24.0}, True)
+    if me._fps != 24.0:
+        print(f"  [FAIL] opening a session did not adopt frame_rate 24 (fps={me._fps})"); bad += 1
+    try:
+        fn(me, {"frame_rate": 24.0}, False)          # same run, same frame rate: fine
+    except RuntimeError:
+        print("  [FAIL] an equal frame_rate on an open session was refused"); bad += 1
+    try:
+        fn(me, {"frame_rate": 25.0}, False)
+        print("  [FAIL] a different frame_rate on an open session was NOT refused"); bad += 1
+    except RuntimeError:
+        pass
+    fn(me, {}, True)                                  # a new run without frame_rate: comfy's default
+    if me._fps != default_fps or default_fps != 25.0:
+        print(f"  [FAIL] no frame_rate -> fps {me._fps} (default {default_fps}), want comfy's 25"); bad += 1
+    # order in the AV step: _call_fps before _begin (the session options read self._fps)
+    body = _extract_method(src, "QFLTXAVModel", "_apply_model_timed")
+    i_fps, i_begin = body.find("self._call_fps("), body.find("self._begin(")
+    if i_fps < 0 or i_begin < 0 or i_fps > i_begin:
+        print(f"  [FAIL] QFLTXAVModel._apply_model_timed does not call _call_fps before _begin "
+              f"(at {i_fps} / {i_begin})"); bad += 1
+    print(f"  _call_fps: {'OK' if bad == 0 else 'FAIL'} (opening adopts frame_rate; open session keeps it and refuses "
+          "another; default 25; called before _begin)")
     return bad
 
 
@@ -201,7 +249,8 @@ def _t_max_ctx_seq(src):
     length semantics (the quantity accumulated) are proven against the REAL comfy connector in
     _t_post_connector_seq."""
     comfy = _make_comfy()
-    fn, _ = _bind(src, "extra_conds", {"comfy": comfy, "qfe": _QFE_STUB})
+    fn, _ = _bind(src, "extra_conds", {"comfy": comfy, "qfe": _QFE_STUB,
+                                       "_LTX_DEFAULT_FPS": _extract_const(src, "_LTX_DEFAULT_FPS")})
     keys = _extract_class_attr(src, "QFLTXModel", "_ENGINE_IGNORED_COND_KEYS")
     _ident = lambda s: int(s)   # identity probe: isolates the max/order/untouched arithmetic  # noqa: E731
     bad = 0
@@ -379,7 +428,7 @@ def main():
     src = _src_text()
     print(f"=== QFLTXModel safety-layer behavioral test (src={os.path.relpath(_SRC, _HERE)}) ===")
     bad = 0
-    for t in (_t_extra_conds, _t_max_ctx_seq, _t_scale_latent_inpaint,
+    for t in (_t_extra_conds, _t_call_fps, _t_max_ctx_seq, _t_scale_latent_inpaint,
               _t_derive_geometry, _t_shared_interrupt_helper):
         try:
             bad += t(src)
