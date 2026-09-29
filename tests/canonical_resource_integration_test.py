@@ -1507,6 +1507,30 @@ class CanonicalIntegration(unittest.TestCase):
                 owner.partially_load(owner.load_device, 4096)
         create.assert_not_called()
 
+    def test_the_transformer_file_reaches_the_native_create_through_the_real_cache_path(self):
+        """Hotfix 2026-09-29 (Windows without Developer Mode, the model on another drive or share): MiniMax-H3, Krea-2
+        and Qwen-Image-2.1 hand the engine the picked weight file as its transformer_path create input instead of a link
+        in the package. It reaches quantfunc_create through the real cache path, and one package with two weight files
+        is two pipelines."""
+        seen = []
+
+        def create(lib, *, capacity_bytes, prepared_resource, create_params):
+            key = prepared_resource._pointer.value
+            seen.append((create_params.model_dir, create_params.transformer_path))
+            self.lib.resources[key].update(held=3072, phase=qfe.QUANTFUNC_RESOURCE_PHASE_ATTACHED)
+            return qfe.QFEngineHandle(lib, ctypes.c_void_p(70 + key), resource=prepared_resource,
+                                      capacity_bytes=capacity_bytes)
+        patchers = []
+        with mock.patch.object(qfe.QFEngineHandle, "create", side_effect=create):
+            for weights in ("/w/a.safetensors", "/w/b.safetensors"):
+                patcher = self.wrapper(engine=qfm.QFLazyEngine(
+                    lambda w=weights: plugin._get_engine("one-package", transformer_path=w)))
+                owner, _ = patcher.model_patches_models()
+                owner.partially_load(owner.load_device, 4096)
+                patchers.append(patcher)
+        self.assertEqual(seen, [(b"one-package", b"/w/a.safetensors"), (b"one-package", b"/w/b.safetensors")])
+        self.assertEqual(len(plugin._PIPELINE_CACHE), 2)
+
 
 if __name__ == "__main__":
     unittest.main(argv=[sys.argv[0]])

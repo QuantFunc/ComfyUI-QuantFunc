@@ -45,15 +45,16 @@ class QFKrea2Model(qfmp.QFImageSessionModel, comfy.model_base.Krea2):
 def register(deps):
     def build(transformer1_path, bundle_dir=None, lora_entries=(), pinned_memory=False):
         """File-based Krea-2 Turbo t2i — the H3 single-expert staging pattern: stage the
-        shipped config bundle (configs/krea2-turbo-*/, minimal official skeleton) + symlink
-        the transformer file; engine create runs denoise_only=True (TE + VAE weights
+        shipped config bundle (configs/krea2-turbo-*/, minimal official skeleton); the engine loads
+        the transformer file from its transformer_path (no link); engine create runs denoise_only=True (TE + VAE weights
         skipped — comfy's krea2 CLIP owns conditioning, comfy's VAEDecode decodes; the
         engine reads the staged configs for session geometry only)."""
-        model_dir = qfmp.stage_denoise_only_package(bundle_dir, transformer1_path)
+        model_dir = qfmp.stage_config_package(bundle_dir, transformer1_path)
         return qfmp.family_build(
             deps, model_dir, {"denoise_only": True}, comfy.supported_models.Krea2,
             {"image_model": "krea2", "disable_unet_model_creation": True}, QFKrea2Model,
             f"[qf_native] loaded QuantFuncNativeLoader (Krea-2 t2i svdq) package={os.path.basename(transformer1_path)} "
-            f"capacity=native Prepared query (create deferred)", pinned_memory)(list(lora_entries))
+            f"capacity=native Prepared query (create deferred)", pinned_memory,
+            transformer_path=transformer1_path)(list(lora_entries))
 
     return build

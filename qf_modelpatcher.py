@@ -1028,20 +1028,17 @@ def ensure_model_config_attrs(model_config):
     return model_config
 
 
-def stage_denoise_only_package(bundle_dir, transformer1_path, extra_links=None):
-    """Build a config-complete PACKAGE dir the engine's `denoise_only` create can read WITHOUT
-    copying the multi-GB weights.
+def stage_config_package(bundle_dir, transformer1_path, extra_links=None):
+    """A config-complete PACKAGE dir for the engine's `denoise_only` create, holding NO weights.
 
-    The file-based loader hands us a bare transformer .safetensors FILE (INT8-Fast shape), but the
-    engine still needs the arch + VAE CONFIGS for session geometry (denoise_only skips the TE+VAE
-    WEIGHTS, not the configs). So we stage: the family's shipped CONFIG bundle (model_index.json +
-    transformer/ vae/ config.json — tiny JSON, no weights) COPIED in, and the user's picked weight
-    file SYMLINKED as transformer/model.safetensors. The engine (denoise_only=True) reads the configs, loads the transformer
-    weights via the symlinks, and never touches TE/VAE weights (comfy owns CLIP + VAE).
-
-    Staged under ComfyUI's OWN temp dir (folder_paths.get_temp_directory(), never system /tmp),
-    keyed deterministically by (bundle, realpath(files)) so repeated loads reuse one dir; rebuilt
-    fresh each call (configs are tiny, symlinks are free) so a re-pick can't leave a stale link."""
+    The file-based loader hands us a bare transformer .safetensors FILE, but the engine still needs the arch + VAE
+    CONFIGS for session geometry (denoise_only skips the TE+VAE WEIGHTS, not the configs). So the family's shipped
+    CONFIG bundle (model_index.json + transformer/ vae/ config.json - tiny JSON) is COPIED into ComfyUI's OWN temp dir
+    (folder_paths.get_temp_directory(), never system /tmp), keyed deterministically by (bundle, realpath(files)): one
+    dir per weight file, so the engine's VRAM measurement cache (written into model_dir) stays per weight file and out
+    of the plugin's own folder. Rebuilt fresh each call (configs are tiny), so a re-pick can't leave a stale file. The
+    weights reach the engine as its transformer_path create input (H3, Krea-2, Qwen-Image-2.1) or as links the caller
+    adds (stage_denoise_only_package, LTX-2.5)."""
     import shutil
     import folder_paths
     if not os.path.isdir(bundle_dir):
@@ -1049,11 +1046,7 @@ def stage_denoise_only_package(bundle_dir, transformer1_path, extra_links=None):
             f"qf_native: config bundle missing: {bundle_dir} - this family's arch/VAE configs are "
             f"not shipped in the plugin (configs/<family>/). Cannot stage a denoise_only package.")
     real1 = os.path.realpath(transformer1_path)
-    # extra_links: {subdir: target_path} — single-expert AV families link MORE weight files
-    # into the staged package (ltx2: the SAME single xfm file into connectors/ [#565 comfy25
-    # prefix branch], the gemma with-proj TE into text_encoder/ [connector aggregate_embed],
-    # the audio_vae file [engine has_audio_ discriminant = weights presence]). Deterministic
-    # key covers them so a re-pick restages.
+    # extra_links: {subdir: target_path} (LTX-2.5) - the deterministic key covers them so a re-pick restages.
     extra_links = {k: os.path.realpath(v) for k, v in (extra_links or {}).items() if v}
     key_src = "|".join([bundle_dir, real1] +
                        [f"{k}={v}" for k, v in sorted(extra_links.items())])
@@ -1067,6 +1060,16 @@ def stage_denoise_only_package(bundle_dir, transformer1_path, extra_links=None):
         else:
             os.remove(stage)
     shutil.copytree(bundle_dir, stage)   # tiny config JSONs only - no weights
+    return stage
+
+
+def stage_denoise_only_package(bundle_dir, transformer1_path, extra_links=None):
+    """LTX-2.5's package: the config package plus its weight files SYMLINKED in (the engine this plugin ships reads
+    LTX-2.5's connectors / text encoder / audio VAE only from the package), the transformer as
+    transformer/model.safetensors. extra_links: {subdir: target_path} - single-expert AV families link MORE weight files
+    (ltx2: the SAME single xfm file into connectors/ [#565 comfy25 prefix branch], the gemma with-proj TE into
+    text_encoder/ [connector aggregate_embed], the audio_vae file [engine has_audio_ discriminant = weights presence])."""
+    stage = stage_config_package(bundle_dir, transformer1_path, extra_links)
     def _link_expert(sub, target):
         d = os.path.join(stage, sub)
         os.makedirs(d, exist_ok=True)
@@ -1082,12 +1085,14 @@ def stage_denoise_only_package(bundle_dir, transformer1_path, extra_links=None):
                 os.link(target, link)
             except OSError as exc:
                 raise RuntimeError(
-                    f"qf_native: cannot link {target} into the staging dir ({exc}) - enable "
-                    f"symlinks (Windows: Developer Mode) or keep the weights on the same volume "
-                    f"as ComfyUI's temp directory.") from exc
-    _link_expert("transformer", real1)
-    for sub, target in sorted(extra_links.items()):
-        _link_expert(sub, target)
+                    f"qf_native: cannot link {target} into ComfyUI's temp directory ({exc}). LTX-2.5 with the model "
+                    f"on another drive or a network share, without Windows Developer Mode, is supported from "
+                    f"QuantFunc engine 0.0.17; for now move the model to the drive ComfyUI's temp directory is on, "
+                    f"or enable Windows Developer Mode.") from exc
+    _link_expert("transformer", os.path.realpath(transformer1_path))
+    for sub, target in sorted((extra_links or {}).items()):
+        if target:
+            _link_expert(sub, os.path.realpath(target))
     return stage
 
 
@@ -1122,7 +1127,8 @@ def tag_lora_rebuild(patcher, lora_entries, rebuild):
     return patcher
 
 
-def family_build(deps, model_dir, create_extra, supported_model, unet_config, make_model, label, pinned_memory=False):
+def family_build(deps, model_dir, create_extra, supported_model, unet_config, make_model, label, pinned_memory=False,
+                 transformer_path=None):
     """The ONE builder every family returns through (it was a closure copied into each family module). build(lora_entries)
     makes a lazy engine for model_dir — the pipeline is created only when a sampler first needs it, and there is ONE per
     model file whatever the LoRA set: the weights are the cache key, and QFLazyEngine applies this patcher's set in place
@@ -1133,7 +1139,8 @@ def family_build(deps, model_dir, create_extra, supported_model, unet_config, ma
     model (a model class fits). pinned_memory (the loaders' switch, default OFF) adds the engine's use_pinned_memory create
     key, so its two states are two pipelines: changing it reloads the model; OFF leaves the create config as it was. The
     loader field's API key (LOADER_API_KEY) goes to the create and to each lazy engine, never into the create config: every
-    key shares the one pipeline, and the lazy engine switches its key in place."""
+    key shares the one pipeline, and the lazy engine switches its key in place. transformer_path: the weight file the
+    engine loads the transformer from (a create input, so part of the pipeline's identity); None = from model_dir."""
     get_engine, bind_pipeline_model, read_auth = deps["get_engine"], deps["bind_pipeline_model"], deps["read_auth"]
     loader_sig = LOADER_SIG.get()
     api_key = LOADER_API_KEY.get()
@@ -1142,7 +1149,8 @@ def family_build(deps, model_dir, create_extra, supported_model, unet_config, ma
         create_cfg = dict(create_extra or {}, **({"use_pinned_memory": True} if pinned_memory else {})) or None
         device, device_idx = current_torch_device()
         factory, register_model = make_engine_factory(
-            lambda: get_engine(model_dir, create_cfg=create_cfg, device_idx=device_idx, api_key=api_key),
+            lambda: get_engine(model_dir, create_cfg=create_cfg, device_idx=device_idx, api_key=api_key,
+                               transformer_path=transformer_path),
             bind_pipeline_model)
         model_config = supported_model(dict(unet_config))
         ensure_model_config_attrs(model_config)

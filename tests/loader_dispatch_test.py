@@ -231,9 +231,9 @@ def main():
             self.pipeline = None
             self.current_session = None
 
-    def fake_get_engine(model_dir, create_cfg=None, device_idx=0, api_key=None):
-        # Mirrors the real Prepared -> first-touch materialization contract.
-        ck = (model_dir, int(device_idx), json.dumps(create_cfg or {}, sort_keys=True))
+    def fake_get_engine(model_dir, create_cfg=None, device_idx=0, api_key=None, transformer_path=None):
+        # Mirrors the real Prepared -> first-touch materialization contract (the transformer file is a create input).
+        ck = (model_dir, int(device_idx), transformer_path, json.dumps(create_cfg or {}, sort_keys=True))
         eng = fake_cache.get(ck)
         if eng is not None and eng.pipeline is not None:
             return eng, ck
@@ -756,6 +756,76 @@ def main():
         _on, _pm_on[_fam] = _pm_cfg(_node, _xfm, _preset, pinned_memory=True)
         _pm_rows[_fam] = (_dflt, _on, _pm_cfg(_node, _xfm, _preset, pinned_memory=False)[0])
     _PM_ON, _PM_OFF = {"denoise_only": True, "use_pinned_memory": True}, {"denoise_only": True}
+    # (D) Windows without Developer Mode, the model on another drive or share (hotfix 2026-09-29, the user's 5060 Ti on an
+    #     SMB share): a symlink is refused (WinError 1314) and a hardlink cannot cross volumes (EXDEV / WinError 17).
+    #     MiniMax-H3, Krea-2 and Qwen-Image-2.1 never link: the create names the picked file as its transformer_path, the
+    #     package holds configs only, and two weight files are two pipelines. LTX-2.5 still links (its engine reads the
+    #     connectors / text encoder / audio VAE from the package) and, when it cannot, says what to do; never a copy.
+    import errno as _errno
+    from unittest import mock as _mock
+    _far = tempfile.mkdtemp(prefix="qf_other_volume_")
+    folder_paths.add_model_folder_path("diffusion_models", _far)
+    _far_loads = {"minimax-h3": (H3L, "far-minimax-h3-quantfunc-int4.safetensors", "minimax-h3-fl2va"),
+                  "krea2": (KreaL, "far-krea2-turbo-quantfunc-int4.safetensors", "krea2-turbo-int4"),
+                  "krea2-b": (KreaL, "far-b-krea2-turbo-quantfunc-int4.safetensors", "krea2-turbo-int4"),
+                  "qwenimage21": (QiL, "far-qwen-image-2.1-quantfunc-int4.safetensors", "qwen-image-2.1-int4")}
+    for _node, _xfm, _preset in _far_loads.values():
+        with open(os.path.join(_far, _xfm), "wb") as _fh:
+            _fh.write(b"\0" * 16)
+    _link_calls = []
+
+    def _refused_symlink(*a, **k):
+        _link_calls.append("symlink")
+        raise OSError(1314, "A required privilege is not held by the client")
+
+    def _cross_volume_link(*a, **k):
+        _link_calls.append("link")
+        raise OSError(_errno.EXDEV, "Invalid cross-device link")
+    _far_got, _ltx_err = {}, None
+    with _mock.patch("os.symlink", _refused_symlink), _mock.patch("os.link", _cross_volume_link):
+        for _fam, (_node, _xfm, _preset) in _far_loads.items():
+            try:
+                _o = _node.load(_xfm, _preset)[0]
+                _ = _o.model._qf.lib
+                _far_got[_fam] = _o.model._qf._ckey
+            except Exception as _e:  # noqa: BLE001 - a refusal is this arm's FAIL, shown in its detail
+                _far_got[_fam] = f"{type(_e).__name__}: {_e}"
+        _far_calls = list(_link_calls)
+        try:
+            LtxL.load("fx-ltx-2.5-quantfunc-4bit.safetensors", "ltx2-2.5-22b")
+        except RuntimeError as _e:
+            _ltx_err = str(_e)
+
+    def _far_ok(ck, xfm):
+        return (isinstance(ck, tuple) and os.path.realpath(ck[2] or "") == os.path.realpath(os.path.join(_far, xfm))
+                and os.path.isfile(os.path.join(ck[0], "model_index.json"))
+                and not any(f.endswith(".safetensors") for _r, _d, _fs in os.walk(ck[0]) for f in _fs))
+    check("links impossible (Windows 1314 / cross-volume EXDEV): MiniMax-H3, Krea-2 and Qwen-Image-2.1 load without "
+          "linking; the create names the picked file as transformer_path and the package holds configs only",
+          not _far_calls and all(_far_ok(_far_got[f], x) for f, (_n, x, _p) in _far_loads.items()),
+          f"-> calls={_far_calls} got={ {f: (v if isinstance(v, str) else v[2]) for f, v in _far_got.items()} }")
+    _fk, _fkb = _far_got.get("krea2"), _far_got.get("krea2-b")
+    check("two weight files of one family are two pipelines (the transformer file is part of the create key), each with "
+          "its own package dir (the engine writes its VRAM measurement cache there: per weight file, never the plugin's)",
+          isinstance(_fk, tuple) and isinstance(_fkb, tuple) and _fk[2] != _fkb[2] and _fk[0] != _fkb[0]
+          and not os.path.commonpath([_fk[0], os.path.dirname(os.path.abspath(qfn.__file__))]) ==
+          os.path.dirname(os.path.abspath(qfn.__file__)), f"-> {_fk} / {_fkb}")
+    _stage_root = os.path.join(folder_paths.get_temp_directory(), "qf_native_stage")
+    _copied = [os.path.join(r, f) for r, _d, fs in os.walk(_stage_root) for f in fs
+               if f.endswith(".safetensors") and not os.path.islink(os.path.join(r, f))]
+    check("links impossible: LTX-2.5 refuses with what to do (Developer Mode, or the model on ComfyUI's drive; engine "
+          "0.0.17 lifts it) and copies nothing",
+          _ltx_err is not None and "Developer Mode" in _ltx_err and "0.0.17" in _ltx_err
+          and "drive" in _ltx_err and not _copied, f"-> {(_ltx_err or 'no refusal')[:200]} copied={_copied}")
+    _pp = qfn._prepare_params("one-package", {"denoise_only": True}, 0, "test-not-a-key", "/w/a.safetensors")
+    check("the real create params carry the package dir and the transformer file (quantfunc_create's model_dir and "
+          "transformer_path)", _pp.model_dir == b"one-package" and _pp.transformer_path == b"/w/a.safetensors",
+          f"-> {_pp.model_dir!r} {_pp.transformer_path!r}")
+    _r1 = qfn._engine_recipe("one-package", {"denoise_only": True}, 0, "/w/a.safetensors")[1]
+    _r2 = qfn._engine_recipe("one-package", {"denoise_only": True}, 0, "/w/b.safetensors")[1]
+    _r0 = qfn._engine_recipe("one-package", {"denoise_only": True}, 0)[1]
+    check("the real engine cache key carries the transformer file: one package, two weight files -> two keys (and no "
+          "file -> a third)", len({_r0, _r1, _r2}) == 3 and "/w/a.safetensors" in _r1, f"-> {_r1}")
     check("pinned_memory ON: every family's create config carries use_pinned_memory=true and nothing else changes; OFF: the "
           "key is absent and the config is {denoise_only: true}; the default (the input absent): ON for LTX-2.5, OFF for "
           "MiniMax-H3, Krea-2 and Qwen-Image-2.1",
@@ -785,12 +855,14 @@ def main():
     check("h3 load(): OFF by default, ON when set; a saved earlier value maps best_quality -> ON, any other -> OFF; the switch wins",
           _hks == [False, True, False, True, False, False], f"-> {_hks}")
     check("krea2 load(): OFF by default, ON when set; a saved other value runs OFF", _kks == [False, True, False], f"-> {_kks}")
-    _hmd = out_h3.model._qf._ckey[0]
-    check("h3 staged: config-complete + xfm linked + transformer_2 removed",
+    _hmd, _htp = out_h3.model._qf._ckey[0], out_h3.model._qf._ckey[2]
+    check("h3: a config-complete package with no weights in it (transformer_2 removed); the create names the picked file as "
+          "its transformer_path",
           all(os.path.isfile(os.path.join(_hmd, q)) for q in
               ("model_index.json", "transformer/config.json", "vae/config.json"))
-          and os.path.realpath(os.path.join(_hmd, "transformer", "model.safetensors")).endswith("fx-minimax-h3-quantfunc-int4.safetensors")
-          and not os.path.exists(os.path.join(_hmd, "transformer_2")))
+          and not os.path.lexists(os.path.join(_hmd, "transformer", "model.safetensors"))
+          and os.path.realpath(_htp or "") == os.path.realpath(os.path.join(dm, "fx-minimax-h3-quantfunc-int4.safetensors"))
+          and not os.path.exists(os.path.join(_hmd, "transformer_2")), f"-> {_htp}")
     # a saved workflow's model_config of another family / of no family: not this family's preset -> refused, naming it
     try:
         KreaL.load("fx-krea2-turbo-quantfunc-int4.safetensors", "fx-ltx")
@@ -866,8 +938,11 @@ def main():
               all(os.path.isfile(os.path.join(md, p)) for p in
                   ("model_index.json", "transformer/config.json", "vae/config.json"))
               and not os.path.exists(os.path.join(md, "transformer_2")))
-        r1 = os.path.realpath(os.path.join(md, "transformer", "model.safetensors"))
-        check("the weight link resolves to the PICKED file", r1.endswith("st-krea2-turbo-quantfunc-int4.safetensors"))
+        tp = out.model._qf._ckey[2]
+        check("no weights in the package; the create names the PICKED file as its transformer_path",
+              not os.path.lexists(os.path.join(md, "transformer", "model.safetensors"))
+              and os.path.realpath(tp or "") == os.path.realpath(os.path.join(dm, "st-krea2-turbo-quantfunc-int4.safetensors")),
+              f"-> {tp}")
 
         # ZERO-LATENT GUARD (user black-video class): ONE shared mechanism, N users — behavior-tested through the
         # shared helper per family tag, and its call-before-engine wiring asserted structurally for every family

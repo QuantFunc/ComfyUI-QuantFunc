@@ -455,7 +455,7 @@ if _COMFY and (Path(_COMFY) / "comfy/model_management.py").is_file():
             asked, lib = [], PipelineLib()
             handle = qfe.QFEngineHandle(lib, ctypes.c_void_p(9), resource=object(), capacity_bytes=4096)
 
-            def get_engine(model_dir, create_cfg=None, device_idx=0, api_key=None):
+            def get_engine(model_dir, create_cfg=None, device_idx=0, api_key=None, transformer_path=None):
                 asked.append((api_key, create_cfg))
                 return handle, "ck"
             deps = {"get_engine": get_engine, "bind_pipeline_model": lambda *a: None, "read_auth": None}

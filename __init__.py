@@ -542,28 +542,29 @@ def _install_host_ram_release():
     cmm.extra_ram_release = extra_ram_release
 
 
-def _engine_recipe(model_dir, create_cfg=None, device_idx=0):
+def _engine_recipe(model_dir, create_cfg=None, device_idx=0, transformer_path=None):
     """Resolve immutable create inputs without entering a cache critical section."""
     lib = qfe.load_lib()
     # the library THIS process loaded, not the resolver's current answer: a newer pair marked mid-session must not
-    # split one model's cache entry (the lookup also re-hashed both files every time)
-    ckey = (qfe.loaded_so_path(), model_dir, "svdq", int(device_idx),
+    # split one model's cache entry (the lookup also re-hashed both files every time). Every create input is in the
+    # key: the transformer weight file too, so two weight files never share one pipeline.
+    ckey = (qfe.loaded_so_path(), model_dir, transformer_path, "svdq", int(device_idx),
             json.dumps(create_cfg or {}, sort_keys=True))
     return lib, ckey, (qfe.library_identity(lib), ckey), create_cfg
 
 
-def _prepare_params(model_dir, create_cfg, device_idx, api_key=None):
+def _prepare_params(model_dir, create_cfg, device_idx, api_key=None, transformer_path=None):
     """Build retained create params only after both engine caches miss. api_key: the loader field's key, or None."""
     key, surl = _read_auth(api_key)
     cfg = dict(create_cfg or {})
     if key:
         cfg["api_key"] = key
         cfg["server_url"] = surl
-    return qfe.make_create_params(model_dir=model_dir, model_backend="svdq",
+    return qfe.make_create_params(model_dir=model_dir, transformer_path=transformer_path, model_backend="svdq",
                                   device_idx=int(device_idx), config_json=cfg or None)
 
 
-def _get_or_prepare_entry(lib, ckey, prepared_key, model_dir, create_cfg, device_idx, api_key=None):
+def _get_or_prepare_entry(lib, ckey, prepared_key, model_dir, create_cfg, device_idx, api_key=None, transformer_path=None):
     """Return the cached handle/entry, constructing a publish candidate outside the cache lock."""
     with _ENGINE_IDENTITY_LOCK:
         eng = _PIPELINE_CACHE.get(ckey)
@@ -579,7 +580,7 @@ def _get_or_prepare_entry(lib, ckey, prepared_key, model_dir, create_cfg, device
     if entry is not None:
         return entry
 
-    params = _prepare_params(model_dir, create_cfg, device_idx, api_key)
+    params = _prepare_params(model_dir, create_cfg, device_idx, api_key, transformer_path)
     candidate = qfmp.QFPreparedEntry(lib, int(params.device_idx), create_params=params, api_key=api_key)
     winner = None
     mismatch = False
@@ -659,12 +660,12 @@ def _materialize_engine(entry, lib, ckey):
         return eng, ckey
 
 
-def _get_engine(model_dir, create_cfg=None, device_idx=0, api_key=None):
+def _get_engine(model_dir, create_cfg=None, device_idx=0, api_key=None, transformer_path=None):
     """Create (or reuse) the engine for a model PACKAGE dir. The native library path is
     resolved internally (resolve_so_path — NEVER a node input, #vuln). Create is MINIMAL:
     a PREQUANT svdq package carries its own layout/precision in its metadata; anything
-    supplied on top competes with it and loses. The transformer weights live INSIDE the
-    package (engine loads model_dir/transformer[_2]/ directly — no path override).
+    supplied on top competes with it and loses. transformer_path: the transformer weight file
+    (the engine's create input); None = the weights inside the package (model_dir/transformer/).
     create_cfg carries the per-family create keys only: never a LoRA set or a session setting, so
     every setting of one model's weights shares one cached pipeline. api_key (the loader field's key, or None) is not a
     create key either: it signs in the create of a missed pipeline, and QFLazyEngine switches a cached one in place."""
@@ -673,8 +674,8 @@ def _get_engine(model_dir, create_cfg=None, device_idx=0, api_key=None):
     # unbypassable by a future direct caller), not duplicated here (one truth source).
     # Cache lookup/publication is atomic; prepare and create never run under the
     # global cache lock (create is single-flight under the prepared entry's lock).
-    lib, ckey, prepared_key, create_cfg = _engine_recipe(model_dir, create_cfg, device_idx)
-    entry = _get_or_prepare_entry(lib, ckey, prepared_key, model_dir, create_cfg, device_idx, api_key)
+    lib, ckey, prepared_key, create_cfg = _engine_recipe(model_dir, create_cfg, device_idx, transformer_path)
+    entry = _get_or_prepare_entry(lib, ckey, prepared_key, model_dir, create_cfg, device_idx, api_key, transformer_path)
     if isinstance(entry, qfe.QFEngineHandle):
         return entry, ckey
     if qfe.FACTORY_PREPARE_ONLY.get():

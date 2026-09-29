@@ -64,8 +64,9 @@ class HostLoaderContract(unittest.TestCase):
         other_lib, selected_lib = NativeLibrary(), NativeLibrary()
         other = plugin.qfe.QFEngineHandle(other_lib, ctypes.c_void_p(1), 512)
         selected = plugin.qfe.QFEngineHandle(selected_lib, ctypes.c_void_p(2), 512)
-        selected_key = ("contract.so", "selected-package", "svdq", 0, "{}")
-        other_key = ("contract.so", "other-package", "svdq", 0, "{}")
+        # the cache key: (library, package, transformer file, backend, device, create config)
+        selected_key = ("contract.so", "selected-package", None, "svdq", 0, "{}")
+        other_key = ("contract.so", "other-package", None, "svdq", 0, "{}")
         consumer = torch.nn.Module()
         consumer._qf = other
         with mock.patch.dict(plugin._PIPELINE_CACHE, {other_key: other, selected_key: selected}, clear=True), \
