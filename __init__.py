@@ -906,15 +906,15 @@ if _IMPORT_OK:
 
     # [attention backend selector, user 2026-08-27] one user-facing dropdown per loader.
     # SM-GATED: SM80+ offers the full set; SM75 (Turing) has NO sage backend and NO
-    # flash_attn build, so only fp16_native is valid there. The widget VALUE is a
+    # flash_attn build, so it offers auto and fp16_native. The widget VALUE is a
     # display name; _attn_backend_to_engine maps it to the engine's comp_opts string
-    # ("fp16_native" -> "native"). "auto" = the engine's per-SM resolution (default), and
-    # is passed through so the user's choice is always the single source of truth.
+    # ("fp16_native" -> "native"). "auto" = the engine's per-GPU resolution, the default on every loader and GPU
+    # (user 2026-09-29), and is passed through so the user's choice is always the single source of truth.
     # [a backend REMOVED as a user-facing choice — user 2026-09-13] one engine-internal backend is
     # no longer offered in the dropdown. "auto" is unaffected (the engine may still pick it
     # internally per-SM); only the explicit user choice is gone.
     _ATTN_BACKEND_SM80PLUS = ["auto", "flash", "sage", "fp16_native"]
-    _ATTN_BACKEND_SM75 = ["fp16_native"]
+    _ATTN_BACKEND_SM75 = ["auto", "fp16_native"]
 
     def _attn_backend_choices():
         choices = _ATTN_BACKEND_SM80PLUS
@@ -929,12 +929,8 @@ if _IMPORT_OK:
             pass
         return choices
 
-    def _attn_backend_input(default="auto"):
-        choices = _attn_backend_choices()
-        # per-loader default; falls back to the first valid choice when the requested
-        # default isn't offered on this SM (e.g. H3 wants 'flash' but SM75 has no flash).
-        d = default if default in choices else choices[0]
-        return (choices, {"default": d,
+    def _attn_backend_input():
+        return (_attn_backend_choices(), {"default": "auto",
                 "tooltip": "auto (default) picks the best setting for your GPU. Try another setting only if a "
                            "result looks wrong or a run fails on your GPU. Takes effect on the next run."})
 
@@ -1076,13 +1072,9 @@ if _IMPORT_OK:
                                 {"tooltip": "The QuantFunc MiniMax-H3 model file in models/diffusion_models."}),
             }, "optional": {
                 "model_config": _model_config_input("minimax-h3"),   # hidden; widget index 1 (see _model_config_input)
-                # [sparse, user 2026-08-25 ONE-number dial; #659 session knob — no rebuild]
-                # H3 default = flash: on this model auto picks a backend that is
-                # BROKEN at high resolution (blank/NaN — measured
-                # 928²/S=31538: attn out absmax 0 → step-1 all-NaN → audio avcodec crash +
-                # video blur). flash (fp16) is the verified-clean default; user can still pick
-                # auto/sage/native. (Wan/LTX → auto is fine → they keep 'auto'.)
-                "attention_backend": _attn_backend_input("flash"),
+                # [#659 session knob — no rebuild] default auto (user 2026-09-29): from engine 0.0.17 the engine's
+                # auto never picks, for this model, the backend measured broken at large sizes (#659).
+                "attention_backend": _attn_backend_input(),
                 "sol_tau": _SOL_TAU_INPUT,
                 "step_cache": _STEP_CACHE_INPUT,
                 "block_cache": _BLOCK_CACHE_INPUT,
@@ -1098,9 +1090,9 @@ if _IMPORT_OK:
                        "place of the usual diffusion-model loader. " + _COMMON_LIMITS)
 
         def load(self, transformer, model_config=None,
-                 attention_backend="flash", sol_tau=1.0, quality_enhance=None, audio_enhance=False,
+                 attention_backend="auto", sol_tau=1.0, quality_enhance=None, audio_enhance=False,
                  step_cache=0.0, block_cache=0.0, quality=None,
-                 pinned_memory=False):  # H3: flash default (auto->sage is broken)
+                 pinned_memory=False):
             _p = _run_family_load(self.QF_FAMILY, transformer, model_config, pinned_memory)
             _mm = getattr(_p, "model", None)
             if _mm is not None and hasattr(_mm, "set_attn_backend"):

@@ -521,6 +521,25 @@ def main():
     check("attention_backend choices drop the removed backend (SM80+ and SM75)",
           not any(_bt.h(c) in _bt.WORDS for c in qfn._ATTN_BACKEND_SM80PLUS + qfn._ATTN_BACKEND_SM75),
           f"-> sm80+={qfn._ATTN_BACKEND_SM80PLUS} sm75={qfn._ATTN_BACKEND_SM75}")
+    # attention_backend defaults (user 2026-09-29): auto on every loader and every GPU (the engine resolves auto per GPU);
+    # SM75 offers auto and fp16_native. Only the offered list and the default move: a saved value stays as saved.
+    import inspect as _insp
+    import torch as _torch
+    _dev0, _cap0 = qfn.qfmp.comfy.model_management.get_torch_device, _torch.cuda.get_device_capability
+    _attn = {}
+    try:
+        qfn.qfmp.comfy.model_management.get_torch_device = lambda: _torch.device("cuda", 0)
+        for _sm in ((7, 5), (8, 6)):
+            _torch.cuda.get_device_capability = lambda _d=None, _sm=_sm: _sm
+            _attn[_sm] = {n: qfn.NODE_CLASS_MAPPINGS[n].INPUT_TYPES()["optional"]["attention_backend"] for n in _FOUR}
+    finally:
+        qfn.qfmp.comfy.model_management.get_torch_device, _torch.cuda.get_device_capability = _dev0, _cap0
+    check("attention_backend: SM75 offers [auto, fp16_native], SM80+ the full list, and every loader defaults to auto on both",
+          all(c[0] == (["auto", "fp16_native"] if sm == (7, 5) else qfn._ATTN_BACKEND_SM80PLUS) and c[1]["default"] == "auto"
+              for sm, per in _attn.items() for c in per.values()), f"-> {_attn}")
+    _sig = {n: _insp.signature(qfn.NODE_CLASS_MAPPINGS[n].load).parameters["attention_backend"].default for n in _FOUR}
+    check("attention_backend: every loader's load() defaults to auto (an API prompt without the input runs auto)",
+          set(_sig.values()) == {"auto"}, f"-> {_sig}")
     # the ALL-IN single file: projections + BOTH modality connector blocks packed (the audio
     # one is ALSO the AV discriminant — no audio_vae staging, comfy owns audio decode).
     import struct as _st2

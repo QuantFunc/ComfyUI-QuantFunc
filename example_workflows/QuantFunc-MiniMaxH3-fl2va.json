@@ -153,7 +153,7 @@
       "widgets_values": [
         "minimax_h3_fl2va_4step_quantfunc_int4_r128.safetensors",
         "minimax-h3-fl2va",
-        "flash",
+        "auto",
         1,
         0,
         0,
@@ -164,7 +164,7 @@
       "widgets_values_named": {
         "transformer": "minimax_h3_fl2va_4step_quantfunc_int4_r128.safetensors",
         "model_config": "minimax-h3-fl2va",
-        "attention_backend": "flash",
+        "attention_backend": "auto",
         "sol_tau": 1,
         "step_cache": 0,
         "block_cache": 0,
