@@ -8,6 +8,7 @@ Each file is checked whole (a phrase broken across two lines still counts) and l
 Run:  python tests/shipped_terms_test.py   (the matcher's own both-ways check runs first)
 """
 import os
+import hashlib
 import subprocess
 import sys
 
@@ -17,6 +18,16 @@ sys.path.insert(0, _HERE)
 from _banned_terms import selftest, term_hits  # noqa: E402
 
 _VENDORED = ("bin/tokenizers/",)
+# User 2026-09-29 explicitly restored one formerly-hidden backend as a dropdown label. Keep the exception scoped to
+# the shared selector implementation and its behavioural test: descriptions, README/workflows, and every other file
+# remain under the original no-technique-word rule. Store the allowed word as a digest so this death-rule file does
+# not itself become an occurrence.
+_EXPLICIT_BACKEND_HASH = "6a14c3ef2763b29b1d98a553f1b21c4243079103a93b4869be6d199940526a0f"
+_EXPLICIT_BACKEND_FILES = {"__init__.py", "tests/loader_dispatch_test.py"}
+
+
+def _allowed_user_backend(rel, term):
+    return rel in _EXPLICIT_BACKEND_FILES and hashlib.sha256(term.lower().encode("utf-8")).hexdigest() == _EXPLICIT_BACKEND_HASH
 
 
 def shipped_files(root=_PLUGIN):
@@ -45,13 +56,13 @@ def scan(root=_PLUGIN):
         if not whole:
             continue
         per_line = [(rel, i, t) for i, line in enumerate(text.splitlines(), 1) for t in term_hits(line)]
-        found += per_line
+        found += [(r, i, t) for r, i, t in per_line if not _allowed_user_backend(r, t)]
         # a phrase broken across two lines is found only on the whole text
         spanning = list(whole)
         for _r, _i, t in per_line:
             if t in spanning:
                 spanning.remove(t)
-        found += [(rel, None, t) for t in spanning]
+        found += [(rel, None, t) for t in spanning if not _allowed_user_backend(rel, t)]
     return n, found
 
 

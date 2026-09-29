@@ -516,27 +516,42 @@ def main():
                                      and t.startswith("ON (default for LTX-2.5" if w.split(".")[0] in _PM_DEFAULT_ON
                                                       else "OFF (default)") for w, t in _pm_tips.items()),
           f"-> {_pm_tips}")
-    # the backend REMOVED as a user-facing attention_backend choice (2026-09-13): no choice is a banned term
+    # The 2026-09-13 technique-word rule still applies to prose and every other backend label. User 2026-09-29
+    # explicitly restored qfa as a user-facing attention_backend choice, so that ONE exact option is the exception.
     import _banned_terms as _bt
-    check("attention_backend choices drop the removed backend (SM80+ and SM75)",
-          not any(_bt.h(c) in _bt.WORDS for c in qfn._ATTN_BACKEND_SM80PLUS + qfn._ATTN_BACKEND_SM75),
+    _backend_labels = qfn._ATTN_BACKEND_SM80PLUS + qfn._ATTN_BACKEND_QFA + qfn._ATTN_BACKEND_SM75
+    check("attention_backend choices expose qfa but no other removed/banned backend",
+          not any(_bt.h(c) in _bt.WORDS for c in _backend_labels if c != "qfa"),
           f"-> sm80+={qfn._ATTN_BACKEND_SM80PLUS} sm75={qfn._ATTN_BACKEND_SM75}")
-    # attention_backend defaults (user 2026-09-29): auto on every loader and every GPU (the engine resolves auto per GPU);
-    # SM75 offers auto and fp16_native. Only the offered list and the default move: a saved value stays as saved.
+    # attention_backend defaults (user 2026-09-29): auto on every loader and every GPU (the engine resolves auto per GPU).
+    # Explicit qfa is user-selectable on every QFA shipping tier (SM75/86/89/120), but is not offered on unsupported
+    # SM80/90/100/103. Only the offered list and the default move: a saved value stays as saved.
     import inspect as _insp
     import torch as _torch
     _dev0, _cap0 = qfn.qfmp.comfy.model_management.get_torch_device, _torch.cuda.get_device_capability
     _attn = {}
     try:
         qfn.qfmp.comfy.model_management.get_torch_device = lambda: _torch.device("cuda", 0)
-        for _sm in ((7, 5), (8, 6)):
+        for _sm in ((7, 5), (8, 0), (8, 6), (8, 9), (9, 0), (10, 0), (10, 3), (12, 0)):
             _torch.cuda.get_device_capability = lambda _d=None, _sm=_sm: _sm
             _attn[_sm] = {n: qfn.NODE_CLASS_MAPPINGS[n].INPUT_TYPES()["optional"]["attention_backend"] for n in _FOUR}
     finally:
         qfn.qfmp.comfy.model_management.get_torch_device, _torch.cuda.get_device_capability = _dev0, _cap0
-    check("attention_backend: SM75 offers [auto, fp16_native], SM80+ the full list, and every loader defaults to auto on both",
-          all(c[0] == (["auto", "fp16_native"] if sm == (7, 5) else qfn._ATTN_BACKEND_SM80PLUS) and c[1]["default"] == "auto"
+    _expected_attn = {
+        (7, 5): ["auto", "qfa", "fp16_native"],
+        (8, 0): ["auto", "flash", "sage", "fp16_native"],
+        (8, 6): ["auto", "qfa", "flash", "sage", "fp16_native"],
+        (8, 9): ["auto", "qfa", "flash", "sage", "fp16_native"],
+        (9, 0): ["auto", "flash", "sage", "fp16_native"],
+        (10, 0): ["auto", "flash", "sage", "fp16_native"],
+        (10, 3): ["auto", "flash", "sage", "fp16_native"],
+        (12, 0): ["auto", "qfa", "flash", "sage", "fp16_native"],
+    }
+    check("attention_backend: every loader offers explicit qfa exactly on SM75/86/89/120 and defaults to auto",
+          all(c[0] == _expected_attn[sm] and c[1]["default"] == "auto"
               for sm, per in _attn.items() for c in per.values()), f"-> {_attn}")
+    check("attention_backend: explicit qfa passes through unchanged to the engine",
+          qfn._attn_backend_to_engine("qfa") == "qfa")
     _sig = {n: _insp.signature(qfn.NODE_CLASS_MAPPINGS[n].load).parameters["attention_backend"].default for n in _FOUR}
     check("attention_backend: every loader's load() defaults to auto (an API prompt without the input runs auto)",
           set(_sig.values()) == {"auto"}, f"-> {_sig}")
