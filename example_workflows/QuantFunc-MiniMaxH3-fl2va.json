@@ -168,7 +168,7 @@
         "sol_tau": 1,
         "step_cache": 0,
         "block_cache": 0,
-        "quality_enhance": false,
+        "quality_enhance": true,
         "audio_enhance": false,
         "pinned_memory": true
       }
@@ -560,13 +560,13 @@
         "Node name for S&R": "MiniMaxH3ImageToVideo"
       },
       "widgets_values": [
-        "Cinematic crane shot inside an iridescent translucent pavilion: a red-haired woman in a long black dress stands at the edge of a circular reflecting pool. The camera slowly rises from eye level to a high top-down view as she looks up, the pool reflecting the shimmering walls. Soft ambient hum, gentle water ripples, a distant echo.",
+        "Five-second cyberpunk space-opera battle: enormous warships exchange relentless heavy cannon fire against a vast starfield. Begin with an epic distant fleet view, then rush between the ships and sweep close across a sharply detailed armored hull as giant energy cannons fire past the lens, ending in a blinding explosion. Masterful cinematic camera movement, immense scale, crisp mechanical textures, powerful stereo sound.",
         960,
         544,
         124
       ],
       "widgets_values_named": {
-        "prompt": "Cinematic crane shot inside an iridescent translucent pavilion: a red-haired woman in a long black dress stands at the edge of a circular reflecting pool. The camera slowly rises from eye level to a high top-down view as she looks up, the pool reflecting the shimmering walls. Soft ambient hum, gentle water ripples, a distant echo.",
+        "prompt":"Five-second cyberpunk space-opera battle: enormous warships exchange relentless heavy cannon fire against a vast starfield. Begin with an epic distant fleet view, then rush between the ships and sweep close across a sharply detailed armored hull as giant energy cannons fire past the lens, ending in a blinding explosion. Masterful cinematic camera movement, immense scale, crisp mechanical textures, powerful stereo sound.",
         "width": 960,
         "height": 544,
         "length": 124
