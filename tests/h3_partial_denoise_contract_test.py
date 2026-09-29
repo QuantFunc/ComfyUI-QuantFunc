@@ -635,6 +635,7 @@ class H3ProductionPathContract(unittest.TestCase):
              mock.patch.object(plugin, "_FAMILY_MATCHERS", []), \
              mock.patch.object(plugin.qfmp, "stage_denoise_only_package",
                                return_value="/contract/staged-minimax-h3"), \
+             mock.patch.object(plugin.qfmp, "engine_reads_weight_paths", return_value=False), \
              mock.patch.object(plugin.qfmp, "current_torch_device", return_value=(cpu, 0)), \
              mock.patch.object(plugin.qfmp.comfy.model_management,
                                "unet_offload_device", return_value=cpu):

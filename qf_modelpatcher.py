@@ -1063,6 +1063,18 @@ def stage_config_package(bundle_dir, transformer1_path, extra_links=None):
     return stage
 
 
+# The export engines carry (0.0.17+, #777) when every family loads its weights from paths - the create's
+# transformer_path, plus LTX-2.5's connectors_path - with model_dir a config-only package. Without it LTX-2.5 reads its
+# connectors only from the package and MiniMax-H3 its folded checkpoint's fold count only beside the weights, so those two
+# keep the link.
+_WEIGHT_PATHS_SYMBOL = "quantfunc_weight_paths"
+
+
+def engine_reads_weight_paths():
+    """True when the loaded QuantFunc engine loads LTX-2.5 and MiniMax-H3 weights from paths (no link needed)."""
+    return hasattr(qfe.load_lib(), _WEIGHT_PATHS_SYMBOL)
+
+
 def stage_denoise_only_package(bundle_dir, transformer1_path, extra_links=None):
     """The package of LTX-2.5 and MiniMax-H3: the config package plus the weight files SYMLINKED in, the transformer as
     transformer/model.safetensors. On the engines this plugin installs, LTX-2.5 reads its connectors only from the

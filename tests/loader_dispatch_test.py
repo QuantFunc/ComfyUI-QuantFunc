@@ -851,6 +851,48 @@ def main():
           all(e is not None and "Developer Mode" in e and "drive" in e and "LTX-2.5" in e and "MiniMax-H3" in e
               for e in (_ltx_err, _h3_err)) and not _copied,
           f"-> ltx={(_ltx_err or 'no refusal')[:160]} h3={(_h3_err or 'no refusal')[:160]} copied={_copied}")
+    # (E) 0.0.08 + engine 0.0.17 (#777; engine-kv 525a39424): an engine exporting quantfunc_weight_paths reads every
+    #     family's weights from paths - LTX-2.5's connectors from connectors_path, MiniMax-H3's fold count from the
+    #     package's transformer/config.json - so with links impossible LTX-2.5 and MiniMax-H3 load link-free too: the
+    #     package holds configs only, the create names the picked file as transformer_path (and LTX-2.5's connectors
+    #     source as connectors_path), and LTX-2.5 is still the joint audio+video model (its discriminant reads that source).
+    _wp_lib = types.SimpleNamespace(quantfunc_weight_paths=lambda: 1)
+    _lib0 = qfn.qfe.load_lib
+    qfn.qfe.load_lib = lambda *a, **k: _wp_lib
+    _wp_got, _link_calls[:] = {}, []
+    _wp_loads = {"minimax-h3": (H3L, "far-minimax-h3-quantfunc-int4.safetensors", "minimax-h3-fl2va"),
+                 "ltx2": (LtxL, "fx-ltx-2.5-quantfunc-4bit.safetensors", "ltx2-2.5-22b")}
+    try:
+        with _mock.patch("os.symlink", _refused_symlink), _mock.patch("os.link", _cross_volume_link):
+            for _fam, (_node, _xfm, _preset) in _wp_loads.items():
+                try:
+                    _o = _node.load(_xfm, _preset)[0]
+                    _ = _o.model._qf.lib
+                    _wp_got[_fam] = (_o.model._qf._ckey, json.loads(_o.model._qf._ckey[-1]), type(_o.model).__name__)
+                except Exception as _e:  # noqa: BLE001 - a refusal is this arm's FAIL, shown in its detail
+                    _wp_got[_fam] = f"{type(_e).__name__}: {_e}"
+    finally:
+        qfn.qfe.load_lib = _lib0
+    _wp_calls = list(_link_calls)
+
+    def _wp_ok(fam, xfm_path, conn=None):
+        got = _wp_got.get(fam)
+        if not isinstance(got, tuple):
+            return False
+        ck, cfg, _cls = got
+        return (os.path.realpath(ck[2] or "") == os.path.realpath(xfm_path)
+                and os.path.isfile(os.path.join(ck[0], "model_index.json"))
+                and not any(f.endswith(".safetensors") for _r, _d, _fs in os.walk(ck[0]) for f in _fs)
+                and cfg.get("denoise_only") is True
+                and (conn is None or os.path.realpath(cfg.get("connectors_path") or "") == os.path.realpath(conn)))
+    check("an engine that reads weight paths (quantfunc_weight_paths), links impossible: MiniMax-H3 and LTX-2.5 load "
+          "link-free - configs-only package, the picked file as transformer_path, LTX-2.5's connectors source as "
+          "connectors_path - and LTX-2.5 is still the joint audio+video model",
+          not _wp_calls and _wp_ok("minimax-h3", os.path.join(_far, "far-minimax-h3-quantfunc-int4.safetensors"))
+          and _wp_ok("ltx2", os.path.join(dm, "fx-ltx-2.5-quantfunc-4bit.safetensors"),
+                     os.path.join(dm, "fx-ltx25-connectors.safetensors"))
+          and isinstance(_wp_got.get("ltx2"), tuple) and _wp_got["ltx2"][2] == "QFLTXAVModel",
+          f"-> calls={_wp_calls} got={ {f: (v if isinstance(v, str) else (v[0][2], v[1], v[2])) for f, v in _wp_got.items()} }")
     _pp = qfn._prepare_params("one-package", {"denoise_only": True}, 0, "test-not-a-key", "/w/a.safetensors")
     check("the real create params carry the package dir and the transformer file (quantfunc_create's model_dir and "
           "transformer_path)", _pp.model_dir == b"one-package" and _pp.transformer_path == b"/w/a.safetensors",
