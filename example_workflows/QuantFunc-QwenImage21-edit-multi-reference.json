@@ -55,7 +55,8 @@
     "qwen_image_21_base_quantfunc_int4_r128.safetensors",
     "qwen-image-2.1-int4",
     "auto",
-    false
+    false,
+    true
    ]
   },
   {

@@ -114,14 +114,14 @@
         "krea2-turbo-int4",
         "auto",
         false,
-        false
+        true
       ],
       "widgets_values_named": {
         "transformer": "krea2-turbo-quantfunc-int4-r128.safetensors",
         "model_config": "krea2-turbo-int4",
         "attention_backend": "auto",
         "quality_enhance": false,
-        "pinned_memory": false
+        "pinned_memory": true
       }
     },
     {
