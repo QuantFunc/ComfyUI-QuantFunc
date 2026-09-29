@@ -1037,8 +1037,8 @@ def stage_config_package(bundle_dir, transformer1_path, extra_links=None):
     (folder_paths.get_temp_directory(), never system /tmp), keyed deterministically by (bundle, realpath(files)): one
     dir per weight file, so the engine's VRAM measurement cache (written into model_dir) stays per weight file and out
     of the plugin's own folder. Rebuilt fresh each call (configs are tiny), so a re-pick can't leave a stale file. The
-    weights reach the engine as its transformer_path create input (H3, Krea-2, Qwen-Image-2.1) or as links the caller
-    adds (stage_denoise_only_package, LTX-2.5)."""
+    weights reach the engine as its transformer_path create input (Krea-2, Qwen-Image-2.1) or as links the caller adds
+    (stage_denoise_only_package: LTX-2.5, MiniMax-H3)."""
     import shutil
     import folder_paths
     if not os.path.isdir(bundle_dir):
@@ -1064,9 +1064,10 @@ def stage_config_package(bundle_dir, transformer1_path, extra_links=None):
 
 
 def stage_denoise_only_package(bundle_dir, transformer1_path, extra_links=None):
-    """LTX-2.5's package: the config package plus its weight files SYMLINKED in (the engine this plugin ships reads
-    LTX-2.5's connectors / text encoder / audio VAE only from the package), the transformer as
-    transformer/model.safetensors. extra_links: {subdir: target_path} - single-expert AV families link MORE weight files
+    """The package of LTX-2.5 and MiniMax-H3: the config package plus the weight files SYMLINKED in, the transformer as
+    transformer/model.safetensors. On the engines this plugin installs, LTX-2.5 reads its connectors only from the
+    package, and MiniMax-H3 reads its folded checkpoint's qf_adaln_fold_dropped_resq only from the config.json beside the
+    weights (#777). extra_links: {subdir: target_path} - single-expert AV families link MORE weight files
     (ltx2: the SAME single xfm file into connectors/ [#565 comfy25 prefix branch], the gemma with-proj TE into
     text_encoder/ [connector aggregate_embed], the audio_vae file [engine has_audio_ discriminant = weights presence])."""
     stage = stage_config_package(bundle_dir, transformer1_path, extra_links)
@@ -1085,10 +1086,10 @@ def stage_denoise_only_package(bundle_dir, transformer1_path, extra_links=None):
                 os.link(target, link)
             except OSError as exc:
                 raise RuntimeError(
-                    f"qf_native: cannot link {target} into ComfyUI's temp directory ({exc}). LTX-2.5 with the model "
-                    f"on another drive or a network share, without Windows Developer Mode, is supported from "
-                    f"QuantFunc engine 0.0.17; for now move the model to the drive ComfyUI's temp directory is on, "
-                    f"or enable Windows Developer Mode.") from exc
+                    f"qf_native: cannot link {target} into ComfyUI's temp directory ({exc}). LTX-2.5 and MiniMax-H3 "
+                    f"need that link with this QuantFunc engine when the model is on another drive or a network share "
+                    f"and Windows Developer Mode is off; a QuantFunc engine update removes this. For now enable Windows "
+                    f"Developer Mode, or move the model to the drive ComfyUI's temp directory is on.") from exc
     _link_expert("transformer", os.path.realpath(transformer1_path))
     for sub, target in sorted((extra_links or {}).items()):
         if target:

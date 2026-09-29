@@ -609,7 +609,7 @@ class H3ProductionPathContract(unittest.TestCase):
              mock.patch.object(plugin, "_get_engine", side_effect=forbid_engine_create), \
              mock.patch.object(plugin, "_FAMILY_BUILDERS", {}), \
              mock.patch.object(plugin, "_FAMILY_MATCHERS", []), \
-             mock.patch.object(plugin.qfmp, "stage_config_package",
+             mock.patch.object(plugin.qfmp, "stage_denoise_only_package",
                                return_value="/contract/staged-minimax-h3"), \
              mock.patch.object(plugin.qfmp, "current_torch_device", return_value=(cpu, 0)), \
              mock.patch.object(plugin.qfmp.comfy.model_management,

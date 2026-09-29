@@ -758,18 +758,18 @@ def main():
     _PM_ON, _PM_OFF = {"denoise_only": True, "use_pinned_memory": True}, {"denoise_only": True}
     # (D) Windows without Developer Mode, the model on another drive or share (hotfix 2026-09-29, the user's 5060 Ti on an
     #     SMB share): a symlink is refused (WinError 1314) and a hardlink cannot cross volumes (EXDEV / WinError 17).
-    #     MiniMax-H3, Krea-2 and Qwen-Image-2.1 never link: the create names the picked file as its transformer_path, the
-    #     package holds configs only, and two weight files are two pipelines. LTX-2.5 still links (its engine reads the
-    #     connectors / text encoder / audio VAE from the package) and, when it cannot, says what to do; never a copy.
+    #     Krea-2 and Qwen-Image-2.1 never link: the create names the picked file as its transformer_path, the package
+    #     holds configs only, and two weight files are two pipelines. LTX-2.5 and MiniMax-H3 still link on this engine
+    #     (LTX-2.5 reads its connectors from the package; MiniMax-H3's folded checkpoint needs transformer/config.json
+    #     beside the weights, see the h3 arm) and, when they cannot, say what to do; never a copy.
     import errno as _errno
     from unittest import mock as _mock
     _far = tempfile.mkdtemp(prefix="qf_other_volume_")
     folder_paths.add_model_folder_path("diffusion_models", _far)
-    _far_loads = {"minimax-h3": (H3L, "far-minimax-h3-quantfunc-int4.safetensors", "minimax-h3-fl2va"),
-                  "krea2": (KreaL, "far-krea2-turbo-quantfunc-int4.safetensors", "krea2-turbo-int4"),
+    _far_loads = {"krea2": (KreaL, "far-krea2-turbo-quantfunc-int4.safetensors", "krea2-turbo-int4"),
                   "krea2-b": (KreaL, "far-b-krea2-turbo-quantfunc-int4.safetensors", "krea2-turbo-int4"),
                   "qwenimage21": (QiL, "far-qwen-image-2.1-quantfunc-int4.safetensors", "qwen-image-2.1-int4")}
-    for _node, _xfm, _preset in _far_loads.values():
+    for _xfm in [x for _n, x, _p in _far_loads.values()] + ["far-minimax-h3-quantfunc-int4.safetensors"]:
         with open(os.path.join(_far, _xfm), "wb") as _fh:
             _fh.write(b"\0" * 16)
     _link_calls = []
@@ -781,7 +781,7 @@ def main():
     def _cross_volume_link(*a, **k):
         _link_calls.append("link")
         raise OSError(_errno.EXDEV, "Invalid cross-device link")
-    _far_got, _ltx_err = {}, None
+    _far_got, _ltx_err, _h3_err = {}, None, None
     with _mock.patch("os.symlink", _refused_symlink), _mock.patch("os.link", _cross_volume_link):
         for _fam, (_node, _xfm, _preset) in _far_loads.items():
             try:
@@ -795,13 +795,17 @@ def main():
             LtxL.load("fx-ltx-2.5-quantfunc-4bit.safetensors", "ltx2-2.5-22b")
         except RuntimeError as _e:
             _ltx_err = str(_e)
+        try:
+            H3L.load("far-minimax-h3-quantfunc-int4.safetensors", "minimax-h3-fl2va")
+        except RuntimeError as _e:
+            _h3_err = str(_e)
 
     def _far_ok(ck, xfm):
         return (isinstance(ck, tuple) and os.path.realpath(ck[2] or "") == os.path.realpath(os.path.join(_far, xfm))
                 and os.path.isfile(os.path.join(ck[0], "model_index.json"))
                 and not any(f.endswith(".safetensors") for _r, _d, _fs in os.walk(ck[0]) for f in _fs))
-    check("links impossible (Windows 1314 / cross-volume EXDEV): MiniMax-H3, Krea-2 and Qwen-Image-2.1 load without "
-          "linking; the create names the picked file as transformer_path and the package holds configs only",
+    check("links impossible (Windows 1314 / cross-volume EXDEV): Krea-2 and Qwen-Image-2.1 load without linking; the "
+          "create names the picked file as transformer_path and the package holds configs only",
           not _far_calls and all(_far_ok(_far_got[f], x) for f, (_n, x, _p) in _far_loads.items()),
           f"-> calls={_far_calls} got={ {f: (v if isinstance(v, str) else v[2]) for f, v in _far_got.items()} }")
     _fk, _fkb = _far_got.get("krea2"), _far_got.get("krea2-b")
@@ -813,10 +817,11 @@ def main():
     _stage_root = os.path.join(folder_paths.get_temp_directory(), "qf_native_stage")
     _copied = [os.path.join(r, f) for r, _d, fs in os.walk(_stage_root) for f in fs
                if f.endswith(".safetensors") and not os.path.islink(os.path.join(r, f))]
-    check("links impossible: LTX-2.5 refuses with what to do (Developer Mode, or the model on ComfyUI's drive; engine "
-          "0.0.17 lifts it) and copies nothing",
-          _ltx_err is not None and "Developer Mode" in _ltx_err and "0.0.17" in _ltx_err
-          and "drive" in _ltx_err and not _copied, f"-> {(_ltx_err or 'no refusal')[:200]} copied={_copied}")
+    check("links impossible: LTX-2.5 and MiniMax-H3 refuse with what to do (Developer Mode, or the model on the drive of "
+          "ComfyUI's temp folder; a QuantFunc engine update lifts it) and copy nothing",
+          all(e is not None and "Developer Mode" in e and "drive" in e and "LTX-2.5" in e and "MiniMax-H3" in e
+              for e in (_ltx_err, _h3_err)) and not _copied,
+          f"-> ltx={(_ltx_err or 'no refusal')[:160]} h3={(_h3_err or 'no refusal')[:160]} copied={_copied}")
     _pp = qfn._prepare_params("one-package", {"denoise_only": True}, 0, "test-not-a-key", "/w/a.safetensors")
     check("the real create params carry the package dir and the transformer file (quantfunc_create's model_dir and "
           "transformer_path)", _pp.model_dir == b"one-package" and _pp.transformer_path == b"/w/a.safetensors",
@@ -855,14 +860,24 @@ def main():
     check("h3 load(): OFF by default, ON when set; a saved earlier value maps best_quality -> ON, any other -> OFF; the switch wins",
           _hks == [False, True, False, True, False, False], f"-> {_hks}")
     check("krea2 load(): OFF by default, ON when set; a saved other value runs OFF", _kks == [False, True, False], f"-> {_kks}")
+    # MiniMax-H3 keeps the LINK on this engine (#777, measured on 远程-linux-d): the release checkpoint is adaln-folded and
+    # its sealed resq_slot_count counts the 50 folded slots; the engine subtracts qf_adaln_fold_dropped_resq, which it
+    # reads ONLY from the config.json beside the weights path (the package's transformer/config.json). Loaded through
+    # transformer_path, that is the model file's own folder: no correction, "armed-slot count (200) != ... (250)".
     _hmd, _htp = out_h3.model._qf._ckey[0], out_h3.model._qf._ckey[2]
-    check("h3: a config-complete package with no weights in it (transformer_2 removed); the create names the picked file as "
-          "its transformer_path",
+    try:
+        _hcfg_fold = json.load(open(os.path.join(_hmd, "transformer", "config.json"), encoding="utf-8")).get("qf_adaln_fold_dropped_resq")
+    except (OSError, ValueError):
+        _hcfg_fold = None
+    check("h3: config-complete package with the weights LINKED as transformer/model.safetensors beside the transformer "
+          "config.json that carries qf_adaln_fold_dropped_resq (the engine reads it next to the weights); no "
+          "transformer_path; transformer_2 removed",
           all(os.path.isfile(os.path.join(_hmd, q)) for q in
               ("model_index.json", "transformer/config.json", "vae/config.json"))
-          and not os.path.lexists(os.path.join(_hmd, "transformer", "model.safetensors"))
-          and os.path.realpath(_htp or "") == os.path.realpath(os.path.join(dm, "fx-minimax-h3-quantfunc-int4.safetensors"))
-          and not os.path.exists(os.path.join(_hmd, "transformer_2")), f"-> {_htp}")
+          and os.path.realpath(os.path.join(_hmd, "transformer", "model.safetensors")).endswith(
+              "fx-minimax-h3-quantfunc-int4.safetensors")
+          and isinstance(_hcfg_fold, int) and _hcfg_fold > 0 and _htp is None
+          and not os.path.exists(os.path.join(_hmd, "transformer_2")), f"-> tp={_htp} fold={_hcfg_fold}")
     # a saved workflow's model_config of another family / of no family: not this family's preset -> refused, naming it
     try:
         KreaL.load("fx-krea2-turbo-quantfunc-int4.safetensors", "fx-ltx")

@@ -560,21 +560,21 @@ def register(deps):
     liveness registry) without importing __init__."""
     def build(transformer1_path, bundle_dir=None, lora_entries=(), pinned_memory=False):
         """File-based loading for MiniMax-H3 — the shared staging pattern:
-        stage the shipped config bundle (configs/minimax-h3-*/, official configs); the engine loads
-        the picked transformer file from its transformer_path (no link, so the weights may sit on any
-        drive or share); engine create runs denoise_only=True (TE + VAE weights
-        skipped — comfy's stock MiniMaxH3 nodes own conditioning/refs and comfy decodes;
-        the engine reads the staged configs for session geometry only). No extra weight
-        links: unlike ltx2 the H3 external session needs no engine-side connector/projection
-        weights (refs arrive as av_conds latents from comfy). H3 svdq is PRE-quantized, so the create is
-        MINIMAL: the svdquant metadata carries the layout/precision, and anything on top competes and
-        mis-resolves (the LTX minimal note)."""
-        model_dir = qfmp.stage_config_package(bundle_dir, transformer1_path)
+        stage the shipped config bundle (configs/minimax-h3-*/, official configs) + link
+        the single transformer file as transformer/model.safetensors; engine create runs denoise_only=True (TE + VAE
+        weights skipped — comfy's stock MiniMaxH3 nodes own conditioning/refs and comfy decodes; the engine reads the
+        staged configs for session geometry only). The LINK stays on the engines this plugin installs (#777, measured):
+        the release checkpoint is adaln-folded, and the engine corrects its sealed resq_slot_count with the bundle's
+        transformer/config.json qf_adaln_fold_dropped_resq, which it reads only beside the weights path - loaded
+        through transformer_path it would miss it and refuse the checkpoint as truncated. No extra weight links: unlike
+        ltx2 the H3 external session needs no engine-side connector/projection weights (refs arrive as av_conds latents
+        from comfy). H3 svdq is PRE-quantized, so the create is MINIMAL: the svdquant metadata carries the
+        layout/precision, and anything on top competes and mis-resolves (the LTX minimal note)."""
+        model_dir = qfmp.stage_denoise_only_package(bundle_dir, transformer1_path)
         return qfmp.family_build(
             deps, model_dir, {"denoise_only": True}, comfy.supported_models.MiniMaxH3,
             {"image_model": "minimax_h3", "disable_unet_model_creation": True}, QFH3Model,
             f"[qf_native] loaded QuantFuncNativeLoader (MiniMax-H3 svdq AV) package={os.path.basename(transformer1_path)} "
-            f"capacity=native Prepared query (create deferred)", pinned_memory,
-            transformer_path=transformer1_path)(list(lora_entries))
+            f"capacity=native Prepared query (create deferred)", pinned_memory)(list(lora_entries))
 
     return build
