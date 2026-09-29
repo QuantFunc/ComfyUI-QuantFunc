@@ -91,6 +91,26 @@ class EngineResourceContract(unittest.TestCase):
             self.assertEqual(lib.created, [(19, 2, b"fixture")])
             engine.destroy()
 
+    def test_create_sends_the_plugin_cache_dir_so_the_engine_caches_persist(self):
+        """0.0.08 (tests-32 2026-09-29): every engine this plugin installs (0.0.13, 0.0.16, 0.0.17) keeps its keymap /
+        metadata disk cache and its VRAM measurement cache in config_json "cache_dir", and sets "_cache_dir" FROM it
+        (PipelineLoader: _cache_dir = cache_dir) - so the "_cache_dir" the plugin used to send never took effect and both
+        caches sat in the per-load package in ComfyUI's temp dir, gone at every ComfyUI start (the metadata was fetched
+        from the backend again after each restart). The caller's own cache_dir wins; the caller's dict is never
+        changed."""
+        plugin_cache = str(Path(qfe.__file__).resolve().parent / "cache")
+        for given in (None, {"bf16": True}, json.dumps({"bf16": True})):
+            cfg = json.loads(qfe.make_create_params(model_dir="fixture", config_json=given).config_json)
+            self.assertEqual(cfg.get("cache_dir"), plugin_cache, f"given={given!r}")
+            self.assertNotIn("_cache_dir", cfg)
+        mine = {"cache_dir": "/elsewhere"}
+        self.assertEqual(json.loads(qfe.make_create_params(model_dir="fixture", config_json=mine).config_json),
+                         {"cache_dir": "/elsewhere"})
+        caller = {"bf16": True}
+        qfe.make_create_params(model_dir="fixture", config_json=caller)
+        self.assertEqual(caller, {"bf16": True})
+        self.assertTrue(os.path.isdir(plugin_cache))
+
     def test_retained_recipe_cannot_be_combined_with_new_keywords(self):
         lib = library()
         params = qfe.make_create_params(model_dir="fixture", device_idx=2)

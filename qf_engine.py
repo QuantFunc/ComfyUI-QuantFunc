@@ -2036,23 +2036,22 @@ def make_create_params(*, model_dir, transformer_path=None, model_backend="svdq"
     _refuse_session_knobs_in_create(config_json)   # [session-knobs] session knob != create key
     if isinstance(config_json, dict):
         config_json = dict(config_json)
-    # [metadata-KV disk cache — user 2026-09-01 "为啥metadata每次都重新请求后端 不是有缓存吗"]
-    # The engine HAS a two-tier keymap/metadata cache (process mem → disk CIPHERTEXT at
-    # <_cache_dir>/.quantfunc_keymap_cache/), but the disk tier arms only when create passes
-    # `_cache_dir` — which this plugin never did, so every ComfyUI RESTART re-fetched from the
-    # backend. Default it to the plugin's own cache/ dir (ciphertext-only on disk; decrypt
-    # stays in-memory per use — no security change). An explicit caller _cache_dir still wins.
+    # [the engine's persistent caches — user 2026-09-01 "为啥metadata每次都重新请求后端 不是有缓存吗"; tests-32 2026-09-29]
+    # Every engine this plugin installs keeps its keymap / metadata disk cache (ciphertext; decrypt stays in memory per
+    # use) and its VRAM measurement cache in config_json "cache_dir", and sets "_cache_dir" FROM it - so the
+    # "_cache_dir" this plugin sent before never took effect and both caches lived in the per-load package in ComfyUI's
+    # temp dir, gone at every ComfyUI start. Default it to the plugin's own cache/ dir; a caller's cache_dir still wins.
     try:
         _cdir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache")
         os.makedirs(_cdir, exist_ok=True)
         if config_json is None:
-            config_json = {"_cache_dir": _cdir}
+            config_json = {"cache_dir": _cdir}
         elif isinstance(config_json, dict):
-            config_json.setdefault("_cache_dir", _cdir)
+            config_json.setdefault("cache_dir", _cdir)
         else:
             _cj = json.loads(config_json)
-            if isinstance(_cj, dict) and "_cache_dir" not in _cj:
-                _cj["_cache_dir"] = _cdir; config_json = json.dumps(_cj)
+            if isinstance(_cj, dict) and "cache_dir" not in _cj:
+                _cj["cache_dir"] = _cdir; config_json = json.dumps(_cj)
     except Exception:
         pass  # cache dir is an optimization - never block create on it
     p = InitParams()

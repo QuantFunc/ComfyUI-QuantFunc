@@ -27,6 +27,10 @@ bin/windows/resource_cache.json
 # Local Claude Code settings — never publish
 .claude/
 
+# The engine's persistent caches (qf_engine.make_create_params sends cache_dir = cache/): the keymap ciphertext and the
+# VRAM measurement cache.
+cache/.quantfunc_*
+
 # The engine installer's files (qf_engine.install_engine): each installed pair's folder, its marker, the install lock.
 bin/*/*-cu[0-9]*/
 bin/*/.engine-*
