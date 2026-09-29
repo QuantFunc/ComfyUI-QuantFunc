@@ -168,7 +168,7 @@
         "sol_tau": 1,
         "step_cache": 0,
         "block_cache": 0,
-        "quality_enhance": false,
+        "quality_enhance": true,
         "audio_enhance": false,
         "pinned_memory": true
       }
