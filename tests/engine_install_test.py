@@ -1271,6 +1271,141 @@ def main():
     check("Windows: the install lock waits (1 s per try) only while held (EACCES) and fails loudly on anything else",
           waited == ("sm89", ["nblck", "nblck", "nblck", "unlock"], [1, 1]) and all(v is True for v in broken.values()),
           f"waited={waited} broken={broken}")
+    # 45) add-ons (tests-32 2026-09-29, option A): a release entry's "addons" / "addons-12" name files the engine loads from
+    #     its own folder. Each one the release publishes for this GPU class (verify.json "<set>/<file>") is fetched,
+    #     checked and put next to the host BEFORE the marker; best effort, never blocking the engine. The plugin builds in
+    #     no add-on name: these names are made up.
+    ADD = {13: "libquantfunc_extra.so", 12: "libquantfunc_extra-12.so"}
+
+    def with_addons(rel, names=ADD, sets=("sm75", "sm86", "sm89", "sm120a"), plat="linux", key="linux"):
+        manifest = json.loads(rel.files[f"{rel.version}/verify.json"])
+        for major, name in names.items():
+            for gset in sets:
+                data = f"ADDON-{rel.version}-{gset}-cu{major}".encode()
+                rel.files[f"{rel.version}/{plat}/{gset}/{name}"] = data
+                manifest[key][f"{gset}/{name}"] = sha(data)
+        rel.files[f"{rel.version}/verify.json"] = json.dumps(manifest).encode()
+        if hasattr(rel, "manifest"):
+            rel.manifest = manifest
+        rel.entries[rel.version].update({"addons": [names[13]], "addons-12": [names[12]]})
+        rel.files["version.json"] = json.dumps({"linux": {}, key: rel.entries} if key != "linux"
+                                               else {"linux": rel.entries}).encode()
+        return rel
+
+    def quiet_install(env):
+        said, real_say = [], qfe.say
+        qfe.say = lambda msg, flush=True: said.append(msg)
+        try:
+            return qfe.install_engine(), said
+        finally:
+            qfe.say = real_say
+
+    for major in (13, 12):
+        rel = with_addons(per_arch_release())
+        with Env(rel, torch_major=major, sm=89) as env:
+            order, real_replace = [], os.replace
+            qfe.os.replace = lambda a, b: (order.append(os.path.basename(b)), real_replace(a, b))[1]
+            try:
+                m = qfe.install_engine()
+            finally:
+                qfe.os.replace = real_replace
+            p = env.path(f"0.0.14-sm89-cu{major}", ADD[major])
+            check(f"add-on, SM 89 x CUDA {major}: the release's add-on for this class and CUDA major lands next to the engine "
+                  f"as a regular file, before the marker; the other major's is never fetched; the marker records only the "
+                  f"engine", env.read(f"0.0.14-sm89-cu{major}", ADD[major]) == rel.files[f"0.0.14/linux/sm89/{ADD[major]}"]
+                  and not os.path.islink(p) and order == [KERNELS[major], HOSTS[major], ADD[major], f".engine-sm89-cu{major}.json"]
+                  and not any(f.endswith("/" + ADD[25 - major]) for f in rel.fetched)
+                  and set(m["sha256"]) == {HOSTS[major], KERNELS[major]} and not env.leftovers(), order)
+    rel = with_addons(per_arch_release())
+    with Env(rel, sm=80) as env:
+        qfe.install_engine()
+        check("add-on: a GPU class the release publishes no add-on for gets none, and nothing is fetched for it",
+              sorted(os.listdir(env.path("0.0.14-sm80-cu13"))) == sorted([HOSTS[13], KERNELS[13]])
+              and not any(ADD[13] in f for f in rel.fetched), rel.fetched)
+    failed = {}
+    for how in ("tampered", "missing"):
+        rel = with_addons(per_arch_release())
+        if how == "tampered":
+            rel.files[f"0.0.14/linux/sm89/{ADD[13]}"] = b"other bytes"
+        else:
+            del rel.files[f"0.0.14/linux/sm89/{ADD[13]}"]
+        with Env(rel, sm=89) as env:
+            try:
+                m, said = quiet_install(env)
+            except Exception as e:  # noqa: BLE001 - an add-on failure that escapes is this arm's FAIL
+                failed[how] = (False, repr(e))
+                continue
+            failed[how] = (env.read("0.0.14-sm89-cu13", ADD[13]) is None and m["version"] == "0.0.14"
+                           and env.marker("sm89") == m and not env.leftovers()
+                           and sum(ADD[13] in s for s in said) == 1, said)
+    check("add-on: one that does not match its SHA-256, or cannot be fetched, is not put in place; the engine installs "
+          "anyway and one line names it", all(v[0] for v in failed.values()), failed)
+    rel = with_addons(per_arch_release())
+    evil = ["../escape.so", "sub/x.so", ".hidden.so", HOSTS[13], KERNELS[13], ".engine-sm89-cu13.json"]
+    for name in evil:
+        rel.files.setdefault(f"0.0.14/linux/sm89/{name}", b"EVIL")   # never over the real kernel
+        rel.manifest["linux"].setdefault(qfe._manifest_key("sm89", name), sha(b"EVIL"))
+    rel.publish()
+    rel.entries["0.0.14"]["addons"] = evil
+    rel.files["version.json"] = json.dumps({"linux": rel.entries}).encode()
+    with Env(rel, sm=89) as env:
+        m = qfe.install_engine()
+        planted = [os.path.join(r, f) for r, _, fs in os.walk(os.path.dirname(env.dir)) for f in fs
+                   if f in ("escape.so", "x.so", ".hidden.so") and r.startswith(os.path.dirname(env.dir))]
+        check("add-on: a name that is a path, hidden or a marker is refused unfetched; one naming the engine's own host or "
+              "kernel is that same verified file, left as it is",
+              m["version"] == "0.0.14" and rel.fetched.count(f"0.0.14/linux/{HOSTS[13]}") == 1
+              and rel.fetched.count(f"0.0.14/linux/sm89/{KERNELS[13]}") == 1 and not planted
+              and not any(f.endswith(("/escape.so", "/x.so", "/.hidden.so", ".json.part")) for f in rel.fetched)
+              and env.read("0.0.14-sm89-cu13", HOSTS[13]) == rel.files[f"0.0.14/linux/{HOSTS[13]}"], (rel.fetched, planted))
+    rel = with_addons(per_arch_release())
+    rel.entries["0.0.14"]["addons"] = {ADD[13]: True}    # a map, not a list: its keys are never taken as names
+    rel.files["version.json"] = json.dumps({"linux": rel.entries}).encode()
+    with Env(rel, sm=89) as env:
+        qfe.install_engine()
+        check("add-on: an \"addons\" value that is not a list (here a map of a valid name) installs nothing, and the "
+              "engine installs",
+              env.read("0.0.14-sm89-cu13", ADD[13]) is None and env.marker("sm89") is not None, rel.fetched)
+    # later starts: an engine installed before its release listed the add-on gets it WITHOUT re-downloading the engine;
+    # an unchanged add-on is not fetched again; a symlink in its place is replaced by the file; a re-published add-on is
+    # replaced
+    rel = per_arch_release()
+    with Env(rel, sm=89) as env:
+        qfe.install_engine()
+        with_addons(rel)
+        rel.fetched.clear()
+        qfe.install_engine()
+        first = rel.fetched[:]
+        rel.fetched.clear()
+        qfe.install_engine()
+        again = rel.fetched[:]
+        p = env.path("0.0.14-sm89-cu13", ADD[13])
+        if os.path.lexists(p):
+            os.remove(p)
+        with open(env.path("elsewhere.so"), "wb") as f:
+            f.write(rel.files[f"0.0.14/linux/sm89/{ADD[13]}"])
+        os.symlink(env.path("elsewhere.so"), p)
+        qfe.install_engine()
+        unlinked = not os.path.islink(p) and env.read("0.0.14-sm89-cu13", ADD[13]) == rel.files[f"0.0.14/linux/sm89/{ADD[13]}"]
+        rel.files[f"0.0.14/linux/sm89/{ADD[13]}"] = b"ADDON v2"
+        rel.manifest["linux"][f"sm89/{ADD[13]}"] = sha(b"ADDON v2")
+        rel.publish()
+        rel.fetched.clear()
+        qfe.install_engine()
+        base = ["version.json", "0.0.14/verify.json", "0.0.14/linux/sets.json"]
+        check("add-on: an installed engine gets a newly listed add-on without re-downloading itself; an unchanged one is not "
+              "fetched again; a symlink in its place is replaced by the file; a re-published one is replaced",
+              first == base + [f"0.0.14/linux/sm89/{ADD[13]}"] and again == base and unlinked
+              and rel.fetched == base + [f"0.0.14/linux/sm89/{ADD[13]}"]
+              and env.read("0.0.14-sm89-cu13", ADD[13]) == b"ADDON v2", (first, again, unlinked, rel.fetched))
+    WADD = {13: "quantfunc_extra.dll", 12: "quantfunc_extra-12.dll"}
+    with windows(), Env(with_addons(WinRelease(), names=WADD, plat="windows", key="win32"), torch_major=12, sm=89,
+                        machine="AMD64") as env:
+        m = qfe.install_engine()
+        check("add-on, Windows SM 89 x CUDA 12: the add-on DLL lands next to the engine DLL, the other major's never fetched",
+              env.read("0.0.13-sm89-cu12", WADD[12]) == env.release.files[f"0.0.13/windows/sm89/{WADD[12]}"]
+              and env.read("0.0.13-sm89-cu12", WIN_DLLS[12]) is not None
+              and not any(f.endswith("/" + WADD[13]) for f in env.release.fetched), env.release.fetched)
     print("ENGINE_INSTALL:", "PASS" if bad == 0 else f"FAIL ({bad} wrong)")
     return 1 if bad else 0
 

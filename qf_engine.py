@@ -924,6 +924,7 @@ _ENGINE_PLATFORMS = {
                 "hosts": {13: "quantfunc.dll", 12: "quantfunc-12.dll"}},
 }
 _ENGINE_KERNEL_RE = re.compile(r"libquantfunc_kernels[-A-Za-z0-9_.]*\.so")   # the host's DT_NEEDED names its kernel
+_ENGINE_ADDON_RE = re.compile(r"[A-Za-z0-9][-A-Za-z0-9_.]{0,63}\.(?:so|dll)")   # a release add-on: a plain file name
 _ENGINE_VERSION_RE = re.compile(r"\d+\.\d+\.\d+")    # a release version: a URL path segment and part of a folder name
 _ENGINE_SET_RE = re.compile(r"[a-z][a-z0-9_]{0,31}")  # a GPU class from sets.json: a URL path segment, part of a name
 _ENGINE_SETS_SCHEMA = 2  # sets.json: one kernel library per GPU architecture ({"sm89": [89], ...}); 1 was consumer/server
@@ -1217,6 +1218,35 @@ def _engine_sets(version, hashes):
     return sets
 
 
+def _install_addons(pair, version, info, gpu_set, major, hashes):
+    """The release's add-ons (its version.json entry's "addons" / "addons-12": file names the engine loads from its own
+    folder) that it publishes for this GPU class in verify.json: each is fetched, checked and put next to the engine.
+    A name is a plain file name; one naming this engine's own host or kernel is that same verified file (one key, one
+    SHA-256), a no-op. Best effort: an add-on that fails is left out with one line and the engine runs without it (the engine logs
+    that)."""
+    names = info.get("addons-12" if major == 12 else "addons")
+    for name in names if isinstance(names, list) else ():
+        if not (isinstance(name, str) and _ENGINE_ADDON_RE.fullmatch(name)):
+            continue
+        key = _manifest_key(gpu_set, name)
+        want, dest, part = hashes.get(key), os.path.join(pair, name), os.path.join(pair, f".{name}.part")
+        if want is None:        # not published for this GPU class
+            continue
+        try:
+            if not os.path.islink(dest) and os.path.isfile(dest) and _sha256_of(dest) == want:
+                continue
+            if _engine_fetch_to(f"{_ENGINE_BASE_URL}/{version}/{_BIN_SUBDIR}/{key}", part, f"engine {version}: {name}") != want:
+                raise RuntimeError(f"{key} does not match its published SHA-256")
+            os.replace(part, dest)
+        except Exception as e:  # noqa: BLE001 - an add-on never blocks the engine
+            say(f"[qf_native] engine add-on {name} was not installed ({type(e).__name__}: {e})", flush=True)
+        finally:
+            try:
+                os.remove(part)
+            except OSError:
+                pass
+
+
 def _engine_write_file(path, data):
     """temp file in the SAME dir -> fsync -> atomic rename (a crash never leaves a half-written file)."""
     tmp = f"{path}.part-{os.getpid()}"
@@ -1329,6 +1359,7 @@ def _install_pair(bin_dir, device_idx):
     if have and have["version"] == version:
         if all(hashes.get(_manifest_key(gpu_set, n)) == h for n, h in have["sha256"].items()):
             _claim(bin_dir, marker, sets[gpu_set])
+            _install_addons(os.path.join(bin_dir, _pair_dir(have)), version, versions[version], gpu_set, major, hashes)
             _engine_status("installed", f"engine {version} ({gpu_set}, CUDA {major})")
             return have
         os.remove(marker)    # KNOWN mismatch: the release no longer publishes these bytes - never loaded again
@@ -1372,6 +1403,7 @@ def _install_pair(bin_dir, device_idx):
                 pass
     m = {"version": version, "set": gpu_set, "cuda": major, "sms": sets[gpu_set], "host": host, "kernel": kernel,
          "sha256": got}
+    _install_addons(pair, version, versions[version], gpu_set, major, hashes)
     _claim(bin_dir, marker, sets[gpu_set], chosen=m)       # the other markers give up its SMs, then this marker, LAST
     keep = {_pair_dir(m), have and _pair_dir(have)}
     for d in os.listdir(bin_dir):
