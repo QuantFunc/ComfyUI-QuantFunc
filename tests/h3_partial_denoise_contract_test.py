@@ -327,15 +327,18 @@ _h3_namespace["_h3_frames_from_latent_t"] = _module_function(
 
 class _Log:
     def __init__(self):
-        self.warnings = []
+        self.warnings, self.infos = [], []
 
     def warning(self, message, *args):
         self.warnings.append(message % args if args else message)
 
+    def info(self, message, *args):
+        self.infos.append(message % args if args else message)
+
 
 _HarnessBase._stage_schedule = _standalone_method(
     MIXIN_SOURCE, "QFSessionModelMixin", "_stage_schedule", _mixin_namespace)
-for _name in ("_H3_DENOISED_SIGMA", "_H3_FULL_START", "_AUDIO_ENHANCE_TWO_STAGE"):
+for _name in ("_H3_DENOISED_SIGMA", "_H3_FULL_START", "_AUDIO_ENHANCE_TWO_STAGE", "_H3_SAFE_AUTO_SYMBOL"):
     _h3_namespace[_name] = _literal_assignment(H3_SOURCE, _name)
 _h3_namespace["_log"] = _Log()
 WARNING = _h3_namespace["_AUDIO_ENHANCE_TWO_STAGE"]
@@ -382,6 +385,7 @@ def _new_model(audio_enhance=False):
     model._base_process_calls = 0
     model._qf_needs_begin = False
     _h3_namespace["_log"].warnings.clear()
+    _h3_namespace["_log"].infos.clear()
     return model, lib
 
 
@@ -526,6 +530,26 @@ class H3TwoStageContract(unittest.TestCase):
         _run_stage(model, FULL, video_shape=(1, 24, 2, 4, 6))
         begin = _events(lib, "begin")[0]
         self.assertEqual((begin["width"], begin["height"]), (6 * 7, 4 * 7))
+
+    def test_p11_auto_on_an_engine_without_the_h3_safe_auto_runs_flash_explicit_choices_pass(self):
+        # tests-32 2026-09-29: an engine without the H3-safe attention auto (an older one kept after a failed update)
+        # would pick the backend measured broken at large sizes (#659) for auto; there auto means flash, with one INFO
+        # line. A capability check (an export only such engines carry), never a version compare.
+        sym = _h3_namespace["_H3_SAFE_AUTO_SYMBOL"]
+        # the engine's export (include/quantfunc.h, engine 0.0.17): a cross-repo name, so pinned here; a typo would
+        # silently turn every new engine's H3 auto into flash
+        self.assertEqual(sym, "quantfunc_attention_auto_route")
+        for has_symbol, chosen, sent in ((False, "auto", "flash"), (True, "auto", "auto"), (False, "flash", "flash"),
+                                         (False, "sage", "sage"), (False, "native", "native"), (True, "sage", "sage")):
+            with self.subTest(has_symbol=has_symbol, chosen=chosen):
+                model, lib = _new_model()
+                if has_symbol:
+                    setattr(lib, sym, lambda: 1)
+                model.residency_opts = lambda chosen=chosen: {"sparse_cdf": 1.0, "attention_backend": chosen,
+                                                               "video_enhance": False}
+                _run_stage(model, FULL)
+                self.assertEqual([b["options"]["attention_backend"] for b in _events(lib, "begin")], [sent])
+                self.assertEqual(len(_h3_namespace["_log"].infos), int(sent != chosen))
 
     def test_p9b_in_comfy_a_none_audio_shift_is_the_video_schedule(self):
         try:

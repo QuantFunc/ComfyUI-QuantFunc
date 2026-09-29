@@ -58,6 +58,10 @@ _H3_DENOISED_SIGMA = 1e-3  # a sampler stage whose last sigma is above this stop
 _H3_FULL_START = 0.98      # a stage starting below this fraction of the model's sigma_max starts part-way
 _AUDIO_ENHANCE_TWO_STAGE = ("[qf_native] H3: audio_enhance is not supported with two-stage (double-sampling) "
                             "workflows; it is ignored for this run.")
+# The export only engines carry whose attention "auto" keeps MiniMax-H3 off the backend measured broken at large sizes
+# (#659): engine 0.0.17+. An older engine (kept after a failed update) would still pick it, so there "auto" runs flash:
+# the safe choice auto stands for. A capability check, never a version compare; explicit choices pass as they are.
+_H3_SAFE_AUTO_SYMBOL = "quantfunc_attention_auto_route"
 
 
 def _h3_nodes():
@@ -300,6 +304,10 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
             "num_frames": self._num_frames,
             "fps": float(self._fps),
         }
+        if _opts["attention_backend"] == "auto" and not hasattr(lib, _H3_SAFE_AUTO_SYMBOL):
+            _log.info("[qf_native] H3: this QuantFunc engine predates the MiniMax-H3 attention auto route; auto runs "
+                      "flash on it (update the engine to use auto)")
+            _opts["attention_backend"] = "flash"
         # [enhance switch] the product switch only; the engine computes the extra audio sub-steps from
         # num_steps and disarms itself under CFG / without an audio lane (MiniMaxH3Pipeline). Sent only
         # when ON (OFF = byte-identical to no knob; the raw extra_audio_steps key is never built here).

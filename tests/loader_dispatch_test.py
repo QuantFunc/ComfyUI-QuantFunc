@@ -540,6 +540,16 @@ def main():
     _sig = {n: _insp.signature(qfn.NODE_CLASS_MAPPINGS[n].load).parameters["attention_backend"].default for n in _FOUR}
     check("attention_backend: every loader's load() defaults to auto (an API prompt without the input runs auto)",
           set(_sig.values()) == {"auto"}, f"-> {_sig}")
+    # tests-32 2026-09-29: only MiniMax-H3 turns auto into flash on an engine without the H3-safe auto; the other families
+    # send the widget value as it is, so neither the capability constant nor its export name appears outside its module.
+    import glob as _glob
+    _h3src = open(os.path.join(_PLUGIN, "qf_h3_modelpatcher.py"), encoding="utf-8").read()
+    _capname = next((ln.split("=", 1)[1].split("#")[0].strip().strip("\"'") for ln in _h3src.splitlines()
+                     if ln.startswith("_H3_SAFE_AUTO_SYMBOL = ")), None)
+    _capref = sorted(os.path.basename(p) for p in _glob.glob(os.path.join(_PLUGIN, "*.py"))
+                     if any(t in open(p, encoding="utf-8").read() for t in ("_H3_SAFE_AUTO_SYMBOL", _capname or "\0")))
+    check("attention_backend: only the MiniMax-H3 model consults the H3-safe-auto capability (other families unchanged)",
+          bool(_capname) and _capref == ["qf_h3_modelpatcher.py"], f"-> {_capname!r} in {_capref}")
     # the ALL-IN single file: projections + BOTH modality connector blocks packed (the audio
     # one is ALSO the AV discriminant — no audio_vae staging, comfy owns audio decode).
     import struct as _st2
