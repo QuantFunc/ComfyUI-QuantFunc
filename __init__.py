@@ -1192,7 +1192,11 @@ if _IMPORT_OK:
                     "downstream of the QuantFunc Native Loader. (For a stock comfy model use the "
                     "built-in LoraLoaderModelOnly instead.)")
             # The ONE-FORMAT refusal (mirror of the engine's E1 arm) applies to every family in this release.
-            self._refuse_foreign_lora_format(_resolve_lora(lora_name))
+            try:
+                self._refuse_foreign_lora_format(_resolve_lora(lora_name))
+            except RuntimeError:
+                qfmp.warn_lora_not_loaded()
+                raise
             stack = qfmp.lora_stack_of(model)
             stack.append({"path": _resolve_lora(lora_name), "scale": float(strength),
                           "target": "all"})

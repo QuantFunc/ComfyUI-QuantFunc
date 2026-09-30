@@ -935,7 +935,13 @@ class QFLazyEngine:
         # UNKNOWN until the engine confirms: a refused update may have left the previous set OR rolled the weights
         # back to the base mid-apply, so after any failure the next run must re-send its set, never trust a mark.
         real.applied_lora_sig = None
-        real.pipeline_update({"lora": lora})
+        try:
+            real.pipeline_update({"lora": lora})
+        except RuntimeError as e:
+            # the engine names the LoRA it cannot load ("'<path>' matched 0 target modules ..."); a busy engine does not
+            if any(entry.get("path") and entry["path"] in str(e) for entry in lora):
+                warn_lora_not_loaded()
+            raise
         real.applied_lora_sig = want
         qfe.info(f"[qf_native] LoRA set applied in place (no reload): {len(lora)} LoRA(s)", flush=True)
         return True
@@ -1206,6 +1212,24 @@ _RESOURCE_DOMAINS = {}
 
 
 _log = qfe.logger(__name__)   # console-safe (#738)
+
+LORA_HELP_URL = "https://www.quantfunc.com/docs/lora-convert"
+
+
+def warn_lora_not_loaded():
+    """The ONE line a LoRA that could not be loaded for a QuantFunc model prints, whichever family and path (user
+    2026-09-30 「lora无法加载的时候让用户自己看 …」): a pointer to the page, instead of leaving the user with per-key lines."""
+    _log.warning(f"[qf_native] LoRA could not be loaded for this QuantFunc model. Please read {LORA_HELP_URL}")
+
+
+def _in_comfy_lora_load(frame):
+    """True when ComfyUI's own LoRA load (comfy.sd.load_lora_for_models, which LoraLoader, LoraLoaderModelOnly and other
+    LoRA nodes call) is `frame` or one of its callers (a method wrapper can sit between it and add_patches)."""
+    while frame is not None:
+        if frame.f_code.co_name == "load_lora_for_models" and frame.f_globals.get("__name__") == "comfy.sd":
+            return True
+        frame = frame.f_back
+    return False
 
 # Native queries never wait (quantfunc.h). The engine answers QUANTFUNC_RESOURCE_BUSY whenever another thread holds
 # the allocator's or the target's lock at that instant, which is ordinary while native work runs. MEASURED (issue
@@ -1693,6 +1717,17 @@ class QFNativeResourcePatcher(comfy.model_patcher.ModelPatcher):
 @qfe.console_safe_methods   # an exception leaving it is console-safe (#738)
 class QFModelPatcher(comfy.model_patcher.ModelPatcher):
     """Logical MODEL; canonical dependencies own native bytes, this patcher owns Torch bytes."""
+    def add_patches(self, patches, strength_patch=1.0, strength_model=1.0):
+        # ComfyUI's own LoRA load patches torch weights, which a QuantFunc model never computes with, so such a LoRA
+        # never reaches it; ComfyUI prints its per-key lines, and this says what to do, once per load.
+        frame = inspect.currentframe()
+        try:
+            if _in_comfy_lora_load(frame.f_back):
+                warn_lora_not_loaded()
+        finally:
+            del frame
+        return super().add_patches(patches, strength_patch, strength_model)
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.add_wrapper_with_key(comfy.patcher_extension.WrappersMP.OUTER_SAMPLE,

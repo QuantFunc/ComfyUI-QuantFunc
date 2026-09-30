@@ -836,6 +836,39 @@ def main():
         _on, _pm_on[_fam] = _pm_cfg(_node, _xfm, _preset, pinned_memory=True)
         _pm_rows[_fam] = (_dflt, _on, _pm_cfg(_node, _xfm, _preset, pinned_memory=False)[0])
     _PM_ON, _PM_OFF = {"denoise_only": True, "use_pinned_memory": True}, {"denoise_only": True}
+    # (C2) a LoRA that cannot be loaded (user 2026-09-30 「lora无法加载的时候让用户自己看 …/docs/lora-convert」): ComfyUI's own
+    #      LoRA load (comfy.sd.load_lora_for_models, which LoraLoader / LoraLoaderModelOnly and other LoRA nodes call)
+    #      patches torch weights, which a QuantFunc model never computes with. On every family it prints ONE warning that
+    #      points at the page, next to ComfyUI's own per-key lines. A patch that is not a LoRA load prints none.
+    import logging as _lg
+    _LORA_URL = "https://www.quantfunc.com/docs/lora-convert"
+
+    class _LoraHint(_lg.Handler):
+        def __enter__(self):
+            self.msgs = []
+            qfn.qfmp._log.addHandler(self)
+            return self.msgs
+
+        def __exit__(self, *_exc):
+            qfn.qfmp._log.removeHandler(self)
+
+        def emit(self, record):
+            if _LORA_URL in record.getMessage():
+                self.msgs.append(record.getMessage())
+    import comfy.sd as _csd
+    _fake_lora = {"diffusion_model.blocks.0.attn.to_q.lora_A.weight": _torch.zeros(4, 8),
+                  "diffusion_model.blocks.0.attn.to_q.lora_B.weight": _torch.zeros(8, 4)}
+    _hint = {}
+    for _fam, (_node, _xfm, _preset) in _pm_loads.items():
+        _mp = _node.load(_xfm, _preset)[0]
+        with _LoraHint() as _got:
+            _csd.load_lora_for_models(_mp, None, dict(_fake_lora), 1.0, 0.0)
+            _lora_n = len(_got)
+            _mp.clone().add_patches({})   # not a LoRA load
+        _hint[_fam] = (_lora_n, len(_got), _got[:1])
+    check("LoRA hint: ComfyUI's own LoRA load on every family (LTX-2.5, MiniMax-H3, Krea-2, Qwen-Image-2.1) prints "
+          "exactly ONE warning pointing at the LoRA page; a patch that is not a LoRA load prints none",
+          len(_hint) == 4 and all(n == 1 and total == 1 for n, total, _m in _hint.values()), f"-> {_hint}")
     # (D) Windows without Developer Mode, the model on another drive or share (hotfix 2026-09-29, the user's 5060 Ti on an
     #     SMB share): a symlink is refused (WinError 1314) and a hardlink cannot cross volumes (EXDEV / WinError 17).
     #     Krea-2 and Qwen-Image-2.1 never link: the create names the picked file as its transformer_path, the package
@@ -1208,6 +1241,18 @@ def main():
               and outAB.model._qf.lora_set() == stAB and _qmp2.lora_stack_of(base) == []
               and base.model._qf.lora_set() == [],
               f"-> wire={stAB} loader_stack={_qmp2.lora_stack_of(base)}")
+        # the one-format refusal of this node still raises, and prints the same ONE LoRA-page warning
+        _kh = json.dumps({"lora_unet_blocks_0_attn_to_q.lora_down.weight":
+                          {"dtype": "F16", "shape": [1, 1], "data_offsets": [0, 2]}}).encode()
+        open(os.path.join(lora_dir, "k.safetensors"), "wb").write(_lst.pack("<Q", len(_kh)) + _kh + b"\0\0")
+        _k_err = ""
+        with _LoraHint() as _k_got:
+            try:
+                LoraNode.apply(base, "k.safetensors", 1.0)
+            except RuntimeError as _e:
+                _k_err = str(_e)
+        check("LoRA hint: the native LoRA node refuses a file it cannot load (raises as before) and prints ONE "
+              "LoRA-page warning", "kohya" in _k_err and len(_k_got) == 1, f"-> {_k_err[:80]!r} {_k_got}")
         # identity-gated retire: a FOREIGN live consumer on the same ckey must SKIP the destroy.
         class _W:                       # two distinct wrapper identities
             pass
@@ -1364,10 +1409,12 @@ def main():
         # set that was applied before the failure (A applied -> a refused B -> A again must send A).
         _rt_status[0] = 7
         _refused = ""
-        try:
-            _ = rt_a.model._qf.lib
-        except RuntimeError as _e:
-            _refused = str(_e)
+        with _LoraHint() as _rt_got:
+            try:
+                _ = rt_a.model._qf.lib
+            except RuntimeError as _e:
+                _refused = str(_e)
+        _busy_hint = list(_rt_got)   # a busy engine is not a LoRA it cannot load: no LoRA-page hint
         _rt_real = rt_a.model._qf._real
         _unknown = _rt_real.applied_lora_sig
         _rt_status[0] = 0
@@ -1388,6 +1435,25 @@ def main():
               and _rt_updates[-1] == {"lora": [_pa]},
               f"-> refused={_refused!r} unknown={_unknown!r} retried={_retried} "
               f"resent={_rt_updates[_n_before:]}")
+        # The engine refusing a LoRA it cannot load names that file (runtime swap: "'<path>' matched 0 target
+        # modules ..."): the refusal still raises the engine's message, and prints ONE LoRA-page warning.
+        _busy_err = _ContractEngine.quantfunc_last_error
+        _ContractEngine.quantfunc_last_error = staticmethod(
+            lambda: f"runtime LoRA swap: '{_pb1['path']}' matched 0 target modules of this transformer".encode())
+        _rt_status[0] = 7
+        _named = ""
+        with _LoraHint() as _named_got:
+            try:
+                _ = rt_b.model._qf.lib
+            except RuntimeError as _e:
+                _named = str(_e)
+        _ContractEngine.quantfunc_last_error = _busy_err
+        _rt_status[0] = 0
+        _ = rt_a.model._qf.lib                      # A back on: the blocks below start from the same state
+        check("LoRA hint: the engine refusing a LoRA it cannot load still raises its message and prints ONE "
+              "LoRA-page warning; a busy refusal prints none",
+              "matched 0 target modules" in _named and len(_named_got) == 1 and _busy_hint == [],
+              f"-> {_named[:90]!r} {_named_got} busy={_busy_hint}")
         # Mid-generation: a set change while a session is still open refuses LOUD; the SAME set passes
         # without touching the engine (both ways).
         _rt_real.current_session = object()           # the fixture's end_session_if_open never closes it
