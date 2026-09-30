@@ -1466,7 +1466,8 @@ def main():
         _ = rt_a.model._qf.lib                      # A back on: the blocks below start from the same state
         check("LoRA hint: the engine refusing a LoRA it cannot load still raises its message and prints ONE "
               "LoRA-page warning; a busy refusal prints none",
-              "matched 0 target modules" in _named and len(_named_got) == 1 and _busy_hint == [],
+              "matched 0 target modules" in _named and len(_named_got) == 1 and _busy_hint == []
+              and "format" in _named_got[0] and "Load LoRA" not in _named_got[0],   # not the stock-loader sentence
               f"-> {_named[:90]!r} {_named_got} busy={_busy_hint}")
         # Mid-generation: a set change while a session is still open refuses LOUD; the SAME set passes
         # without touching the engine (both ways).
