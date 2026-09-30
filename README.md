@@ -299,9 +299,9 @@ twice. A different transformer file or `pinned_memory` setting loads a second co
 | `QuantFunc-Krea2-t2i-double-sampling.json` | Krea-2 text-to-image in two passes: a fast loader at 1024x1024, then 1.5x latent upscale and a quality loader at 1536x1536 (one shared model) |
 | `QuantFunc-LTX25-t2v.json` | LTX-2.5 text-to-video with audio, the official two-stage pipeline (half size, then 2x latent upsampler and refine) |
 | `QuantFunc-MiniMaxH3-fl2va.json` | MiniMax-H3 first/last frame to video with audio |
-| `QuantFunc-MiniMaxH3-fl2va-double-sampling.json` | the same in two stages: 960x544, then the stage 1 latent upscaled 2x (QuantFunc MiniMax-H3 Latent Upscale, no decode / encode) and refined at 1920x1088 |
+| `QuantFunc-MiniMaxH3-fl2va-double-sampling.json` | the same in two stages on one sampling schedule: the first steps at 960x544, then the latent upscaled 2x (QuantFunc MiniMax-H3 Latent Upscale, no decode / encode) and the remaining steps at 1920x1088 |
 | `QuantFunc-MiniMaxH3-ref2va.json` | MiniMax-H3 reference images to video with audio |
-| `QuantFunc-MiniMaxH3-ref2va-double-sampling.json` | the same in two stages: 960x544, then the stage 1 latent upscaled 2x (QuantFunc MiniMax-H3 Latent Upscale, no decode / encode) and refined at 1920x1088 |
+| `QuantFunc-MiniMaxH3-ref2va-double-sampling.json` | the same in two stages on one sampling schedule: the first steps at 960x544, then the latent upscaled 2x (QuantFunc MiniMax-H3 Latent Upscale, no decode / encode) and the remaining steps at 1920x1088 |
 
 ### 3.4 VRAM
 
