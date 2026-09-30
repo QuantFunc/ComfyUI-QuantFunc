@@ -450,9 +450,9 @@ def main():
           and _qa.residency_opts().get("attention_backend") == "auto" and _qa.dial_opts().get("attention_backend") == "auto",
           f"-> unset={_sess[False].get('attention_backend')!r} flash={_qa_flash!r} back={_qa.residency_opts().get('attention_backend')!r}")
     # the add-on attention choice (user 2026-09-29) needs an engine that carries it (0.0.17+, one export marks it): an older
-    # engine does not run it as chosen (0.0.16: Qwen-Image-2.1 native, MiniMax-H3 dense sage), so the LOADER refuses it
-    # loudly there, before any model loads; every other choice, and that one on an engine that has it, is passed on, and
-    # the session then sends whatever the loader set (dial_opts does not second-guess it).
+    # engine does not run it as chosen (0.0.16: Qwen-Image-2.1 native, MiniMax-H3 dense sage), so set_attn_backend - the one
+    # setter every loader calls on the model it builds - refuses it loudly there, before any model loads; every other
+    # choice, and that one on an engine that has it, is set and then sent as is (dial_opts does not second-guess it).
     _sym = getattr(_qmp_q, "_ATTN_ROUTE_SYMBOL", None)
 
     class _FakeLib:
@@ -464,23 +464,25 @@ def main():
             if _has and _sym:
                 setattr(_fake, _sym, lambda: 1)
             _qmp_q.qfe.load_lib = lambda _f=_fake: _f
-            for _b in ("qfa", "auto", "flash", "fp16_native"):
+            for _b in ("qfa", "auto", "flash"):   # the setter itself, fed as a loader feeds it (a loader that skips the
+                _qa.set_attn_backend("auto")        # widget mapping still meets the refusal)
                 try:
-                    _gate[(_has, _b)] = qfn._attn_backend_to_engine(_b)
+                    _qa.set_attn_backend(_b)
+                    _gate[(_has, _b)] = _qa.dial_opts()["attention_backend"]
                 except RuntimeError as _e:
                     _gate[(_has, _b)] = "refused: " + str(_e)
-        _qa.set_attn_backend("qfa")
-        _sent = _qa.dial_opts()["attention_backend"]   # load_lib still the last (symbol-carrying) fake: never consulted
     finally:
         _qmp_q.qfe.load_lib = _ld0
         _qa.set_attn_backend("auto")
     _old = _gate[(False, "qfa")]
-    check("attention_backend: the loader refuses the add-on attention choice on an engine without it, naming the way out "
-          "(auto, or an engine update); on an engine with it, and every other choice on any engine, it is passed on",
+    check("attention_backend: every loader's setter refuses the add-on attention choice on an engine without it, naming "
+          "the way out (auto, or an engine update); on an engine with it, and every other choice on any engine, the "
+          "choice is set and sent as is",
           _sym == "quantfunc_attention_auto_route" and _old.startswith("refused: ") and "auto" in _old and "update" in _old
-          and _gate[(True, "qfa")] == "qfa" and _sent == "qfa"
-          and all(_gate[(h, "auto")] == "auto" and _gate[(h, "flash")] == "flash" and _gate[(h, "fp16_native")] == "native"
-                  for h in (False, True)), f"-> {_sym!r} {_gate} sent={_sent!r}")
+          and _gate[(True, "qfa")] == "qfa"
+          and all(_gate[(h, "auto")] == "auto" and _gate[(h, "flash")] == "flash" for h in (False, True))
+          and qfn._attn_backend_to_engine("fp16_native") == "native" and qfn._attn_backend_to_engine("qfa") == "qfa",
+          f"-> {_sym!r} {_gate}")
     try:
         _QProbe().residency_opts()
         _unset = "sent"

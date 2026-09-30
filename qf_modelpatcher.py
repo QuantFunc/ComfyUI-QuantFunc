@@ -316,7 +316,13 @@ class QFSessionModelMixin:
     def set_attn_backend(self, v):
         # [runtime dial 2026-08-29] session knob — rides residency_opts() into EVERY
         # denoise_begin; the engine swaps the per-forward dispatch string (no rebuild).
-        self._attn_backend = str(v or "auto")
+        # Every loader calls this on the model it builds, so the add-on attention choice is refused here on an engine
+        # without it: at the loader, before any model loads (an older engine does not run it as chosen).
+        v = str(v or "auto")
+        if v == "qfa" and not engine_routes_attention():
+            raise RuntimeError(f"QuantFunc: attention_backend '{v}' needs a newer QuantFunc engine; the installed one does "
+                               "not have it. Pick auto, or update the QuantFunc engine.")
+        self._attn_backend = v
 
     def set_sol_tau(self, v):
         # [sol-tau dial 2026-08-31] the ONE user-facing attention dial (user "就一个
@@ -1069,7 +1075,8 @@ def stage_config_package(bundle_dir, transformer1_path, extra_links=None):
 # keep the link.
 _WEIGHT_PATHS_SYMBOL = "quantfunc_weight_paths"
 # The export engines carry (0.0.17+) when they route attention per GPU and load the add-on attention library; the
-# loaders' add-on choice needs it (engine_routes_attention). MiniMax-H3 reads the same export for its auto.
+# loaders' add-on choice needs it (set_attn_backend -> engine_routes_attention). MiniMax-H3 reads the same export for
+# its auto.
 _ATTN_ROUTE_SYMBOL = "quantfunc_attention_auto_route"
 
 

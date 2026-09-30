@@ -906,7 +906,7 @@ if _IMPORT_OK:
 
     # [attention backend selector, user 2026-08-27] one user-facing dropdown per loader.
     # SM-GATED: the add-on attention (user 2026-09-29) is offered on the SMs its library ships for (SM75/86/89/120, the
-    # engine's AUTO table); the loader refuses that choice on an engine without it (_attn_backend_to_engine). SM75 has NO
+    # engine's AUTO table); the loader refuses that choice on an engine without it (set_attn_backend). SM75 has NO
     # sage backend and NO flash_attn build, so it offers auto, the add-on and fp16_native. The widget VALUE is a
     # display name; _attn_backend_to_engine maps it to the engine's comp_opts string
     # ("fp16_native" -> "native"). "auto" = the engine's per-GPU resolution, the default on every loader and GPU
@@ -941,11 +941,7 @@ if _IMPORT_OK:
                            "looks wrong or a run fails on your GPU. Takes effect on the next run."})
 
     def _attn_backend_to_engine(v):
-        # widget display name -> engine comp_opts attention_backend string. The add-on choice needs an engine that carries
-        # it; an older one does not run it as chosen, so it is refused here, at the loader, before any model loads.
-        if v == "qfa" and not qfmp.engine_routes_attention():
-            raise RuntimeError(f"QuantFunc: attention_backend '{v}' needs a newer QuantFunc engine; the installed one does "
-                               "not have it. Pick auto, or update the QuantFunc engine.")
+        # widget display name -> engine comp_opts attention_backend string
         return "native" if v == "fp16_native" else (v or "auto")
 
     # _LOADER_LAYOUT (user 2026-09-28 「要输入的都在上方 开关的统一在下方 所有控件都这样」): on every loader the value inputs come
