@@ -836,12 +836,12 @@ def main():
         _on, _pm_on[_fam] = _pm_cfg(_node, _xfm, _preset, pinned_memory=True)
         _pm_rows[_fam] = (_dflt, _on, _pm_cfg(_node, _xfm, _preset, pinned_memory=False)[0])
     _PM_ON, _PM_OFF = {"denoise_only": True, "use_pinned_memory": True}, {"denoise_only": True}
-    # (C2) a LoRA that cannot be loaded (user 2026-09-30 「lora无法加载的时候让用户自己看 …/docs/lora-convert」): ComfyUI's own
+    # (C2) a LoRA that cannot be loaded (user 2026-09-30 「lora无法加载的时候让用户自己看 …」, page 「…换成https://www.quantfunc.com/docs/lora」): ComfyUI's own
     #      LoRA load (comfy.sd.load_lora_for_models, which LoraLoader / LoraLoaderModelOnly and other LoRA nodes call)
     #      patches torch weights, which a QuantFunc model never computes with. On every family it prints ONE warning that
     #      points at the page, next to ComfyUI's own per-key lines. A patch that is not a LoRA load prints none.
     import logging as _lg
-    _LORA_URL = "https://www.quantfunc.com/docs/lora-convert"
+    _LORA_URL = "https://www.quantfunc.com/docs/lora"
 
     class _LoraHint(_lg.Handler):
         def __enter__(self):
@@ -870,9 +870,10 @@ def main():
         _hint[_fam] = (_zero_n, _lora_n, len(_got), _got[:1])
     _NATIVE_LORA = qfn.NODE_DISPLAY_NAME_MAPPINGS["QuantFuncNativeLoRA"]
     check("LoRA hint: ComfyUI's own LoRA load on every family (LTX-2.5, MiniMax-H3, Krea-2, Qwen-Image-2.1) prints "
-          "exactly ONE warning pointing at the LoRA page that names the QuantFunc LoRA node to use instead of ComfyUI's "
+          "exactly ONE warning ending with the LoRA page (the whole URL) that names the QuantFunc LoRA node to use instead of ComfyUI's "
           "Load LoRA; a load at model strength 0 (CLIP only) and a patch that is not a LoRA load print none",
           len(_hint) == 4 and all(z == 0 and n == 1 and total == 1 and _NATIVE_LORA in m[0] and "Load LoRA" in m[0]
+                                  and m[0].endswith(" " + _LORA_URL)
                                   for z, n, total, m in _hint.values()), f"-> {_hint}")
     # (D) Windows without Developer Mode, the model on another drive or share (hotfix 2026-09-29, the user's 5060 Ti on an
     #     SMB share): a symlink is refused (WinError 1314) and a hardlink cannot cross volumes (EXDEV / WinError 17).

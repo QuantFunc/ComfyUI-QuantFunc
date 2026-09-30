@@ -1214,7 +1214,7 @@ _RESOURCE_DOMAINS = {}
 
 _log = qfe.logger(__name__)   # console-safe (#738)
 
-LORA_HELP_URL = "https://www.quantfunc.com/docs/lora-convert"
+LORA_HELP_URL = "https://www.quantfunc.com/docs/lora"
 NATIVE_LORA_NODE = "QuantFunc Native LoRA"   # QuantFuncNativeLoRA's display name (NODE_DISPLAY_NAME_MAPPINGS uses this)
 
 
