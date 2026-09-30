@@ -415,12 +415,18 @@ class QFSessionModelMixin:
           auto rendered byte-for-byte as the flash run before it). "auto" is every family's create-time default.
         - video_enhance: ALWAYS sent, both states (the quality_enhance switch; what OFF does per model family is engine
           law). Every loader sets it on the model it builds, so a model without one is a wiring error: refused here,
-          never a silent default. `quality` is never sent."""
+          never a silent default. `quality` is never sent.
+        - the add-on attention choice is refused on an engine without the _ATTN_ROUTE_SYMBOL export: such an engine runs
+          a different backend for it without an error (0.0.16: Qwen-Image-2.1 native, MiniMax-H3 dense sage)."""
         on = getattr(self, "_video_enhance", None)
         if on is None:
             raise RuntimeError("QuantFunc: this model has no quality_enhance setting (the loader sets one on every model it "
                                "builds; set_video_enhance was never called)")
-        return {"attention_backend": str(getattr(self, "_attn_backend", "auto") or "auto"), "video_enhance": on}
+        backend = str(getattr(self, "_attn_backend", "auto") or "auto")
+        if backend == "qfa" and not hasattr(qfe.load_lib(), _ATTN_ROUTE_SYMBOL):
+            raise RuntimeError(f"QuantFunc: attention_backend '{backend}' needs QuantFunc engine 0.0.17 or newer; this engine "
+                               "would run a different attention instead. Pick auto, or update the QuantFunc engine.")
+        return {"attention_backend": backend, "video_enhance": on}
 
     # ── comfy's per-model VRAM interface (2026-09-19, user: 「与 comfyui 打通,让它知道我们需要多少显存、当前占了多少」) ──
     # comfy asks a model TWO numbers and does the rest itself: `memory_required(shape)` — how much MORE VRAM one
@@ -1068,6 +1074,9 @@ def stage_config_package(bundle_dir, transformer1_path, extra_links=None):
 # connectors only from the package and MiniMax-H3 its folded checkpoint's fold count only beside the weights, so those two
 # keep the link.
 _WEIGHT_PATHS_SYMBOL = "quantfunc_weight_paths"
+# The export engines carry (0.0.17+) when they route attention per GPU and load the add-on attention library; the
+# explicit add-on choice needs it (dial_opts). MiniMax-H3 reads the same export for its auto (qf_h3_modelpatcher).
+_ATTN_ROUTE_SYMBOL = "quantfunc_attention_auto_route"
 
 
 def engine_reads_weight_paths():

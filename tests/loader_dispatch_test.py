@@ -449,6 +449,35 @@ def main():
           _sess[False].get("attention_backend") == "auto" and _qa_flash == "flash"
           and _qa.residency_opts().get("attention_backend") == "auto" and _qa.dial_opts().get("attention_backend") == "auto",
           f"-> unset={_sess[False].get('attention_backend')!r} flash={_qa_flash!r} back={_qa.residency_opts().get('attention_backend')!r}")
+    # the add-on attention choice (user 2026-09-29) needs an engine that carries it (0.0.17+, one export marks it): an older
+    # engine runs another backend for it without an error (0.0.16: Qwen-Image-2.1 native, MiniMax-H3 dense sage), so the
+    # begin refuses it loudly there; every other choice, and that one on an engine that has it, is sent as chosen.
+    _sym = getattr(_qmp_q, "_ATTN_ROUTE_SYMBOL", None)
+
+    class _FakeLib:
+        pass
+    _ld0, _gate = _qmp_q.qfe.load_lib, {}
+    try:
+        for _has in (False, True):
+            _fake = _FakeLib()
+            if _has and _sym:
+                setattr(_fake, _sym, lambda: 1)
+            _qmp_q.qfe.load_lib = lambda _f=_fake: _f
+            for _b in ("qfa", "auto", "flash"):
+                _qa.set_attn_backend(_b)
+                try:
+                    _gate[(_has, _b)] = _qa.dial_opts()["attention_backend"]
+                except RuntimeError as _e:
+                    _gate[(_has, _b)] = "refused: " + str(_e)
+    finally:
+        _qmp_q.qfe.load_lib = _ld0
+        _qa.set_attn_backend("auto")
+    _old = _gate[(False, "qfa")]
+    check("session: the add-on attention choice on an engine without it is refused loudly, naming the way out (auto, or an "
+          "engine update); on an engine with it, and every other choice on any engine, the choice is sent as is",
+          _sym == "quantfunc_attention_auto_route" and _old.startswith("refused: ") and "auto" in _old and "update" in _old
+          and _gate[(True, "qfa")] == "qfa" and all(_gate[(h, b)] == b for h in (False, True) for b in ("auto", "flash")),
+          f"-> {_sym!r} {_gate}")
     try:
         _QProbe().residency_opts()
         _unset = "sent"
@@ -516,16 +545,17 @@ def main():
                                      and t.startswith("ON (default for LTX-2.5" if w.split(".")[0] in _PM_DEFAULT_ON
                                                       else "OFF (default)") for w, t in _pm_tips.items()),
           f"-> {_pm_tips}")
-    # The 2026-09-13 technique-word rule still applies to prose and every other backend label. User 2026-09-29
-    # explicitly restored qfa as a user-facing attention_backend choice, so that ONE exact option is the exception.
+    # The 2026-09-13 technique-word rule still applies to prose and every other backend label. User 2026-09-29 explicitly
+    # restored one backend (the add-on attention) as a user-facing choice, so that ONE exact option value is the exception
+    # (tests/shipped_terms_test.py allows it only as that literal).
     import _banned_terms as _bt
-    _backend_labels = qfn._ATTN_BACKEND_SM80PLUS + qfn._ATTN_BACKEND_QFA + qfn._ATTN_BACKEND_SM75
-    check("attention_backend choices expose qfa but no other removed/banned backend",
+    _backend_labels = qfn._ATTN_BACKEND_SM80PLUS + qfn._ATTN_BACKEND_ADDON + qfn._ATTN_BACKEND_SM75
+    check("attention_backend choices expose the add-on attention but no other removed/banned backend",
           not any(_bt.h(c) in _bt.WORDS for c in _backend_labels if c != "qfa"),
           f"-> sm80+={qfn._ATTN_BACKEND_SM80PLUS} sm75={qfn._ATTN_BACKEND_SM75}")
     # attention_backend defaults (user 2026-09-29): auto on every loader and every GPU (the engine resolves auto per GPU).
-    # Explicit qfa is user-selectable on every QFA shipping tier (SM75/86/89/120), but is not offered on unsupported
-    # SM80/90/100/103. Only the offered list and the default move: a saved value stays as saved.
+    # The add-on attention is user-selectable on the SMs its library ships for (SM75/86/89/120, the engine's AUTO table),
+    # and not offered on SM80/90/100/103. Only the offered list and the default move: a saved value stays as saved.
     import inspect as _insp
     import torch as _torch
     _dev0, _cap0 = qfn.qfmp.comfy.model_management.get_torch_device, _torch.cuda.get_device_capability
@@ -547,24 +577,27 @@ def main():
         (10, 3): ["auto", "flash", "sage", "fp16_native"],
         (12, 0): ["auto", "qfa", "flash", "sage", "fp16_native"],
     }
-    check("attention_backend: every loader offers explicit qfa exactly on SM75/86/89/120 and defaults to auto",
+    check("attention_backend: every loader offers the add-on attention exactly on SM75/86/89/120 and defaults to auto",
           all(c[0] == _expected_attn[sm] and c[1]["default"] == "auto"
               for sm, per in _attn.items() for c in per.values()), f"-> {_attn}")
-    check("attention_backend: explicit qfa passes through unchanged to the engine",
+    check("attention_backend: the add-on attention choice passes through unchanged to the engine",
           qfn._attn_backend_to_engine("qfa") == "qfa")
     _sig = {n: _insp.signature(qfn.NODE_CLASS_MAPPINGS[n].load).parameters["attention_backend"].default for n in _FOUR}
     check("attention_backend: every loader's load() defaults to auto (an API prompt without the input runs auto)",
           set(_sig.values()) == {"auto"}, f"-> {_sig}")
-    # tests-32 2026-09-29: only MiniMax-H3 turns auto into flash on an engine without the H3-safe auto; the other families
-    # send the widget value as it is, so neither the capability constant nor its export name appears outside its module.
+    # tests-32 2026-09-29: only MiniMax-H3 turns auto into flash on an engine without the H3-safe auto. The one other reader
+    # of that export is the shared begin dials (dial_opts), which refuse the add-on attention choice on such an engine; the
+    # two modules name the same export (a cross-repo name: a typo on either side silently mis-routes every engine).
     import glob as _glob
     _h3src = open(os.path.join(_PLUGIN, "qf_h3_modelpatcher.py"), encoding="utf-8").read()
     _capname = next((ln.split("=", 1)[1].split("#")[0].strip().strip("\"'") for ln in _h3src.splitlines()
                      if ln.startswith("_H3_SAFE_AUTO_SYMBOL = ")), None)
     _capref = sorted(os.path.basename(p) for p in _glob.glob(os.path.join(_PLUGIN, "*.py"))
                      if any(t in open(p, encoding="utf-8").read() for t in ("_H3_SAFE_AUTO_SYMBOL", _capname or "\0")))
-    check("attention_backend: only the MiniMax-H3 model consults the H3-safe-auto capability (other families unchanged)",
-          bool(_capname) and _capref == ["qf_h3_modelpatcher.py"], f"-> {_capname!r} in {_capref}")
+    check("attention_backend: the auto-route export is read only by MiniMax-H3's auto and the shared begin dials, under "
+          "one name",
+          bool(_capname) and _capref == ["qf_h3_modelpatcher.py", "qf_modelpatcher.py"]
+          and getattr(_qmp_q, "_ATTN_ROUTE_SYMBOL", None) == _capname, f"-> {_capname!r} in {_capref}")
     # the ALL-IN single file: projections + BOTH modality connector blocks packed (the audio
     # one is ALSO the AV discriminant — no audio_vae staging, comfy owns audio decode).
     import struct as _st2

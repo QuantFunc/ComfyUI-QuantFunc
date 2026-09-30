@@ -905,9 +905,9 @@ if _IMPORT_OK:
         "explains the fix.")
 
     # [attention backend selector, user 2026-08-27] one user-facing dropdown per loader.
-    # SM-GATED: explicit qfa is offered on every QFA shipping tier (SM75/86/89/120).
-    # SM75 (Turing) has NO sage backend and NO flash_attn build, so it offers only
-    # auto/qfa/fp16_native. Other unsupported SMs keep the non-QFA set. The widget VALUE is a
+    # SM-GATED: the add-on attention (user 2026-09-29) is offered on the SMs its library ships for (SM75/86/89/120, the
+    # engine's AUTO table); an engine without it refuses that choice at the next run (dial_opts). SM75 (Turing) has NO
+    # sage backend and NO flash_attn build, so it offers auto, the add-on and fp16_native. The widget VALUE is a
     # display name; _attn_backend_to_engine maps it to the engine's comp_opts string
     # ("fp16_native" -> "native"). "auto" = the engine's per-GPU resolution, the default on every loader and GPU
     # (user 2026-09-29), and is passed through so the user's choice is always the single source of truth.
@@ -915,9 +915,9 @@ if _IMPORT_OK:
     # no longer offered in the dropdown. "auto" is unaffected (the engine may still pick it
     # internally per-SM); only the explicit user choice is gone.
     _ATTN_BACKEND_SM80PLUS = ["auto", "flash", "sage", "fp16_native"]
-    _ATTN_BACKEND_QFA = ["auto", "qfa", "flash", "sage", "fp16_native"]
+    _ATTN_BACKEND_ADDON = ["auto", "qfa", "flash", "sage", "fp16_native"]
     _ATTN_BACKEND_SM75 = ["auto", "qfa", "fp16_native"]
-    _QFA_SMS = {75, 86, 89, 120}
+    _ATTN_ADDON_SMS = {75, 86, 89, 120}
 
     def _attn_backend_choices():
         choices = _ATTN_BACKEND_SM80PLUS
@@ -927,18 +927,18 @@ if _IMPORT_OK:
             if getattr(dev, "type", None) == "cuda":
                 maj, _min = torch.cuda.get_device_capability(dev)
                 sm = maj * 10 + _min
-                if sm == 75:  # SM75 Turing: qfa ships here, but sage/flash do not
+                if sm == 75:  # SM75 Turing: the add-on ships here, sage/flash do not
                     choices = _ATTN_BACKEND_SM75
-                elif sm in _QFA_SMS:
-                    choices = _ATTN_BACKEND_QFA
+                elif sm in _ATTN_ADDON_SMS:
+                    choices = _ATTN_BACKEND_ADDON
         except Exception:  # noqa: BLE001 - no torch/CUDA at import -> assume modern; engine validates
             pass
         return choices
 
     def _attn_backend_input():
         return (_attn_backend_choices(), {"default": "auto",
-                "tooltip": "auto (default) picks the best setting for your GPU. A manually selected setting requires "
-                           "matching engine support and reports an error if unavailable. Takes effect on the next run."})
+                "tooltip": "auto (default) picks the best setting for your GPU. Try another setting only if a result "
+                           "looks wrong or a run fails on your GPU. Takes effect on the next run."})
 
     def _attn_backend_to_engine(v):
         # widget display name -> engine comp_opts attention_backend string
