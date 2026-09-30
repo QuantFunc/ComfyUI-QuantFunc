@@ -1340,6 +1340,19 @@ def main():
                            and sum(ADD[13] in s for s in said) == 1, said)
     check("add-on: one that does not match its SHA-256, or cannot be fetched, is not put in place; the engine installs "
           "anyway and one line names it", all(v[0] for v in failed.values()), failed)
+    # a copy already in place that no longer verifies (changed after install, or republished) and whose refresh fails is
+    # removed, not left behind: the engine loads any file with the add-on's name from its folder (CR 2026-09-30 V2)
+    rel = with_addons(per_arch_release())
+    with Env(rel, sm=89) as env:
+        qfe.install_engine()
+        was_good = env.read("0.0.14-sm89-cu13", ADD[13]) == rel.files[f"0.0.14/linux/sm89/{ADD[13]}"]
+        with open(env.path("0.0.14-sm89-cu13", ADD[13]), "wb") as f:
+            f.write(b"STALE-OR-TAMPERED")
+        rel.files[f"0.0.14/linux/sm89/{ADD[13]}"] = b"other bytes"   # its refresh does not verify either
+        m, said = quiet_install(env)
+        check("add-on: a copy in place that no longer verifies, whose refresh fails too, is removed; the engine stays "
+              "installed and one line names it", was_good and env.read("0.0.14-sm89-cu13", ADD[13]) is None
+              and m["version"] == "0.0.14" and not env.leftovers() and sum(ADD[13] in x for x in said) == 1, said)
     rel = with_addons(per_arch_release())
     evil = ["../escape.so", "sub/x.so", ".hidden.so", HOSTS[13], KERNELS[13], ".engine-sm89-cu13.json"]
     for name in evil:

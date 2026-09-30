@@ -7,11 +7,11 @@ vocabularies under bin/tokenizers/ (a model's word list, not the plugin's wordin
 Each file is checked whole (a phrase broken across two lines still counts) and line by line (for the location).
 Run:  python tests/shipped_terms_test.py   (the matcher's own both-ways check runs first)
 """
+import io
 import os
-import hashlib
-import re
 import subprocess
 import sys
+import tokenize
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _PLUGIN = os.path.dirname(_HERE)
@@ -20,36 +20,45 @@ from _banned_terms import h, selftest, term_hits  # noqa: E402
 
 _VENDORED = ("bin/tokenizers/",)
 # User 2026-09-29 explicitly restored one formerly-hidden backend as a dropdown label. The exception is that exact option
-# VALUE only - a lowercase "<word>" string literal - in the files that offer, gate and test it: a comment, a tooltip, a
-# message, an identifier or any other file stays under the rule. The word is stored as a digest, like every banned term.
+# VALUE only - a whole string constant "<word>", lowercase, nothing else in it - in the two files that offer and test it:
+# a comment, a docstring, a tooltip or message, an identifier or any other file stays under the rule. The word is stored
+# as a digest, like every banned term.
 _EXPLICIT_BACKEND_HASH = "6a14c3ef2763b29b1d98a553f1b21c4243079103a93b4869be6d199940526a0f"
-_EXPLICIT_BACKEND_FILES = {"__init__.py", "qf_modelpatcher.py", "tests/loader_dispatch_test.py"}
-_LITERAL = re.compile(r'"([a-z0-9]+)"')
+_EXPLICIT_BACKEND_FILES = {"__init__.py", "tests/loader_dispatch_test.py"}
 
 
-def _allowed_line(rel, line, term, allowed=_EXPLICIT_BACKEND_HASH, files=_EXPLICIT_BACKEND_FILES):
-    """True when every `term` on `line` is the option value itself (see _EXPLICIT_BACKEND_FILES)."""
-    if rel not in files or h(term) != allowed:
-        return False
-    rest = _LITERAL.sub(lambda m: " " if h(m.group(1)) == allowed else m.group(0), line)
-    return not any(h(t) == allowed for t in re.findall(r"[a-z0-9]+", rest.lower()))
+def _blank_option_value(text, allowed=_EXPLICIT_BACKEND_HASH):
+    """Python source `text` with each string constant that IS the option value blanked out (Python's own tokenizer
+    decides what a whole string constant is). Source that does not tokenize is returned unchanged, so it is scanned whole."""
+    lines = text.splitlines(keepends=True)
+    try:
+        toks = list(tokenize.generate_tokens(io.StringIO(text).readline))
+    except (tokenize.TokenError, SyntaxError):
+        return text
+    for t in toks:
+        s = t.string
+        if (t.type == tokenize.STRING and t.start[0] == t.end[0] and len(s) > 2 and s[0] == s[-1] == '"'
+                and s[1] != '"' and s[1:-1] == s[1:-1].lower() and h(s[1:-1]) == allowed):
+            (row, c0), c1 = t.start, t.end[1]
+            lines[row - 1] = lines[row - 1][:c0] + " " * (c1 - c0) + lines[row - 1][c1:]
+    return "".join(lines)
 
 
 
 def exemption_selftest():
-    """The option-value exemption, both ways, on a canary: only a lowercase "<word>" literal in an allowed file passes."""
-    cw = hashlib.sha256(b"zqvcanary").hexdigest()
+    """The option-value exemption, both ways, on a canary: only a whole "<word>" string constant is blanked; the word in a
+    comment, a docstring, a longer or single-quoted string, an identifier or another case is still found."""
+    cw = {h("zqvcanary")}
 
-    def ok(line, rel="__init__.py"):
-        return _allowed_line(rel, line, "zqvcanary", allowed=cw)
-    allowed = [ok('X = ["auto", "zqvcanary", "flash"]'), ok('if v == "zqvcanary":')]
-    refused = [ok("# zqvcanary is offered here"),                  # a comment
-               ok('"tooltip": "picks zqvcanary for you"'),         # prose inside a longer string
-               ok("_ZQVCANARY_SMS = {75}"),                        # an identifier
-               ok('X = ["zqvcanary"]  # zqvcanary'),               # the value, then prose on the same line
-               ok('X = ["ZQVCANARY"]'),                            # not the exact option value
-               ok('X = ["zqvcanary"]', rel="README.md")]           # any other file
-    return all(allowed) and not any(refused), (allowed, refused)
+    def hits(src):
+        return term_hits(_blank_option_value(src, allowed=h("zqvcanary")), cw, set(), set())
+    kept = ['X = ["auto", "zqvcanary", "flash"]\n', 'if v == "zqvcanary":\n    pass\n', 'f(("zqvcanary", 1))\n']
+    found = ['# the "zqvcanary" option\n', "x = 'use \"zqvcanary\" here'\n", 'x = "zqvcanary for you"\n',
+             '"""the "zqvcanary" doc"""\n', "_ZQVCANARY_SMS = {75}\n", 'X = ["ZQVCANARY"]\n', "x = 'zqvcanary'\n",
+             'X = ["zqvcanary"]  # zqvcanary\n']
+    ok = (all(not hits(s) for s in kept) and all(hits(s) for s in found)
+          and all(f.endswith(".py") for f in _EXPLICIT_BACKEND_FILES))   # markdown/json/js never get the blanking
+    return ok, ([hits(s) for s in kept], [hits(s) for s in found])
 
 def shipped_files(root=_PLUGIN):
     try:
@@ -73,18 +82,19 @@ def scan(root=_PLUGIN):
             continue
         n += 1
         text = data.decode("utf-8", "replace")
+        if rel in _EXPLICIT_BACKEND_FILES:
+            text = _blank_option_value(text)
         whole = term_hits(text)
         if not whole:
             continue
-        lines = text.splitlines()
-        per_line = [(rel, i, t) for i, line in enumerate(lines, 1) for t in term_hits(line)]
-        found += [(r, i, t) for r, i, t in per_line if not _allowed_line(r, lines[i - 1], t)]
+        per_line = [(rel, i, t) for i, line in enumerate(text.splitlines(), 1) for t in term_hits(line)]
+        found += per_line
         # a phrase broken across two lines is found only on the whole text
         spanning = list(whole)
         for _r, _i, t in per_line:
             if t in spanning:
                 spanning.remove(t)
-        found += [(rel, None, t) for t in spanning]   # only a phrase spans lines; the one allowed word never does
+        found += [(rel, None, t) for t in spanning]
     return n, found
 
 
@@ -93,7 +103,7 @@ def main():
     selftest()
     print("  PASS the matcher finds each kind of planted canary (word, phrase, CJK) and passes clean text")
     ok, detail = exemption_selftest()
-    print(("  PASS " if ok else "  FAIL ") + "the option-value exemption passes only the exact literal, only in its files"
+    print(("  PASS " if ok else "  FAIL ") + "the option-value exemption blanks only a whole-string option value, only in its Python files"
           + ("" if ok else f" -> {detail}"))
     fails += not ok
     n, found = scan()

@@ -1239,12 +1239,12 @@ def _install_addons(pair, version, info, gpu_set, major, hashes):
                 raise RuntimeError(f"{key} does not match its published SHA-256")
             os.replace(part, dest)
         except Exception as e:  # noqa: BLE001 - an add-on never blocks the engine
+            for leftover in (part, dest):   # neither a partial download nor a copy that no longer verifies stays loadable
+                try:
+                    os.remove(leftover)
+                except OSError:
+                    pass
             say(f"[qf_native] engine add-on {name} was not installed ({type(e).__name__}: {e})", flush=True)
-        finally:
-            try:
-                os.remove(part)
-            except OSError:
-                pass
 
 
 def _engine_write_file(path, data):

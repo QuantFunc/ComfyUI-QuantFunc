@@ -415,18 +415,12 @@ class QFSessionModelMixin:
           auto rendered byte-for-byte as the flash run before it). "auto" is every family's create-time default.
         - video_enhance: ALWAYS sent, both states (the quality_enhance switch; what OFF does per model family is engine
           law). Every loader sets it on the model it builds, so a model without one is a wiring error: refused here,
-          never a silent default. `quality` is never sent.
-        - the add-on attention choice is refused on an engine without the _ATTN_ROUTE_SYMBOL export: such an engine runs
-          a different backend for it without an error (0.0.16: Qwen-Image-2.1 native, MiniMax-H3 dense sage)."""
+          never a silent default. `quality` is never sent."""
         on = getattr(self, "_video_enhance", None)
         if on is None:
             raise RuntimeError("QuantFunc: this model has no quality_enhance setting (the loader sets one on every model it "
                                "builds; set_video_enhance was never called)")
-        backend = str(getattr(self, "_attn_backend", "auto") or "auto")
-        if backend == "qfa" and not hasattr(qfe.load_lib(), _ATTN_ROUTE_SYMBOL):
-            raise RuntimeError(f"QuantFunc: attention_backend '{backend}' needs QuantFunc engine 0.0.17 or newer; this engine "
-                               "would run a different attention instead. Pick auto, or update the QuantFunc engine.")
-        return {"attention_backend": backend, "video_enhance": on}
+        return {"attention_backend": str(getattr(self, "_attn_backend", "auto") or "auto"), "video_enhance": on}
 
     # ── comfy's per-model VRAM interface (2026-09-19, user: 「与 comfyui 打通,让它知道我们需要多少显存、当前占了多少」) ──
     # comfy asks a model TWO numbers and does the rest itself: `memory_required(shape)` — how much MORE VRAM one
@@ -1041,10 +1035,10 @@ def stage_config_package(bundle_dir, transformer1_path, extra_links=None):
     CONFIGS for session geometry (denoise_only skips the TE+VAE WEIGHTS, not the configs). So the family's shipped
     CONFIG bundle (model_index.json + transformer/ vae/ config.json - tiny JSON) is COPIED into ComfyUI's OWN temp dir
     (folder_paths.get_temp_directory(), never system /tmp), keyed deterministically by (bundle, realpath(files)): one
-    dir per weight file, so the engine's VRAM measurement cache (written into model_dir) stays per weight file and out
-    of the plugin's own folder. Rebuilt fresh each call (configs are tiny), so a re-pick can't leave a stale file. The
-    weights reach the engine as its transformer_path create input (Krea-2, Qwen-Image-2.1) or as links the caller adds
-    (stage_denoise_only_package: LTX-2.5, MiniMax-H3)."""
+    dir per weight file. Rebuilt fresh each call (configs are tiny), so a re-pick can't leave a stale file. The weights
+    reach the engine as its transformer_path create input (Krea-2 and Qwen-Image-2.1 always; LTX-2.5 and MiniMax-H3 on an
+    engine with the _WEIGHT_PATHS_SYMBOL export), or as the links stage_denoise_only_package adds (LTX-2.5 and
+    MiniMax-H3 on an older engine)."""
     import shutil
     import folder_paths
     if not os.path.isdir(bundle_dir):
@@ -1075,7 +1069,7 @@ def stage_config_package(bundle_dir, transformer1_path, extra_links=None):
 # keep the link.
 _WEIGHT_PATHS_SYMBOL = "quantfunc_weight_paths"
 # The export engines carry (0.0.17+) when they route attention per GPU and load the add-on attention library; the
-# explicit add-on choice needs it (dial_opts). MiniMax-H3 reads the same export for its auto (qf_h3_modelpatcher).
+# loaders' add-on choice needs it (engine_routes_attention). MiniMax-H3 reads the same export for its auto.
 _ATTN_ROUTE_SYMBOL = "quantfunc_attention_auto_route"
 
 
@@ -1084,11 +1078,16 @@ def engine_reads_weight_paths():
     return hasattr(qfe.load_lib(), _WEIGHT_PATHS_SYMBOL)
 
 
+def engine_routes_attention():
+    """True when the loaded QuantFunc engine carries the add-on attention (its per-GPU attention route)."""
+    return hasattr(qfe.load_lib(), _ATTN_ROUTE_SYMBOL)
+
+
 def stage_denoise_only_package(bundle_dir, transformer1_path, extra_links=None):
     """The package of LTX-2.5 and MiniMax-H3: the config package plus the weight files SYMLINKED in, the transformer as
-    transformer/model.safetensors. On the engines this plugin installs, LTX-2.5 reads its connectors only from the
-    package, and MiniMax-H3 reads its folded checkpoint's qf_adaln_fold_dropped_resq only from the config.json beside the
-    weights (#777). extra_links: {subdir: target_path} - single-expert AV families link MORE weight files
+    transformer/model.safetensors. For an engine without the _WEIGHT_PATHS_SYMBOL export (before 0.0.17): it reads
+    LTX-2.5's connectors only from the package, and MiniMax-H3's folded-checkpoint qf_adaln_fold_dropped_resq only from
+    the config.json beside the weights (#777). extra_links: {subdir: target_path} - single-expert AV families link MORE weight files
     (ltx2: the SAME single xfm file into connectors/ [#565 comfy25 prefix branch], the gemma with-proj TE into
     text_encoder/ [connector aggregate_embed], the audio_vae file [engine has_audio_ discriminant = weights presence])."""
     stage = stage_config_package(bundle_dir, transformer1_path, extra_links)
