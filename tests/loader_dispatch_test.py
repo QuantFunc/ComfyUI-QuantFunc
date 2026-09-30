@@ -862,13 +862,17 @@ def main():
     for _fam, (_node, _xfm, _preset) in _pm_loads.items():
         _mp = _node.load(_xfm, _preset)[0]
         with _LoraHint() as _got:
+            _csd.load_lora_for_models(_mp, None, dict(_fake_lora), 0.0, 1.0)   # strength 0 on the model: CLIP only
+            _zero_n = len(_got)
             _csd.load_lora_for_models(_mp, None, dict(_fake_lora), 1.0, 0.0)
             _lora_n = len(_got)
             _mp.clone().add_patches({})   # not a LoRA load
-        _hint[_fam] = (_lora_n, len(_got), _got[:1])
+        _hint[_fam] = (_zero_n, _lora_n, len(_got), _got[:1])
     check("LoRA hint: ComfyUI's own LoRA load on every family (LTX-2.5, MiniMax-H3, Krea-2, Qwen-Image-2.1) prints "
-          "exactly ONE warning pointing at the LoRA page; a patch that is not a LoRA load prints none",
-          len(_hint) == 4 and all(n == 1 and total == 1 for n, total, _m in _hint.values()), f"-> {_hint}")
+          "exactly ONE warning pointing at the LoRA page; a load at model strength 0 (CLIP only) and a patch that is "
+          "not a LoRA load print none",
+          len(_hint) == 4 and all(z == 0 and n == 1 and total == 1 for z, n, total, _m in _hint.values()),
+          f"-> {_hint}")
     # (D) Windows without Developer Mode, the model on another drive or share (hotfix 2026-09-29, the user's 5060 Ti on an
     #     SMB share): a symlink is refused (WinError 1314) and a hardlink cannot cross volumes (EXDEV / WinError 17).
     #     Krea-2 and Qwen-Image-2.1 never link: the create names the picked file as its transformer_path, the package
@@ -1442,11 +1446,18 @@ def main():
             lambda: f"runtime LoRA swap: '{_pb1['path']}' matched 0 target modules of this transformer".encode())
         _rt_status[0] = 7
         _named = ""
-        with _LoraHint() as _named_got:
-            try:
-                _ = rt_b.model._qf.lib
-            except RuntimeError as _e:
-                _named = str(_e)
+        # a console that cannot print a character of the path gets it escaped in the engine's message (last_err ->
+        # console_safe, e.g. a non-ASCII path on a cp1252 console): the path is matched the way the message was written
+        _cs0 = qfn.qfe.console_safe
+        qfn.qfe.console_safe = lambda text: _cs0(text).replace("_", "\\x5f")   # a character the path has, the URL not
+        try:
+            with _LoraHint() as _named_got:
+                try:
+                    _ = rt_b.model._qf.lib
+                except RuntimeError as _e:
+                    _named = str(_e)
+        finally:
+            qfn.qfe.console_safe = _cs0
         _ContractEngine.quantfunc_last_error = _busy_err
         _rt_status[0] = 0
         _ = rt_a.model._qf.lib                      # A back on: the blocks below start from the same state
