@@ -1207,17 +1207,70 @@ if _IMPORT_OK:
             # LoRA node placed after a ModelSampling node cannot silently drop its shift.
             return (rebuilt.adopt_comfy_state_from(model),)
 
+    class QuantFuncH3LatentUpscale:
+        """The hires-fix step of a MiniMax-H3 two-stage workflow (user 2026-09-30 「stage1的latent放大后就可以直接连接stage2的
+        采样节点」「只需要输入低采样的分辨率 + 放大倍数 要自动算出超分阶段分辨率」): scales the stage 1 video latent in latent
+        space (no VAE decode / encode), keeps the stage 1 audio latent, and outputs the high-res size for the stage 2
+        conditioning. The high-res size is the stage 1 size times scale_by, snapped to H3's canvas multiple (ComfyUI's own
+        CANVAS_MULTIPLE); the latent is scaled to exactly that size, so the sampler's latent and the stage 2 keyframes always
+        agree. Stock LatentUpscaleBy rounds the latent to any integer size (an odd one H3 cannot patchify), and stock
+        LatentUpscale assumes an 8x VAE."""
+        @classmethod
+        def INPUT_TYPES(cls):
+            import nodes as _comfy_nodes
+            return {"required": {
+                "samples": ("LATENT", {"tooltip": "The stage 1 sampler's output (MiniMax-H3 audio+video latent)."}),
+                "width": ("INT", {"default": 960, "min": 32, "max": _comfy_nodes.MAX_RESOLUTION, "step": 32,
+                                  "tooltip": "The stage 1 width, the one the stage 1 conditioning node uses."}),
+                "height": ("INT", {"default": 544, "min": 32, "max": _comfy_nodes.MAX_RESOLUTION, "step": 32,
+                                   "tooltip": "The stage 1 height, the one the stage 1 conditioning node uses."}),
+                "scale_by": ("FLOAT", {"default": 2.0, "min": 1.0, "max": 4.0, "step": 0.05}),
+                "upscale_method": (_comfy_nodes.LatentUpscaleBy.upscale_methods, {"default": "bilinear"}),
+            }}
+
+        RETURN_TYPES = ("LATENT", "INT", "INT")
+        RETURN_NAMES = ("samples", "width", "height")
+        FUNCTION = "upscale"
+        CATEGORY = "latent"
+
+        def upscale(self, samples, width, height, scale_by, upscale_method):
+            import comfy.nested_tensor
+            import comfy.utils
+            from comfy_extras.nodes_minimax_h3 import CANVAS_MULTIPLE
+            parts = samples["samples"].unbind() if isinstance(samples["samples"], comfy.nested_tensor.NestedTensor) else ()
+            if len(parts) != 2 or parts[0].ndim != 5:
+                raise ValueError("QuantFunc MiniMax-H3 Latent Upscale takes the audio+video latent a MiniMax-H3 sampler outputs")
+            if samples.get("noise_mask") is not None:
+                raise ValueError("QuantFunc MiniMax-H3 Latent Upscale: this latent carries a noise mask, which it cannot scale")
+            video, audio = parts
+            lat_h, lat_w = video.shape[-2:]
+            if width % lat_w or height % lat_h or width // lat_w != height // lat_h:
+                raise ValueError(f"QuantFunc MiniMax-H3 Latent Upscale: width x height ({width}x{height}) is not the size this "
+                                 f"latent was made at ({lat_w}x{lat_h} latent). Connect the stage 1 width and height.")
+            px = width // lat_w                       # pixels per latent cell (the video VAE's spatial factor)
+            if CANVAS_MULTIPLE % px:
+                raise ValueError(f"QuantFunc MiniMax-H3 Latent Upscale: canvas multiple {CANVAS_MULTIPLE} is not a multiple "
+                                 f"of the latent's {px} pixels per cell")
+            out_w, out_h = (max(CANVAS_MULTIPLE, round(v * scale_by / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
+                            for v in (width, height))
+            video = comfy.utils.common_upscale(video, out_w // px, out_h // px, upscale_method, "disabled")
+            out = samples.copy()
+            out["samples"] = comfy.nested_tensor.NestedTensor((video, audio))
+            return (out, out_w, out_h)
+
     # merge into (not replace) the mappings — matches the real plugin's multi-file NODE_CLASS_MAPPINGS.update
     NODE_CLASS_MAPPINGS.update({"QuantFuncLTXLoader": QuantFuncLTXLoader,
                                 "QuantFuncH3Loader": QuantFuncH3Loader,
                                 "QuantFuncKrea2Loader": QuantFuncKrea2Loader,
                                 "QuantFuncQwenImage21Loader": QuantFuncQwenImage21Loader,
-                                "QuantFuncNativeLoRA": QuantFuncNativeLoRA})
+                                "QuantFuncNativeLoRA": QuantFuncNativeLoRA,
+                                "QuantFuncH3LatentUpscale": QuantFuncH3LatentUpscale})
     NODE_DISPLAY_NAME_MAPPINGS.update({
         "QuantFuncLTXLoader": "QuantFunc LTX-2 Loader",
         "QuantFuncH3Loader": "QuantFunc MiniMax-H3 Loader",
         "QuantFuncKrea2Loader": "QuantFunc Krea-2 Loader",
-        "QuantFuncQwenImage21Loader": "QuantFunc Qwen-Image-2.1 Loader"})
+        "QuantFuncQwenImage21Loader": "QuantFunc Qwen-Image-2.1 Loader",
+        "QuantFuncH3LatentUpscale": "QuantFunc MiniMax-H3 Latent Upscale"})
 
     # AUTOMATION — a mechanism must not depend on someone remembering to run it (CR): run the reject-list
     # completeness scan AT IMPORT so a comfy upgrade that adds a consumable conditioning key emits a loud
