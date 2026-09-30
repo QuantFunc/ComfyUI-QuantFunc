@@ -123,7 +123,7 @@ On Linux and Windows the plugin **installs its engine by itself** when ComfyUI s
 ComfyUI/
 └── custom_nodes/
     └── ComfyUI-QuantFunc/
-        ├── __init__.py                the loaders (MiniMax-H3, LTX-2, Krea-2, Qwen-Image-2.1) and QuantFunc Native LoRA
+        ├── __init__.py                the loaders (MiniMax-H3, LTX-2, Krea-2, Qwen-Image-2.1), QuantFunc Native LoRA and QuantFunc MiniMax-H3 Latent Upscale
         ├── qf_engine.py               the engine bridge and the engine installer
         ├── qf_*_modelpatcher.py       one per model family
         ├── configs/                   one folder per model preset
@@ -299,9 +299,9 @@ twice. A different transformer file or `pinned_memory` setting loads a second co
 | `QuantFunc-Krea2-t2i-double-sampling.json` | Krea-2 text-to-image in two passes: a fast loader at 1024x1024, then 1.5x latent upscale and a quality loader at 1536x1536 (one shared model) |
 | `QuantFunc-LTX25-t2v.json` | LTX-2.5 text-to-video with audio, the official two-stage pipeline (half size, then 2x latent upsampler and refine) |
 | `QuantFunc-MiniMaxH3-fl2va.json` | MiniMax-H3 first/last frame to video with audio |
-| `QuantFunc-MiniMaxH3-fl2va-double-sampling.json` | the same, with the schedule split over two samplers |
+| `QuantFunc-MiniMaxH3-fl2va-double-sampling.json` | the same in two stages: 960x544, then the stage 1 latent upscaled 2x (QuantFunc MiniMax-H3 Latent Upscale, no decode / encode) and refined at 1920x1088 |
 | `QuantFunc-MiniMaxH3-ref2va.json` | MiniMax-H3 reference images to video with audio |
-| `QuantFunc-MiniMaxH3-ref2va-double-sampling.json` | the same, with the schedule split over two samplers |
+| `QuantFunc-MiniMaxH3-ref2va-double-sampling.json` | the same in two stages: 960x544, then the stage 1 latent upscaled 2x (QuantFunc MiniMax-H3 Latent Upscale, no decode / encode) and refined at 1920x1088 |
 
 ### 3.4 VRAM
 

@@ -1739,38 +1739,42 @@ def main():
         check("file_hints contract scan", False, f"-> raised {type(e).__name__}: {e}")
 
     # (H3-LU) QuantFunc MiniMax-H3 Latent Upscale (user 2026-09-30: the two-stage examples scale the stage 1 LATENT, and
-    #     the high-res size is the stage 1 size times a factor). The latent must come out at EXACTLY the high-res size it
-    #     reports (the stage 2 keyframes are encoded at that size), snapped to H3's canvas multiple (the model patchifies
-    #     2x2 on the /16 latent, so an odd latent dim cannot run), with the stage 1 audio latent kept as is.
+    #     the high-res size is the stage 1 size times a factor). Every size comes from the latent: the node must report
+    #     EXACTLY the size of the latent it returns (the stage 2 keyframes / references are encoded at the reported size),
+    #     snapped to H3's canvas multiple, with the stage 1 audio latent kept as is.
     try:
         import torch as _t
         import comfy.nested_tensor as _cnt
+        import comfy.latent_formats as _clf
         from comfy_extras.nodes_minimax_h3 import CANVAS_MULTIPLE as _CM
+        _px = _clf.MiniMaxH3Video.spacial_downscale_ratio
         _lu = qfn.NODE_CLASS_MAPPINGS["QuantFuncH3LatentUpscale"]()
-        _vid, _aud = _t.randn(1, 24, 3, 34, 60), _t.randn(1, 32, 2, 208)
-        _av = {"samples": _cnt.NestedTensor((_vid, _aud))}
+        _aud = _t.randn(1, 32, 2, 208)
+
+        def _av(lat_h, lat_w, ch=24):
+            return {"samples": _cnt.NestedTensor((_t.randn(1, ch, 3, lat_h, lat_w), _aud))}
         _rows = {}
-        for _f in (2.0, 1.5, 1.3):
-            _o, _w2, _h2 = _lu.upscale(_av, 960, 544, _f, "bilinear")
+        for _lat, _f in (((34, 60), 2.0), ((34, 60), 1.5), ((34, 60), 1.3), ((18, 32), 2.0)):
+            _o, _w2, _h2 = _lu.upscale(_av(*_lat), _f, "bilinear")
             _v2, _a2 = _o["samples"].unbind()
-            _rows[_f] = (_w2, _h2, tuple(_v2.shape), _w2 % _CM == 0 and _h2 % _CM == 0
-                         and tuple(_v2.shape[-2:]) == (_h2 // 16, _w2 // 16), _t.equal(_a2, _aud))
-        check("H3 latent upscale: 960x544 x2.0 -> 1920x1088 and the latent is exactly that size (68x120); x1.5 -> 1440x832 "
-              "(544x1.5=816 snaps to 832, a whole 32 multiple); x1.3 -> 1248x704; every size a canvas multiple, the latent "
-              "equal to it, the audio latent unchanged",
-              _rows[2.0][:3] == (1920, 1088, (1, 24, 3, 68, 120)) and _rows[1.5][:2] == (1440, 832)
-              and _rows[1.3][:2] == (1248, 704) and all(r[3] and r[4] for r in _rows.values()), f"-> {_rows}")
+            _rows[(_lat, _f)] = (_w2, _h2, _w2 % _CM == 0 and _h2 % _CM == 0
+                                 and (_v2.shape[-2] * _px, _v2.shape[-1] * _px) == (_h2, _w2), _t.equal(_a2, _aud))
+        check("H3 latent upscale: a 960x544 latent x2.0 -> 1920x1088, x1.5 -> 1440x832 (816 snaps to 832), x1.3 -> "
+              "1248x704; a 512x288 latent x2.0 -> 1024x576; every reported size a canvas multiple and EXACTLY the returned "
+              "latent's size, the audio latent unchanged",
+              [r[:2] for r in _rows.values()] == [(1920, 1088), (1440, 832), (1248, 704), (1024, 576)]
+              and all(r[2] and r[3] for r in _rows.values()), f"-> {_rows}")
         _refused = []
-        for _bad_args in (({"samples": _t.randn(1, 4, 34, 60)}, 960, 544),    # not an H3 audio+video latent
-                          (_av, 1024, 544),                                   # not the size the latent was made at
-                          (dict(_av, noise_mask=_cnt.NestedTensor((_t.ones(1, 1, 3, 34, 60), _t.ones(1, 1, 2, 208)))), 960, 544)):
+        for _bad in ({"samples": _t.randn(1, 4, 34, 60)},                          # not an audio+video latent
+                     {"samples": _cnt.NestedTensor((_t.randn(1, 128, 3, 34, 60), _aud))},   # an AV latent, not H3's
+                     dict(_av(34, 60), noise_mask=_cnt.NestedTensor((_t.ones(1, 1, 3, 34, 60), _t.ones(1, 1, 2, 208))))):
             try:
-                _lu.upscale(_bad_args[0], _bad_args[1], _bad_args[2], 2.0, "bilinear")
+                _lu.upscale(_bad, 2.0, "bilinear")
                 _refused.append(False)
             except ValueError:
                 _refused.append(True)
-        check("H3 latent upscale refuses a latent that is not H3 audio+video, a width x height that is not the latent's own "
-              "size, and a latent with a noise mask", _refused == [True, True, True], f"-> {_refused}")
+        check("H3 latent upscale refuses a latent that is not audio+video, an audio+video latent that is not H3's (other "
+              "channel count), and a latent with a noise mask", _refused == [True, True, True], f"-> {_refused}")
     except Exception as e:  # noqa: BLE001
         check("H3 latent upscale arm", False, f"-> raised {type(e).__name__}: {e}")
 

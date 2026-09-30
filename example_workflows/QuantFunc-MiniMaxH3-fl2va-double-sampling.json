@@ -1,8 +1,8 @@
 {
   "id": "fbc04cb5-4f11-404a-bb13-4e0549856e49",
   "revision": 0,
-  "last_node_id": 33,
-  "last_link_id": 42,
+  "last_node_id": 31,
+  "last_link_id": 38,
   "nodes": [
     {
       "id": 1,
@@ -22,10 +22,10 @@
       "outputs": [],
       "properties": {},
       "widgets_values": [
-        "## QuantFunc MiniMax-H3\n\n- **QuantFunc MiniMax-H3 Loader** replaces the official `Load Diffusion Model` (UNETLoader): the QuantFunc engine runs the H3 transformer, video and audio; the text encoder (`CLIPLoader`, type `minimax`), the video and audio VAEs and the sampler stay stock ComfyUI.\n- `transformer` from ModelScope [QuantFunc/Minimax-H3-Quantfunc-4bit](https://modelscope.cn/models/QuantFunc/Minimax-H3-Quantfunc-4bit), in `models/diffusion_models`: `minimax_h3_fl2va_4step_quantfunc_int4_r128.safetensors`.\n- From Hugging Face [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3): text encoder `qwen3vl_32b_minimax_h3_int8_convrot.safetensors` (the bf16 file also works), VAEs `minimax_h3_video_vae_fp16.safetensors` and `minimax_h3_audio_vae_fp32.safetensors`.\n- `audio_enhance`: ON adds a short extra pass that makes the sound clearer (most useful at few steps). It is not supported in two-stage (double-sampling) workflows: it is ignored there.\n- Input images: `flf2v_demo_first_frame.png`, `flf2v_demo_last_frame.png` from [Comfy-Org/workflow_templates](https://github.com/Comfy-Org/workflow_templates/tree/main/input); use your own.\n- Size: 960x544 (multiples of 32), 124 frames (~5 s at 24 fps; frames are 17k+5).\n\n**First and last frame to video with audio.** The video starts at the first frame and ends at the last; either frame is optional (none: text to video). 4 steps, res_multistep / simple.\n\n**Two stages: low-res, then the upscaled latent refined at high res.** Set only `Stage 1 width` x `Stage 1 height` (960x544) and the upscale factor (`scale_by` on the upscale node, 2). The high-res size is computed: the stage 1 size times the factor, rounded to a multiple of 32 (960x544 x 2 = 1920x1088); the upscale node outputs it as its `width` / `height`. Stage 1 renders the whole clip on the small canvas (`Stage 1 steps`: 4). Its latent is scaled up directly (no decode / encode), the stage 1 audio is kept, and stage 2 adds noise back and refines it (`Stage 2 steps`: 2 steps from denoise 0.5; higher denoise changes more, lower keeps stage 1 closer). A second conditioning node re-anchors the first and last frames at the high-res size (it takes the size from the upscale node, so the two always agree). Edit the prompt and the length once, in `Prompt` and `Length (frames)`. For a quicker look, use a smaller stage 1 size (for example 512x288, which x2 gives 1024x576).\n"
+        "## QuantFunc MiniMax-H3\n\n- **QuantFunc MiniMax-H3 Loader** replaces the official `Load Diffusion Model` (UNETLoader): the QuantFunc engine runs the H3 transformer, video and audio; the text encoder (`CLIPLoader`, type `minimax`), the video and audio VAEs and the sampler stay stock ComfyUI.\n- `transformer` from ModelScope [QuantFunc/Minimax-H3-Quantfunc-4bit](https://modelscope.cn/models/QuantFunc/Minimax-H3-Quantfunc-4bit), in `models/diffusion_models`: `minimax_h3_fl2va_4step_quantfunc_int4_r128.safetensors`.\n- From Hugging Face [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3): text encoder `qwen3vl_32b_minimax_h3_int8_convrot.safetensors` (the bf16 file also works), VAEs `minimax_h3_video_vae_fp16.safetensors` and `minimax_h3_audio_vae_fp32.safetensors`.\n- `audio_enhance`: ON adds a short extra pass that makes the sound clearer (most useful at few steps). It is not supported in two-stage (double-sampling) workflows: it is ignored there.\n- Input images: `flf2v_demo_first_frame.png`, `flf2v_demo_last_frame.png` from [Comfy-Org/workflow_templates](https://github.com/Comfy-Org/workflow_templates/tree/main/input); use your own.\n- Size: 960x544 (multiples of 32), 124 frames (~5 s at 24 fps; frames are 17k+5).\n\n**First and last frame to video with audio.** The video starts at the first frame and ends at the last; either frame is optional (none: text to video). 4 steps, res_multistep / simple.\n\n**Two stages: low-res, then the upscaled latent refined at high res.** Set only the width x height on `Stage 1 conditioning` (960x544) and the upscale factor (`scale_by` on the upscale node, 2). The high-res size is computed: the stage 1 size times the factor, rounded to a multiple of 32 (960x544 x 2 = 1920x1088); the upscale node outputs it as its `width` / `height`. Stage 1 renders the whole clip on the small canvas (`Stage 1 steps`: 4). Its latent is scaled up directly (no decode / encode), the stage 1 audio is kept, and stage 2 adds noise back and refines it (`Stage 2 steps`: 2 steps from denoise 0.5; higher denoise changes more, lower keeps stage 1 closer). `Stage 2 conditioning` re-anchors the first and last frames at the high-res size. It takes that size from the upscale node, so the two always agree; its own latent output is not used. Edit the prompt and the length once, in `Prompt` and `Length (frames)`. For a quicker look, use a smaller stage 1 size (for example 512x288, which x2 gives 1024x576).\n"
       ],
       "widgets_values_named": {
-        "text": "## QuantFunc MiniMax-H3\n\n- **QuantFunc MiniMax-H3 Loader** replaces the official `Load Diffusion Model` (UNETLoader): the QuantFunc engine runs the H3 transformer, video and audio; the text encoder (`CLIPLoader`, type `minimax`), the video and audio VAEs and the sampler stay stock ComfyUI.\n- `transformer` from ModelScope [QuantFunc/Minimax-H3-Quantfunc-4bit](https://modelscope.cn/models/QuantFunc/Minimax-H3-Quantfunc-4bit), in `models/diffusion_models`: `minimax_h3_fl2va_4step_quantfunc_int4_r128.safetensors`.\n- From Hugging Face [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3): text encoder `qwen3vl_32b_minimax_h3_int8_convrot.safetensors` (the bf16 file also works), VAEs `minimax_h3_video_vae_fp16.safetensors` and `minimax_h3_audio_vae_fp32.safetensors`.\n- `audio_enhance`: ON adds a short extra pass that makes the sound clearer (most useful at few steps). It is not supported in two-stage (double-sampling) workflows: it is ignored there.\n- Input images: `flf2v_demo_first_frame.png`, `flf2v_demo_last_frame.png` from [Comfy-Org/workflow_templates](https://github.com/Comfy-Org/workflow_templates/tree/main/input); use your own.\n- Size: 960x544 (multiples of 32), 124 frames (~5 s at 24 fps; frames are 17k+5).\n\n**First and last frame to video with audio.** The video starts at the first frame and ends at the last; either frame is optional (none: text to video). 4 steps, res_multistep / simple.\n\n**Two stages: low-res, then the upscaled latent refined at high res.** Set only `Stage 1 width` x `Stage 1 height` (960x544) and the upscale factor (`scale_by` on the upscale node, 2). The high-res size is computed: the stage 1 size times the factor, rounded to a multiple of 32 (960x544 x 2 = 1920x1088); the upscale node outputs it as its `width` / `height`. Stage 1 renders the whole clip on the small canvas (`Stage 1 steps`: 4). Its latent is scaled up directly (no decode / encode), the stage 1 audio is kept, and stage 2 adds noise back and refines it (`Stage 2 steps`: 2 steps from denoise 0.5; higher denoise changes more, lower keeps stage 1 closer). A second conditioning node re-anchors the first and last frames at the high-res size (it takes the size from the upscale node, so the two always agree). Edit the prompt and the length once, in `Prompt` and `Length (frames)`. For a quicker look, use a smaller stage 1 size (for example 512x288, which x2 gives 1024x576).\n"
+        "text": "## QuantFunc MiniMax-H3\n\n- **QuantFunc MiniMax-H3 Loader** replaces the official `Load Diffusion Model` (UNETLoader): the QuantFunc engine runs the H3 transformer, video and audio; the text encoder (`CLIPLoader`, type `minimax`), the video and audio VAEs and the sampler stay stock ComfyUI.\n- `transformer` from ModelScope [QuantFunc/Minimax-H3-Quantfunc-4bit](https://modelscope.cn/models/QuantFunc/Minimax-H3-Quantfunc-4bit), in `models/diffusion_models`: `minimax_h3_fl2va_4step_quantfunc_int4_r128.safetensors`.\n- From Hugging Face [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3): text encoder `qwen3vl_32b_minimax_h3_int8_convrot.safetensors` (the bf16 file also works), VAEs `minimax_h3_video_vae_fp16.safetensors` and `minimax_h3_audio_vae_fp32.safetensors`.\n- `audio_enhance`: ON adds a short extra pass that makes the sound clearer (most useful at few steps). It is not supported in two-stage (double-sampling) workflows: it is ignored there.\n- Input images: `flf2v_demo_first_frame.png`, `flf2v_demo_last_frame.png` from [Comfy-Org/workflow_templates](https://github.com/Comfy-Org/workflow_templates/tree/main/input); use your own.\n- Size: 960x544 (multiples of 32), 124 frames (~5 s at 24 fps; frames are 17k+5).\n\n**First and last frame to video with audio.** The video starts at the first frame and ends at the last; either frame is optional (none: text to video). 4 steps, res_multistep / simple.\n\n**Two stages: low-res, then the upscaled latent refined at high res.** Set only the width x height on `Stage 1 conditioning` (960x544) and the upscale factor (`scale_by` on the upscale node, 2). The high-res size is computed: the stage 1 size times the factor, rounded to a multiple of 32 (960x544 x 2 = 1920x1088); the upscale node outputs it as its `width` / `height`. Stage 1 renders the whole clip on the small canvas (`Stage 1 steps`: 4). Its latent is scaled up directly (no decode / encode), the stage 1 audio is kept, and stage 2 adds noise back and refines it (`Stage 2 steps`: 2 steps from denoise 0.5; higher denoise changes more, lower keeps stage 1 closer). `Stage 2 conditioning` re-anchors the first and last frames at the high-res size. It takes that size from the upscale node, so the two always agree; its own latent output is not used. Edit the prompt and the length once, in `Prompt` and `Length (frames)`. For a quicker look, use a smaller stage 1 size (for example 512x288, which x2 gives 1024x576).\n"
       },
       "color": "#432",
       "bgcolor": "#653"
@@ -141,10 +141,10 @@
           "name": "MODEL",
           "type": "MODEL",
           "links": [
+            7,
             9,
-            11,
-            20,
-            40
+            16,
+            36
           ]
         }
       ],
@@ -226,7 +226,7 @@
           "type": "CLIP",
           "links": [
             1,
-            32
+            28
           ]
         }
       ],
@@ -276,8 +276,8 @@
           "type": "VAE",
           "links": [
             2,
-            26,
-            33
+            22,
+            29
           ]
         }
       ],
@@ -323,7 +323,7 @@
           "name": "VAE",
           "type": "VAE",
           "links": [
-            28
+            24
           ]
         }
       ],
@@ -379,7 +379,7 @@
           "type": "IMAGE",
           "links": [
             3,
-            34
+            30
           ]
         },
         {
@@ -443,7 +443,7 @@
           "type": "IMAGE",
           "links": [
             4,
-            35
+            31
           ]
         },
         {
@@ -478,7 +478,7 @@
         220
       ],
       "flags": {},
-      "order": 13,
+      "order": 11,
       "mode": 0,
       "inputs": [
         {
@@ -523,7 +523,7 @@
           "widget": {
             "name": "width"
           },
-          "link": 7
+          "link": null
         },
         {
           "localized_name": "height",
@@ -532,7 +532,7 @@
           "widget": {
             "name": "height"
           },
-          "link": 8
+          "link": null
         },
         {
           "localized_name": "length",
@@ -550,7 +550,7 @@
           "name": "positive",
           "type": "CONDITIONING",
           "links": [
-            10
+            8
           ]
         },
         {
@@ -558,7 +558,7 @@
           "name": "LATENT",
           "type": "LATENT",
           "links": [
-            16
+            14
           ]
         }
       ],
@@ -577,7 +577,7 @@
         "height": 544,
         "length": 124
       },
-      "title": "Stage 1 conditioning (low-res)"
+      "title": "Stage 1 conditioning (low-res: set the width x height here)"
     },
     {
       "id": 9,
@@ -610,8 +610,8 @@
           "name": "NOISE",
           "type": "NOISE",
           "links": [
-            12,
-            21
+            10,
+            17
           ]
         }
       ],
@@ -639,20 +639,20 @@
         46
       ],
       "flags": {},
-      "order": 16,
+      "order": 14,
       "mode": 0,
       "inputs": [
         {
           "localized_name": "model",
           "name": "model",
           "type": "MODEL",
-          "link": 9
+          "link": 7
         },
         {
           "localized_name": "conditioning",
           "name": "conditioning",
           "type": "CONDITIONING",
-          "link": 10
+          "link": 8
         }
       ],
       "outputs": [
@@ -661,7 +661,7 @@
           "name": "GUIDER",
           "type": "GUIDER",
           "links": [
-            13
+            11
           ]
         }
       ],
@@ -700,8 +700,8 @@
           "name": "SAMPLER",
           "type": "SAMPLER",
           "links": [
-            14,
-            22
+            12,
+            18
           ]
         }
       ],
@@ -727,14 +727,14 @@
         106
       ],
       "flags": {},
-      "order": 14,
+      "order": 12,
       "mode": 0,
       "inputs": [
         {
           "localized_name": "model",
           "name": "model",
           "type": "MODEL",
-          "link": 11
+          "link": 9
         },
         {
           "localized_name": "scheduler",
@@ -770,7 +770,7 @@
           "name": "SIGMAS",
           "type": "SIGMAS",
           "links": [
-            15
+            13
           ]
         }
       ],
@@ -801,38 +801,38 @@
         106
       ],
       "flags": {},
-      "order": 17,
+      "order": 15,
       "mode": 0,
       "inputs": [
         {
           "localized_name": "noise",
           "name": "noise",
           "type": "NOISE",
-          "link": 12
+          "link": 10
         },
         {
           "localized_name": "guider",
           "name": "guider",
           "type": "GUIDER",
-          "link": 13
+          "link": 11
         },
         {
           "localized_name": "sampler",
           "name": "sampler",
           "type": "SAMPLER",
-          "link": 14
+          "link": 12
         },
         {
           "localized_name": "sigmas",
           "name": "sigmas",
           "type": "SIGMAS",
-          "link": 15
+          "link": 13
         },
         {
           "localized_name": "latent_image",
           "name": "latent_image",
           "type": "LATENT",
-          "link": 16
+          "link": 14
         }
       ],
       "outputs": [
@@ -841,7 +841,7 @@
           "name": "output",
           "type": "LATENT",
           "links": [
-            17
+            15
           ]
         },
         {
@@ -868,38 +868,38 @@
         106
       ],
       "flags": {},
-      "order": 21,
+      "order": 19,
       "mode": 0,
       "inputs": [
         {
           "localized_name": "noise",
           "name": "noise",
           "type": "NOISE",
-          "link": 21
+          "link": 17
         },
         {
           "localized_name": "guider",
           "name": "guider",
           "type": "GUIDER",
-          "link": 42
+          "link": 38
         },
         {
           "localized_name": "sampler",
           "name": "sampler",
           "type": "SAMPLER",
-          "link": 22
+          "link": 18
         },
         {
           "localized_name": "sigmas",
           "name": "sigmas",
           "type": "SIGMAS",
-          "link": 23
+          "link": 19
         },
         {
           "localized_name": "latent_image",
           "name": "latent_image",
           "type": "LATENT",
-          "link": 24
+          "link": 20
         }
       ],
       "outputs": [
@@ -908,8 +908,8 @@
           "name": "output",
           "type": "LATENT",
           "links": [
-            25,
-            27
+            21,
+            23
           ]
         },
         {
@@ -936,20 +936,20 @@
         46
       ],
       "flags": {},
-      "order": 22,
+      "order": 20,
       "mode": 0,
       "inputs": [
         {
           "localized_name": "samples",
           "name": "samples",
           "type": "LATENT",
-          "link": 25
+          "link": 21
         },
         {
           "localized_name": "vae",
           "name": "vae",
           "type": "VAE",
-          "link": 26
+          "link": 22
         }
       ],
       "outputs": [
@@ -958,7 +958,7 @@
           "name": "IMAGE",
           "type": "IMAGE",
           "links": [
-            29
+            25
           ]
         }
       ],
@@ -978,20 +978,20 @@
         46
       ],
       "flags": {},
-      "order": 23,
+      "order": 21,
       "mode": 0,
       "inputs": [
         {
           "localized_name": "samples",
           "name": "samples",
           "type": "LATENT",
-          "link": 27
+          "link": 23
         },
         {
           "localized_name": "vae",
           "name": "vae",
           "type": "VAE",
-          "link": 28
+          "link": 24
         }
       ],
       "outputs": [
@@ -1000,7 +1000,7 @@
           "name": "AUDIO",
           "type": "AUDIO",
           "links": [
-            30
+            26
           ]
         }
       ],
@@ -1020,21 +1020,21 @@
         150
       ],
       "flags": {},
-      "order": 24,
+      "order": 22,
       "mode": 0,
       "inputs": [
         {
           "localized_name": "images",
           "name": "images",
           "type": "IMAGE",
-          "link": 29
+          "link": 25
         },
         {
           "localized_name": "audio",
           "name": "audio",
           "shape": 7,
           "type": "AUDIO",
-          "link": 30
+          "link": 26
         },
         {
           "localized_name": "fps",
@@ -1082,7 +1082,7 @@
           "name": "VIDEO",
           "type": "VIDEO",
           "links": [
-            31
+            27
           ]
         }
       ],
@@ -1114,14 +1114,14 @@
         106
       ],
       "flags": {},
-      "order": 25,
+      "order": 23,
       "mode": 0,
       "inputs": [
         {
           "localized_name": "video",
           "name": "video",
           "type": "VIDEO",
-          "link": 31
+          "link": 27
         },
         {
           "localized_name": "filename_prefix",
@@ -1192,35 +1192,17 @@
       ],
       "size": [
         300,
-        150
+        110
       ],
       "flags": {},
-      "order": 18,
+      "order": 16,
       "mode": 0,
       "inputs": [
         {
           "localized_name": "samples",
           "name": "samples",
           "type": "LATENT",
-          "link": 17
-        },
-        {
-          "localized_name": "width",
-          "name": "width",
-          "type": "INT",
-          "link": 18,
-          "widget": {
-            "name": "width"
-          }
-        },
-        {
-          "localized_name": "height",
-          "name": "height",
-          "type": "INT",
-          "link": 19,
-          "widget": {
-            "name": "height"
-          }
+          "link": 15
         },
         {
           "localized_name": "scale_by",
@@ -1247,7 +1229,7 @@
           "name": "samples",
           "type": "LATENT",
           "links": [
-            24
+            20
           ]
         },
         {
@@ -1255,7 +1237,7 @@
           "name": "width",
           "type": "INT",
           "links": [
-            38
+            34
           ]
         },
         {
@@ -1263,7 +1245,7 @@
           "name": "height",
           "type": "INT",
           "links": [
-            39
+            35
           ]
         }
       ],
@@ -1271,14 +1253,10 @@
         "Node name for S&R": "QuantFuncH3LatentUpscale"
       },
       "widgets_values": [
-        960,
-        544,
         2.0,
         "bilinear"
       ],
       "widgets_values_named": {
-        "width": 960,
-        "height": 544,
         "scale_by": 2.0,
         "upscale_method": "bilinear"
       },
@@ -1296,34 +1274,34 @@
         220
       ],
       "flags": {},
-      "order": 19,
+      "order": 17,
       "mode": 0,
       "inputs": [
         {
           "localized_name": "clip",
           "name": "clip",
           "type": "CLIP",
-          "link": 32
+          "link": 28
         },
         {
           "localized_name": "vae",
           "name": "vae",
           "type": "VAE",
-          "link": 33
+          "link": 29
         },
         {
           "localized_name": "first_frame",
           "name": "first_frame",
           "shape": 7,
           "type": "IMAGE",
-          "link": 34
+          "link": 30
         },
         {
           "localized_name": "last_frame",
           "name": "last_frame",
           "shape": 7,
           "type": "IMAGE",
-          "link": 35
+          "link": 31
         },
         {
           "localized_name": "prompt",
@@ -1332,7 +1310,7 @@
           "widget": {
             "name": "prompt"
           },
-          "link": 36
+          "link": 32
         },
         {
           "localized_name": "width",
@@ -1341,7 +1319,7 @@
           "widget": {
             "name": "width"
           },
-          "link": 38
+          "link": 34
         },
         {
           "localized_name": "height",
@@ -1350,7 +1328,7 @@
           "widget": {
             "name": "height"
           },
-          "link": 39
+          "link": 35
         },
         {
           "localized_name": "length",
@@ -1359,7 +1337,7 @@
           "widget": {
             "name": "length"
           },
-          "link": 37
+          "link": 33
         }
       ],
       "outputs": [
@@ -1368,7 +1346,7 @@
           "name": "positive",
           "type": "CONDITIONING",
           "links": [
-            41
+            37
           ]
         },
         {
@@ -1383,17 +1361,17 @@
       },
       "widgets_values": [
         "Cinematic crane shot inside an iridescent translucent pavilion: a red-haired woman in a long black dress stands at the edge of a circular reflecting pool. The camera slowly rises from eye level to a high top-down view as she looks up, the pool reflecting the shimmering walls. Soft ambient hum, gentle water ripples, a distant echo.",
-        960,
-        544,
+        1920,
+        1088,
         124
       ],
       "widgets_values_named": {
         "prompt": "Cinematic crane shot inside an iridescent translucent pavilion: a red-haired woman in a long black dress stands at the edge of a circular reflecting pool. The camera slowly rises from eye level to a high top-down view as she looks up, the pool reflecting the shimmering walls. Soft ambient hum, gentle water ripples, a distant echo.",
-        "width": 960,
-        "height": 544,
+        "width": 1920,
+        "height": 1088,
         "length": 124
       },
-      "title": "Stage 2 keyframes (high-res; size from the upscale node)"
+      "title": "Stage 2 conditioning (high-res; size from the upscale node)"
     },
     {
       "id": 27,
@@ -1407,20 +1385,20 @@
         46
       ],
       "flags": {},
-      "order": 20,
+      "order": 18,
       "mode": 0,
       "inputs": [
         {
           "localized_name": "model",
           "name": "model",
           "type": "MODEL",
-          "link": 40
+          "link": 36
         },
         {
           "localized_name": "conditioning",
           "name": "conditioning",
           "type": "CONDITIONING",
-          "link": 41
+          "link": 37
         }
       ],
       "outputs": [
@@ -1429,7 +1407,7 @@
           "name": "GUIDER",
           "type": "GUIDER",
           "links": [
-            42
+            38
           ]
         }
       ],
@@ -1450,14 +1428,14 @@
         106
       ],
       "flags": {},
-      "order": 15,
+      "order": 13,
       "mode": 0,
       "inputs": [
         {
           "localized_name": "model",
           "name": "model",
           "type": "MODEL",
-          "link": 20
+          "link": 16
         },
         {
           "localized_name": "scheduler",
@@ -1493,7 +1471,7 @@
           "name": "SIGMAS",
           "type": "SIGMAS",
           "links": [
-            23
+            19
           ]
         }
       ],
@@ -1544,7 +1522,7 @@
           "type": "STRING",
           "links": [
             5,
-            36
+            32
           ]
         }
       ],
@@ -1591,7 +1569,7 @@
           "type": "INT",
           "links": [
             6,
-            37
+            33
           ]
         }
       ],
@@ -1607,104 +1585,6 @@
         "control_after_generate": "fixed"
       },
       "title": "Length (frames)"
-    },
-    {
-      "id": 32,
-      "type": "PrimitiveInt",
-      "pos": [
-        580,
-        766
-      ],
-      "size": [
-        270,
-        82
-      ],
-      "flags": {},
-      "order": 11,
-      "mode": 0,
-      "inputs": [
-        {
-          "localized_name": "value",
-          "name": "value",
-          "type": "INT",
-          "link": null,
-          "widget": {
-            "name": "value"
-          }
-        }
-      ],
-      "outputs": [
-        {
-          "localized_name": "INT",
-          "name": "INT",
-          "type": "INT",
-          "links": [
-            7,
-            18
-          ]
-        }
-      ],
-      "properties": {
-        "Node name for S&R": "PrimitiveInt"
-      },
-      "widgets_values": [
-        960,
-        "fixed"
-      ],
-      "widgets_values_named": {
-        "value": 960,
-        "control_after_generate": "fixed"
-      },
-      "title": "Stage 1 width (low-res)"
-    },
-    {
-      "id": 33,
-      "type": "PrimitiveInt",
-      "pos": [
-        580,
-        918
-      ],
-      "size": [
-        270,
-        82
-      ],
-      "flags": {},
-      "order": 12,
-      "mode": 0,
-      "inputs": [
-        {
-          "localized_name": "value",
-          "name": "value",
-          "type": "INT",
-          "link": null,
-          "widget": {
-            "name": "value"
-          }
-        }
-      ],
-      "outputs": [
-        {
-          "localized_name": "INT",
-          "name": "INT",
-          "type": "INT",
-          "links": [
-            8,
-            19
-          ]
-        }
-      ],
-      "properties": {
-        "Node name for S&R": "PrimitiveInt"
-      },
-      "widgets_values": [
-        544,
-        "fixed"
-      ],
-      "widgets_values_named": {
-        "value": 544,
-        "control_after_generate": "fixed"
-      },
-      "title": "Stage 1 height (low-res)"
     }
   ],
   "links": [
@@ -1758,22 +1638,6 @@
     ],
     [
       7,
-      32,
-      0,
-      8,
-      5,
-      "INT"
-    ],
-    [
-      8,
-      33,
-      0,
-      8,
-      6,
-      "INT"
-    ],
-    [
-      9,
       2,
       0,
       10,
@@ -1781,7 +1645,7 @@
       "MODEL"
     ],
     [
-      10,
+      8,
       8,
       0,
       10,
@@ -1789,7 +1653,7 @@
       "CONDITIONING"
     ],
     [
-      11,
+      9,
       2,
       0,
       12,
@@ -1797,7 +1661,7 @@
       "MODEL"
     ],
     [
-      12,
+      10,
       9,
       0,
       13,
@@ -1805,7 +1669,7 @@
       "NOISE"
     ],
     [
-      13,
+      11,
       10,
       0,
       13,
@@ -1813,7 +1677,7 @@
       "GUIDER"
     ],
     [
-      14,
+      12,
       11,
       0,
       13,
@@ -1821,7 +1685,7 @@
       "SAMPLER"
     ],
     [
-      15,
+      13,
       12,
       0,
       13,
@@ -1829,7 +1693,7 @@
       "SIGMAS"
     ],
     [
-      16,
+      14,
       8,
       1,
       13,
@@ -1837,7 +1701,7 @@
       "LATENT"
     ],
     [
-      17,
+      15,
       13,
       0,
       21,
@@ -1845,23 +1709,7 @@
       "LATENT"
     ],
     [
-      18,
-      32,
-      0,
-      21,
-      1,
-      "INT"
-    ],
-    [
-      19,
-      33,
-      0,
-      21,
-      2,
-      "INT"
-    ],
-    [
-      20,
+      16,
       2,
       0,
       28,
@@ -1869,7 +1717,7 @@
       "MODEL"
     ],
     [
-      21,
+      17,
       9,
       0,
       16,
@@ -1877,7 +1725,7 @@
       "NOISE"
     ],
     [
-      22,
+      18,
       11,
       0,
       16,
@@ -1885,7 +1733,7 @@
       "SAMPLER"
     ],
     [
-      23,
+      19,
       28,
       0,
       16,
@@ -1893,7 +1741,7 @@
       "SIGMAS"
     ],
     [
-      24,
+      20,
       21,
       0,
       16,
@@ -1901,7 +1749,7 @@
       "LATENT"
     ],
     [
-      25,
+      21,
       16,
       0,
       17,
@@ -1909,7 +1757,7 @@
       "LATENT"
     ],
     [
-      26,
+      22,
       4,
       0,
       17,
@@ -1917,7 +1765,7 @@
       "VAE"
     ],
     [
-      27,
+      23,
       16,
       0,
       18,
@@ -1925,7 +1773,7 @@
       "LATENT"
     ],
     [
-      28,
+      24,
       5,
       0,
       18,
@@ -1933,7 +1781,7 @@
       "VAE"
     ],
     [
-      29,
+      25,
       17,
       0,
       19,
@@ -1941,7 +1789,7 @@
       "IMAGE"
     ],
     [
-      30,
+      26,
       18,
       0,
       19,
@@ -1949,7 +1797,7 @@
       "AUDIO"
     ],
     [
-      31,
+      27,
       19,
       0,
       20,
@@ -1957,7 +1805,7 @@
       "VIDEO"
     ],
     [
-      32,
+      28,
       3,
       0,
       26,
@@ -1965,7 +1813,7 @@
       "CLIP"
     ],
     [
-      33,
+      29,
       4,
       0,
       26,
@@ -1973,7 +1821,7 @@
       "VAE"
     ],
     [
-      34,
+      30,
       6,
       0,
       26,
@@ -1981,7 +1829,7 @@
       "IMAGE"
     ],
     [
-      35,
+      31,
       7,
       0,
       26,
@@ -1989,7 +1837,7 @@
       "IMAGE"
     ],
     [
-      36,
+      32,
       30,
       0,
       26,
@@ -1997,7 +1845,7 @@
       "STRING"
     ],
     [
-      37,
+      33,
       31,
       0,
       26,
@@ -2005,7 +1853,7 @@
       "INT"
     ],
     [
-      38,
+      34,
       21,
       1,
       26,
@@ -2013,7 +1861,7 @@
       "INT"
     ],
     [
-      39,
+      35,
       21,
       2,
       26,
@@ -2021,7 +1869,7 @@
       "INT"
     ],
     [
-      40,
+      36,
       2,
       0,
       27,
@@ -2029,7 +1877,7 @@
       "MODEL"
     ],
     [
-      41,
+      37,
       26,
       0,
       27,
@@ -2037,7 +1885,7 @@
       "CONDITIONING"
     ],
     [
-      42,
+      38,
       27,
       0,
       16,

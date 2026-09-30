@@ -1211,48 +1211,44 @@ if _IMPORT_OK:
         """The hires-fix step of a MiniMax-H3 two-stage workflow (user 2026-09-30 「stage1的latent放大后就可以直接连接stage2的
         采样节点」「只需要输入低采样的分辨率 + 放大倍数 要自动算出超分阶段分辨率」): scales the stage 1 video latent in latent
         space (no VAE decode / encode), keeps the stage 1 audio latent, and outputs the high-res size for the stage 2
-        conditioning. The high-res size is the stage 1 size times scale_by, snapped to H3's canvas multiple (ComfyUI's own
-        CANVAS_MULTIPLE); the latent is scaled to exactly that size, so the sampler's latent and the stage 2 keyframes always
-        agree. Stock LatentUpscaleBy rounds the latent to any integer size (an odd one H3 cannot patchify), and stock
+        conditioning. Every size comes from the latent itself and ComfyUI's own H3 definitions (the latent format's channels
+        and pixels per cell, the H3 nodes' CANVAS_MULTIPLE): the high-res size is the stage 1 size times scale_by, snapped
+        to CANVAS_MULTIPLE, and the latent is scaled to exactly that size, so the stage 2 latent and the stage 2 keyframes /
+        references always agree. Stock LatentUpscaleBy rounds each latent side to any integer and reports no size; stock
         LatentUpscale assumes an 8x VAE."""
         @classmethod
         def INPUT_TYPES(cls):
             import nodes as _comfy_nodes
             return {"required": {
                 "samples": ("LATENT", {"tooltip": "The stage 1 sampler's output (MiniMax-H3 audio+video latent)."}),
-                "width": ("INT", {"default": 960, "min": 32, "max": _comfy_nodes.MAX_RESOLUTION, "step": 32,
-                                  "tooltip": "The stage 1 width, the one the stage 1 conditioning node uses."}),
-                "height": ("INT", {"default": 544, "min": 32, "max": _comfy_nodes.MAX_RESOLUTION, "step": 32,
-                                   "tooltip": "The stage 1 height, the one the stage 1 conditioning node uses."}),
-                "scale_by": ("FLOAT", {"default": 2.0, "min": 1.0, "max": 4.0, "step": 0.05}),
+                "scale_by": ("FLOAT", {"default": 2.0, "min": 1.0, "max": 4.0, "step": 0.05,
+                                       "tooltip": "High-res size = the stage 1 size x this, rounded to a multiple of 32."}),
                 "upscale_method": (_comfy_nodes.LatentUpscaleBy.upscale_methods, {"default": "bilinear"}),
             }}
 
         RETURN_TYPES = ("LATENT", "INT", "INT")
         RETURN_NAMES = ("samples", "width", "height")
         FUNCTION = "upscale"
-        CATEGORY = "latent"
+        CATEGORY = "model/latent"
 
-        def upscale(self, samples, width, height, scale_by, upscale_method):
+        def upscale(self, samples, scale_by, upscale_method):
+            import comfy.latent_formats
             import comfy.nested_tensor
             import comfy.utils
             from comfy_extras.nodes_minimax_h3 import CANVAS_MULTIPLE
+            fmt = comfy.latent_formats.MiniMaxH3Video
             parts = samples["samples"].unbind() if isinstance(samples["samples"], comfy.nested_tensor.NestedTensor) else ()
-            if len(parts) != 2 or parts[0].ndim != 5:
+            if len(parts) != 2 or parts[0].ndim != 5 or parts[0].shape[1] != fmt.latent_channels:
                 raise ValueError("QuantFunc MiniMax-H3 Latent Upscale takes the audio+video latent a MiniMax-H3 sampler outputs")
             if samples.get("noise_mask") is not None:
                 raise ValueError("QuantFunc MiniMax-H3 Latent Upscale: this latent carries a noise mask, which it cannot scale")
-            video, audio = parts
-            lat_h, lat_w = video.shape[-2:]
-            if width % lat_w or height % lat_h or width // lat_w != height // lat_h:
-                raise ValueError(f"QuantFunc MiniMax-H3 Latent Upscale: width x height ({width}x{height}) is not the size this "
-                                 f"latent was made at ({lat_w}x{lat_h} latent). Connect the stage 1 width and height.")
-            px = width // lat_w                       # pixels per latent cell (the video VAE's spatial factor)
+            px = fmt.spacial_downscale_ratio
             if CANVAS_MULTIPLE % px:
-                raise ValueError(f"QuantFunc MiniMax-H3 Latent Upscale: canvas multiple {CANVAS_MULTIPLE} is not a multiple "
-                                 f"of the latent's {px} pixels per cell")
-            out_w, out_h = (max(CANVAS_MULTIPLE, round(v * scale_by / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
-                            for v in (width, height))
+                raise ValueError(f"QuantFunc MiniMax-H3 Latent Upscale: canvas multiple {CANVAS_MULTIPLE} is not a whole "
+                                 f"number of {px}-pixel latent cells")
+            video, audio = parts
+            out_w, out_h = (max(CANVAS_MULTIPLE, round(n * px * scale_by / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
+                            for n in (video.shape[-1], video.shape[-2]))
             video = comfy.utils.common_upscale(video, out_w // px, out_h // px, upscale_method, "disabled")
             out = samples.copy()
             out["samples"] = comfy.nested_tensor.NestedTensor((video, audio))
