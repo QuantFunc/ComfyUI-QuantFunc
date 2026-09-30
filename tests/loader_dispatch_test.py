@@ -868,11 +868,12 @@ def main():
             _lora_n = len(_got)
             _mp.clone().add_patches({})   # not a LoRA load
         _hint[_fam] = (_zero_n, _lora_n, len(_got), _got[:1])
+    _NATIVE_LORA = qfn.NODE_DISPLAY_NAME_MAPPINGS["QuantFuncNativeLoRA"]
     check("LoRA hint: ComfyUI's own LoRA load on every family (LTX-2.5, MiniMax-H3, Krea-2, Qwen-Image-2.1) prints "
-          "exactly ONE warning pointing at the LoRA page; a load at model strength 0 (CLIP only) and a patch that is "
-          "not a LoRA load print none",
-          len(_hint) == 4 and all(z == 0 and n == 1 and total == 1 for z, n, total, _m in _hint.values()),
-          f"-> {_hint}")
+          "exactly ONE warning pointing at the LoRA page that names the QuantFunc LoRA node to use instead of ComfyUI's "
+          "Load LoRA; a load at model strength 0 (CLIP only) and a patch that is not a LoRA load print none",
+          len(_hint) == 4 and all(z == 0 and n == 1 and total == 1 and _NATIVE_LORA in m[0] and "Load LoRA" in m[0]
+                                  for z, n, total, m in _hint.values()), f"-> {_hint}")
     # (D) Windows without Developer Mode, the model on another drive or share (hotfix 2026-09-29, the user's 5060 Ti on an
     #     SMB share): a symlink is refused (WinError 1314) and a hardlink cannot cross volumes (EXDEV / WinError 17).
     #     Krea-2 and Qwen-Image-2.1 never link: the create names the picked file as its transformer_path, the package
@@ -1256,7 +1257,9 @@ def main():
             except RuntimeError as _e:
                 _k_err = str(_e)
         check("LoRA hint: the native LoRA node refuses a file it cannot load (raises as before) and prints ONE "
-              "LoRA-page warning", "kohya" in _k_err and len(_k_got) == 1, f"-> {_k_err[:80]!r} {_k_got}")
+              "LoRA-page warning that says the file is not in the node's format (not 'use another node')",
+              "kohya" in _k_err and len(_k_got) == 1 and "format" in _k_got[0] and "Load LoRA" not in _k_got[0],
+              f"-> {_k_err[:80]!r} {_k_got}")
         # identity-gated retire: a FOREIGN live consumer on the same ckey must SKIP the destroy.
         class _W:                       # two distinct wrapper identities
             pass

@@ -1236,7 +1236,7 @@ if _IMPORT_OK:
     # (R7: the old single-node "QuantFuncNativeLoader" display entry is GONE with the class —
     # a display mapping for an unregistered class is dead weight; the three per-family loaders
     # register their display names beside their class mappings above.)
-    NODE_DISPLAY_NAME_MAPPINGS.update({"QuantFuncNativeLoRA": "QuantFunc Native LoRA"})
+    NODE_DISPLAY_NAME_MAPPINGS.update({"QuantFuncNativeLoRA": qfmp.NATIVE_LORA_NODE})
 
     def _serve_api_key_route():
         """On a SERVING ComfyUI (its PromptServer exists while custom nodes load), add the route the loaders' API key

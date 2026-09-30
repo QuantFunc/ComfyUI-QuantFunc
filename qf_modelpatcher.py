@@ -1215,12 +1215,20 @@ _RESOURCE_DOMAINS = {}
 _log = qfe.logger(__name__)   # console-safe (#738)
 
 LORA_HELP_URL = "https://www.quantfunc.com/docs/lora-convert"
+NATIVE_LORA_NODE = "QuantFunc Native LoRA"   # QuantFuncNativeLoRA's display name (NODE_DISPLAY_NAME_MAPPINGS uses this)
 
 
-def warn_lora_not_loaded():
+def warn_lora_not_loaded(stock_loader=False):
     """The ONE line a LoRA that could not be loaded for a QuantFunc model prints, whichever family and path (user
-    2026-09-30 「lora无法加载的时候让用户自己看 …」): a pointer to the page, instead of leaving the user with per-key lines."""
-    _log.warning(f"[qf_native] LoRA could not be loaded for this QuantFunc model. Please read {LORA_HELP_URL}")
+    2026-09-30 「lora无法加载的时候让用户自己看 …」「…要他们用我们的Quantfunc lora节点吧」): what went wrong in one sentence,
+    and the page, instead of leaving the user with per-key lines. stock_loader: ComfyUI's own LoRA node was used."""
+    if stock_loader:
+        why = (f"ComfyUI's Load LoRA / LoraLoaderModelOnly nodes cannot apply a LoRA to it, use the \"{NATIVE_LORA_NODE}\" "
+               "node instead")
+    else:
+        why = (f"the \"{NATIVE_LORA_NODE}\" node cannot use this file (it is not in the format that node takes, or it is "
+               "a LoRA for another model)")
+    _log.warning(f"[qf_native] LoRA could not be loaded for this QuantFunc model: {why}. Please read {LORA_HELP_URL}")
 
 
 def _in_comfy_lora_load(frame):
@@ -1724,7 +1732,7 @@ class QFModelPatcher(comfy.model_patcher.ModelPatcher):
         # the LoRA is meant for the text encoder only: nothing to say.
         strength = args[0] if args else kwargs.get("strength_patch", 1.0)
         if strength and _in_comfy_lora_load(getattr(inspect.currentframe(), "f_back", None)):
-            warn_lora_not_loaded()
+            warn_lora_not_loaded(stock_loader=True)
         return super().add_patches(patches, *args, **kwargs)
 
     def __init__(self, *args, **kwargs):
