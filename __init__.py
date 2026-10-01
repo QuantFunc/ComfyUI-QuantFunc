@@ -1268,6 +1268,14 @@ if _IMPORT_OK:
         "QuantFuncQwenImage21Loader": "QuantFunc Qwen-Image-2.1 Loader",
         "QuantFuncH3LatentUpscale": "QuantFunc MiniMax-H3 Latent Upscale"})
 
+    try:
+        from .qf_h3_conditioning import QuantFuncH3ImageToVideoStage2, QuantFuncH3ReferenceToVideoStage2
+        NODE_CLASS_MAPPINGS.update({
+            "QuantFuncH3ImageToVideoStage2": QuantFuncH3ImageToVideoStage2,
+            "QuantFuncH3ReferenceToVideoStage2": QuantFuncH3ReferenceToVideoStage2})
+    except ImportError as _h3_cond_exc:
+        _log.warning("[qf_native] H3 Stage 2 conditioning unavailable: %s", ascii(_h3_cond_exc))
+
     # AUTOMATION — a mechanism must not depend on someone remembering to run it (CR): run the reject-list
     # completeness scan AT IMPORT so a comfy upgrade that adds a consumable conditioning key emits a loud
     # logging.warning HERE, instead of waiting for a human to run the CLI on every comfy upgrade. Loaded by

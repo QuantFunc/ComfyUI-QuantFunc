@@ -2,7 +2,7 @@
   "id": "88df3e97-1da7-4822-b84d-3854ee30e7bc",
   "revision": 0,
   "last_node_id": 31,
-  "last_link_id": 40,
+  "last_link_id": 41,
   "nodes": [
     {
       "id": 1,
@@ -22,10 +22,10 @@
       "outputs": [],
       "properties": {},
       "widgets_values": [
-        "## QuantFunc MiniMax-H3\n\n- **QuantFunc MiniMax-H3 Loader** replaces the official `Load Diffusion Model` (UNETLoader): the QuantFunc engine runs the H3 transformer, video and audio; the text encoder (`CLIPLoader`, type `minimax`), the video and audio VAEs and the sampler stay stock ComfyUI.\n- `transformer` from ModelScope [QuantFunc/Minimax-H3-Quantfunc-4bit](https://modelscope.cn/models/QuantFunc/Minimax-H3-Quantfunc-4bit), in `models/diffusion_models`: `minimax_h3_ref2va_8steps_quantfunc_int4_r128.safetensors`.\n- From Hugging Face [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3): text encoder `qwen3vl_32b_minimax_h3_int8_convrot.safetensors` (the bf16 file also works), VAEs `minimax_h3_video_vae_fp16.safetensors` and `minimax_h3_audio_vae_fp32.safetensors`.\n- `audio_enhance`: ON adds a short extra pass that makes the sound clearer (most useful at few steps). It is not supported in two-stage (double-sampling) workflows: it is ignored there.\n- Input images: `red_superboy_on_city_roof.png`, `mecha_dragon_lightning.png` from [Comfy-Org/workflow_templates](https://github.com/Comfy-Org/workflow_templates/tree/main/input); use your own.\n- Size: 960x544 (multiples of 32), 124 frames (~5 s at 24 fps; frames are 17k+5).\n\n**Reference images to video with audio.** `<Picture 1>` and `<Picture 2>` in the prompt are the reference images in order (up to more: connect another image to the next `ref_image` input). 8 steps, res_multistep / simple.\n\n**Two stages on one schedule: low-res, then high-res.** `Total steps` (8) makes one noise schedule from full noise to clean. Stage 1 runs its first `Stage 1 steps` (4) on the small canvas and stops there; stage 2 continues the same schedule to the end at high res (4 steps). 8 steps is this model's native step count, and other totals changed the picture in our tests, so change it with care; keep `Stage 1 steps` between 1 and `Total steps` - 1. Stage 1's prediction of the clean video is scaled up, and stage 2 adds noise at exactly the level where stage 1 stopped, so the high-res latent has the noise the schedule expects there. Set only the width x height on `Stage 1 conditioning` (960x544) and the upscale factor (`scale_by` on the upscale node, 2). The high-res size is computed: the stage 1 size times the factor, rounded to a multiple of 32 (960x544 x 2 = 1920x1088); the upscale node outputs it as its `width` / `height`. `Stage 2 conditioning` sizes the references for the high-res canvas (`ref_image_size` match sizes them to the canvas area). It takes that size from the upscale node, so the two always agree; its own latent output is not used. Edit the prompt and the length once, in `Prompt` and `Length (frames)`. For a quicker look, use a smaller stage 1 size (for example 512x288, which x2 gives 1024x576).\n"
+        "## QuantFunc MiniMax-H3\n\nQuantFunc runs the H3 transformer and joint video/audio sampling. CLIPLoader (type minimax), the VAEs, scheduler and sampler are stock ComfyUI; Stage 2 uses the QuantFunc conditioning reuse node.\n\n- Transformer: `minimax_h3_ref2va_8steps_quantfunc_int4_r128.safetensors`, from [QuantFunc on ModelScope](https://modelscope.cn/models/QuantFunc/Minimax-H3-Quantfunc-4bit), in models/diffusion_models.\n- Text encoder: `qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors`. Video VAE: `minimax_h3_video_vae_int8_convrot.safetensors`. Audio VAE: `minimax_h3_audio_vae_fp32.safetensors`, from [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3).\n- Saved canvas: 768x768, 124 frames.\n- Saved sampling: 8 total steps, res_multistep / simple, denoise 1, attention sage.\n- Saved seed: 42 (fixed).\n- References: `ComfyUI_temp_tupev_00031_.png` is active; `mecha_dragon_lightning.png` is bypassed.\n- Reference sizing: match. The active image is `<Picture 1>` in the prompt; connect more references in order as needed.\n\n**Two stages on one schedule.** Stage 1 runs 3 steps at 768x768; Stage 2 continues the remaining 5 steps at 1152x1152. The upscale node scales Stage 1's denoised video latent by 1.5 using nearest-exact, keeps the audio latent, and outputs the Stage 2 width/height. Stage 2 adds noise at the split sigma and continues the same schedule.\n\nSet the low-res size in Stage 1 conditioning and the scale in the latent upscale node. Stage 2 reads the computed size; its unused empty latent output does not feed the sampler. Edit the prompt and frame count once, in Prompt and Length (frames).\n\n**Stage 2 conditioning reuse.** Stage 2 keeps Stage 1 Qwen text/vision embeddings and token tags, avoiding a second Qwen encode. The stock H3 logic rebuilds reference VAE conditions (match sizing) at the Stage 2 size.\nThis deliberately retains the Stage 1 Qwen visual representation; it is not equivalent to re-encoding the 1152x1152 reference image in Qwen.\naudio_enhance is unsupported for double sampling and is ignored for this run.\n"
       ],
       "widgets_values_named": {
-        "text": "## QuantFunc MiniMax-H3\n\n- **QuantFunc MiniMax-H3 Loader** replaces the official `Load Diffusion Model` (UNETLoader): the QuantFunc engine runs the H3 transformer, video and audio; the text encoder (`CLIPLoader`, type `minimax`), the video and audio VAEs and the sampler stay stock ComfyUI.\n- `transformer` from ModelScope [QuantFunc/Minimax-H3-Quantfunc-4bit](https://modelscope.cn/models/QuantFunc/Minimax-H3-Quantfunc-4bit), in `models/diffusion_models`: `minimax_h3_ref2va_8steps_quantfunc_int4_r128.safetensors`.\n- From Hugging Face [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3): text encoder `qwen3vl_32b_minimax_h3_int8_convrot.safetensors` (the bf16 file also works), VAEs `minimax_h3_video_vae_fp16.safetensors` and `minimax_h3_audio_vae_fp32.safetensors`.\n- `audio_enhance`: ON adds a short extra pass that makes the sound clearer (most useful at few steps). It is not supported in two-stage (double-sampling) workflows: it is ignored there.\n- Input images: `red_superboy_on_city_roof.png`, `mecha_dragon_lightning.png` from [Comfy-Org/workflow_templates](https://github.com/Comfy-Org/workflow_templates/tree/main/input); use your own.\n- Size: 960x544 (multiples of 32), 124 frames (~5 s at 24 fps; frames are 17k+5).\n\n**Reference images to video with audio.** `<Picture 1>` and `<Picture 2>` in the prompt are the reference images in order (up to more: connect another image to the next `ref_image` input). 8 steps, res_multistep / simple.\n\n**Two stages on one schedule: low-res, then high-res.** `Total steps` (8) makes one noise schedule from full noise to clean. Stage 1 runs its first `Stage 1 steps` (4) on the small canvas and stops there; stage 2 continues the same schedule to the end at high res (4 steps). 8 steps is this model's native step count, and other totals changed the picture in our tests, so change it with care; keep `Stage 1 steps` between 1 and `Total steps` - 1. Stage 1's prediction of the clean video is scaled up, and stage 2 adds noise at exactly the level where stage 1 stopped, so the high-res latent has the noise the schedule expects there. Set only the width x height on `Stage 1 conditioning` (960x544) and the upscale factor (`scale_by` on the upscale node, 2). The high-res size is computed: the stage 1 size times the factor, rounded to a multiple of 32 (960x544 x 2 = 1920x1088); the upscale node outputs it as its `width` / `height`. `Stage 2 conditioning` sizes the references for the high-res canvas (`ref_image_size` match sizes them to the canvas area). It takes that size from the upscale node, so the two always agree; its own latent output is not used. Edit the prompt and the length once, in `Prompt` and `Length (frames)`. For a quicker look, use a smaller stage 1 size (for example 512x288, which x2 gives 1024x576).\n"
+        "text": "## QuantFunc MiniMax-H3\n\nQuantFunc runs the H3 transformer and joint video/audio sampling. CLIPLoader (type minimax), the VAEs, scheduler and sampler are stock ComfyUI; Stage 2 uses the QuantFunc conditioning reuse node.\n\n- Transformer: `minimax_h3_ref2va_8steps_quantfunc_int4_r128.safetensors`, from [QuantFunc on ModelScope](https://modelscope.cn/models/QuantFunc/Minimax-H3-Quantfunc-4bit), in models/diffusion_models.\n- Text encoder: `qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors`. Video VAE: `minimax_h3_video_vae_int8_convrot.safetensors`. Audio VAE: `minimax_h3_audio_vae_fp32.safetensors`, from [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3).\n- Saved canvas: 768x768, 124 frames.\n- Saved sampling: 8 total steps, res_multistep / simple, denoise 1, attention sage.\n- Saved seed: 42 (fixed).\n- References: `ComfyUI_temp_tupev_00031_.png` is active; `mecha_dragon_lightning.png` is bypassed.\n- Reference sizing: match. The active image is `<Picture 1>` in the prompt; connect more references in order as needed.\n\n**Two stages on one schedule.** Stage 1 runs 3 steps at 768x768; Stage 2 continues the remaining 5 steps at 1152x1152. The upscale node scales Stage 1's denoised video latent by 1.5 using nearest-exact, keeps the audio latent, and outputs the Stage 2 width/height. Stage 2 adds noise at the split sigma and continues the same schedule.\n\nSet the low-res size in Stage 1 conditioning and the scale in the latent upscale node. Stage 2 reads the computed size; its unused empty latent output does not feed the sampler. Edit the prompt and frame count once, in Prompt and Length (frames).\n\n**Stage 2 conditioning reuse.** Stage 2 keeps Stage 1 Qwen text/vision embeddings and token tags, avoiding a second Qwen encode. The stock H3 logic rebuilds reference VAE conditions (match sizing) at the Stage 2 size.\nThis deliberately retains the Stage 1 Qwen visual representation; it is not equivalent to re-encoding the 1152x1152 reference image in Qwen.\naudio_enhance is unsupported for double sampling and is ignored for this run.\n"
       },
       "color": "#432",
       "bgcolor": "#653"
@@ -34,8 +34,8 @@
       "id": 2,
       "type": "QuantFuncH3Loader",
       "pos": [
-        0,
-        530
+        -23.325416466071374,
+        739.0644396298069
       ],
       "size": [
         307.151953125,
@@ -137,7 +137,7 @@
       ],
       "outputs": [
         {
-          "localized_name": "MODEL",
+          "localized_name": "模型",
           "name": "MODEL",
           "type": "MODEL",
           "links": [
@@ -154,22 +154,22 @@
       "widgets_values": [
         "minimax_h3_ref2va_8steps_quantfunc_int4_r128.safetensors",
         "minimax-h3-fl2va",
-        "auto",
+        "sage",
         1,
         0,
         0,
-        false,
+        true,
         false,
         true
       ],
       "widgets_values_named": {
         "transformer": "minimax_h3_ref2va_8steps_quantfunc_int4_r128.safetensors",
         "model_config": "minimax-h3-fl2va",
-        "attention_backend": "auto",
+        "attention_backend": "sage",
         "sol_tau": 1,
         "step_cache": 0,
         "block_cache": 0,
-        "quality_enhance": false,
+        "quality_enhance": true,
         "audio_enhance": false,
         "pinned_memory": true
       }
@@ -178,8 +178,8 @@
       "id": 3,
       "type": "CLIPLoader",
       "pos": [
-        0,
-        850
+        -17.278056391721748,
+        1153.2297971363264
       ],
       "size": [
         270,
@@ -190,7 +190,7 @@
       "mode": 0,
       "inputs": [
         {
-          "localized_name": "clip_name",
+          "localized_name": "CLIP名称",
           "name": "clip_name",
           "type": "COMBO",
           "widget": {
@@ -199,7 +199,7 @@
           "link": null
         },
         {
-          "localized_name": "type",
+          "localized_name": "类型",
           "name": "type",
           "type": "COMBO",
           "widget": {
@@ -208,7 +208,7 @@
           "link": null
         },
         {
-          "localized_name": "device",
+          "localized_name": "设备",
           "name": "device",
           "shape": 7,
           "type": "COMBO",
@@ -224,8 +224,7 @@
           "name": "CLIP",
           "type": "CLIP",
           "links": [
-            1,
-            22
+            1
           ]
         }
       ],
@@ -233,12 +232,12 @@
         "Node name for S&R": "CLIPLoader"
       },
       "widgets_values": [
-        "qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
+        "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
         "minimax",
         "default"
       ],
       "widgets_values_named": {
-        "clip_name": "qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
+        "clip_name": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
         "type": "minimax",
         "device": "default"
       }
@@ -247,8 +246,8 @@
       "id": 4,
       "type": "VAELoader",
       "pos": [
-        0,
-        1026
+        -17.278056391721748,
+        1329.2297971363264
       ],
       "size": [
         270,
@@ -259,7 +258,7 @@
       "mode": 0,
       "inputs": [
         {
-          "localized_name": "vae_name",
+          "localized_name": "vae名称",
           "name": "vae_name",
           "type": "COMBO",
           "widget": {
@@ -285,18 +284,18 @@
         "Node name for S&R": "VAELoader"
       },
       "widgets_values": [
-        "minimax_h3_video_vae_fp16.safetensors"
+        "minimax_h3_video_vae_int8_convrot.safetensors"
       ],
       "widgets_values_named": {
-        "vae_name": "minimax_h3_video_vae_fp16.safetensors"
+        "vae_name": "minimax_h3_video_vae_int8_convrot.safetensors"
       }
     },
     {
       "id": 5,
       "type": "VAELoader",
       "pos": [
-        0,
-        1154
+        -17.278056391721748,
+        1457.2297971363264
       ],
       "size": [
         270,
@@ -307,7 +306,7 @@
       "mode": 0,
       "inputs": [
         {
-          "localized_name": "vae_name",
+          "localized_name": "vae名称",
           "name": "vae_name",
           "type": "COMBO",
           "widget": {
@@ -343,8 +342,8 @@
       "id": 6,
       "type": "LoadImage",
       "pos": [
-        580,
-        0
+        482.3789742684344,
+        -850.0801585497996
       ],
       "size": [
         282.798828125,
@@ -355,7 +354,7 @@
       "mode": 0,
       "inputs": [
         {
-          "localized_name": "image",
+          "localized_name": "图像",
           "name": "image",
           "type": "COMBO",
           "widget": {
@@ -364,7 +363,7 @@
           "link": null
         },
         {
-          "localized_name": "choose file to upload",
+          "localized_name": "选择文件上传",
           "name": "upload",
           "type": "IMAGEUPLOAD",
           "widget": {
@@ -375,7 +374,7 @@
       ],
       "outputs": [
         {
-          "localized_name": "IMAGE",
+          "localized_name": "图像",
           "name": "IMAGE",
           "type": "IMAGE",
           "links": [
@@ -384,7 +383,7 @@
           ]
         },
         {
-          "localized_name": "MASK",
+          "localized_name": "遮罩",
           "name": "MASK",
           "type": "MASK",
           "links": null
@@ -395,11 +394,11 @@
         "Node name for S&R": "LoadImage"
       },
       "widgets_values": [
-        "red_superboy_on_city_roof.png",
+        "ComfyUI_temp_tupev_00031_.png",
         "image"
       ],
       "widgets_values_named": {
-        "image": "red_superboy_on_city_roof.png",
+        "image": "ComfyUI_temp_tupev_00031_.png",
         "upload": "image"
       }
     },
@@ -407,8 +406,8 @@
       "id": 7,
       "type": "LoadImage",
       "pos": [
-        580,
-        172
+        491.88195511224535,
+        -412.86208310248173
       ],
       "size": [
         282.798828125,
@@ -416,10 +415,10 @@
       ],
       "flags": {},
       "order": 6,
-      "mode": 0,
+      "mode": 4,
       "inputs": [
         {
-          "localized_name": "image",
+          "localized_name": "图像",
           "name": "image",
           "type": "COMBO",
           "widget": {
@@ -428,7 +427,7 @@
           "link": null
         },
         {
-          "localized_name": "choose file to upload",
+          "localized_name": "选择文件上传",
           "name": "upload",
           "type": "IMAGEUPLOAD",
           "widget": {
@@ -439,7 +438,7 @@
       ],
       "outputs": [
         {
-          "localized_name": "IMAGE",
+          "localized_name": "图像",
           "name": "IMAGE",
           "type": "IMAGE",
           "links": [
@@ -448,7 +447,7 @@
           ]
         },
         {
-          "localized_name": "MASK",
+          "localized_name": "遮罩",
           "name": "MASK",
           "type": "MASK",
           "links": null
@@ -475,11 +474,11 @@
         0
       ],
       "size": [
-        400,
-        344
+        421.085546875,
+        404
       ],
       "flags": {},
-      "order": 11,
+      "order": 12,
       "mode": 0,
       "inputs": [
         {
@@ -545,7 +544,21 @@
           "link": null
         },
         {
-          "localized_name": "prompt",
+          "localized_name": "ref_audio_1",
+          "name": "ref_audios.ref_audio_1",
+          "shape": 7,
+          "type": "AUDIO",
+          "link": null
+        },
+        {
+          "localized_name": "ref_audio_2",
+          "name": "ref_audios.ref_audio_2",
+          "shape": 7,
+          "type": "AUDIO",
+          "link": null
+        },
+        {
+          "localized_name": "提示词",
           "name": "prompt",
           "type": "STRING",
           "widget": {
@@ -554,7 +567,7 @@
           "link": 5
         },
         {
-          "localized_name": "width",
+          "localized_name": "宽度",
           "name": "width",
           "type": "INT",
           "widget": {
@@ -563,7 +576,7 @@
           "link": null
         },
         {
-          "localized_name": "height",
+          "localized_name": "高度",
           "name": "height",
           "type": "INT",
           "widget": {
@@ -572,7 +585,7 @@
           "link": null
         },
         {
-          "localized_name": "length",
+          "localized_name": "长度",
           "name": "length",
           "type": "INT",
           "widget": {
@@ -581,7 +594,7 @@
           "link": 6
         },
         {
-          "localized_name": "ref_image_size",
+          "localized_name": "参考图像尺寸",
           "name": "ref_image_size",
           "type": "COMBO",
           "widget": {
@@ -592,15 +605,16 @@
       ],
       "outputs": [
         {
-          "localized_name": "positive",
+          "localized_name": "正向",
           "name": "positive",
           "type": "CONDITIONING",
           "links": [
-            8
+            8,
+            41
           ]
         },
         {
-          "localized_name": "LATENT",
+          "localized_name": "Latent",
           "name": "LATENT",
           "type": "LATENT",
           "links": [
@@ -608,31 +622,31 @@
           ]
         }
       ],
+      "title": "Stage 1 conditioning (low-res: set the width x height here)",
       "properties": {
         "Node name for S&R": "MiniMaxH3ReferenceToVideo"
       },
       "widgets_values": [
         "Bold comic-book ink style, heavy linework, red and blue-black palette, night city. Use <Picture 1> and <Picture 2> as references. CUT 1: the little red-caped superhero boy from <Picture 1> stands on a rooftop, hands on his hips, grins at the camera and shouts \"Get ready!\". CUT 2: the giant black mech-kaiju from <Picture 2> rears back and ROARS, red chest core flaring, blue lightning arcing off its head, thunder rumbling over the skyline.",
-        960,
-        544,
+        768,
+        768,
         124,
         "match"
       ],
       "widgets_values_named": {
         "prompt": "Bold comic-book ink style, heavy linework, red and blue-black palette, night city. Use <Picture 1> and <Picture 2> as references. CUT 1: the little red-caped superhero boy from <Picture 1> stands on a rooftop, hands on his hips, grins at the camera and shouts \"Get ready!\". CUT 2: the giant black mech-kaiju from <Picture 2> rears back and ROARS, red chest core flaring, blue lightning arcing off its head, thunder rumbling over the skyline.",
-        "width": 960,
-        "height": 544,
+        "width": 768,
+        "height": 768,
         "length": 124,
         "ref_image_size": "match"
-      },
-      "title": "Stage 1 conditioning (low-res: set the width x height here)"
+      }
     },
     {
       "id": 9,
       "type": "RandomNoise",
       "pos": [
-        922.798828125,
-        414
+        918.4793258909658,
+        445.96437347855516
       ],
       "size": [
         270,
@@ -643,7 +657,7 @@
       "mode": 0,
       "inputs": [
         {
-          "localized_name": "noise_seed",
+          "localized_name": "噪波随机种",
           "name": "noise_seed",
           "type": "INT",
           "widget": {
@@ -654,7 +668,7 @@
       ],
       "outputs": [
         {
-          "localized_name": "NOISE",
+          "localized_name": "噪波",
           "name": "NOISE",
           "type": "NOISE",
           "links": [
@@ -687,17 +701,17 @@
         46
       ],
       "flags": {},
-      "order": 13,
+      "order": 14,
       "mode": 0,
       "inputs": [
         {
-          "localized_name": "model",
+          "localized_name": "模型",
           "name": "model",
           "type": "MODEL",
           "link": 7
         },
         {
-          "localized_name": "conditioning",
+          "localized_name": "条件",
           "name": "conditioning",
           "type": "CONDITIONING",
           "link": 8
@@ -705,7 +719,7 @@
       ],
       "outputs": [
         {
-          "localized_name": "GUIDER",
+          "localized_name": "引导器",
           "name": "GUIDER",
           "type": "GUIDER",
           "links": [
@@ -733,7 +747,7 @@
       "mode": 0,
       "inputs": [
         {
-          "localized_name": "sampler_name",
+          "localized_name": "采样器名称",
           "name": "sampler_name",
           "type": "COMBO",
           "widget": {
@@ -744,7 +758,7 @@
       ],
       "outputs": [
         {
-          "localized_name": "SAMPLER",
+          "localized_name": "采样器",
           "name": "SAMPLER",
           "type": "SAMPLER",
           "links": [
@@ -771,21 +785,21 @@
         810
       ],
       "size": [
-        270,
+        300.7935546875,
         106
       ],
       "flags": {},
-      "order": 12,
+      "order": 11,
       "mode": 0,
       "inputs": [
         {
-          "localized_name": "model",
+          "localized_name": "模型",
           "name": "model",
           "type": "MODEL",
           "link": 9
         },
         {
-          "localized_name": "scheduler",
+          "localized_name": "调度器",
           "name": "scheduler",
           "type": "COMBO",
           "widget": {
@@ -794,7 +808,7 @@
           "link": null
         },
         {
-          "localized_name": "steps",
+          "localized_name": "步数",
           "name": "steps",
           "type": "INT",
           "widget": {
@@ -803,7 +817,7 @@
           "link": null
         },
         {
-          "localized_name": "denoise",
+          "localized_name": "降噪",
           "name": "denoise",
           "type": "FLOAT",
           "widget": {
@@ -814,7 +828,7 @@
       ],
       "outputs": [
         {
-          "localized_name": "SIGMAS",
+          "localized_name": "Sigmas",
           "name": "SIGMAS",
           "type": "SIGMAS",
           "links": [
@@ -822,6 +836,7 @@
           ]
         }
       ],
+      "title": "Total steps (both stages, one schedule)",
       "properties": {
         "Node name for S&R": "BasicScheduler"
       },
@@ -834,8 +849,7 @@
         "scheduler": "simple",
         "steps": 8,
         "denoise": 1
-      },
-      "title": "Total steps (both stages, one schedule)"
+      }
     },
     {
       "id": 13,
@@ -845,7 +859,7 @@
         0
       ],
       "size": [
-        212.3638671875,
+        267.5572265625,
         106
       ],
       "flags": {},
@@ -853,31 +867,31 @@
       "mode": 0,
       "inputs": [
         {
-          "localized_name": "noise",
+          "localized_name": "噪波",
           "name": "noise",
           "type": "NOISE",
           "link": 11
         },
         {
-          "localized_name": "guider",
+          "localized_name": "引导器",
           "name": "guider",
           "type": "GUIDER",
           "link": 12
         },
         {
-          "localized_name": "sampler",
+          "localized_name": "采样器",
           "name": "sampler",
           "type": "SAMPLER",
           "link": 13
         },
         {
-          "localized_name": "sigmas",
+          "localized_name": "西格玛",
           "name": "sigmas",
           "type": "SIGMAS",
           "link": 14
         },
         {
-          "localized_name": "latent_image",
+          "localized_name": "Latent图像",
           "name": "latent_image",
           "type": "LATENT",
           "link": 15
@@ -885,13 +899,13 @@
       ],
       "outputs": [
         {
-          "localized_name": "output",
+          "localized_name": "Latent",
           "name": "output",
           "type": "LATENT",
           "links": null
         },
         {
-          "localized_name": "denoised_output",
+          "localized_name": "降噪Latent",
           "name": "denoised_output",
           "type": "LATENT",
           "links": [
@@ -908,25 +922,25 @@
       "id": 14,
       "type": "SplitSigmas",
       "pos": [
-        922.798828125,
-        946
+        919.3432548111234,
+        994.3785484057039
       ],
       "size": [
-        270,
+        339.6421875,
         78
       ],
       "flags": {},
-      "order": 14,
+      "order": 13,
       "mode": 0,
       "inputs": [
         {
-          "localized_name": "sigmas",
+          "localized_name": "Sigmas",
           "name": "sigmas",
           "type": "SIGMAS",
           "link": 10
         },
         {
-          "localized_name": "step",
+          "localized_name": "步数",
           "name": "step",
           "type": "INT",
           "widget": {
@@ -937,7 +951,7 @@
       ],
       "outputs": [
         {
-          "localized_name": "high_sigmas",
+          "localized_name": "高Sigmas",
           "name": "high_sigmas",
           "type": "SIGMAS",
           "links": [
@@ -945,7 +959,7 @@
           ]
         },
         {
-          "localized_name": "low_sigmas",
+          "localized_name": "低Sigmas",
           "name": "low_sigmas",
           "type": "SIGMAS",
           "links": [
@@ -953,16 +967,16 @@
           ]
         }
       ],
+      "title": "Stage 1 steps (low-res; stage 2 does the rest)",
       "properties": {
         "Node name for S&R": "SplitSigmas"
       },
       "widgets_values": [
-        4
+        3
       ],
       "widgets_values_named": {
-        "step": 4
-      },
-      "title": "Stage 1 steps (low-res; stage 2 does the rest)"
+        "step": 3
+      }
     },
     {
       "id": 16,
@@ -972,7 +986,7 @@
         0
       ],
       "size": [
-        212.3638671875,
+        408.5552734375,
         106
       ],
       "flags": {},
@@ -980,31 +994,31 @@
       "mode": 0,
       "inputs": [
         {
-          "localized_name": "noise",
+          "localized_name": "噪波",
           "name": "noise",
           "type": "NOISE",
           "link": 17
         },
         {
-          "localized_name": "guider",
+          "localized_name": "引导器",
           "name": "guider",
           "type": "GUIDER",
           "link": 18
         },
         {
-          "localized_name": "sampler",
+          "localized_name": "采样器",
           "name": "sampler",
           "type": "SAMPLER",
           "link": 19
         },
         {
-          "localized_name": "sigmas",
+          "localized_name": "西格玛",
           "name": "sigmas",
           "type": "SIGMAS",
           "link": 20
         },
         {
-          "localized_name": "latent_image",
+          "localized_name": "Latent图像",
           "name": "latent_image",
           "type": "LATENT",
           "link": 21
@@ -1012,7 +1026,7 @@
       ],
       "outputs": [
         {
-          "localized_name": "output",
+          "localized_name": "Latent",
           "name": "output",
           "type": "LATENT",
           "links": [
@@ -1021,7 +1035,7 @@
           ]
         },
         {
-          "localized_name": "denoised_output",
+          "localized_name": "降噪Latent",
           "name": "denoised_output",
           "type": "LATENT",
           "links": null
@@ -1048,7 +1062,7 @@
       "mode": 0,
       "inputs": [
         {
-          "localized_name": "samples",
+          "localized_name": "Latent",
           "name": "samples",
           "type": "LATENT",
           "link": 32
@@ -1062,7 +1076,7 @@
       ],
       "outputs": [
         {
-          "localized_name": "IMAGE",
+          "localized_name": "图像",
           "name": "IMAGE",
           "type": "IMAGE",
           "links": [
@@ -1090,7 +1104,7 @@
       "mode": 0,
       "inputs": [
         {
-          "localized_name": "samples",
+          "localized_name": "Latent",
           "name": "samples",
           "type": "LATENT",
           "link": 34
@@ -1104,7 +1118,7 @@
       ],
       "outputs": [
         {
-          "localized_name": "AUDIO",
+          "localized_name": "音频",
           "name": "AUDIO",
           "type": "AUDIO",
           "links": [
@@ -1120,8 +1134,8 @@
       "id": 19,
       "type": "CreateVideo",
       "pos": [
-        2443,
-        0
+        2612.324848236587,
+        5.183407426399583
       ],
       "size": [
         270,
@@ -1132,20 +1146,20 @@
       "mode": 0,
       "inputs": [
         {
-          "localized_name": "images",
+          "localized_name": "图像",
           "name": "images",
           "type": "IMAGE",
           "link": 36
         },
         {
-          "localized_name": "audio",
+          "localized_name": "音频",
           "name": "audio",
           "shape": 7,
           "type": "AUDIO",
           "link": 37
         },
         {
-          "localized_name": "fps",
+          "localized_name": "帧率",
           "name": "fps",
           "type": "FLOAT",
           "widget": {
@@ -1186,7 +1200,7 @@
       ],
       "outputs": [
         {
-          "localized_name": "VIDEO",
+          "localized_name": "视频",
           "name": "VIDEO",
           "type": "VIDEO",
           "links": [
@@ -1214,25 +1228,25 @@
       "id": 20,
       "type": "SaveVideo",
       "pos": [
-        2443,
-        220
+        2612.324848236587,
+        225.18340742639958
       ],
       "size": [
-        270,
-        106
+        850.5293612510346,
+        1206.2244363878638
       ],
       "flags": {},
       "order": 23,
       "mode": 0,
       "inputs": [
         {
-          "localized_name": "video",
+          "localized_name": "视频",
           "name": "video",
           "type": "VIDEO",
           "link": 38
         },
         {
-          "localized_name": "filename_prefix",
+          "localized_name": "文件名前缀",
           "name": "filename_prefix",
           "type": "STRING",
           "widget": {
@@ -1241,16 +1255,7 @@
           "link": null
         },
         {
-          "localized_name": "codec",
-          "name": "format.codec",
-          "type": "COMFY_DYNAMICCOMBO_V3",
-          "widget": {
-            "name": "format.codec"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "format",
+          "localized_name": "格式",
           "name": "format",
           "type": "COMFY_DYNAMICCOMBO_V3",
           "widget": {
@@ -1259,7 +1264,16 @@
           "link": null
         },
         {
-          "localized_name": "codec",
+          "localized_name": "编解码器",
+          "name": "format.codec",
+          "type": "COMFY_DYNAMICCOMBO_V3",
+          "widget": {
+            "name": "format.codec"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "编码器",
           "name": "codec",
           "shape": 7,
           "type": "COMFY_DYNAMICCOMBO_V3",
@@ -1300,7 +1314,7 @@
       ],
       "size": [
         300,
-        110
+        122
       ],
       "flags": {},
       "order": 16,
@@ -1316,19 +1330,19 @@
           "localized_name": "scale_by",
           "name": "scale_by",
           "type": "FLOAT",
-          "link": null,
           "widget": {
             "name": "scale_by"
-          }
+          },
+          "link": null
         },
         {
           "localized_name": "upscale_method",
           "name": "upscale_method",
           "type": "COMBO",
-          "link": null,
           "widget": {
             "name": "upscale_method"
-          }
+          },
+          "link": null
         }
       ],
       "outputs": [
@@ -1357,39 +1371,38 @@
           ]
         }
       ],
+      "title": "Upscale latent (scale_by = the factor)",
       "properties": {
         "Node name for S&R": "QuantFuncH3LatentUpscale"
       },
       "widgets_values": [
-        2.0,
-        "bilinear"
+        1.5,
+        "nearest-exact"
       ],
       "widgets_values_named": {
-        "scale_by": 2.0,
-        "upscale_method": "bilinear"
-      },
-      "title": "Upscale latent (scale_by = the factor)"
+        "scale_by": 1.5,
+        "upscale_method": "nearest-exact"
+      }
     },
     {
       "id": 26,
-      "type": "MiniMaxH3ReferenceToVideo",
+      "type": "QuantFuncH3ReferenceToVideoStage2",
       "pos": [
         1713,
         0
       ],
       "size": [
-        400,
-        344
+        433.089453125,
+        404
       ],
       "flags": {},
       "order": 17,
       "mode": 0,
       "inputs": [
         {
-          "localized_name": "clip",
-          "name": "clip",
-          "type": "CLIP",
-          "link": 22
+          "name": "positive",
+          "type": "CONDITIONING",
+          "link": 41
         },
         {
           "localized_name": "vae",
@@ -1448,16 +1461,21 @@
           "link": null
         },
         {
-          "localized_name": "prompt",
-          "name": "prompt",
-          "type": "STRING",
-          "widget": {
-            "name": "prompt"
-          },
-          "link": 26
+          "localized_name": "ref_audio_1",
+          "name": "ref_audios.ref_audio_1",
+          "shape": 7,
+          "type": "AUDIO",
+          "link": null
         },
         {
-          "localized_name": "width",
+          "localized_name": "ref_audio_2",
+          "name": "ref_audios.ref_audio_2",
+          "shape": 7,
+          "type": "AUDIO",
+          "link": null
+        },
+        {
+          "localized_name": "宽度",
           "name": "width",
           "type": "INT",
           "widget": {
@@ -1466,7 +1484,7 @@
           "link": 28
         },
         {
-          "localized_name": "height",
+          "localized_name": "高度",
           "name": "height",
           "type": "INT",
           "widget": {
@@ -1475,7 +1493,7 @@
           "link": 29
         },
         {
-          "localized_name": "length",
+          "localized_name": "长度",
           "name": "length",
           "type": "INT",
           "widget": {
@@ -1484,7 +1502,7 @@
           "link": 27
         },
         {
-          "localized_name": "ref_image_size",
+          "localized_name": "参考图像尺寸",
           "name": "ref_image_size",
           "type": "COMBO",
           "widget": {
@@ -1495,7 +1513,7 @@
       ],
       "outputs": [
         {
-          "localized_name": "positive",
+          "localized_name": "正向",
           "name": "positive",
           "type": "CONDITIONING",
           "links": [
@@ -1503,37 +1521,35 @@
           ]
         },
         {
-          "localized_name": "LATENT",
+          "localized_name": "Latent",
           "name": "LATENT",
           "type": "LATENT",
           "links": null
         }
       ],
+      "title": "Stage 2 conditioning (reuse Stage 1 CLIP; rebuild high-res references)",
       "properties": {
-        "Node name for S&R": "MiniMaxH3ReferenceToVideo"
+        "Node name for S&R": "QuantFuncH3ReferenceToVideoStage2"
       },
       "widgets_values": [
-        "Bold comic-book ink style, heavy linework, red and blue-black palette, night city. Use <Picture 1> and <Picture 2> as references. CUT 1: the little red-caped superhero boy from <Picture 1> stands on a rooftop, hands on his hips, grins at the camera and shouts \"Get ready!\". CUT 2: the giant black mech-kaiju from <Picture 2> rears back and ROARS, red chest core flaring, blue lightning arcing off its head, thunder rumbling over the skyline.",
         1920,
         1088,
         124,
         "match"
       ],
       "widgets_values_named": {
-        "prompt": "Bold comic-book ink style, heavy linework, red and blue-black palette, night city. Use <Picture 1> and <Picture 2> as references. CUT 1: the little red-caped superhero boy from <Picture 1> stands on a rooftop, hands on his hips, grins at the camera and shouts \"Get ready!\". CUT 2: the giant black mech-kaiju from <Picture 2> rears back and ROARS, red chest core flaring, blue lightning arcing off its head, thunder rumbling over the skyline.",
         "width": 1920,
         "height": 1088,
         "length": 124,
         "ref_image_size": "match"
-      },
-      "title": "Stage 2 conditioning (high-res; size from the upscale node)"
+      }
     },
     {
       "id": 27,
       "type": "BasicGuider",
       "pos": [
-        1713,
-        374
+        1382.1252841635678,
+        372.2721896152693
       ],
       "size": [
         160,
@@ -1544,13 +1560,13 @@
       "mode": 0,
       "inputs": [
         {
-          "localized_name": "model",
+          "localized_name": "模型",
           "name": "model",
           "type": "MODEL",
           "link": 30
         },
         {
-          "localized_name": "conditioning",
+          "localized_name": "条件",
           "name": "conditioning",
           "type": "CONDITIONING",
           "link": 31
@@ -1558,7 +1574,7 @@
       ],
       "outputs": [
         {
-          "localized_name": "GUIDER",
+          "localized_name": "引导器",
           "name": "GUIDER",
           "type": "GUIDER",
           "links": [
@@ -1566,10 +1582,10 @@
           ]
         }
       ],
+      "title": "Stage 2 guider",
       "properties": {
         "Node name for S&R": "BasicGuider"
-      },
-      "title": "Stage 2 guider"
+      }
     },
     {
       "id": 30,
@@ -1587,36 +1603,35 @@
       "mode": 0,
       "inputs": [
         {
-          "localized_name": "value",
+          "localized_name": "值",
           "name": "value",
           "type": "STRING",
-          "link": null,
           "widget": {
             "name": "value"
-          }
+          },
+          "link": null
         }
       ],
       "outputs": [
         {
-          "localized_name": "STRING",
+          "localized_name": "字符串",
           "name": "STRING",
           "type": "STRING",
           "links": [
-            5,
-            26
+            5
           ]
         }
       ],
+      "title": "Prompt",
       "properties": {
         "Node name for S&R": "PrimitiveStringMultiline"
       },
       "widgets_values": [
-        "Bold comic-book ink style, heavy linework, red and blue-black palette, night city. Use <Picture 1> and <Picture 2> as references. CUT 1: the little red-caped superhero boy from <Picture 1> stands on a rooftop, hands on his hips, grins at the camera and shouts \"Get ready!\". CUT 2: the giant black mech-kaiju from <Picture 2> rears back and ROARS, red chest core flaring, blue lightning arcing off its head, thunder rumbling over the skyline."
+        "subject_definitions: <Subject 1> is the woman in the supplied <Picture 1>, with long black hair and white-and-purple armor with glowing violet details.\n\nsummary: [reference generation] A five-second video of <Subject 1> dancing on a peaceful beach.\n\nretention_analysis: <Subject 1>: fully_preserved - Keep her face, hair, and original armor. Place her on a beach.\n\ndetailed_description: [Shot 1] Photorealistic. <Subject 1> dances gently on a quiet beach at golden hour. She sways her torso and makes graceful arm gestures, ending with a soft smile. Her hair flows in the sea breeze, and the armor plates retain their shape. Warm sunlight, soft ocean waves, pale sand, and a clear sky.\n\noverall_soundscape: Gentle ocean waves and a soft sea breeze.\n\nnon_diegetic_music: Light piano and fingerpicked acoustic guitar at 85 BPM, with delicate percussion and a gentle ending."
       ],
       "widgets_values_named": {
-        "value": "Bold comic-book ink style, heavy linework, red and blue-black palette, night city. Use <Picture 1> and <Picture 2> as references. CUT 1: the little red-caped superhero boy from <Picture 1> stands on a rooftop, hands on his hips, grins at the camera and shouts \"Get ready!\". CUT 2: the giant black mech-kaiju from <Picture 2> rears back and ROARS, red chest core flaring, blue lightning arcing off its head, thunder rumbling over the skyline."
-      },
-      "title": "Prompt"
+        "value": "subject_definitions: <Subject 1> is the woman in the supplied <Picture 1>, with long black hair and white-and-purple armor with glowing violet details.\n\nsummary: [reference generation] A five-second video of <Subject 1> dancing on a peaceful beach.\n\nretention_analysis: <Subject 1>: fully_preserved - Keep her face, hair, and original armor. Place her on a beach.\n\ndetailed_description: [Shot 1] Photorealistic. <Subject 1> dances gently on a quiet beach at golden hour. She sways her torso and makes graceful arm gestures, ending with a soft smile. Her hair flows in the sea breeze, and the armor plates retain their shape. Warm sunlight, soft ocean waves, pale sand, and a clear sky.\n\noverall_soundscape: Gentle ocean waves and a soft sea breeze.\n\nnon_diegetic_music: Light piano and fingerpicked acoustic guitar at 85 BPM, with delicate percussion and a gentle ending."
+      }
     },
     {
       "id": 31,
@@ -1634,18 +1649,18 @@
       "mode": 0,
       "inputs": [
         {
-          "localized_name": "value",
+          "localized_name": "数值",
           "name": "value",
           "type": "INT",
-          "link": null,
           "widget": {
             "name": "value"
-          }
+          },
+          "link": null
         }
       ],
       "outputs": [
         {
-          "localized_name": "INT",
+          "localized_name": "整数",
           "name": "INT",
           "type": "INT",
           "links": [
@@ -1654,6 +1669,7 @@
           ]
         }
       ],
+      "title": "Length (frames)",
       "properties": {
         "Node name for S&R": "PrimitiveInt"
       },
@@ -1663,60 +1679,11 @@
       ],
       "widgets_values_named": {
         "value": 124,
-        "control_after_generate": "fixed"
-      },
-      "title": "Length (frames)"
+        "fixed": "fixed"
+      }
     }
   ],
   "links": [
-    [
-      1,
-      3,
-      0,
-      8,
-      0,
-      "CLIP"
-    ],
-    [
-      2,
-      4,
-      0,
-      8,
-      1,
-      "VAE"
-    ],
-    [
-      3,
-      6,
-      0,
-      8,
-      3,
-      "IMAGE"
-    ],
-    [
-      4,
-      7,
-      0,
-      8,
-      4,
-      "IMAGE"
-    ],
-    [
-      5,
-      30,
-      0,
-      8,
-      9,
-      "STRING"
-    ],
-    [
-      6,
-      31,
-      0,
-      8,
-      12,
-      "INT"
-    ],
     [
       7,
       2,
@@ -1838,70 +1805,6 @@
       "LATENT"
     ],
     [
-      22,
-      3,
-      0,
-      26,
-      0,
-      "CLIP"
-    ],
-    [
-      23,
-      4,
-      0,
-      26,
-      1,
-      "VAE"
-    ],
-    [
-      24,
-      6,
-      0,
-      26,
-      3,
-      "IMAGE"
-    ],
-    [
-      25,
-      7,
-      0,
-      26,
-      4,
-      "IMAGE"
-    ],
-    [
-      26,
-      30,
-      0,
-      26,
-      9,
-      "STRING"
-    ],
-    [
-      27,
-      31,
-      0,
-      26,
-      12,
-      "INT"
-    ],
-    [
-      28,
-      21,
-      1,
-      26,
-      10,
-      "INT"
-    ],
-    [
-      29,
-      21,
-      2,
-      26,
-      11,
-      "INT"
-    ],
-    [
       30,
       2,
       0,
@@ -1974,11 +1877,67 @@
       "VIDEO"
     ],
     [
+      1,
+      3,
+      0,
+      8,
+      0,
+      "CLIP"
+    ],
+    [
+      2,
+      4,
+      0,
+      8,
+      1,
+      "VAE"
+    ],
+    [
       39,
       5,
       0,
       8,
       2,
+      "VAE"
+    ],
+    [
+      3,
+      6,
+      0,
+      8,
+      3,
+      "IMAGE"
+    ],
+    [
+      4,
+      7,
+      0,
+      8,
+      4,
+      "IMAGE"
+    ],
+    [
+      5,
+      30,
+      0,
+      8,
+      11,
+      "STRING"
+    ],
+    [
+      6,
+      31,
+      0,
+      8,
+      14,
+      "INT"
+    ],
+    [
+      23,
+      4,
+      0,
+      26,
+      1,
       "VAE"
     ],
     [
@@ -1988,16 +1947,64 @@
       26,
       2,
       "VAE"
+    ],
+    [
+      24,
+      6,
+      0,
+      26,
+      3,
+      "IMAGE"
+    ],
+    [
+      25,
+      7,
+      0,
+      26,
+      4,
+      "IMAGE"
+    ],
+    [
+      28,
+      21,
+      1,
+      26,
+      11,
+      "INT"
+    ],
+    [
+      29,
+      21,
+      2,
+      26,
+      12,
+      "INT"
+    ],
+    [
+      27,
+      31,
+      0,
+      26,
+      13,
+      "INT"
+    ],
+    [
+      41,
+      8,
+      0,
+      26,
+      0,
+      "CONDITIONING"
     ]
   ],
   "groups": [],
   "config": {},
   "extra": {
     "ds": {
-      "scale": 0.6,
+      "scale": 1.2861532860000013,
       "offset": [
-        120,
-        90
+        -753.2223920466022,
+        -111.1264274072294
       ]
     }
   },
