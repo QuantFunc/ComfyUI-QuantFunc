@@ -1,0 +1,317 @@
+#!/usr/bin/env python3
+"""The loaders' hidden `log_level` input (qf_log_level.add_log_level_input), without ComfyUI:
+
+  L1  the input is declared HIDDEN, in ComfyUI's (type, options) form, and is never a required or optional
+      (visible) input: users do not choose the log level; only "warning" and "info" are accepted;
+  L2  running the node applies the chosen level BEFORE the node's own function runs, and the
+      loader itself never receives `log_level`;
+  L3  a workflow that does not set it (every existing workflow) applies warning (engine level 3);
+  L4  the node's other inputs, and its return value, are untouched;
+  L5  __init__.py attaches the input AFTER every node registration (a loader registered later -- the cloud-TE
+      loader once was -- would silently get no input);
+  L6  the node function keeps its own name and parameters (plus a keyword-only `log_level`), also when it
+      takes **kwargs, so anything that inspects it sees the true signature;
+  L7  qf_engine.set_log_level never loads the engine library: with no library loaded it only records the
+      level, load_lib() applies it right after loading, and later requests apply at once. (Loading the
+      library for the level broke every loader run in a test environment without one.)
+  L8  ComfyUI does not validate hidden inputs, so the loader refuses any other value (or a non-string) with a
+      ValueError naming the accepted ones, before the level is set or the loader runs;
+  L9  a node that already declares hidden inputs (the quality loaders' retired quality_enhance) keeps them, and
+      the node's own spec dicts are never modified.
+  L10 qf_engine.info (the plugin's own per-run detail lines) prints only at info: silent before any loader ran and
+      at warning (tests-07 ruling: the production default is warning for the plugin's output too);
+  L11 those lines (loaded / SESSION OPEN / CLOSED / VRAM ledger / engine lib) reach the console only through it (AST).
+MUTATION: print the fingerprint at load (drop _FINGERPRINT_PENDING) -> L12 goes RED; make info() print at every level -> L10 goes RED; turn one converted line back into print -> L11 goes RED;
+make _run skip set_level -> L2/L3 go RED; forward log_level to the loader -> L2 goes RED; move the
+attach loop above the cloud-TE registration -> L5 goes RED; drop the __signature__ -> L6 goes RED; make
+set_log_level call load_lib(), or drop the pending-level apply in load_lib -> L7 goes RED; declare the input
+optional again -> L1 goes RED; drop the value check in _run -> L8 goes RED; write log_level into the node's
+own hidden dict -> L9 goes RED; take the file identity after the dlopen, or skip the identity check when it is
+unknown -> L14 goes RED.
+
+Run:  python tests/log_level_input_test.py   (pure Python; no ComfyUI, torch or engine library)
+"""
+import ast
+import importlib.util
+import inspect
+import os
+import sys
+import tempfile
+import types
+
+_PLUGIN = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_spec = importlib.util.spec_from_file_location("qf_log_level", os.path.join(_PLUGIN, "qf_log_level.py"))
+qf_log_level = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(qf_log_level)
+
+events = []
+
+
+class _Loader:
+    FUNCTION = "load"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"transformer": (["a.safetensors"],)},
+                "optional": {"attention_backend": (["auto", "sage"],)}}
+
+    def load(self, transformer, attention_backend="auto"):
+        """Load the model."""
+        events.append(("load", transformer, attention_backend))
+        return ("MODEL",)
+
+
+class _KwLoader:
+    FUNCTION = "load"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"transformer": (["a.safetensors"],)}}
+
+    def load(self, transformer, **extra):
+        return ("MODEL",)
+
+
+_SHARED_HIDDEN = {"quality_enhance": ("BOOLEAN", {})}   # module-level, like the quality loaders' own
+
+
+class _HiddenLoader:
+    FUNCTION = "load"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"transformer": (["a.safetensors"],)}, "hidden": _SHARED_HIDDEN}
+
+    def load(self, transformer, quality_enhance=None):
+        return ("MODEL",)
+
+
+def _load_qf_engine():
+    """qf_engine by file path (it imports only the standard library)."""
+    spec = importlib.util.spec_from_file_location("qf_engine_under_test", os.path.join(_PLUGIN, "qf_engine.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def main():
+    failures = []
+
+    def check(label, ok):
+        print(f"{'PASS' if ok else 'FAIL'} {label}")
+        if not ok:
+            failures.append(label)
+
+    qf_log_level.add_log_level_input(_Loader, lambda level: events.append(("set_level", level)))
+
+    spec = _Loader.INPUT_TYPES()
+    check("L1 declared hidden, as ComfyUI's (type, options) input form",
+          spec.get("hidden", {}).get("log_level") == ("STRING", {}))
+    check("L1 never a visible input (not required, not optional)",
+          "log_level" not in spec["required"] and "log_level" not in spec.get("optional", {}))
+    check("L1 only warning and info are accepted (no debug)", list(qf_log_level.LOG_LEVELS) == ["warning", "info"])
+    check("L4 other inputs untouched", spec["required"] == {"transformer": (["a.safetensors"],)}
+          and spec["optional"] == {"attention_backend": (["auto", "sage"],)})
+
+    events.clear()
+    out = getattr(_Loader(), _Loader.FUNCTION)(transformer="a.safetensors", attention_backend="sage",
+                                               log_level="info")
+    check("L2 level applied before the loader runs",
+          events == [("set_level", 2), ("load", "a.safetensors", "sage")])
+    check("L4 return value untouched", out == ("MODEL",))
+
+    events.clear()
+    getattr(_Loader(), _Loader.FUNCTION)(transformer="a.safetensors")
+    check("L3 unset input applies warning (3)",
+          events == [("set_level", 3), ("load", "a.safetensors", "auto")])
+
+    # L8: an unknown value is refused before anything runs (ComfyUI does not validate hidden inputs).
+    for bad in ("debug", "INFO", "", None, 2):
+        events.clear()
+        try:
+            getattr(_Loader(), _Loader.FUNCTION)(transformer="a.safetensors", log_level=bad)
+            refused = ""
+        except Exception as e:  # noqa: BLE001 — any other exception type is a FAIL of this arm, not a crash
+            refused = f"{type(e).__name__}: {e}"
+        check(f"L8 log_level={bad!r} refused (ValueError naming the accepted values) before anything runs",
+              refused.startswith("ValueError") and "['warning', 'info']" in refused and events == [])
+
+    # L9: an existing hidden declaration is kept, and the node's own dicts are not modified.
+    qf_log_level.add_log_level_input(_HiddenLoader, lambda level: None)
+    hid = _HiddenLoader.INPUT_TYPES()["hidden"]
+    check("L9 the node's own hidden inputs are kept next to log_level",
+          hid == {"quality_enhance": ("BOOLEAN", {}), "log_level": ("STRING", {})})
+    check("L9 the node's own spec dicts are not modified",
+          _SHARED_HIDDEN == {"quality_enhance": ("BOOLEAN", {})} and "log_level" not in _SHARED_HIDDEN)
+
+    # L5: the attach must come after every registration (Call NODE_CLASS_MAPPINGS.update / subscript assignment).
+    tree = ast.parse(open(os.path.join(_PLUGIN, "__init__.py"), encoding="utf-8").read())
+    regs, attach = [], []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "update" \
+                and isinstance(node.func.value, ast.Name) and node.func.value.id == "NODE_CLASS_MAPPINGS":
+            regs.append(node.lineno)
+        if isinstance(node, ast.Assign) and any(isinstance(tg, ast.Subscript) and isinstance(tg.value, ast.Name)
+                                                and tg.value.id == "NODE_CLASS_MAPPINGS" for tg in node.targets):
+            regs.append(node.lineno)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "_qf_add_log_level":
+            attach.append(node.lineno)
+    check("L5 exactly one attach call site in __init__.py", len(attach) == 1)
+    check("L5 attach runs after every node registration", bool(attach) and bool(regs) and min(attach) > max(regs))
+
+    # L6: the true signature survives the wrap (plus a keyword-only log_level, placed before any **kwargs).
+    sig = inspect.signature(getattr(_Loader, _Loader.FUNCTION))
+    check("L6 load keeps its name and docstring",
+          _Loader.load.__name__ == "load" and _Loader.load.__doc__ == "Load the model.")
+    check("L6 load keeps its parameters, plus keyword-only log_level",
+          [(p.name, p.kind.name, p.default) for p in sig.parameters.values()] ==
+          [("self", "POSITIONAL_OR_KEYWORD", inspect.Parameter.empty),
+           ("transformer", "POSITIONAL_OR_KEYWORD", inspect.Parameter.empty),
+           ("attention_backend", "POSITIONAL_OR_KEYWORD", "auto"),
+           ("log_level", "KEYWORD_ONLY", "warning")])
+    qf_log_level.add_log_level_input(_KwLoader, lambda level: None)
+    check("L6 a **kwargs loader gets log_level before the **kwargs",
+          list(inspect.signature(_KwLoader.load).parameters) == ["self", "transformer", "log_level", "extra"])
+
+    # L7: asking for a level never loads the library; the level is applied when (or once) it is loaded.
+    eng = _load_qf_engine()
+    applied = []
+
+    def _no_load():
+        raise AssertionError("set_log_level tried to load the engine library")
+    eng.resolve_so_path = _no_load
+    try:
+        eng.set_log_level(2)
+        tried_to_load = False
+    except AssertionError:
+        tried_to_load = True
+    check("L7 no library loaded: the level is recorded, nothing is loaded",
+          not tried_to_load and eng._LIB is None and eng._LOG_LEVEL == 2)
+    with tempfile.TemporaryDirectory() as d:          # the first engine call loads the library (simulated)
+        eng.resolve_so_path = lambda: os.path.join(d, "engine-under-test")
+        eng.assert_toolchain_compatible = lambda so_path: None
+        eng.ctypes = types.SimpleNamespace(RTLD_GLOBAL=0, RTLD_LOCAL=0, CDLL=lambda *a, **k: object())
+        eng._bind = lambda raw: types.SimpleNamespace(quantfunc_set_log_level=applied.append)
+        eng.load_lib()
+    check("L7 load_lib applies the recorded level right after loading", applied == [2])
+    eng.set_log_level(3)
+    check("L7 once loaded, a new level applies at once", applied == [2, 3])
+
+    # L10: the plugin's own detail lines follow the same level (tests-07 ruling on R3, 「生产环境默认只打warning日志」):
+    #      qf_engine.info is silent before any loader ran and at warning, and prints (formatted) at info.
+    import contextlib
+    import io
+    heard = {}
+    for label, level in (("never set", None), ("warning", 3), ("info", 2)):
+        eng._LOG_LEVEL = level
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            eng.info("[qf_native] detail %d", 7)
+        heard[label] = buf.getvalue()
+    check("L10 qf_engine.info: silent before any loader ran and at warning, printed at info",
+          heard == {"never set": "", "warning": "", "info": "[qf_native] detail 7\n"})
+    # L11: the per-run detail lines reach the console ONLY through that helper (AST over every plugin module): a bare
+    #      print / logging.info of one of them would print at the production level again.
+    tokens = ("loaded QuantFuncNativeLoader", "SESSION OPEN", "SESSION CLOSED", "VRAM ledger", "engine lib:")
+    bare = []
+    for fn in sorted(os.listdir(_PLUGIN)):
+        if not fn.endswith(".py"):
+            continue
+        for node in ast.walk(ast.parse(open(os.path.join(_PLUGIN, fn), encoding="utf-8").read())):
+            if not (isinstance(node, ast.Call) and node.args):
+                continue
+            f = node.func
+            helper = (isinstance(f, ast.Name) and f.id == "info") or (
+                isinstance(f, ast.Attribute) and f.attr == "info" and isinstance(f.value, ast.Name) and f.value.id == "qfe")
+            text = "".join(v.value for v in ast.walk(node.args[0]) if isinstance(v, ast.Constant) and isinstance(v.value, str))
+            if not helper and any(t in text for t in tokens):
+                bare.append(f"{fn}:{node.lineno}")
+    check(f"L11 the per-run detail lines print only through qf_engine.info (bare: {bare or 'none'})", not bare)
+
+    # L12: the library fingerprint (an info line) waits for the FIRST info-level loader. The engine usually loads before
+    #      any loader set a level; printed at load it would be
+    #      suppressed forever — and it is how a run proves which library it loaded.
+    eng2 = _load_qf_engine()
+    with tempfile.TemporaryDirectory() as d:
+        eng2.resolve_so_path = lambda: os.path.join(d, "engine-under-test")
+        eng2.assert_toolchain_compatible = lambda so_path: None
+        eng2.ctypes = types.SimpleNamespace(RTLD_GLOBAL=0, RTLD_LOCAL=0, CDLL=lambda *a, **k: object())
+        eng2._bind = lambda raw: types.SimpleNamespace(quantfunc_set_log_level=lambda level: None)
+        seen = []
+        for step in ("load", "warning", "info", "info again"):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                if step == "load":
+                    eng2.load_lib()
+                else:
+                    eng2.set_log_level(3 if step == "warning" else 2)
+            seen.append(buf.getvalue().count("engine lib:"))
+    check(f"L12 the library fingerprint waits for the first info-level loader, then prints once (seen {seen})",
+          seen == [0, 0, 1, 0])
+
+    # L13: the late fingerprint names only the file this process LOADED (self-CR round 6, A). A library replaced at the
+    #      same path after the load (a new file moved in, or the old one rewritten) gets no md5; an untouched one does.
+    import hashlib
+    lines = {}
+    for case in ("untouched", "moved in", "rewritten"):
+        eng3 = _load_qf_engine()
+        with tempfile.TemporaryDirectory() as d:
+            lib_file = os.path.join(d, "engine-under-test")
+            open(lib_file, "wb").write(b"LOADED-ENGINE")
+            eng3.resolve_so_path = lambda f=lib_file: f
+            eng3.assert_toolchain_compatible = lambda so_path: None
+            eng3.ctypes = types.SimpleNamespace(RTLD_GLOBAL=0, RTLD_LOCAL=0, CDLL=lambda *a, **k: object())
+            eng3._bind = lambda raw: types.SimpleNamespace(quantfunc_set_log_level=lambda level: None)
+            eng3.load_lib()
+            if case == "moved in":
+                open(lib_file + ".new", "wb").write(b"ANOTHER-ENGINE")
+                os.replace(lib_file + ".new", lib_file)
+            elif case == "rewritten":
+                open(lib_file, "wb").write(b"ANOTHER-ENGINE-REWRITTEN-IN-PLACE")
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                eng3.set_log_level(2)
+            lines[case] = buf.getvalue()
+    good = hashlib.md5(b"LOADED-ENGINE").hexdigest()
+    check("L13 the late fingerprint hashes only the loaded file: an untouched library gets its md5; one replaced at the "
+          f"same path (moved in, or rewritten) gets none ({ {c: v.strip()[-70:] for c, v in lines.items()} })",
+          f"md5={good}" in lines["untouched"]
+          and all("md5=" not in lines[c] and "fingerprint unavailable" in lines[c] for c in ("moved in", "rewritten")))
+
+    # L14: the identity is taken BEFORE the load, and an unknown one certifies nothing (self-CR round 8, A, rules 4+5).
+    #      "swapped during load": the process mapped the old file and a new one landed at the path before the load
+    #      returned, so the new file's md5 must never be printed. "identity unavailable": the file could not be identified
+    #      at the load (a failed stat); an unverified file is never certified.
+    lines14 = {}
+    for case in ("swapped during load", "identity unavailable"):
+        eng4 = _load_qf_engine()
+        with tempfile.TemporaryDirectory() as d:
+            lib_file = os.path.join(d, "engine-under-test")
+            open(lib_file, "wb").write(b"LOADED-ENGINE")
+
+            def cdll(*a, f=lib_file, swap=(case == "swapped during load"), **k):
+                if swap:
+                    open(f + ".new", "wb").write(b"ANOTHER-ENGINE")
+                    os.replace(f + ".new", f)
+                return object()
+            eng4.resolve_so_path = lambda f=lib_file: f
+            eng4.assert_toolchain_compatible = lambda so_path: None
+            eng4.ctypes = types.SimpleNamespace(RTLD_GLOBAL=0, RTLD_LOCAL=0, CDLL=cdll)
+            eng4._bind = lambda raw: types.SimpleNamespace(quantfunc_set_log_level=lambda level: None)
+            if case == "identity unavailable":
+                eng4._file_identity = lambda path: None
+            eng4.load_lib()
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                eng4.set_log_level(2)
+            lines14[case] = buf.getvalue()
+    check("L14 the identity is taken before the load, and an unknown one certifies nothing: a file swapped during the "
+          f"load, or one that could not be identified, gets no md5 ({ {c: v.strip()[-70:] for c, v in lines14.items()} })",
+          all("md5=" not in v and "fingerprint unavailable" in v for v in lines14.values()))
+
+    print(f"LOG_LEVEL_INPUT: {'PASS' if not failures else 'FAIL'} ({len(failures)} failure(s))")
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,275 @@
+{
+ "_about": "#713 frozen list of every .safetensors QuantFunc publishes on ModelScope, refreshed by tests/refresh_published_names.py. 'native' repos: each file is ASSIGNED (by a person — what the file is) to the preset + arm that must load it; tests/published_names_test.py runs the production name predicate on it. 'none: ...' repos have no loader in the native release line and must be refused by every native preset. 'retiring: ...' repos belong to a family being removed from the release: each file is checked as native while its assigned preset is still in the tree, and as none once the preset is gone — never unchecked.",
+ "fetched": "2026-09-24",
+ "repos": {
+  "Krea-2-QuantFunc-4bit": {
+   "loader": "native",
+   "files": {
+    "krea2-turbo-quantfunc-int4-r128.safetensors": {
+     "preset": "krea2-turbo-int4",
+     "arm": "transformer1"
+    },
+    "krea2-turbo-quantfunc-int4-r32.safetensors": {
+     "preset": "krea2-turbo-int4",
+     "arm": "transformer1"
+    }
+   }
+  },
+  "LTX-2.5-QuantFunc-4bit": {
+   "loader": "native",
+   "files": {
+    "ltx-2.5-22b-distilled-quantfunc-int4-r128.safetensors": {
+     "preset": "ltx2-2.5-22b",
+     "arm": "transformer1"
+    }
+   }
+  },
+  "Minimax-H3-Quantfunc-4bit": {
+   "loader": "native",
+   "files": {
+    "minimax_h3_fl2va_4step_quantfunc_int4_r128.safetensors": {
+     "preset": "minimax-h3-fl2va",
+     "arm": "transformer1"
+    },
+    "minimax_h3_ref2va_8steps_quantfunc_int4_r128.safetensors": {
+     "preset": "minimax-h3-fl2va",
+     "arm": "transformer1"
+    }
+   }
+  },
+  "Nunchaku-Qwen-Image-2512": {
+   "loader": "none: legacy nodes of the shipped plugin (origin/main nodes.py / nodes_format_adapters.py); the native release line has no loader for it",
+   "files": {
+    "nunchaku_qwen_image_2512_balance_fp4.safetensors": {
+     "preset": null,
+     "arm": null
+    },
+    "nunchaku_qwen_image_2512_balance_int4.safetensors": {
+     "preset": null,
+     "arm": null
+    },
+    "nunchaku_qwen_image_2512_best_quality_fp4.safetensors": {
+     "preset": null,
+     "arm": null
+    },
+    "nunchaku_qwen_image_2512_best_quality_int4.safetensors": {
+     "preset": null,
+     "arm": null
+    },
+    "nunchaku_qwen_image_2512_ultimate_speed_fp4.safetensors": {
+     "preset": null,
+     "arm": null
+    },
+    "nunchaku_qwen_image_2512_ultimate_speed_int4.safetensors": {
+     "preset": null,
+     "arm": null
+    }
+   }
+  },
+  "Nunchaku-Qwen-Image-EDIT-2511": {
+   "loader": "none: legacy nodes of the shipped plugin (origin/main nodes.py / nodes_format_adapters.py); the native release line has no loader for it",
+   "files": {
+    "nunchaku_qwen_image_2511_balance_fp4.safetensors": {
+     "preset": null,
+     "arm": null
+    },
+    "nunchaku_qwen_image_2511_balance_int4.safetensors": {
+     "preset": null,
+     "arm": null
+    },
+    "nunchaku_qwen_image_2511_best_quality_fp4.safetensors": {
+     "preset": null,
+     "arm": null
+    },
+    "nunchaku_qwen_image_2511_best_quality_int4.safetensors": {
+     "preset": null,
+     "arm": null
+    },
+    "nunchaku_qwen_image_2511_ultimate_speed_fp4.safetensors": {
+     "preset": null,
+     "arm": null
+    },
+    "nunchaku_qwen_image_2511_ultimate_speed_int4.safetensors": {
+     "preset": null,
+     "arm": null
+    }
+   }
+  },
+  "Plugin": {
+   "loader": "none: engine + plugin binaries, no model weights",
+   "files": {}
+  },
+  "Qwen-Image-2.1-4bit": {
+   "loader": "native",
+   "files": {
+    "qwen_image_21_base_quantfunc_int4_r128.safetensors": {
+     "preset": "qwen-image-2.1-int4",
+     "arm": "transformer1"
+    },
+    "qwen_image_21_base_quantfunc_int4_r32.safetensors": {
+     "preset": "qwen-image-2.1-int4",
+     "arm": "transformer1"
+    }
+   }
+  },
+  "Qwen-Image-Edit-Series": {
+   "loader": "none: legacy nodes of the shipped plugin (origin/main nodes.py / nodes_format_adapters.py); the native release line has no loader for it",
+   "files": {
+    "prequant/qwen-image-edit-2509-50x-above.safetensors": {
+     "preset": null,
+     "arm": null
+    },
+    "prequant/qwen-image-edit-2511-50x-above.safetensors": {
+     "preset": null,
+     "arm": null
+    },
+    "prequant/qwen-image-edit-2511-50x-below.safetensors": {
+     "preset": null,
+     "arm": null
+    },
+    "qwen-image-edit-series-50x-above-base-model/text_encoder/model.safetensors": {
+     "preset": null,
+     "arm": null
+    },
+    "qwen-image-edit-series-50x-above-base-model/vae/diffusion_pytorch_model.safetensors": {
+     "preset": null,
+     "arm": null
+    },
+    "qwen-image-edit-series-50x-above-base-model/vision_encoder/model.safetensors": {
+     "preset": null,
+     "arm": null
+    },
+    "qwen-image-edit-series-50x-below-base-model/text_encoder/model.safetensors": {
+     "preset": null,
+     "arm": null
+    },
+    "qwen-image-edit-series-50x-below-base-model/vae/diffusion_pytorch_model.safetensors": {
+     "preset": null,
+     "arm": null
+    },
+    "qwen-image-edit-series-50x-below-base-model/vision_encoder/model.safetensors": {
+     "preset": null,
+     "arm": null
+    },
+    "transformer/qwen-image-2511-50x-above-lighting-4steps.safetensors": {
+     "preset": null,
+     "arm": null
+    },
+    "transformer/qwen-image-2511-50x-above-svdq-4steps.safetensors": {
+     "preset": null,
+     "arm": null
+    },
+    "transformer/qwen-image-2511-50x-above-svdq.safetensors": {
+     "preset": null,
+     "arm": null
+    },
+    "transformer/qwen-image-2511-50x-below-lighting-4steps-v2.safetensors": {
+     "preset": null,
+     "arm": null
+    },
+    "transformer/qwen-image-2511-50x-below-svdq-4steps.safetensors": {
+     "preset": null,
+     "arm": null
+    },
+    "transformer/qwen-image-2511-50x-below-svdq.safetensors": {
+     "preset": null,
+     "arm": null
+    },
+    "transformer/qwen-image-edit-2511-30x-below-lighting-4steps-better.safetensors": {
+     "preset": null,
+     "arm": null
+    },
+    "transformer/qwen-image-edit-2511-40x-lighting-4steps-better.safetensors": {
+     "preset": null,
+     "arm": null
+    },
+    "transformer/qwen-image-edit-2511-50x-above-lighting-4steps-better.safetensors": {
+     "preset": null,
+     "arm": null
+    }
+   }
+  },
+  "Qwen-Image-Series": {
+   "loader": "none: legacy nodes of the shipped plugin (origin/main nodes.py / nodes_format_adapters.py); the native release line has no loader for it",
+   "files": {
+    "prequant/qwen-image-2512-50x-above.safetensors": {
+     "preset": null,
+     "arm": null
+    },
+    "prequant/qwen-image-2512-50x-below.safetensors": {
+     "preset": null,
+     "arm": null
+    },
+    "prequant/qwen-image-50x-above.safetensors": {
+     "preset": null,
+     "arm": null
+    },
+    "prequant/qwen-image-50x-below.safetensors": {
+     "preset": null,
+     "arm": null
+    },
+    "qwen-image-series-50x-above-base-model/text_encoder/model.safetensors": {
+     "preset": null,
+     "arm": null
+    },
+    "qwen-image-series-50x-above-base-model/vae/diffusion_pytorch_model.safetensors": {
+     "preset": null,
+     "arm": null
+    },
+    "qwen-image-series-50x-below-base-model/text_encoder/model.safetensors": {
+     "preset": null,
+     "arm": null
+    },
+    "qwen-image-series-50x-below-base-model/vae/diffusion_pytorch_model.safetensors": {
+     "preset": null,
+     "arm": null
+    },
+    "transformer/qwen-image-2512-30x-below-lighting-4steps-better.safetensors": {
+     "preset": null,
+     "arm": null
+    },
+    "transformer/qwen-image-2512-40x-lighting-4steps-better.safetensors": {
+     "preset": null,
+     "arm": null
+    },
+    "transformer/qwen-image-2512-50x-above-lighting-4steps-better.safetensors": {
+     "preset": null,
+     "arm": null
+    },
+    "transformer/qwen-image-2512-50x-above-lighting-4steps-v2.safetensors": {
+     "preset": null,
+     "arm": null
+    },
+    "transformer/qwen-image-2512-50x-below-lighting-4steps-v2.safetensors": {
+     "preset": null,
+     "arm": null
+    },
+    "transformer/qwen-image-50x-below-lighting-4steps.safetensors": {
+     "preset": null,
+     "arm": null
+    }
+   }
+  },
+  "Wan2.2-A14B-QuantFunc-4bit": {
+   "loader": "retiring: the user narrowed this release to LTX-2.5, H3, Krea2 and QI-2.1 (via tests-07, 2026-09-24); the Wan nodes are being removed on the release line. While a tree still carries a file's assigned preset it is checked exactly like native; once that preset is removed the file must be refused by every preset",
+   "files": {
+    "wan2.2-a14b-i2v-4steps-high-quantfunc-int4-r128.safetensors": {
+     "preset": "wan2.2-a14b-i2v",
+     "arm": "transformer1"
+    },
+    "wan2.2-a14b-i2v-4steps-low-quantfunc-int4-r128.safetensors": {
+     "preset": "wan2.2-a14b-i2v",
+     "arm": "transformer2"
+    },
+    "wan2.2-a14b-t2v-4steps-high-quantfunc-int4-r128.safetensors": {
+     "preset": "wan2.2-a14b-t2v",
+     "arm": "transformer1"
+    },
+    "wan2.2-a14b-t2v-4steps-low-quantfunc-int4-r128.safetensors": {
+     "preset": "wan2.2-a14b-t2v",
+     "arm": "transformer2"
+    }
+   }
+  }
+ }
+}

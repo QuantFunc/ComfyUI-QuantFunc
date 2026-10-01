@@ -730,15 +730,21 @@ def register(deps):
             qfe.info(f"[qf_native] ltx2: transformer-only export - connectors completion file: "
                   f"{os.path.basename(conn_src)}", flush=True)
         extra = {"connectors": conn_src}
-        model_dir = qfmp.stage_denoise_only_package(bundle_dir, transformer1_path, extra_links=extra)
-        return _build_from_package(model_dir, os.path.basename(transformer1_path),
+        if qfmp.engine_reads_weight_paths():   # 0.0.17+: weights from paths, the package holds configs only (#777)
+            model_dir = qfmp.stage_config_package(bundle_dir, transformer1_path, extra_links=extra)
+            create_extra, weights = {"denoise_only": True, "connectors_path": conn_src}, transformer1_path
+        else:
+            model_dir = qfmp.stage_denoise_only_package(bundle_dir, transformer1_path, extra_links=extra)
+            create_extra, weights = {"denoise_only": True}, None
+        return _build_from_package(model_dir, os.path.basename(transformer1_path), conn_src,
                                    lora_entries=lora_entries,
                                    # pinned memory is the loaders' pinned_memory switch (user 2026-09-26); the
                                    # LTX-2.5 loader defaults it ON (every other family OFF), as a recorded temporary
                                    # exception until the compute/transfer overlap no longer needs it
-                                   create_extra={"denoise_only": True}, pinned_memory=pinned_memory)
+                                   create_extra=create_extra, pinned_memory=pinned_memory, transformer_path=weights)
 
-    def _build_from_package(model_dir, model_name, lora_entries=(), create_extra=None, pinned_memory=False):
+    def _build_from_package(model_dir, model_name, conn_src, lora_entries=(), create_extra=None, pinned_memory=False,
+                            transformer_path=None):
         # NOTE (CR simplicity): the joint audio+video (a2v) path needs an engine external-step
         # split (makeExternalStepFn) this seam does not implement, and since the widget was
         # removed there is no way to request it — so the old join_audio_prompt flag and its two
@@ -769,11 +775,11 @@ def register(deps):
             f.endswith(".safetensors") for f in os.listdir(_voc_dir))
         _voc_bundled = (not _voc_ok) and any(
             _file_has_prefix(f, "vocoder.") for f in _avae_files)
-        _conn_staged = os.path.join(model_dir, "connectors", "model.safetensors")
+        # the connectors source itself (the link in the package points at it; a config-only package has no link)
         _is_av = (bool(_avae_files) and (_voc_ok or _voc_bundled)) or (
-            _file_has_prefix(_conn_staged,
+            _file_has_prefix(conn_src,
                              "model.diffusion_model.audio_embeddings_connector.")
-            or _file_has_prefix(_conn_staged, "audio_embeddings_connector."))
+            or _file_has_prefix(conn_src, "audio_embeddings_connector."))
         # LTX svdq is PRE-quantized: pass the MINIMUM to create (minimal=True → empty config_json).
         # The svdquant metadata carries the layout/precision (embedded config: cross_attn_mod=True /
         # audio_cross_attn_mod=True / cross_attention_dim 4096 / num_heads 32 → 9-mod). ANYTHING
@@ -785,7 +791,8 @@ def register(deps):
                 deps, model_dir, create_extra, comfy.supported_models.LTXAV,
                 {"image_model": "ltxav", "disable_unet_model_creation": True}, QFLTXAVModel,
                 f"[qf_native] loaded QuantFuncNativeLoader (LTX-2.5 JOINT-AV svdq) package={model_name} "
-                f"capacity=native Prepared query (create deferred)", pinned_memory)(list(lora_entries))
+                f"capacity=native Prepared query (create deferred)", pinned_memory,
+                transformer_path=transformer_path)(list(lora_entries))
         raise RuntimeError("QuantFuncNativeLoader: connector_ckpt (comfy LTX-2.3 ckpt with the "
                            "video_embeddings_connector) is required")
 

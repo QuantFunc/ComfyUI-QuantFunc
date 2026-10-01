@@ -316,7 +316,13 @@ class QFSessionModelMixin:
     def set_attn_backend(self, v):
         # [runtime dial 2026-08-29] session knob — rides residency_opts() into EVERY
         # denoise_begin; the engine swaps the per-forward dispatch string (no rebuild).
-        self._attn_backend = str(v or "auto")
+        # Every loader calls this on the model it builds, so the add-on attention choice is refused here on an engine
+        # without it: at the loader, before any model loads (an older engine does not run it as chosen).
+        v = str(v or "auto")
+        if v == "qfa" and not engine_routes_attention():
+            raise RuntimeError(f"QuantFunc: attention_backend '{v}' needs a newer QuantFunc engine; the installed one does "
+                               "not have it. Pick auto, or update the QuantFunc engine.")
+        self._attn_backend = v
 
     def set_sol_tau(self, v):
         # [sol-tau dial 2026-08-31] the ONE user-facing attention dial (user "就一个
@@ -929,7 +935,14 @@ class QFLazyEngine:
         # UNKNOWN until the engine confirms: a refused update may have left the previous set OR rolled the weights
         # back to the base mid-apply, so after any failure the next run must re-send its set, never trust a mark.
         real.applied_lora_sig = None
-        real.pipeline_update({"lora": lora})
+        try:
+            real.pipeline_update({"lora": lora})
+        except RuntimeError as e:
+            # the engine names the LoRA it cannot load ("'<path>' matched 0 target modules ..."); a busy engine does not.
+            # Its message reached us through console_safe, so the path is matched as that console writes it.
+            if any(entry.get("path") and qfe.console_safe(entry["path"]) in str(e) for entry in lora):
+                warn_lora_not_loaded()
+            raise
         real.applied_lora_sig = want
         qfe.info(f"[qf_native] LoRA set applied in place (no reload): {len(lora)} LoRA(s)", flush=True)
         return True
@@ -1035,10 +1048,10 @@ def stage_config_package(bundle_dir, transformer1_path, extra_links=None):
     CONFIGS for session geometry (denoise_only skips the TE+VAE WEIGHTS, not the configs). So the family's shipped
     CONFIG bundle (model_index.json + transformer/ vae/ config.json - tiny JSON) is COPIED into ComfyUI's OWN temp dir
     (folder_paths.get_temp_directory(), never system /tmp), keyed deterministically by (bundle, realpath(files)): one
-    dir per weight file, so the engine's VRAM measurement cache (written into model_dir) stays per weight file and out
-    of the plugin's own folder. Rebuilt fresh each call (configs are tiny), so a re-pick can't leave a stale file. The
-    weights reach the engine as its transformer_path create input (Krea-2, Qwen-Image-2.1) or as links the caller adds
-    (stage_denoise_only_package: LTX-2.5, MiniMax-H3)."""
+    dir per weight file. Rebuilt fresh each call (configs are tiny), so a re-pick can't leave a stale file. The weights
+    reach the engine as its transformer_path create input (Krea-2 and Qwen-Image-2.1 always; LTX-2.5 and MiniMax-H3 on an
+    engine with the _WEIGHT_PATHS_SYMBOL export), or as the links stage_denoise_only_package adds (LTX-2.5 and
+    MiniMax-H3 on an older engine)."""
     import shutil
     import folder_paths
     if not os.path.isdir(bundle_dir):
@@ -1063,11 +1076,32 @@ def stage_config_package(bundle_dir, transformer1_path, extra_links=None):
     return stage
 
 
+# The export engines carry (0.0.17+, #777) when every family loads its weights from paths - the create's
+# transformer_path, plus LTX-2.5's connectors_path - with model_dir a config-only package. Without it LTX-2.5 reads its
+# connectors only from the package and MiniMax-H3 its folded checkpoint's fold count only beside the weights, so those two
+# keep the link.
+_WEIGHT_PATHS_SYMBOL = "quantfunc_weight_paths"
+# The export engines carry (0.0.17+) when they route attention per GPU and load the add-on attention library; the
+# loaders' add-on choice needs it (set_attn_backend -> engine_routes_attention). MiniMax-H3 reads the same export for
+# its auto.
+_ATTN_ROUTE_SYMBOL = "quantfunc_attention_auto_route"
+
+
+def engine_reads_weight_paths():
+    """True when the loaded QuantFunc engine loads LTX-2.5 and MiniMax-H3 weights from paths (no link needed)."""
+    return hasattr(qfe.load_lib(), _WEIGHT_PATHS_SYMBOL)
+
+
+def engine_routes_attention():
+    """True when the loaded QuantFunc engine carries the add-on attention (its per-GPU attention route)."""
+    return hasattr(qfe.load_lib(), _ATTN_ROUTE_SYMBOL)
+
+
 def stage_denoise_only_package(bundle_dir, transformer1_path, extra_links=None):
     """The package of LTX-2.5 and MiniMax-H3: the config package plus the weight files SYMLINKED in, the transformer as
-    transformer/model.safetensors. On the engines this plugin installs, LTX-2.5 reads its connectors only from the
-    package, and MiniMax-H3 reads its folded checkpoint's qf_adaln_fold_dropped_resq only from the config.json beside the
-    weights (#777). extra_links: {subdir: target_path} - single-expert AV families link MORE weight files
+    transformer/model.safetensors. For an engine without the _WEIGHT_PATHS_SYMBOL export (before 0.0.17): it reads
+    LTX-2.5's connectors only from the package, and MiniMax-H3's folded-checkpoint qf_adaln_fold_dropped_resq only from
+    the config.json beside the weights (#777). extra_links: {subdir: target_path} - single-expert AV families link MORE weight files
     (ltx2: the SAME single xfm file into connectors/ [#565 comfy25 prefix branch], the gemma with-proj TE into
     text_encoder/ [connector aggregate_embed], the audio_vae file [engine has_audio_ discriminant = weights presence])."""
     stage = stage_config_package(bundle_dir, transformer1_path, extra_links)
@@ -1179,6 +1213,32 @@ _RESOURCE_DOMAINS = {}
 
 
 _log = qfe.logger(__name__)   # console-safe (#738)
+
+LORA_HELP_URL = "https://www.quantfunc.com/docs/lora"
+NATIVE_LORA_NODE = "QuantFunc Native LoRA"   # QuantFuncNativeLoRA's display name (NODE_DISPLAY_NAME_MAPPINGS uses this)
+
+
+def warn_lora_not_loaded(stock_loader=False):
+    """The ONE line a LoRA that could not be loaded for a QuantFunc model prints, whichever family and path (user
+    2026-09-30 「lora无法加载的时候让用户自己看 …」「…要他们用我们的Quantfunc lora节点吧」): what went wrong in one sentence,
+    and the page, instead of leaving the user with per-key lines. stock_loader: ComfyUI's own LoRA node was used."""
+    if stock_loader:
+        why = (f"ComfyUI's Load LoRA / LoraLoaderModelOnly nodes cannot apply a LoRA to it, use the \"{NATIVE_LORA_NODE}\" "
+               "node instead")
+    else:
+        why = (f"the \"{NATIVE_LORA_NODE}\" node cannot use this file (it is not in the format that node takes, or it is "
+               "a LoRA for another model)")
+    _log.warning(f"[qf_native] LoRA could not be loaded for this QuantFunc model: {why}. Please read {LORA_HELP_URL}")
+
+
+def _in_comfy_lora_load(frame):
+    """True when ComfyUI's own LoRA load (comfy.sd.load_lora_for_models, which LoraLoader, LoraLoaderModelOnly and other
+    LoRA nodes call) is `frame` or one of its callers (a method wrapper can sit between it and add_patches)."""
+    while frame is not None:
+        if frame.f_code.co_name == "load_lora_for_models" and frame.f_globals.get("__name__") == "comfy.sd":
+            return True
+        frame = frame.f_back
+    return False
 
 # Native queries never wait (quantfunc.h). The engine answers QUANTFUNC_RESOURCE_BUSY whenever another thread holds
 # the allocator's or the target's lock at that instant, which is ordinary while native work runs. MEASURED (issue
@@ -1666,6 +1726,15 @@ class QFNativeResourcePatcher(comfy.model_patcher.ModelPatcher):
 @qfe.console_safe_methods   # an exception leaving it is console-safe (#738)
 class QFModelPatcher(comfy.model_patcher.ModelPatcher):
     """Logical MODEL; canonical dependencies own native bytes, this patcher owns Torch bytes."""
+    def add_patches(self, patches, *args, **kwargs):
+        # ComfyUI's own LoRA load patches torch weights, which a QuantFunc model never computes with, so such a LoRA
+        # never reaches it; ComfyUI prints its per-key lines, and this says what to do, once per load. At model strength 0
+        # the LoRA is meant for the text encoder only: nothing to say.
+        strength = args[0] if args else kwargs.get("strength_patch", 1.0)
+        if strength and _in_comfy_lora_load(getattr(inspect.currentframe(), "f_back", None)):
+            warn_lora_not_loaded(stock_loader=True)
+        return super().add_patches(patches, *args, **kwargs)
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.add_wrapper_with_key(comfy.patcher_extension.WrappersMP.OUTER_SAMPLE,

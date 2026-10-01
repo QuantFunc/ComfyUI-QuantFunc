@@ -1,0 +1,13 @@
+# LTX-2.5 connectors completion-file provenance — recorded run
+# host: jonathan-System-Product-Name  utc: 2026-08-30T19:22:26Z  commit: 43045b4
+# reproduce: python3 tests/ltx_connectors_provenance_verify.py
+# inputs (per-box weights, NOT committed):
+#   2020918024 models/diffusion_models/ltx-2.5-connectors-comfy-int8-convrot.safetensors
+#   21504034224 models/diffusers/ltx-2.5-22b-dev-transformer-comfy-int8-convrot.safetensors
+#   18272647930 models/diffusion_models/ltx-2.5-22b-distilled-quantfunc-int4-r128-allin-int8.safetensors
+
+completion: ltx-2.5-connectors-comfy-int8-convrot.safetensors
+  connector keys: 450  (video 225 + audio 225)
+  (A) completion vs dev mirror : 450/450 md5-identical
+  (B) completion vs distilled allin: 450/450 md5-identical
+VERDICT: PASS — verbatim extraction, byte-identical to dev mirror AND distilled allin connector set

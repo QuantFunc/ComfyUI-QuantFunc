@@ -1,8 +1,8 @@
 {
   "id": "d7735185-a582-4989-8bee-980ccce09629",
   "revision": 0,
-  "last_node_id": 20,
-  "last_link_id": 24,
+  "last_node_id": 17,
+  "last_link_id": 19,
   "nodes": [
     {
       "id": 1,
@@ -44,14 +44,105 @@
       "flags": {},
       "order": 1,
       "mode": 0,
-      "inputs": [],
+      "inputs": [
+        {
+          "localized_name": "transformer",
+          "name": "transformer",
+          "type": "COMBO",
+          "widget": {
+            "name": "transformer"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "model_config",
+          "name": "model_config",
+          "shape": 7,
+          "type": "COMBO",
+          "widget": {
+            "name": "model_config"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "attention_backend",
+          "name": "attention_backend",
+          "shape": 7,
+          "type": "COMBO",
+          "widget": {
+            "name": "attention_backend"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "sol_tau",
+          "name": "sol_tau",
+          "shape": 7,
+          "type": "FLOAT",
+          "widget": {
+            "name": "sol_tau"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "step_cache",
+          "name": "step_cache",
+          "shape": 7,
+          "type": "FLOAT",
+          "widget": {
+            "name": "step_cache"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "block_cache",
+          "name": "block_cache",
+          "shape": 7,
+          "type": "FLOAT",
+          "widget": {
+            "name": "block_cache"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "quality_enhance",
+          "name": "quality_enhance",
+          "shape": 7,
+          "type": "BOOLEAN",
+          "widget": {
+            "name": "quality_enhance"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "audio_enhance",
+          "name": "audio_enhance",
+          "shape": 7,
+          "type": "BOOLEAN",
+          "widget": {
+            "name": "audio_enhance"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "pinned_memory",
+          "name": "pinned_memory",
+          "shape": 7,
+          "type": "BOOLEAN",
+          "widget": {
+            "name": "pinned_memory"
+          },
+          "link": null
+        }
+      ],
       "outputs": [
         {
+          "localized_name": "MODEL",
           "name": "MODEL",
           "type": "MODEL",
           "links": [
-            23,
-            24
+            5,
+            7
           ]
         }
       ],
@@ -62,22 +153,22 @@
       "widgets_values": [
         "minimax_h3_fl2va_4step_quantfunc_int4_r128.safetensors",
         "minimax-h3-fl2va",
-        "sage",
+        "auto",
         1,
         0,
         0,
-        true,
+        false,
         false,
         true
       ],
       "widgets_values_named": {
         "transformer": "minimax_h3_fl2va_4step_quantfunc_int4_r128.safetensors",
         "model_config": "minimax-h3-fl2va",
-        "attention_backend": "sage",
+        "attention_backend": "auto",
         "sol_tau": 1,
         "step_cache": 0,
         "block_cache": 0,
-        "quality_enhance": true,
+        "quality_enhance": false,
         "audio_enhance": false,
         "pinned_memory": true
       }
@@ -86,8 +177,8 @@
       "id": 3,
       "type": "CLIPLoader",
       "pos": [
-        9.50293338822621,
-        1326.0103610535439
+        0,
+        850
       ],
       "size": [
         270,
@@ -96,9 +187,39 @@
       "flags": {},
       "order": 2,
       "mode": 0,
-      "inputs": [],
+      "inputs": [
+        {
+          "localized_name": "clip_name",
+          "name": "clip_name",
+          "type": "COMBO",
+          "widget": {
+            "name": "clip_name"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "type",
+          "name": "type",
+          "type": "COMBO",
+          "widget": {
+            "name": "type"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "device",
+          "name": "device",
+          "shape": 7,
+          "type": "COMBO",
+          "widget": {
+            "name": "device"
+          },
+          "link": null
+        }
+      ],
       "outputs": [
         {
+          "localized_name": "CLIP",
           "name": "CLIP",
           "type": "CLIP",
           "links": [
@@ -110,12 +231,12 @@
         "Node name for S&R": "CLIPLoader"
       },
       "widgets_values": [
-        "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+        "qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
         "minimax",
         "default"
       ],
       "widgets_values_named": {
-        "clip_name": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+        "clip_name": "qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
         "type": "minimax",
         "device": "default"
       }
@@ -134,9 +255,20 @@
       "flags": {},
       "order": 3,
       "mode": 0,
-      "inputs": [],
+      "inputs": [
+        {
+          "localized_name": "vae_name",
+          "name": "vae_name",
+          "type": "COMBO",
+          "widget": {
+            "name": "vae_name"
+          },
+          "link": null
+        }
+      ],
       "outputs": [
         {
+          "localized_name": "VAE",
           "name": "VAE",
           "type": "VAE",
           "links": [
@@ -150,10 +282,10 @@
         "Node name for S&R": "VAELoader"
       },
       "widgets_values": [
-        "minimax_h3_video_vae_int8_convrot.safetensors"
+        "minimax_h3_video_vae_fp16.safetensors"
       ],
       "widgets_values_named": {
-        "vae_name": "minimax_h3_video_vae_int8_convrot.safetensors"
+        "vae_name": "minimax_h3_video_vae_fp16.safetensors"
       }
     },
     {
@@ -170,9 +302,20 @@
       "flags": {},
       "order": 4,
       "mode": 0,
-      "inputs": [],
+      "inputs": [
+        {
+          "localized_name": "vae_name",
+          "name": "vae_name",
+          "type": "COMBO",
+          "widget": {
+            "name": "vae_name"
+          },
+          "link": null
+        }
+      ],
       "outputs": [
         {
+          "localized_name": "VAE",
           "name": "VAE",
           "type": "VAE",
           "links": [
@@ -192,6 +335,132 @@
       }
     },
     {
+      "id": 6,
+      "type": "LoadImage",
+      "pos": [
+        580,
+        0
+      ],
+      "size": [
+        282.798828125,
+        102
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "image",
+          "name": "image",
+          "type": "COMBO",
+          "widget": {
+            "name": "image"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "choose file to upload",
+          "name": "upload",
+          "type": "IMAGEUPLOAD",
+          "widget": {
+            "name": "upload"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "IMAGE",
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            3
+          ]
+        },
+        {
+          "localized_name": "MASK",
+          "name": "MASK",
+          "type": "MASK",
+          "links": null
+        }
+      ],
+      "title": "First frame",
+      "properties": {
+        "Node name for S&R": "LoadImage"
+      },
+      "widgets_values": [
+        "flf2v_demo_first_frame.png",
+        "image"
+      ],
+      "widgets_values_named": {
+        "image": "flf2v_demo_first_frame.png",
+        "upload": "image"
+      }
+    },
+    {
+      "id": 7,
+      "type": "LoadImage",
+      "pos": [
+        580,
+        172
+      ],
+      "size": [
+        282.798828125,
+        102
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "image",
+          "name": "image",
+          "type": "COMBO",
+          "widget": {
+            "name": "image"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "choose file to upload",
+          "name": "upload",
+          "type": "IMAGEUPLOAD",
+          "widget": {
+            "name": "upload"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "IMAGE",
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            4
+          ]
+        },
+        {
+          "localized_name": "MASK",
+          "name": "MASK",
+          "type": "MASK",
+          "links": null
+        }
+      ],
+      "title": "Last frame",
+      "properties": {
+        "Node name for S&R": "LoadImage"
+      },
+      "widgets_values": [
+        "flf2v_demo_last_frame.png",
+        "image"
+      ],
+      "widgets_values_named": {
+        "image": "flf2v_demo_last_frame.png",
+        "upload": "image"
+      }
+    },
+    {
       "id": 8,
       "type": "MiniMaxH3ImageToVideo",
       "pos": [
@@ -203,34 +472,75 @@
         220
       ],
       "flags": {},
-      "order": 8,
+      "order": 7,
       "mode": 0,
       "inputs": [
         {
+          "localized_name": "clip",
           "name": "clip",
           "type": "CLIP",
           "link": 1
         },
         {
+          "localized_name": "vae",
           "name": "vae",
           "type": "VAE",
           "link": 2
         },
         {
+          "localized_name": "first_frame",
           "name": "first_frame",
           "shape": 7,
           "type": "IMAGE",
-          "link": null
+          "link": 3
         },
         {
+          "localized_name": "last_frame",
           "name": "last_frame",
           "shape": 7,
           "type": "IMAGE",
+          "link": 4
+        },
+        {
+          "localized_name": "prompt",
+          "name": "prompt",
+          "type": "STRING",
+          "widget": {
+            "name": "prompt"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "width",
+          "name": "width",
+          "type": "INT",
+          "widget": {
+            "name": "width"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "height",
+          "name": "height",
+          "type": "INT",
+          "widget": {
+            "name": "height"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "length",
+          "name": "length",
+          "type": "INT",
+          "widget": {
+            "name": "length"
+          },
           "link": null
         }
       ],
       "outputs": [
         {
+          "localized_name": "positive",
           "name": "positive",
           "type": "CONDITIONING",
           "links": [
@@ -238,6 +548,7 @@
           ]
         },
         {
+          "localized_name": "LATENT",
           "name": "LATENT",
           "type": "LATENT",
           "links": [
@@ -249,15 +560,15 @@
         "Node name for S&R": "MiniMaxH3ImageToVideo"
       },
       "widgets_values": [
-        "Five-second cyberpunk space-opera battle: enormous warships exchange relentless heavy cannon fire against a vast starfield. Begin with an epic distant fleet view, then rush between the ships and sweep close across a sharply detailed armored hull as giant energy cannons fire past the lens, ending in a blinding explosion. Masterful cinematic camera movement, immense scale, crisp mechanical textures, powerful stereo sound.",
-        1376,
-        768,
+        "Cinematic crane shot inside an iridescent translucent pavilion: a red-haired woman in a long black dress stands at the edge of a circular reflecting pool. The camera slowly rises from eye level to a high top-down view as she looks up, the pool reflecting the shimmering walls. Soft ambient hum, gentle water ripples, a distant echo.",
+        960,
+        544,
         124
       ],
       "widgets_values_named": {
-        "prompt": "Five-second cyberpunk space-opera battle: enormous warships exchange relentless heavy cannon fire against a vast starfield. Begin with an epic distant fleet view, then rush between the ships and sweep close across a sharply detailed armored hull as giant energy cannons fire past the lens, ending in a blinding explosion. Masterful cinematic camera movement, immense scale, crisp mechanical textures, powerful stereo sound.",
-        "width": 1376,
-        "height": 768,
+        "prompt": "Cinematic crane shot inside an iridescent translucent pavilion: a red-haired woman in a long black dress stands at the edge of a circular reflecting pool. The camera slowly rises from eye level to a high top-down view as she looks up, the pool reflecting the shimmering walls. Soft ambient hum, gentle water ripples, a distant echo.",
+        "width": 960,
+        "height": 544,
         "length": 124
       }
     },
@@ -273,11 +584,22 @@
         82
       ],
       "flags": {},
-      "order": 5,
+      "order": 8,
       "mode": 0,
-      "inputs": [],
+      "inputs": [
+        {
+          "localized_name": "noise_seed",
+          "name": "noise_seed",
+          "type": "INT",
+          "widget": {
+            "name": "noise_seed"
+          },
+          "link": null
+        }
+      ],
       "outputs": [
         {
+          "localized_name": "NOISE",
           "name": "NOISE",
           "type": "NOISE",
           "links": [
@@ -313,11 +635,13 @@
       "mode": 0,
       "inputs": [
         {
+          "localized_name": "model",
           "name": "model",
           "type": "MODEL",
-          "link": 23
+          "link": 5
         },
         {
+          "localized_name": "conditioning",
           "name": "conditioning",
           "type": "CONDITIONING",
           "link": 6
@@ -325,6 +649,7 @@
       ],
       "outputs": [
         {
+          "localized_name": "GUIDER",
           "name": "GUIDER",
           "type": "GUIDER",
           "links": [
@@ -348,11 +673,22 @@
         58
       ],
       "flags": {},
-      "order": 6,
+      "order": 10,
       "mode": 0,
-      "inputs": [],
+      "inputs": [
+        {
+          "localized_name": "sampler_name",
+          "name": "sampler_name",
+          "type": "COMBO",
+          "widget": {
+            "name": "sampler_name"
+          },
+          "link": null
+        }
+      ],
       "outputs": [
         {
+          "localized_name": "SAMPLER",
           "name": "SAMPLER",
           "type": "SAMPLER",
           "links": [
@@ -382,17 +718,46 @@
         106
       ],
       "flags": {},
-      "order": 7,
+      "order": 11,
       "mode": 0,
       "inputs": [
         {
+          "localized_name": "model",
           "name": "model",
           "type": "MODEL",
-          "link": 24
+          "link": 7
+        },
+        {
+          "localized_name": "scheduler",
+          "name": "scheduler",
+          "type": "COMBO",
+          "widget": {
+            "name": "scheduler"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "steps",
+          "name": "steps",
+          "type": "INT",
+          "widget": {
+            "name": "steps"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "denoise",
+          "name": "denoise",
+          "type": "FLOAT",
+          "widget": {
+            "name": "denoise"
+          },
+          "link": null
         }
       ],
       "outputs": [
         {
+          "localized_name": "SIGMAS",
           "name": "SIGMAS",
           "type": "SIGMAS",
           "links": [
@@ -405,12 +770,12 @@
       },
       "widgets_values": [
         "simple",
-        6,
+        4,
         1
       ],
       "widgets_values_named": {
         "scheduler": "simple",
-        "steps": 6,
+        "steps": 4,
         "denoise": 1
       }
     },
@@ -426,30 +791,35 @@
         106
       ],
       "flags": {},
-      "order": 10,
+      "order": 12,
       "mode": 0,
       "inputs": [
         {
+          "localized_name": "noise",
           "name": "noise",
           "type": "NOISE",
           "link": 8
         },
         {
+          "localized_name": "guider",
           "name": "guider",
           "type": "GUIDER",
           "link": 9
         },
         {
+          "localized_name": "sampler",
           "name": "sampler",
           "type": "SAMPLER",
           "link": 10
         },
         {
+          "localized_name": "sigmas",
           "name": "sigmas",
           "type": "SIGMAS",
           "link": 12
         },
         {
+          "localized_name": "latent_image",
           "name": "latent_image",
           "type": "LATENT",
           "link": 11
@@ -457,6 +827,7 @@
       ],
       "outputs": [
         {
+          "localized_name": "output",
           "name": "output",
           "type": "LATENT",
           "links": [
@@ -465,6 +836,7 @@
           ]
         },
         {
+          "localized_name": "denoised_output",
           "name": "denoised_output",
           "type": "LATENT",
           "links": null
@@ -486,15 +858,17 @@
         46
       ],
       "flags": {},
-      "order": 11,
+      "order": 13,
       "mode": 0,
       "inputs": [
         {
+          "localized_name": "samples",
           "name": "samples",
           "type": "LATENT",
           "link": 13
         },
         {
+          "localized_name": "vae",
           "name": "vae",
           "type": "VAE",
           "link": 14
@@ -502,6 +876,7 @@
       ],
       "outputs": [
         {
+          "localized_name": "IMAGE",
           "name": "IMAGE",
           "type": "IMAGE",
           "links": [
@@ -525,15 +900,17 @@
         46
       ],
       "flags": {},
-      "order": 12,
+      "order": 14,
       "mode": 0,
       "inputs": [
         {
+          "localized_name": "samples",
           "name": "samples",
           "type": "LATENT",
           "link": 15
         },
         {
+          "localized_name": "vae",
           "name": "vae",
           "type": "VAE",
           "link": 16
@@ -541,6 +918,7 @@
       ],
       "outputs": [
         {
+          "localized_name": "AUDIO",
           "name": "AUDIO",
           "type": "AUDIO",
           "links": [
@@ -556,31 +934,73 @@
       "id": 16,
       "type": "CreateVideo",
       "pos": [
-        2068.5962538887816,
-        -30.23661054940925
+        1879.4015625000002,
+        0
       ],
       "size": [
         270,
         150
       ],
       "flags": {},
-      "order": 13,
+      "order": 15,
       "mode": 0,
       "inputs": [
         {
+          "localized_name": "images",
           "name": "images",
           "type": "IMAGE",
           "link": 17
         },
         {
+          "localized_name": "audio",
           "name": "audio",
           "shape": 7,
           "type": "AUDIO",
           "link": 18
+        },
+        {
+          "localized_name": "fps",
+          "name": "fps",
+          "type": "FLOAT",
+          "widget": {
+            "name": "fps"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "bit_depth",
+          "name": "bit_depth",
+          "shape": 7,
+          "type": "COMBO",
+          "widget": {
+            "name": "bit_depth"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "color_space",
+          "name": "color_space",
+          "shape": 7,
+          "type": "COMBO",
+          "widget": {
+            "name": "color_space"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "codec",
+          "name": "codec",
+          "shape": 7,
+          "type": "COMBO",
+          "widget": {
+            "name": "codec"
+          },
+          "link": null
         }
       ],
       "outputs": [
         {
+          "localized_name": "VIDEO",
           "name": "VIDEO",
           "type": "VIDEO",
           "links": [
@@ -608,25 +1028,64 @@
       "id": 17,
       "type": "SaveVideo",
       "pos": [
-        2078.0991398214233,
-        247.6448712445209
+        1879.4015625000002,
+        220
       ],
       "size": [
-        853.1197243439653,
-        934.9538875269404
+        270,
+        106
       ],
       "flags": {},
-      "order": 14,
+      "order": 16,
       "mode": 0,
       "inputs": [
         {
+          "localized_name": "video",
           "name": "video",
           "type": "VIDEO",
           "link": 19
+        },
+        {
+          "localized_name": "filename_prefix",
+          "name": "filename_prefix",
+          "type": "STRING",
+          "widget": {
+            "name": "filename_prefix"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "codec",
+          "name": "format.codec",
+          "type": "COMFY_DYNAMICCOMBO_V3",
+          "widget": {
+            "name": "format.codec"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "format",
+          "name": "format",
+          "type": "COMFY_DYNAMICCOMBO_V3",
+          "widget": {
+            "name": "format"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "codec",
+          "name": "codec",
+          "shape": 7,
+          "type": "COMFY_DYNAMICCOMBO_V3",
+          "widget": {
+            "name": "codec"
+          },
+          "link": null
         }
       ],
       "outputs": [
         {
+          "localized_name": "video",
           "name": "video",
           "type": "VIDEO",
           "links": null
@@ -665,12 +1124,44 @@
       "VAE"
     ],
     [
+      3,
+      6,
+      0,
+      8,
+      2,
+      "IMAGE"
+    ],
+    [
+      4,
+      7,
+      0,
+      8,
+      3,
+      "IMAGE"
+    ],
+    [
+      5,
+      2,
+      0,
+      10,
+      0,
+      "MODEL"
+    ],
+    [
       6,
       8,
       0,
       10,
       1,
       "CONDITIONING"
+    ],
+    [
+      7,
+      2,
+      0,
+      12,
+      0,
+      "MODEL"
     ],
     [
       8,
@@ -761,22 +1252,6 @@
       "AUDIO"
     ],
     [
-      23,
-      2,
-      0,
-      10,
-      0,
-      "MODEL"
-    ],
-    [
-      24,
-      2,
-      0,
-      12,
-      0,
-      "MODEL"
-    ],
-    [
       19,
       16,
       0,
@@ -789,13 +1264,12 @@
   "config": {},
   "extra": {
     "ds": {
-      "scale": 1.062936600000001,
+      "scale": 0.6,
       "offset": [
-        318.4487378476537,
-        164.40182904590614
+        120,
+        90
       ]
-    },
-    "frontendVersion": "1.53.6"
+    }
   },
   "version": 0.4
 }

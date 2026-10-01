@@ -58,6 +58,10 @@ _H3_DENOISED_SIGMA = 1e-3  # a sampler stage whose last sigma is above this stop
 _H3_FULL_START = 0.98      # a stage starting below this fraction of the model's sigma_max starts part-way
 _AUDIO_ENHANCE_TWO_STAGE = ("[qf_native] H3: audio_enhance is not supported with two-stage (double-sampling) "
                             "workflows; it is ignored for this run.")
+# The export only engines carry whose attention "auto" keeps MiniMax-H3 off the backend measured broken at large sizes
+# (#659): engine 0.0.17+. An older engine (kept after a failed update) would still pick it, so there "auto" runs flash:
+# the safe choice auto stands for. A capability check, never a version compare; explicit choices pass as they are.
+_H3_SAFE_AUTO_SYMBOL = "quantfunc_attention_auto_route"
 
 
 def _h3_nodes():
@@ -300,6 +304,10 @@ class QFH3Model(QFSessionModelMixin, comfy.model_base.MiniMaxH3):
             "num_frames": self._num_frames,
             "fps": float(self._fps),
         }
+        if _opts["attention_backend"] == "auto" and not hasattr(lib, _H3_SAFE_AUTO_SYMBOL):
+            _log.info("[qf_native] H3: this QuantFunc engine predates the MiniMax-H3 attention auto route; auto runs "
+                      "flash on it (update the engine to use auto)")
+            _opts["attention_backend"] = "flash"
         # [enhance switch] the product switch only; the engine computes the extra audio sub-steps from
         # num_steps and disarms itself under CFG / without an audio lane (MiniMaxH3Pipeline). Sent only
         # when ON (OFF = byte-identical to no knob; the raw extra_audio_steps key is never built here).
@@ -563,18 +571,22 @@ def register(deps):
         stage the shipped config bundle (configs/minimax-h3-*/, official configs) + link
         the single transformer file as transformer/model.safetensors; engine create runs denoise_only=True (TE + VAE
         weights skipped — comfy's stock MiniMaxH3 nodes own conditioning/refs and comfy decodes; the engine reads the
-        staged configs for session geometry only). The LINK stays on the engines this plugin installs (#777, measured):
+        staged configs for session geometry only). The LINK stays on an engine without quantfunc_weight_paths (#777, measured):
         the release checkpoint is adaln-folded, and the engine corrects its sealed resq_slot_count with the bundle's
         transformer/config.json qf_adaln_fold_dropped_resq, which it reads only beside the weights path - loaded
         through transformer_path it would miss it and refuse the checkpoint as truncated. No extra weight links: unlike
         ltx2 the H3 external session needs no engine-side connector/projection weights (refs arrive as av_conds latents
         from comfy). H3 svdq is PRE-quantized, so the create is MINIMAL: the svdquant metadata carries the
         layout/precision, and anything on top competes and mis-resolves (the LTX minimal note)."""
-        model_dir = qfmp.stage_denoise_only_package(bundle_dir, transformer1_path)
+        if qfmp.engine_reads_weight_paths():   # 0.0.17+: the fold count comes from the package's transformer/config.json
+            model_dir, weights = qfmp.stage_config_package(bundle_dir, transformer1_path), transformer1_path
+        else:
+            model_dir, weights = qfmp.stage_denoise_only_package(bundle_dir, transformer1_path), None
         return qfmp.family_build(
             deps, model_dir, {"denoise_only": True}, comfy.supported_models.MiniMaxH3,
             {"image_model": "minimax_h3", "disable_unet_model_creation": True}, QFH3Model,
             f"[qf_native] loaded QuantFuncNativeLoader (MiniMax-H3 svdq AV) package={os.path.basename(transformer1_path)} "
-            f"capacity=native Prepared query (create deferred)", pinned_memory)(list(lora_entries))
+            f"capacity=native Prepared query (create deferred)", pinned_memory,
+            transformer_path=weights)(list(lora_entries))
 
     return build

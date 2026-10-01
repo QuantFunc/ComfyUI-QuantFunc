@@ -905,16 +905,19 @@ if _IMPORT_OK:
         "explains the fix.")
 
     # [attention backend selector, user 2026-08-27] one user-facing dropdown per loader.
-    # SM-GATED: SM80+ offers the full set; SM75 (Turing) has NO sage backend and NO
-    # flash_attn build, so only fp16_native is valid there. The widget VALUE is a
+    # SM-GATED: the add-on attention (user 2026-09-29) is offered on the SMs its library ships for (SM75/86/89/120, the
+    # engine's AUTO table); the loader refuses that choice on an engine without it (set_attn_backend). SM75 has NO
+    # sage backend and NO flash_attn build, so it offers auto, the add-on and fp16_native. The widget VALUE is a
     # display name; _attn_backend_to_engine maps it to the engine's comp_opts string
-    # ("fp16_native" -> "native"). "auto" = the engine's per-SM resolution (default), and
-    # is passed through so the user's choice is always the single source of truth.
+    # ("fp16_native" -> "native"). "auto" = the engine's per-GPU resolution, the default on every loader and GPU
+    # (user 2026-09-29), and is passed through so the user's choice is always the single source of truth.
     # [a backend REMOVED as a user-facing choice — user 2026-09-13] one engine-internal backend is
     # no longer offered in the dropdown. "auto" is unaffected (the engine may still pick it
     # internally per-SM); only the explicit user choice is gone.
     _ATTN_BACKEND_SM80PLUS = ["auto", "flash", "sage", "fp16_native"]
-    _ATTN_BACKEND_SM75 = ["fp16_native"]
+    _ATTN_BACKEND_ADDON = ["auto", "qfa", "flash", "sage", "fp16_native"]
+    _ATTN_BACKEND_SM75 = ["auto", "qfa", "fp16_native"]
+    _ATTN_ADDON_SMS = {75, 86, 89, 120}
 
     def _attn_backend_choices():
         choices = _ATTN_BACKEND_SM80PLUS
@@ -923,20 +926,19 @@ if _IMPORT_OK:
             dev = qfmp.comfy.model_management.get_torch_device()   # the GPU ComfyUI computes on, not GPU 0
             if getattr(dev, "type", None) == "cuda":
                 maj, _min = torch.cuda.get_device_capability(dev)
-                if maj < 8:  # SM75 Turing (sm_7x): no sage, no flash_attn
+                sm = maj * 10 + _min
+                if sm == 75:  # SM75 Turing: the add-on ships here, sage/flash do not
                     choices = _ATTN_BACKEND_SM75
+                elif sm in _ATTN_ADDON_SMS:
+                    choices = _ATTN_BACKEND_ADDON
         except Exception:  # noqa: BLE001 - no torch/CUDA at import -> assume modern; engine validates
             pass
         return choices
 
-    def _attn_backend_input(default="auto"):
-        choices = _attn_backend_choices()
-        # per-loader default; falls back to the first valid choice when the requested
-        # default isn't offered on this SM (e.g. H3 wants 'flash' but SM75 has no flash).
-        d = default if default in choices else choices[0]
-        return (choices, {"default": d,
-                "tooltip": "auto (default) picks the best setting for your GPU. Try another setting only if a "
-                           "result looks wrong or a run fails on your GPU. Takes effect on the next run."})
+    def _attn_backend_input():
+        return (_attn_backend_choices(), {"default": "auto",
+                "tooltip": "auto (default) picks the best setting for your GPU. Try another setting only if a result "
+                           "looks wrong or a run fails on your GPU. Takes effect on the next run."})
 
     def _attn_backend_to_engine(v):
         # widget display name -> engine comp_opts attention_backend string
@@ -1076,13 +1078,9 @@ if _IMPORT_OK:
                                 {"tooltip": "The QuantFunc MiniMax-H3 model file in models/diffusion_models."}),
             }, "optional": {
                 "model_config": _model_config_input("minimax-h3"),   # hidden; widget index 1 (see _model_config_input)
-                # [sparse, user 2026-08-25 ONE-number dial; #659 session knob — no rebuild]
-                # H3 default = flash: on this model auto picks a backend that is
-                # BROKEN at high resolution (blank/NaN — measured
-                # 928²/S=31538: attn out absmax 0 → step-1 all-NaN → audio avcodec crash +
-                # video blur). flash (fp16) is the verified-clean default; user can still pick
-                # auto/sage/native. (Wan/LTX → auto is fine → they keep 'auto'.)
-                "attention_backend": _attn_backend_input("flash"),
+                # [#659 session knob — no rebuild] default auto (user 2026-09-29): from engine 0.0.17 the engine's
+                # auto never picks, for this model, the backend measured broken at large sizes (#659).
+                "attention_backend": _attn_backend_input(),
                 "sol_tau": _SOL_TAU_INPUT,
                 "step_cache": _STEP_CACHE_INPUT,
                 "block_cache": _BLOCK_CACHE_INPUT,
@@ -1098,9 +1096,9 @@ if _IMPORT_OK:
                        "place of the usual diffusion-model loader. " + _COMMON_LIMITS)
 
         def load(self, transformer, model_config=None,
-                 attention_backend="flash", sol_tau=1.0, quality_enhance=None, audio_enhance=False,
+                 attention_backend="auto", sol_tau=1.0, quality_enhance=None, audio_enhance=False,
                  step_cache=0.0, block_cache=0.0, quality=None,
-                 pinned_memory=False):  # H3: flash default (auto->sage is broken)
+                 pinned_memory=False):
             _p = _run_family_load(self.QF_FAMILY, transformer, model_config, pinned_memory)
             _mm = getattr(_p, "model", None)
             if _mm is not None and hasattr(_mm, "set_attn_backend"):
@@ -1194,7 +1192,12 @@ if _IMPORT_OK:
                     "downstream of the QuantFunc Native Loader. (For a stock comfy model use the "
                     "built-in LoraLoaderModelOnly instead.)")
             # The ONE-FORMAT refusal (mirror of the engine's E1 arm) applies to every family in this release.
-            self._refuse_foreign_lora_format(_resolve_lora(lora_name))
+            path = _resolve_lora(lora_name)   # a missing file is its own error, not a LoRA that cannot be loaded
+            try:
+                self._refuse_foreign_lora_format(path)
+            except RuntimeError:
+                qfmp.warn_lora_not_loaded()
+                raise
             stack = qfmp.lora_stack_of(model)
             stack.append({"path": _resolve_lora(lora_name), "scale": float(strength),
                           "target": "all"})
@@ -1204,17 +1207,66 @@ if _IMPORT_OK:
             # LoRA node placed after a ModelSampling node cannot silently drop its shift.
             return (rebuilt.adopt_comfy_state_from(model),)
 
+    class QuantFuncH3LatentUpscale:
+        """The hires-fix step of a MiniMax-H3 two-stage workflow (user 2026-09-30 「stage1的latent放大后就可以直接连接stage2的
+        采样节点」「只需要输入低采样的分辨率 + 放大倍数 要自动算出超分阶段分辨率」): scales the stage 1 video latent in latent
+        space (no VAE decode / encode), keeps the stage 1 audio latent, and outputs the high-res size for the stage 2
+        conditioning. Every size comes from the latent itself and ComfyUI's own H3 definitions (the latent format's channels
+        and pixels per cell, the H3 nodes' CANVAS_MULTIPLE): the high-res size is the stage 1 size times scale_by, snapped
+        to CANVAS_MULTIPLE, and the latent is scaled to exactly that size, so the stage 2 latent and the stage 2 keyframes /
+        references always agree. Stock LatentUpscaleBy rounds each latent side to any integer and reports no size; stock
+        LatentUpscale assumes an 8x VAE."""
+        @classmethod
+        def INPUT_TYPES(cls):
+            import nodes as _comfy_nodes
+            return {"required": {
+                "samples": ("LATENT", {"tooltip": "The stage 1 sampler's output (MiniMax-H3 audio+video latent)."}),
+                "scale_by": ("FLOAT", {"default": 2.0, "min": 1.0, "max": 4.0, "step": 0.05,
+                                       "tooltip": "High-res size = the stage 1 size x this, rounded to a multiple of 32."}),
+                "upscale_method": (_comfy_nodes.LatentUpscaleBy.upscale_methods, {"default": "bilinear"}),
+            }}
+
+        RETURN_TYPES = ("LATENT", "INT", "INT")
+        RETURN_NAMES = ("samples", "width", "height")
+        FUNCTION = "upscale"
+        CATEGORY = "model/latent"
+
+        def upscale(self, samples, scale_by, upscale_method):
+            import comfy.latent_formats
+            import comfy.nested_tensor
+            import comfy.utils
+            from comfy_extras.nodes_minimax_h3 import CANVAS_MULTIPLE
+            fmt = comfy.latent_formats.MiniMaxH3Video
+            parts = samples["samples"].unbind() if isinstance(samples["samples"], comfy.nested_tensor.NestedTensor) else ()
+            if len(parts) != 2 or parts[0].ndim != 5 or parts[0].shape[1] != fmt.latent_channels:
+                raise ValueError("QuantFunc MiniMax-H3 Latent Upscale takes the audio+video latent a MiniMax-H3 sampler outputs")
+            if samples.get("noise_mask") is not None:
+                raise ValueError("QuantFunc MiniMax-H3 Latent Upscale: this latent carries a noise mask, which it cannot scale")
+            px = fmt.spacial_downscale_ratio
+            if CANVAS_MULTIPLE % px:
+                raise ValueError(f"QuantFunc MiniMax-H3 Latent Upscale: canvas multiple {CANVAS_MULTIPLE} is not a whole "
+                                 f"number of {px}-pixel latent cells")
+            video, audio = parts
+            out_w, out_h = (max(CANVAS_MULTIPLE, round(n * px * scale_by / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
+                            for n in (video.shape[-1], video.shape[-2]))
+            video = comfy.utils.common_upscale(video, out_w // px, out_h // px, upscale_method, "disabled")
+            out = samples.copy()
+            out["samples"] = comfy.nested_tensor.NestedTensor((video, audio))
+            return (out, out_w, out_h)
+
     # merge into (not replace) the mappings — matches the real plugin's multi-file NODE_CLASS_MAPPINGS.update
     NODE_CLASS_MAPPINGS.update({"QuantFuncLTXLoader": QuantFuncLTXLoader,
                                 "QuantFuncH3Loader": QuantFuncH3Loader,
                                 "QuantFuncKrea2Loader": QuantFuncKrea2Loader,
                                 "QuantFuncQwenImage21Loader": QuantFuncQwenImage21Loader,
-                                "QuantFuncNativeLoRA": QuantFuncNativeLoRA})
+                                "QuantFuncNativeLoRA": QuantFuncNativeLoRA,
+                                "QuantFuncH3LatentUpscale": QuantFuncH3LatentUpscale})
     NODE_DISPLAY_NAME_MAPPINGS.update({
         "QuantFuncLTXLoader": "QuantFunc LTX-2 Loader",
         "QuantFuncH3Loader": "QuantFunc MiniMax-H3 Loader",
         "QuantFuncKrea2Loader": "QuantFunc Krea-2 Loader",
-        "QuantFuncQwenImage21Loader": "QuantFunc Qwen-Image-2.1 Loader"})
+        "QuantFuncQwenImage21Loader": "QuantFunc Qwen-Image-2.1 Loader",
+        "QuantFuncH3LatentUpscale": "QuantFunc MiniMax-H3 Latent Upscale"})
 
     # AUTOMATION — a mechanism must not depend on someone remembering to run it (CR): run the reject-list
     # completeness scan AT IMPORT so a comfy upgrade that adds a consumable conditioning key emits a loud
@@ -1233,7 +1285,7 @@ if _IMPORT_OK:
     # (R7: the old single-node "QuantFuncNativeLoader" display entry is GONE with the class —
     # a display mapping for an unregistered class is dead weight; the three per-family loaders
     # register their display names beside their class mappings above.)
-    NODE_DISPLAY_NAME_MAPPINGS.update({"QuantFuncNativeLoRA": "QuantFunc Native LoRA"})
+    NODE_DISPLAY_NAME_MAPPINGS.update({"QuantFuncNativeLoRA": qfmp.NATIVE_LORA_NODE})
 
     def _serve_api_key_route():
         """On a SERVING ComfyUI (its PromptServer exists while custom nodes load), add the route the loaders' API key

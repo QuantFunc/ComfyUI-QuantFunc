@@ -1,0 +1,514 @@
+#!/usr/bin/env python3
+"""EXECUTING behavioral test for QFLTXModel's engine-conditioning safety layer (the A' CR NO-GO fix).
+
+WHY THIS EXISTS (the self-CR regression/correctness NEEDS-EVIDENCE): reject_list_completeness.py proves the
+reject-LIST is COMPLETE (a static textual scan of comfy's consumed keys vs the tuple), but nothing EXECUTED
+the ported methods — extra_conds / _derive_geometry (+ the scale_latent_inpaint inheritance) and the Interrupt session-clearing
+guard. "4/4 pass" read as if the safety layer was exercised when it was not. This file closes that: it drives
+the REAL on-disk method bodies and asserts raise / no-raise on both directions.
+
+HOW: the plugin uses relative imports + comfy, so a plain
+import fails on this box (comfy's torchvision/torchaudio ABI). So we AST-EXTRACT each real method body from
+qf_ltx_modelpatcher.py and exec it with a mock `self` + a tiny comfy stub (real torch — it imports fine here).
+No comfy, no engine, no GPU. QF_LTXSAFETY_TEST_SRC lets a reviewer point this at a MUTATED copy to prove the
+test is able-to-FAIL (a green test that can't go red proves nothing).
+
+Run: python3 tests/qfltx_safety_layer_test.py     # exit 0 = pass, non-zero = fail (run_plugin_tests picks it up)
+     QF_LTXSAFETY_TEST_SRC=<mutant> python3 tests/qfltx_safety_layer_test.py   # prove able-to-fail
+"""
+import ast
+import os
+import sys
+import textwrap
+import types
+
+import torch  # available on this box (torchvision/torchaudio are ABI-broken, but torch itself imports)
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_SRC = os.environ.get("QF_LTXSAFETY_TEST_SRC") or os.path.join(_HERE, "..", "qf_ltx_modelpatcher.py")
+
+
+
+def _src_text():
+    return open(_SRC, encoding="utf-8", errors="replace").read()
+
+
+def _extract_method(src_text, cls, meth):
+    """Return the DEDENTED source of cls.meth (a class method) so it can be exec'd as a standalone function."""
+    for node in ast.parse(src_text).body:
+        if isinstance(node, ast.ClassDef) and node.name == cls:
+            for m in node.body:
+                if isinstance(m, ast.FunctionDef) and m.name == meth:
+                    return textwrap.dedent(ast.get_source_segment(src_text, m))
+    raise AssertionError(f"method {cls}.{meth} not found in {_SRC}")
+
+
+# One module per model family (each seam's comfy model subclass + _apply_model), while qf_modelpatcher.py is the
+# family-AGNOSTIC substrate that owns the SHARED interrupt helper. The other families' modules are pinned too, so
+# this test keeps checking the real split for every family (LTX itself is _SRC).
+_OTHER_FAMILY_SRCS = {f: os.path.join(_HERE, "..", f) for f in ("qf_h3_modelpatcher.py", "qf_krea2_modelpatcher.py",
+                                                                 "qf_qwenimage21_modelpatcher.py")}
+_SHARED_SRC = os.path.join(_HERE, "..", "qf_modelpatcher.py")
+
+
+def _extract_module_fn(src_text, name):
+    """DEDENTED source of a MODULE-LEVEL def (the shared interrupt helper lives at module scope)."""
+    for node in ast.parse(src_text).body:
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return textwrap.dedent(ast.get_source_segment(src_text, node))
+    raise AssertionError(f"module fn {name} not found in the given source")
+
+
+def _shared_src_text():
+    return open(_SHARED_SRC, encoding="utf-8", errors="replace").read()
+
+
+def _bind_shared_helper(comfy):
+    """Exec the REAL shared interrupt helper — it lives in the family-AGNOSTIC substrate
+    (qf_modelpatcher.py), NOT in a family module; that separation is what this arm pins."""
+    ns = {"comfy": comfy}
+    exec(_extract_module_fn(_shared_src_text(), "_interrupt_poll_end_session_on_raise"), ns)  # noqa: S102
+    return ns["_interrupt_poll_end_session_on_raise"]
+
+
+def _extract_const(src_text, name):
+    for node in ast.parse(src_text).body:
+        if isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == name for t in node.targets):
+            return ast.literal_eval(node.value)
+    raise AssertionError(f"const {name} not found in {_SRC}")
+
+
+def _extract_class_attr(src_text, cls, name):
+    for node in ast.parse(src_text).body:
+        if isinstance(node, ast.ClassDef) and node.name == cls:
+            for m in node.body:
+                if isinstance(m, ast.Assign) and any(
+                        isinstance(t, ast.Name) and t.id == name for t in m.targets):
+                    return ast.literal_eval(m.value)
+    raise AssertionError(f"class attr {cls}.{name} not found")
+
+
+# ── a tiny comfy stub: only what the extracted method bodies touch ────────────────────────────────────────
+class _CONDRegular:
+    def __init__(self, x):
+        self.cond = x
+
+
+class _CONDConstant(_CONDRegular):
+    """comfy.conds.CONDConstant (the frame_rate channel): a constant the sampler hands to every model call."""
+
+
+class _InterruptExc(BaseException):
+    """Faithful mimic of comfy.model_management.InterruptProcessingException, which subclasses BaseException
+    (model_management.py:2003) — NOT Exception. This is load-bearing: it forces the guard to use
+    `except BaseException`; a guard written `except Exception` would NOT catch this → the session would strand,
+    which this test then flags."""
+
+
+# comfy's own frame-rate default, as the stub's model_base.LTXV.extra_conds applies it. Deliberately NOT 25 (comfy's
+# real value today): the seam must return whatever COMFY resolves, so a local literal cannot pass this test.
+_COMFY_STUB_FRAME_RATE = 17.5
+
+
+class _StubLTXV:
+    """comfy.model_base.LTXV as far as the frame_rate channel goes: its extra_conds emits the conditioning's frame_rate,
+    else comfy's own default (model_base.py: CONDConstant(kwargs.get("frame_rate", <default>)))."""
+    fail = False
+
+    @staticmethod
+    def extra_conds(self, **kwargs):
+        if _StubLTXV.fail:
+            raise AttributeError("comfy internals moved (test)")
+        return {"frame_rate": _CONDConstant(kwargs.get("frame_rate", _COMFY_STUB_FRAME_RATE))}
+
+
+def _make_comfy(interrupt_raises=False):
+    comfy = types.ModuleType("comfy")
+    comfy.conds = types.SimpleNamespace(CONDRegular=_CONDRegular, CONDConstant=_CONDConstant)
+    comfy.model_base = types.SimpleNamespace(LTXV=_StubLTXV)
+
+    def _throw():
+        if interrupt_raises:
+            raise _InterruptExc("comfy InterruptProcessingException (test)")
+    comfy.model_management = types.SimpleNamespace(throw_exception_if_processing_interrupted=_throw)
+    return comfy
+
+
+class _MockEngine:
+    """Mock QFEngineHandle: records end_session_if_open + clears current_session (mirrors qf_engine.py)."""
+    def __init__(self, open_session=None):
+        self.current_session = open_session
+        self.step_count = 0
+        self.sampler_step_count = 0
+        self.end_calls = 0
+
+    def end_session_if_open(self):
+        self.end_calls += 1
+        was_open = self.current_session is not None
+        self.current_session = None
+        return (was_open, True)
+
+
+def _bind(src, meth, extra_globals=None):
+    """Exec a class method's source into a fresh namespace; return the callable."""
+    ns = {}
+    if extra_globals:
+        ns.update(extra_globals)
+    exec(_extract_method(src, "QFLTXModel", meth), ns)  # noqa: S102 — trusted repo source
+    return ns[meth], ns
+
+
+def _mock_self(**attrs):
+    m = types.SimpleNamespace()
+    for k, v in attrs.items():
+        setattr(m, k, v)
+    return m
+
+
+# extra_conds prints its run-start note through qf_engine.info (the plugin's own log level): a silent stub here.
+_QFE_STUB = types.SimpleNamespace(info=lambda *a, **k: None)
+
+
+def _ltx_mock_factory(src, comfy):
+    """A mock-`self` maker for extra_conds: the REAL _native_frame_rate body is bound on it (extra_conds calls it)."""
+    nfr, _ = _bind(src, "_native_frame_rate", {"comfy": comfy})
+
+    def mk(**attrs):
+        me = _mock_self(**attrs)
+        me._native_frame_rate = types.MethodType(nfr, me)
+        return me
+    return mk
+
+
+# ── tests ─────────────────────────────────────────────────────────────────────────────────────────────────
+def _t_extra_conds(src):
+    comfy = _make_comfy()
+    fn, _ = _bind(src, "extra_conds", {"comfy": comfy, "qfe": _QFE_STUB})
+    mk = _ltx_mock_factory(src, comfy)
+    keys = _extract_class_attr(src, "QFLTXModel", "_ENGINE_IGNORED_COND_KEYS")
+    assert len(keys) >= 7, f"reject-list shrank unexpectedly: {keys}"
+    bad = 0
+    # (1) EACH reject-listed key, wired individually, must RAISE.
+    for k in keys:
+        eng = _MockEngine()
+        me = mk(_qf=eng, _ENGINE_IGNORED_COND_KEYS=keys, _max_ctx_seq=0)
+        try:
+            fn(me, **{k: object()})
+            print(f"  [FAIL] extra_conds({k}=..) did NOT raise"); bad += 1
+        except RuntimeError:
+            pass
+    # (2) a non-reject key (cross_attn only) must NOT raise and must emit c_crossattn.
+    eng = _MockEngine()
+    me = mk(_qf=eng, _ENGINE_IGNORED_COND_KEYS=keys, _max_ctx_seq=0,
+                    _post_connector_seq=lambda s: int(s))
+    out = fn(me, cross_attn=torch.zeros(1, 3, 8))
+    if "c_crossattn" not in out or not isinstance(out["c_crossattn"], _CONDRegular):
+        print(f"  [FAIL] extra_conds(cross_attn) did not emit c_crossattn: {out}"); bad += 1
+    # (3) documented-accepted keys (frame_rate / attention_mask / latent_image) must NOT raise.
+    for k in ("frame_rate", "attention_mask", "latent_image"):
+        eng = _MockEngine()
+        me = mk(_qf=eng, _ENGINE_IGNORED_COND_KEYS=keys, _max_ctx_seq=0,
+                        _post_connector_seq=lambda s: int(s))
+        try:
+            fn(me, **{k: object(), "cross_attn": torch.zeros(1, 3, 8)})
+        except RuntimeError:
+            print(f"  [FAIL] extra_conds({k}=..) wrongly raised (accepted infra)"); bad += 1
+    # (4) run-start session close is invoked (idempotent no-op when nothing open).
+    eng = _MockEngine(open_session=object())
+    me = mk(_qf=eng, _ENGINE_IGNORED_COND_KEYS=keys, _max_ctx_seq=0,
+                    _post_connector_seq=lambda s: int(s))
+    fn(me, cross_attn=torch.zeros(1, 3, 8))
+    if eng.end_calls != 1 or eng.current_session is not None:
+        print(f"  [FAIL] extra_conds did not close a stale session (calls={eng.end_calls})"); bad += 1
+    # (5) frame_rate is CONSUMED, and resolved by COMFY's own model code (the stub's LTXV.extra_conds): the cond's
+    #     value passes through unchanged, a graph without one gets comfy's value (the stub's sentinel, not a local 25).
+    #     It is the engine session's fps (_call_fps); the old local 25 drove every 24-fps graph off (dead audio).
+    for kw, want in (({"frame_rate": 24.0}, 24.0), ({"frame_rate": 30.0}, 30.0), ({}, _COMFY_STUB_FRAME_RATE)):
+        me = mk(_qf=_MockEngine(), _ENGINE_IGNORED_COND_KEYS=keys, _max_ctx_seq=0,
+                _post_connector_seq=lambda s: int(s))
+        fr = fn(me, cross_attn=torch.zeros(1, 3, 8), **kw).get("frame_rate")
+        if not isinstance(fr, _CONDConstant) or fr.cond != want:
+            print(f"  [FAIL] extra_conds({kw}) emitted frame_rate={getattr(fr, 'cond', fr)!r}, want CONDConstant({want})")
+            bad += 1
+    # (6) comfy cannot resolve it (internals moved) -> REFUSED, never a local default.
+    _StubLTXV.fail = True
+    try:
+        me = mk(_qf=_MockEngine(), _ENGINE_IGNORED_COND_KEYS=keys, _max_ctx_seq=0,
+                _post_connector_seq=lambda s: int(s))
+        try:
+            out = fn(me, cross_attn=torch.zeros(1, 3, 8))
+            print(f"  [FAIL] unresolvable comfy frame_rate was NOT refused (emitted {out.get('frame_rate')!r})"); bad += 1
+        except RuntimeError:
+            pass
+    finally:
+        _StubLTXV.fail = False
+    print(f"  extra_conds: {'OK' if bad == 0 else 'FAIL'} ({len(keys)} reject keys raise; cross_attn emits; "
+          "frame_rate/attention_mask/latent_image accepted; stale session closed; frame_rate = comfy's own "
+          "resolution (24/30 pass, none -> comfy's value); unresolvable -> refused)")
+    return bad
+
+
+def _t_call_fps(src):
+    """The engine session's fps is the conditioning's frame_rate (the engine's video + video<->audio RoPE time grid;
+    a 24-fps graph driven at the old hardcoded 25 had dead audio). Opening adopts it, an open session keeps it and
+    refuses another, and the AV step calls it BEFORE _begin (which puts self._fps into the session options)."""
+    fn, _ = _bind(src, "_call_fps", {})
+    bad = 0
+    me = _mock_self(_fps=None)
+    for fr in (24.0, 25.0, 30.0):                     # each reaches the session unchanged
+        fn(me, {"frame_rate": fr}, True)
+        if me._fps != fr:
+            print(f"  [FAIL] opening a session with frame_rate {fr} set fps {me._fps}"); bad += 1
+    fn(me, {"frame_rate": 24.0}, True)
+    if me._fps != 24.0:
+        print(f"  [FAIL] opening a session did not adopt frame_rate 24 (fps={me._fps})"); bad += 1
+    try:
+        fn(me, {"frame_rate": 24.0}, False)          # same run, same frame rate: fine
+    except RuntimeError:
+        print("  [FAIL] an equal frame_rate on an open session was refused"); bad += 1
+    try:
+        fn(me, {"frame_rate": 25.0}, False)
+        print("  [FAIL] a different frame_rate on an open session was NOT refused"); bad += 1
+    except RuntimeError:
+        pass
+    for opening in (True, False):                     # a call without frame_rate: refused, never a default
+        try:
+            fn(_mock_self(_fps=24.0), {}, opening)
+            print(f"  [FAIL] a call without frame_rate was NOT refused (opening={opening})"); bad += 1
+        except RuntimeError:
+            pass
+    # order in the AV step: _call_fps before _begin (the session options read self._fps)
+    body = _extract_method(src, "QFLTXAVModel", "_apply_model_timed")
+    i_fps, i_begin = body.find("self._call_fps("), body.find("self._begin(")
+    if i_fps < 0 or i_begin < 0 or i_fps > i_begin:
+        print(f"  [FAIL] QFLTXAVModel._apply_model_timed does not call _call_fps before _begin "
+              f"(at {i_fps} / {i_begin})"); bad += 1
+    # _begin hands the engine exactly self._fps (options_json "fps") - where the old code put its local 25
+    beg = ast.parse(_extract_method(src, "QFLTXModel", "_begin"))
+    fps_vals = [v for d in ast.walk(beg) if isinstance(d, ast.Dict)
+                for k, v in zip(d.keys, d.values) if isinstance(k, ast.Constant) and k.value == "fps"]
+    if not (len(fps_vals) == 1
+            and any(isinstance(n, ast.Attribute) and n.attr == "_fps" and isinstance(n.value, ast.Name)
+                    and n.value.id == "self" for n in ast.walk(fps_vals[0]))
+            and not any(isinstance(n, ast.Constant) and isinstance(n.value, (int, float))
+                        for n in ast.walk(fps_vals[0]))):
+        print("  [FAIL] QFLTXModel._begin does not send exactly self._fps as the session fps "
+              f"({[ast.unparse(v) for v in fps_vals]})"); bad += 1
+    print(f"  _call_fps: {'OK' if bad == 0 else 'FAIL'} (opening adopts 24/25/30 unchanged; open session keeps it and "
+          "refuses another; no frame_rate -> refused; called before _begin, which sends self._fps)")
+    return bad
+
+
+def _t_max_ctx_seq(src):
+    """CONFORMANCE (_max_ctx_seq port): extra_conds must ACCUMULATE the MAX seq len across a run's cond
+    groups (pos+neg BOTH call extra_conds before sampling), never last-wins — else _begin (called on the
+    first group only) under-sizes the engine context maxima when a longer group reaches the SAME session as
+    a separate step (the WAN gap this ports). Order-independent; a cross_attn-less call must not touch it.
+    These arms test the ACCUMULATION ARITHMETIC with an IDENTITY probe (post==raw); the §6.5 POST-connector
+    length semantics (the quantity accumulated) are proven against the REAL comfy connector in
+    _t_post_connector_seq."""
+    comfy = _make_comfy()
+    fn, _ = _bind(src, "extra_conds", {"comfy": comfy, "qfe": _QFE_STUB})
+    mk = _ltx_mock_factory(src, comfy)
+    keys = _extract_class_attr(src, "QFLTXModel", "_ENGINE_IGNORED_COND_KEYS")
+    _ident = lambda s: int(s)   # identity probe: isolates the max/order/untouched arithmetic  # noqa: E731
+    bad = 0
+    # (a) pos S=10 then neg S=20 → accumulator == 20 (max, not the last value).
+    eng = _MockEngine(); me = mk(_qf=eng, _ENGINE_IGNORED_COND_KEYS=keys, _max_ctx_seq=0,
+                                         _post_connector_seq=_ident)
+    fn(me, cross_attn=torch.zeros(1, 10, 8)); fn(me, cross_attn=torch.zeros(1, 20, 8))
+    if me._max_ctx_seq != 20:
+        print(f"  [FAIL] pos(10)+neg(20) → _max_ctx_seq={me._max_ctx_seq}, expected 20"); bad += 1
+    # (b) reverse order neg S=20 then pos S=10 → still 20 (a smaller later must NOT shrink it).
+    eng = _MockEngine(); me = mk(_qf=eng, _ENGINE_IGNORED_COND_KEYS=keys, _max_ctx_seq=0,
+                                         _post_connector_seq=_ident)
+    fn(me, cross_attn=torch.zeros(1, 20, 8)); fn(me, cross_attn=torch.zeros(1, 10, 8))
+    if me._max_ctx_seq != 20:
+        print(f"  [FAIL] neg(20)+pos(10) → _max_ctx_seq={me._max_ctx_seq}, expected 20 (order-independent)"); bad += 1
+    # (c) a cross_attn-less call must leave the accumulator UNTOUCHED (the _begin safe-fallback path).
+    eng = _MockEngine(); me = mk(_qf=eng, _ENGINE_IGNORED_COND_KEYS=keys, _max_ctx_seq=7,
+                                         _post_connector_seq=_ident)
+    fn(me)
+    if me._max_ctx_seq != 7:
+        print(f"  [FAIL] cross_attn-less call changed _max_ctx_seq to {me._max_ctx_seq}, expected 7"); bad += 1
+    print(f"  max_ctx_seq: {'OK' if bad == 0 else 'FAIL'} (accumulates max across pos+neg, order-independent; "
+          "cross_attn-less untouched)")
+    return bad
+
+
+def _t_shared_interrupt_helper(src):
+    """§6.5 simplicity: ONE shared interrupt guard for EVERY family. STRUCTURAL: the raw
+    comfy.model_management.throw_exception_if_processing_interrupted() call appears on exactly ONE
+    non-comment line across qf_modelpatcher.py + every family module — inside the shared helper — and
+    every family calls the helper. FUNCTIONAL: the REAL helper source ends the open session and re-raises on
+    a BaseException-derived interrupt (an `except Exception` rewrite MISSES it → end_calls==0 → FAIL), and
+    is a no-op without an interrupt."""
+    fam_srcs = {"qf_ltx_modelpatcher.py": src}
+    fam_srcs.update({f: open(p, encoding="utf-8", errors="replace").read() for f, p in _OTHER_FAMILY_SRCS.items()})
+    bad = 0
+    def _code_lines(text):
+        return [ln for ln in text.splitlines() if not ln.lstrip().startswith("#")]
+    raw_call = "comfy.model_management.throw_exception_if_processing_interrupted()"
+    # ONE raw poll site, and it must be in the family-AGNOSTIC substrate — every FAMILY module
+    # routes through the shared helper. (Scanning all three files is what makes a family module
+    # re-introducing its own poll a FAILURE rather than an invisible drift.)
+    raws = {"qf_modelpatcher.py (shared)": sum(raw_call in ln for ln in _code_lines(_shared_src_text()))}
+    raws.update({f: sum(raw_call in ln for ln in _code_lines(s)) for f, s in fam_srcs.items()})
+    if raws["qf_modelpatcher.py (shared)"] != 1:
+        print(f"  [FAIL] the shared substrate has {raws['qf_modelpatcher.py (shared)']} raw interrupt-poll "
+              "call lines, expected exactly 1 (inside _interrupt_poll_end_session_on_raise)"); bad += 1
+    for fam_file in fam_srcs:
+        if raws[fam_file] != 0:
+            print(f"  [FAIL] {fam_file} has {raws[fam_file]} raw interrupt-poll call lines, expected 0 "
+                  "(a family module must route through the shared helper)"); bad += 1
+    helper_call = "_interrupt_poll_end_session_on_raise(self._qf)"
+    # The image families (Krea-2, Qwen-Image-2.1) step in the shared image seam, qf_modelpatcher.QFImageSessionModel:
+    # the seam's step loop must call the helper, and such a family's model must derive from it, with any _apply_model
+    # of its own delegating to super() (so no family can step without the poll).
+    image_seam = "class QFImageSessionModel(QFSessionModelMixin)"
+    shared_code = _code_lines(_shared_src_text())
+    if not any(image_seam in ln for ln in shared_code) or sum(helper_call in ln for ln in shared_code) < 1:
+        print("  [FAIL] the shared image seam (QFImageSessionModel) is missing or does not call the interrupt helper")
+        bad += 1
+    for fam_file, fam_src in fam_srcs.items():
+        if "(qfmp.QFImageSessionModel," in fam_src:
+            if "def _apply_model" in fam_src and "super()._apply_model(" not in fam_src:
+                print(f"  [FAIL] {fam_file} overrides the image seam's _apply_model without delegating to it"); bad += 1
+        elif sum(helper_call in ln for ln in _code_lines(fam_src)) < 1:
+            print(f"  [FAIL] {fam_file} does not call the shared interrupt helper"); bad += 1
+    # FUNCTIONAL — the real helper body: interrupt → end + re-raise; no interrupt → no-op.
+    helper = _bind_shared_helper(_make_comfy(interrupt_raises=True))
+    eng = _MockEngine(open_session=object())
+    try:
+        helper(eng)
+        print("  [FAIL] helper did not re-raise the interrupt"); bad += 1
+    except _InterruptExc:
+        if eng.end_calls != 1 or eng.current_session is not None:
+            print(f"  [FAIL] helper interrupt path: end_calls={eng.end_calls} "
+                  f"session={eng.current_session} (expected 1 / None)"); bad += 1
+    except BaseException as e:   # noqa: BLE001
+        print(f"  [FAIL] helper raised the wrong type: {type(e).__name__}"); bad += 1
+    helper2 = _bind_shared_helper(_make_comfy(interrupt_raises=False))
+    eng2 = _MockEngine(open_session=object())
+    helper2(eng2)
+    if eng2.end_calls != 0:
+        print(f"  [FAIL] helper no-interrupt path called end_session ({eng2.end_calls} times)"); bad += 1
+    print(f"  shared_interrupt_helper: {'OK' if bad == 0 else 'FAIL'} (one raw poll site; every family via "
+          "helper; ends+re-raises on BaseException interrupt; no-op otherwise)")
+    return bad
+
+
+def _t_scale_latent_inpaint(src):
+    """2026-08-22 wan-align pivot: the LTX seam INHERITS comfy's own LTXV.scale_latent_inpaint (model_base.py:
+    `return latent_image` — the masked latent is blended OUTSIDE the model by KSamplerX0Inpaint; exact because
+    the engine step is stateless in x) — the Inplace i2v route rides it, so the plugin must NOT override it
+    (the old loud-fail override would break i2v). Positive control: the H3 seam still overrides it."""
+    def overrides(text, cls):
+        try:
+            _extract_method(text, cls, "scale_latent_inpaint"); return True
+        except AssertionError:
+            return False
+    for cls in ("QFLTXModel", "QFLTXAVModel"):
+        if overrides(src, cls):
+            print(f"  [FAIL] {cls} overrides scale_latent_inpaint (must be inherited since the 2026-08-22 pivot)"); return 1
+    if not overrides(open(_OTHER_FAMILY_SRCS["qf_h3_modelpatcher.py"], encoding="utf-8", errors="replace").read(), "QFH3Model"):
+        print("  [FAIL] positive control: QFH3Model no longer overrides scale_latent_inpaint"); return 1
+    print("  scale_latent_inpaint: OK (inherited by LTX/LTXAV, overridden by H3)"); return 0
+
+
+def _t_derive_geometry(src):
+    """The loader carries NO geometry widgets any more (official-loader shape), so the seam DERIVES
+    the session geometry from the graph. This pins the derivation and the schedule rule the mixin shares
+    with H3: no / short / non-decreasing schedules are refused, trimmed ranges are accepted. The frame count follows the
+    model's comfy latent_format (arm 1b feeds a different temporal scale, so a written-down scale cannot pass)."""
+    try:   # the model's latent_format: ComfyUI's own LTXV when COMFY_ROOT is set, else a stub with comfy's values
+        from comfy.latent_formats import LTXV as _LTXVFormat
+        lf = _LTXVFormat()
+    except ImportError:
+        lf = types.SimpleNamespace(temporal_downscale_ratio=8, spacial_downscale_ratio=32)
+    kT = int(lf.temporal_downscale_ratio)
+    fn, _ = _bind(src, "_derive_geometry")
+    # the schedule rule is the mixin's _stage_schedule, shared with H3 (qf_modelpatcher.py): bound from its real source
+    shared = {}
+    exec(_extract_method(_shared_src_text(), "QFSessionModelMixin", "_stage_schedule"), shared)  # noqa: S102
+    bad = 0
+    Flat, steps = 4, 6
+    x = torch.zeros(1, 128, Flat, 2, 2)
+    ms = types.SimpleNamespace(sigma_max=1.0)
+
+    def _mock_self(**attrs):   # a model with the shared rule as its method and the LTX latent_format
+        m = types.SimpleNamespace(**{"latent_format": lf, **attrs})
+        m._stage_schedule = types.MethodType(shared["_stage_schedule"], m)
+        return m
+
+    # 1) a FULL-range schedule derives BOTH quantities from the graph (no widgets involved).
+    me = _mock_self(_num_frames=0, _num_steps=0, model_sampling=ms)
+    full = [1.0 - i / steps for i in range(steps)] + [0.0]     # 1.0 -> 0.0, len == steps+1
+    try:
+        fn(me, x, {"sample_sigmas": full})
+        want_frames = (Flat - 1) * kT + 1
+        if me._num_frames != want_frames:
+            print(f"  [FAIL] _derive_geometry: num_frames {me._num_frames} != {want_frames}"); bad += 1
+        if me._num_steps != steps:
+            print(f"  [FAIL] _derive_geometry: num_steps {me._num_steps} != {steps}"); bad += 1
+    except RuntimeError as e:
+        print(f"  [FAIL] _derive_geometry raised on a FULL-range schedule: {e}"); bad += 1
+    # 1b) another temporal scale: the frame count must follow the model's latent_format, not a number in the seam.
+    lf4 = types.SimpleNamespace(temporal_downscale_ratio=kT // 2, spacial_downscale_ratio=lf.spacial_downscale_ratio)
+    me4 = _mock_self(_num_frames=0, _num_steps=0, model_sampling=ms, latent_format=lf4)
+    fn(me4, x, {"sample_sigmas": full})
+    if me4._num_frames != (Flat - 1) * (kT // 2) + 1:
+        print(f"  [FAIL] _derive_geometry ignored the model's latent_format: num_frames {me4._num_frames} at "
+              f"temporal scale {kT // 2}"); bad += 1
+
+    # 2) no schedule at all -> refuse (the seam cannot invent a step count).
+    for name, to in (("missing", {}), ("too-short", {"sample_sigmas": [1.0]})):
+        try:
+            fn(_mock_self(_num_frames=0, _num_steps=0, model_sampling=ms), x, to)
+            print(f"  [FAIL] _derive_geometry did NOT raise on a {name} sigma schedule"); bad += 1
+        except RuntimeError:
+            pass
+
+    # 3) a TRIMMED range is ACCEPTED, both directions (two-stage official workflows: stage-A 1.0->0.975,
+    #    stage-B 0.85->0 after the latent upsample): the session is purely sigma-driven, so the step count
+    #    is len(sigmas)-1. Only a NON-DECREASING schedule is refused (it would drive the session backwards).
+    trims = {
+        "end-trimmed":   [1.0 - i / steps for i in range(steps + 1)][:-1] + [0.3],
+        "start-trimmed": [0.5 - i * (0.5 / steps) for i in range(steps)] + [0.0],
+    }
+    for name, sig in trims.items():
+        me = _mock_self(_num_frames=0, _num_steps=0, model_sampling=ms)
+        try:
+            fn(me, x, {"sample_sigmas": sig})
+            if me._num_steps != len(sig) - 1:
+                print(f"  [FAIL] _derive_geometry: {name} num_steps {me._num_steps} != {len(sig) - 1}"); bad += 1
+        except RuntimeError as e:
+            print(f"  [FAIL] _derive_geometry refused a {name} schedule: {e}"); bad += 1
+    try:
+        fn(_mock_self(_num_frames=0, _num_steps=0, model_sampling=ms), x, {"sample_sigmas": [0.3, 0.6, 1.0]})
+        print("  [FAIL] _derive_geometry did NOT raise on a non-decreasing schedule"); bad += 1
+    except RuntimeError:
+        pass
+
+    print(f"  _derive_geometry: {'OK' if bad == 0 else 'FAIL'} (derives frames+steps from the graph; "
+          "missing/short/non-decreasing refuse; trimmed ranges accepted)")
+    return bad
+
+
+def main():
+    src = _src_text()
+    print(f"=== QFLTXModel safety-layer behavioral test (src={os.path.relpath(_SRC, _HERE)}) ===")
+    bad = 0
+    for t in (_t_extra_conds, _t_call_fps, _t_max_ctx_seq, _t_scale_latent_inpaint,
+              _t_derive_geometry, _t_shared_interrupt_helper):
+        try:
+            bad += t(src)
+        except Exception as e:   # noqa: BLE001 — a harness error is a FAIL, not a crash-through
+            print(f"  [FAIL] {t.__name__} errored: {type(e).__name__}: {e}"); bad += 1
+    print("QFLTX_SAFETY_LAYER:", "PASS" if bad == 0 else f"FAIL ({bad} wrong)")
+    return 0 if bad == 0 else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

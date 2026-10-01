@@ -1,8 +1,8 @@
 {
-  "id": "88df3e97-1da7-4822-b84d-3854ee30e7bc",
+  "id": "fbc04cb5-4f11-404a-bb13-4e0549856e49",
   "revision": 0,
-  "last_node_id": 20,
-  "last_link_id": 26,
+  "last_node_id": 31,
+  "last_link_id": 38,
   "nodes": [
     {
       "id": 1,
@@ -22,10 +22,10 @@
       "outputs": [],
       "properties": {},
       "widgets_values": [
-        "## QuantFunc MiniMax-H3\n\n- **QuantFunc MiniMax-H3 Loader** replaces the official `Load Diffusion Model` (UNETLoader): the QuantFunc engine runs the H3 transformer, video and audio; the text encoder (`CLIPLoader`, type `minimax`), the video and audio VAEs and the sampler stay stock ComfyUI.\n- `transformer` from ModelScope [QuantFunc/Minimax-H3-Quantfunc-4bit](https://modelscope.cn/models/QuantFunc/Minimax-H3-Quantfunc-4bit), in `models/diffusion_models`: `minimax_h3_ref2va_8steps_quantfunc_int4_r128.safetensors`.\n- From Hugging Face [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3): text encoder `qwen3vl_32b_minimax_h3_int8_convrot.safetensors` (the bf16 file also works), VAEs `minimax_h3_video_vae_fp16.safetensors` and `minimax_h3_audio_vae_fp32.safetensors`.\n- `audio_enhance`: ON adds a short extra pass that makes the sound clearer (most useful at few steps). It is not supported in two-stage (double-sampling) workflows: it is ignored there.\n- Input images: `red_superboy_on_city_roof.png`, `mecha_dragon_lightning.png` from [Comfy-Org/workflow_templates](https://github.com/Comfy-Org/workflow_templates/tree/main/input); use your own.\n- Size: 960x544 (multiples of 32), 124 frames (~5 s at 24 fps; frames are 17k+5).\n\n**Reference images to video with audio.** `<Picture 1>` and `<Picture 2>` in the prompt are the reference images in order (up to more: connect another image to the next `ref_image` input). 8 steps, res_multistep / simple.\n\n**Two stages (double sampling).** `SplitSigmas` splits one 8-step schedule: the first sampler adds the noise and runs the high sigmas, the second (`DisableNoise`) finishes the low ones on the same latent. Change the model, a LoRA or the guidance between the stages here.\n"
+        "## QuantFunc MiniMax-H3\n\n- **QuantFunc MiniMax-H3 Loader** replaces the official `Load Diffusion Model` (UNETLoader): the QuantFunc engine runs the H3 transformer, video and audio; the text encoder (`CLIPLoader`, type `minimax`), the video and audio VAEs and the sampler stay stock ComfyUI.\n- `transformer` from ModelScope [QuantFunc/Minimax-H3-Quantfunc-4bit](https://modelscope.cn/models/QuantFunc/Minimax-H3-Quantfunc-4bit), in `models/diffusion_models`: `minimax_h3_fl2va_4step_quantfunc_int4_r128.safetensors`.\n- From Hugging Face [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3): text encoder `qwen3vl_32b_minimax_h3_int8_convrot.safetensors` (the bf16 file also works), VAEs `minimax_h3_video_vae_fp16.safetensors` and `minimax_h3_audio_vae_fp32.safetensors`.\n- `audio_enhance`: ON adds a short extra pass that makes the sound clearer (most useful at few steps). It is not supported in two-stage (double-sampling) workflows: it is ignored there.\n- Input images: `flf2v_demo_first_frame.png`, `flf2v_demo_last_frame.png` from [Comfy-Org/workflow_templates](https://github.com/Comfy-Org/workflow_templates/tree/main/input); use your own.\n- Size: 960x544 (multiples of 32), 124 frames (~5 s at 24 fps; frames are 17k+5).\n\n**First and last frame to video with audio.** The video starts at the first frame and ends at the last; either frame is optional (none: text to video). 4 steps, res_multistep / simple.\n\n**Two stages on one schedule: low-res, then high-res.** `Total steps` (4) makes one noise schedule from full noise to clean. Stage 1 runs its first `Stage 1 steps` (2) on the small canvas and stops there; stage 2 continues the same schedule to the end at high res (2 steps). 4 steps is this model's native step count, and other totals changed the picture in our tests, so change it with care; keep `Stage 1 steps` between 1 and `Total steps` - 1. Stage 1's prediction of the clean video is scaled up, and stage 2 adds noise at exactly the level where stage 1 stopped, so the high-res latent has the noise the schedule expects there. Set only the width x height on `Stage 1 conditioning` (960x544) and the upscale factor (`scale_by` on the upscale node, 2). The high-res size is computed: the stage 1 size times the factor, rounded to a multiple of 32 (960x544 x 2 = 1920x1088); the upscale node outputs it as its `width` / `height`. `Stage 2 conditioning` re-anchors the first and last frames at the high-res size. It takes that size from the upscale node, so the two always agree; its own latent output is not used. Edit the prompt and the length once, in `Prompt` and `Length (frames)`. For a quicker look, use a smaller stage 1 size (for example 512x288, which x2 gives 1024x576).\n"
       ],
       "widgets_values_named": {
-        "text": "## QuantFunc MiniMax-H3\n\n- **QuantFunc MiniMax-H3 Loader** replaces the official `Load Diffusion Model` (UNETLoader): the QuantFunc engine runs the H3 transformer, video and audio; the text encoder (`CLIPLoader`, type `minimax`), the video and audio VAEs and the sampler stay stock ComfyUI.\n- `transformer` from ModelScope [QuantFunc/Minimax-H3-Quantfunc-4bit](https://modelscope.cn/models/QuantFunc/Minimax-H3-Quantfunc-4bit), in `models/diffusion_models`: `minimax_h3_ref2va_8steps_quantfunc_int4_r128.safetensors`.\n- From Hugging Face [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3): text encoder `qwen3vl_32b_minimax_h3_int8_convrot.safetensors` (the bf16 file also works), VAEs `minimax_h3_video_vae_fp16.safetensors` and `minimax_h3_audio_vae_fp32.safetensors`.\n- `audio_enhance`: ON adds a short extra pass that makes the sound clearer (most useful at few steps). It is not supported in two-stage (double-sampling) workflows: it is ignored there.\n- Input images: `red_superboy_on_city_roof.png`, `mecha_dragon_lightning.png` from [Comfy-Org/workflow_templates](https://github.com/Comfy-Org/workflow_templates/tree/main/input); use your own.\n- Size: 960x544 (multiples of 32), 124 frames (~5 s at 24 fps; frames are 17k+5).\n\n**Reference images to video with audio.** `<Picture 1>` and `<Picture 2>` in the prompt are the reference images in order (up to more: connect another image to the next `ref_image` input). 8 steps, res_multistep / simple.\n\n**Two stages (double sampling).** `SplitSigmas` splits one 8-step schedule: the first sampler adds the noise and runs the high sigmas, the second (`DisableNoise`) finishes the low ones on the same latent. Change the model, a LoRA or the guidance between the stages here.\n"
+        "text": "## QuantFunc MiniMax-H3\n\n- **QuantFunc MiniMax-H3 Loader** replaces the official `Load Diffusion Model` (UNETLoader): the QuantFunc engine runs the H3 transformer, video and audio; the text encoder (`CLIPLoader`, type `minimax`), the video and audio VAEs and the sampler stay stock ComfyUI.\n- `transformer` from ModelScope [QuantFunc/Minimax-H3-Quantfunc-4bit](https://modelscope.cn/models/QuantFunc/Minimax-H3-Quantfunc-4bit), in `models/diffusion_models`: `minimax_h3_fl2va_4step_quantfunc_int4_r128.safetensors`.\n- From Hugging Face [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3): text encoder `qwen3vl_32b_minimax_h3_int8_convrot.safetensors` (the bf16 file also works), VAEs `minimax_h3_video_vae_fp16.safetensors` and `minimax_h3_audio_vae_fp32.safetensors`.\n- `audio_enhance`: ON adds a short extra pass that makes the sound clearer (most useful at few steps). It is not supported in two-stage (double-sampling) workflows: it is ignored there.\n- Input images: `flf2v_demo_first_frame.png`, `flf2v_demo_last_frame.png` from [Comfy-Org/workflow_templates](https://github.com/Comfy-Org/workflow_templates/tree/main/input); use your own.\n- Size: 960x544 (multiples of 32), 124 frames (~5 s at 24 fps; frames are 17k+5).\n\n**First and last frame to video with audio.** The video starts at the first frame and ends at the last; either frame is optional (none: text to video). 4 steps, res_multistep / simple.\n\n**Two stages on one schedule: low-res, then high-res.** `Total steps` (4) makes one noise schedule from full noise to clean. Stage 1 runs its first `Stage 1 steps` (2) on the small canvas and stops there; stage 2 continues the same schedule to the end at high res (2 steps). 4 steps is this model's native step count, and other totals changed the picture in our tests, so change it with care; keep `Stage 1 steps` between 1 and `Total steps` - 1. Stage 1's prediction of the clean video is scaled up, and stage 2 adds noise at exactly the level where stage 1 stopped, so the high-res latent has the noise the schedule expects there. Set only the width x height on `Stage 1 conditioning` (960x544) and the upscale factor (`scale_by` on the upscale node, 2). The high-res size is computed: the stage 1 size times the factor, rounded to a multiple of 32 (960x544 x 2 = 1920x1088); the upscale node outputs it as its `width` / `height`. `Stage 2 conditioning` re-anchors the first and last frames at the high-res size. It takes that size from the upscale node, so the two always agree; its own latent output is not used. Edit the prompt and the length once, in `Prompt` and `Length (frames)`. For a quicker look, use a smaller stage 1 size (for example 512x288, which x2 gives 1024x576).\n"
       },
       "color": "#432",
       "bgcolor": "#653"
@@ -44,14 +44,106 @@
       "flags": {},
       "order": 1,
       "mode": 0,
-      "inputs": [],
+      "inputs": [
+        {
+          "localized_name": "transformer",
+          "name": "transformer",
+          "type": "COMBO",
+          "widget": {
+            "name": "transformer"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "model_config",
+          "name": "model_config",
+          "shape": 7,
+          "type": "COMBO",
+          "widget": {
+            "name": "model_config"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "attention_backend",
+          "name": "attention_backend",
+          "shape": 7,
+          "type": "COMBO",
+          "widget": {
+            "name": "attention_backend"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "sol_tau",
+          "name": "sol_tau",
+          "shape": 7,
+          "type": "FLOAT",
+          "widget": {
+            "name": "sol_tau"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "step_cache",
+          "name": "step_cache",
+          "shape": 7,
+          "type": "FLOAT",
+          "widget": {
+            "name": "step_cache"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "block_cache",
+          "name": "block_cache",
+          "shape": 7,
+          "type": "FLOAT",
+          "widget": {
+            "name": "block_cache"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "quality_enhance",
+          "name": "quality_enhance",
+          "shape": 7,
+          "type": "BOOLEAN",
+          "widget": {
+            "name": "quality_enhance"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "audio_enhance",
+          "name": "audio_enhance",
+          "shape": 7,
+          "type": "BOOLEAN",
+          "widget": {
+            "name": "audio_enhance"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "pinned_memory",
+          "name": "pinned_memory",
+          "shape": 7,
+          "type": "BOOLEAN",
+          "widget": {
+            "name": "pinned_memory"
+          },
+          "link": null
+        }
+      ],
       "outputs": [
         {
+          "localized_name": "MODEL",
           "name": "MODEL",
           "type": "MODEL",
           "links": [
-            6,
-            8
+            7,
+            9,
+            30
           ]
         }
       ],
@@ -62,22 +154,22 @@
       "widgets_values": [
         "minimax_h3_fl2va_4step_quantfunc_int4_r128.safetensors",
         "minimax-h3-fl2va",
-        "flash",
+        "auto",
         1,
         0,
         0,
-        true,
+        false,
         false,
         true
       ],
       "widgets_values_named": {
         "transformer": "minimax_h3_fl2va_4step_quantfunc_int4_r128.safetensors",
         "model_config": "minimax-h3-fl2va",
-        "attention_backend": "flash",
+        "attention_backend": "auto",
         "sol_tau": 1,
         "step_cache": 0,
         "block_cache": 0,
-        "quality_enhance": true,
+        "quality_enhance": false,
         "audio_enhance": false,
         "pinned_memory": true
       }
@@ -96,13 +188,44 @@
       "flags": {},
       "order": 2,
       "mode": 0,
-      "inputs": [],
+      "inputs": [
+        {
+          "localized_name": "clip_name",
+          "name": "clip_name",
+          "type": "COMBO",
+          "widget": {
+            "name": "clip_name"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "type",
+          "name": "type",
+          "type": "COMBO",
+          "widget": {
+            "name": "type"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "device",
+          "name": "device",
+          "shape": 7,
+          "type": "COMBO",
+          "widget": {
+            "name": "device"
+          },
+          "link": null
+        }
+      ],
       "outputs": [
         {
+          "localized_name": "CLIP",
           "name": "CLIP",
           "type": "CLIP",
           "links": [
-            1
+            1,
+            22
           ]
         }
       ],
@@ -134,14 +257,26 @@
       "flags": {},
       "order": 3,
       "mode": 0,
-      "inputs": [],
+      "inputs": [
+        {
+          "localized_name": "vae_name",
+          "name": "vae_name",
+          "type": "COMBO",
+          "widget": {
+            "name": "vae_name"
+          },
+          "link": null
+        }
+      ],
       "outputs": [
         {
+          "localized_name": "VAE",
           "name": "VAE",
           "type": "VAE",
           "links": [
             2,
-            21
+            23,
+            33
           ]
         }
       ],
@@ -170,14 +305,24 @@
       "flags": {},
       "order": 4,
       "mode": 0,
-      "inputs": [],
+      "inputs": [
+        {
+          "localized_name": "vae_name",
+          "name": "vae_name",
+          "type": "COMBO",
+          "widget": {
+            "name": "vae_name"
+          },
+          "link": null
+        }
+      ],
       "outputs": [
         {
+          "localized_name": "VAE",
           "name": "VAE",
           "type": "VAE",
           "links": [
-            3,
-            23
+            35
           ]
         }
       ],
@@ -206,31 +351,53 @@
       "flags": {},
       "order": 5,
       "mode": 0,
-      "inputs": [],
+      "inputs": [
+        {
+          "localized_name": "image",
+          "name": "image",
+          "type": "COMBO",
+          "widget": {
+            "name": "image"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "choose file to upload",
+          "name": "upload",
+          "type": "IMAGEUPLOAD",
+          "widget": {
+            "name": "upload"
+          },
+          "link": null
+        }
+      ],
       "outputs": [
         {
+          "localized_name": "IMAGE",
           "name": "IMAGE",
           "type": "IMAGE",
           "links": [
-            4
+            3,
+            24
           ]
         },
         {
+          "localized_name": "MASK",
           "name": "MASK",
           "type": "MASK",
           "links": null
         }
       ],
-      "title": "Reference 1",
+      "title": "First frame",
       "properties": {
         "Node name for S&R": "LoadImage"
       },
       "widgets_values": [
-        "red_superboy_on_city_roof.png",
+        "flf2v_demo_first_frame.png",
         "image"
       ],
       "widgets_values_named": {
-        "image": "red_superboy_on_city_roof.png",
+        "image": "flf2v_demo_first_frame.png",
         "upload": "image"
       }
     },
@@ -248,143 +415,175 @@
       "flags": {},
       "order": 6,
       "mode": 0,
-      "inputs": [],
+      "inputs": [
+        {
+          "localized_name": "image",
+          "name": "image",
+          "type": "COMBO",
+          "widget": {
+            "name": "image"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "choose file to upload",
+          "name": "upload",
+          "type": "IMAGEUPLOAD",
+          "widget": {
+            "name": "upload"
+          },
+          "link": null
+        }
+      ],
       "outputs": [
         {
+          "localized_name": "IMAGE",
           "name": "IMAGE",
           "type": "IMAGE",
           "links": [
-            5
+            4,
+            25
           ]
         },
         {
+          "localized_name": "MASK",
           "name": "MASK",
           "type": "MASK",
           "links": null
         }
       ],
-      "title": "Reference 2",
+      "title": "Last frame",
       "properties": {
         "Node name for S&R": "LoadImage"
       },
       "widgets_values": [
-        "mecha_dragon_lightning.png",
+        "flf2v_demo_last_frame.png",
         "image"
       ],
       "widgets_values_named": {
-        "image": "mecha_dragon_lightning.png",
+        "image": "flf2v_demo_last_frame.png",
         "upload": "image"
       }
     },
     {
       "id": 8,
-      "type": "MiniMaxH3ReferenceToVideo",
+      "type": "MiniMaxH3ImageToVideo",
       "pos": [
         922.798828125,
         0
       ],
       "size": [
         400,
-        364
+        220
       ],
       "flags": {},
       "order": 11,
       "mode": 0,
       "inputs": [
         {
+          "localized_name": "clip",
           "name": "clip",
           "type": "CLIP",
           "link": 1
         },
         {
+          "localized_name": "vae",
           "name": "vae",
-          "shape": 7,
           "type": "VAE",
           "link": 2
         },
         {
-          "name": "audio_vae",
+          "localized_name": "first_frame",
+          "name": "first_frame",
           "shape": 7,
-          "type": "VAE",
+          "type": "IMAGE",
           "link": 3
         },
         {
-          "name": "ref_images.ref_image_0",
+          "localized_name": "last_frame",
+          "name": "last_frame",
           "shape": 7,
           "type": "IMAGE",
           "link": 4
         },
         {
-          "name": "ref_images.ref_image_1",
-          "shape": 7,
-          "type": "IMAGE",
+          "localized_name": "prompt",
+          "name": "prompt",
+          "type": "STRING",
+          "widget": {
+            "name": "prompt"
+          },
           "link": 5
         },
         {
-          "name": "ref_images.ref_image_2",
-          "shape": 7,
-          "type": "IMAGE",
+          "localized_name": "width",
+          "name": "width",
+          "type": "INT",
+          "widget": {
+            "name": "width"
+          },
           "link": null
         },
         {
-          "name": "ref_videos.ref_video_0",
-          "shape": 7,
-          "type": "IMAGE",
+          "localized_name": "height",
+          "name": "height",
+          "type": "INT",
+          "widget": {
+            "name": "height"
+          },
           "link": null
         },
         {
-          "name": "ref_video_audios.ref_video_audio_0",
-          "shape": 7,
-          "type": "AUDIO",
-          "link": null
-        },
-        {
-          "name": "ref_audios.ref_audio_0",
-          "shape": 7,
-          "type": "AUDIO",
-          "link": null
+          "localized_name": "length",
+          "name": "length",
+          "type": "INT",
+          "widget": {
+            "name": "length"
+          },
+          "link": 6
         }
       ],
       "outputs": [
         {
+          "localized_name": "positive",
           "name": "positive",
           "type": "CONDITIONING",
           "links": [
-            7
+            8
           ]
         },
         {
+          "localized_name": "LATENT",
           "name": "LATENT",
           "type": "LATENT",
           "links": [
-            12
+            15
           ]
         }
       ],
       "properties": {
-        "Node name for S&R": "MiniMaxH3ReferenceToVideo"
+        "Node name for S&R": "MiniMaxH3ImageToVideo"
       },
       "widgets_values": [
-        "Bold comic-book ink style, heavy linework, red and blue-black palette, night city. Use <Picture 1> and <Picture 2> as references. CUT 1: the little red-caped superhero boy from <Picture 1> stands on a rooftop, hands on his hips, grins at the camera and shouts \"Get ready!\". CUT 2: the giant black mech-kaiju from <Picture 2> rears back and ROARS, red chest core flaring, blue lightning arcing off its head, thunder rumbling over the skyline.",
+        "Cinematic crane shot inside an iridescent translucent pavilion: a red-haired woman in a long black dress stands at the edge of a circular reflecting pool. The camera slowly rises from eye level to a high top-down view as she looks up, the pool reflecting the shimmering walls. Soft ambient hum, gentle water ripples, a distant echo.",
         960,
         544,
-        124,
-        "match"
+        124
       ],
       "widgets_values_named": {
-        "prompt": "Bold comic-book ink style, heavy linework, red and blue-black palette, night city. Use <Picture 1> and <Picture 2> as references. CUT 1: the little red-caped superhero boy from <Picture 1> stands on a rooftop, hands on his hips, grins at the camera and shouts \"Get ready!\". CUT 2: the giant black mech-kaiju from <Picture 2> rears back and ROARS, red chest core flaring, blue lightning arcing off its head, thunder rumbling over the skyline.",
+        "prompt": "Cinematic crane shot inside an iridescent translucent pavilion: a red-haired woman in a long black dress stands at the edge of a circular reflecting pool. The camera slowly rises from eye level to a high top-down view as she looks up, the pool reflecting the shimmering walls. Soft ambient hum, gentle water ripples, a distant echo.",
         "width": 960,
         "height": 544,
-        "length": 124,
-        "ref_image_size": "match"
-      }
+        "length": 124
+      },
+      "title": "Stage 1 conditioning (low-res: set the width x height here)"
     },
     {
       "id": 9,
       "type": "RandomNoise",
       "pos": [
         922.798828125,
-        414
+        290
       ],
       "size": [
         270,
@@ -393,13 +592,25 @@
       "flags": {},
       "order": 7,
       "mode": 0,
-      "inputs": [],
+      "inputs": [
+        {
+          "localized_name": "noise_seed",
+          "name": "noise_seed",
+          "type": "INT",
+          "widget": {
+            "name": "noise_seed"
+          },
+          "link": null
+        }
+      ],
       "outputs": [
         {
+          "localized_name": "NOISE",
           "name": "NOISE",
           "type": "NOISE",
           "links": [
-            9
+            11,
+            17
           ]
         }
       ],
@@ -420,7 +631,7 @@
       "type": "BasicGuider",
       "pos": [
         922.798828125,
-        566
+        442
       ],
       "size": [
         159.568359375,
@@ -431,23 +642,25 @@
       "mode": 0,
       "inputs": [
         {
+          "localized_name": "model",
           "name": "model",
           "type": "MODEL",
-          "link": 6
+          "link": 7
         },
         {
+          "localized_name": "conditioning",
           "name": "conditioning",
           "type": "CONDITIONING",
-          "link": 7
+          "link": 8
         }
       ],
       "outputs": [
         {
+          "localized_name": "GUIDER",
           "name": "GUIDER",
           "type": "GUIDER",
           "links": [
-            10,
-            16
+            12
           ]
         }
       ],
@@ -460,7 +673,7 @@
       "type": "KSamplerSelect",
       "pos": [
         922.798828125,
-        682
+        558
       ],
       "size": [
         270,
@@ -469,14 +682,25 @@
       "flags": {},
       "order": 8,
       "mode": 0,
-      "inputs": [],
+      "inputs": [
+        {
+          "localized_name": "sampler_name",
+          "name": "sampler_name",
+          "type": "COMBO",
+          "widget": {
+            "name": "sampler_name"
+          },
+          "link": null
+        }
+      ],
       "outputs": [
         {
+          "localized_name": "SAMPLER",
           "name": "SAMPLER",
           "type": "SAMPLER",
           "links": [
-            11,
-            17
+            13,
+            19
           ]
         }
       ],
@@ -495,28 +719,57 @@
       "type": "BasicScheduler",
       "pos": [
         922.798828125,
-        810
+        686
       ],
       "size": [
         270,
         106
       ],
       "flags": {},
-      "order": 10,
+      "order": 12,
       "mode": 0,
       "inputs": [
         {
+          "localized_name": "model",
           "name": "model",
           "type": "MODEL",
-          "link": 8
+          "link": 9
+        },
+        {
+          "localized_name": "scheduler",
+          "name": "scheduler",
+          "type": "COMBO",
+          "widget": {
+            "name": "scheduler"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "steps",
+          "name": "steps",
+          "type": "INT",
+          "widget": {
+            "name": "steps"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "denoise",
+          "name": "denoise",
+          "type": "FLOAT",
+          "widget": {
+            "name": "denoise"
+          },
+          "link": null
         }
       ],
       "outputs": [
         {
+          "localized_name": "SIGMAS",
           "name": "SIGMAS",
           "type": "SIGMAS",
           "links": [
-            13
+            10
           ]
         }
       ],
@@ -525,14 +778,15 @@
       },
       "widgets_values": [
         "simple",
-        8,
+        4,
         1
       ],
       "widgets_values_named": {
         "scheduler": "simple",
-        "steps": 8,
+        "steps": 4,
         "denoise": 1
-      }
+      },
+      "title": "Total steps (both stages, one schedule)"
     },
     {
       "id": 13,
@@ -546,50 +800,57 @@
         106
       ],
       "flags": {},
-      "order": 14,
+      "order": 15,
       "mode": 0,
       "inputs": [
         {
+          "localized_name": "noise",
           "name": "noise",
           "type": "NOISE",
-          "link": 9
-        },
-        {
-          "name": "guider",
-          "type": "GUIDER",
-          "link": 10
-        },
-        {
-          "name": "sampler",
-          "type": "SAMPLER",
           "link": 11
         },
         {
+          "localized_name": "guider",
+          "name": "guider",
+          "type": "GUIDER",
+          "link": 12
+        },
+        {
+          "localized_name": "sampler",
+          "name": "sampler",
+          "type": "SAMPLER",
+          "link": 13
+        },
+        {
+          "localized_name": "sigmas",
           "name": "sigmas",
           "type": "SIGMAS",
           "link": 14
         },
         {
+          "localized_name": "latent_image",
           "name": "latent_image",
           "type": "LATENT",
-          "link": 12
+          "link": 15
         }
       ],
       "outputs": [
         {
+          "localized_name": "output",
           "name": "output",
           "type": "LATENT",
-          "links": [
-            19
-          ]
+          "links": null
         },
         {
+          "localized_name": "denoised_output",
           "name": "denoised_output",
           "type": "LATENT",
-          "links": null
+          "links": [
+            16
+          ]
         }
       ],
-      "title": "Stage 1",
+      "title": "Stage 1 sampler (stops at the split)",
       "properties": {
         "Node name for S&R": "SamplerCustomAdvanced"
       }
@@ -598,25 +859,36 @@
       "id": 14,
       "type": "SplitSigmas",
       "pos": [
-        1382.798828125,
-        176
+        922.798828125,
+        822
       ],
       "size": [
         270,
         78
       ],
       "flags": {},
-      "order": 12,
+      "order": 14,
       "mode": 0,
       "inputs": [
         {
+          "localized_name": "sigmas",
           "name": "sigmas",
           "type": "SIGMAS",
-          "link": 13
+          "link": 10
+        },
+        {
+          "localized_name": "step",
+          "name": "step",
+          "type": "INT",
+          "widget": {
+            "name": "step"
+          },
+          "link": null
         }
       ],
       "outputs": [
         {
+          "localized_name": "high_sigmas",
           "name": "high_sigmas",
           "type": "SIGMAS",
           "links": [
@@ -624,10 +896,11 @@
           ]
         },
         {
+          "localized_name": "low_sigmas",
           "name": "low_sigmas",
           "type": "SIGMAS",
           "links": [
-            18
+            20
           ]
         }
       ],
@@ -635,45 +908,18 @@
         "Node name for S&R": "SplitSigmas"
       },
       "widgets_values": [
-        4
+        2
       ],
       "widgets_values_named": {
-        "step": 4
-      }
-    },
-    {
-      "id": 15,
-      "type": "DisableNoise",
-      "pos": [
-        1382.798828125,
-        324
-      ],
-      "size": [
-        140,
-        26
-      ],
-      "flags": {},
-      "order": 9,
-      "mode": 0,
-      "inputs": [],
-      "outputs": [
-        {
-          "name": "NOISE",
-          "type": "NOISE",
-          "links": [
-            15
-          ]
-        }
-      ],
-      "properties": {
-        "Node name for S&R": "DisableNoise"
-      }
+        "step": 2
+      },
+      "title": "Stage 1 steps (low-res; stage 2 does the rest)"
     },
     {
       "id": 16,
       "type": "SamplerCustomAdvanced",
       "pos": [
-        1712.798828125,
+        2173,
         0
       ],
       "size": [
@@ -681,51 +927,58 @@
         106
       ],
       "flags": {},
-      "order": 15,
+      "order": 19,
       "mode": 0,
       "inputs": [
         {
+          "localized_name": "noise",
           "name": "noise",
           "type": "NOISE",
-          "link": 15
-        },
-        {
-          "name": "guider",
-          "type": "GUIDER",
-          "link": 16
-        },
-        {
-          "name": "sampler",
-          "type": "SAMPLER",
           "link": 17
         },
         {
-          "name": "sigmas",
-          "type": "SIGMAS",
+          "localized_name": "guider",
+          "name": "guider",
+          "type": "GUIDER",
           "link": 18
         },
         {
+          "localized_name": "sampler",
+          "name": "sampler",
+          "type": "SAMPLER",
+          "link": 19
+        },
+        {
+          "localized_name": "sigmas",
+          "name": "sigmas",
+          "type": "SIGMAS",
+          "link": 20
+        },
+        {
+          "localized_name": "latent_image",
           "name": "latent_image",
           "type": "LATENT",
-          "link": 19
+          "link": 21
         }
       ],
       "outputs": [
         {
+          "localized_name": "output",
           "name": "output",
           "type": "LATENT",
           "links": [
-            20,
-            22
+            32,
+            34
           ]
         },
         {
+          "localized_name": "denoised_output",
           "name": "denoised_output",
           "type": "LATENT",
           "links": null
         }
       ],
-      "title": "Stage 2",
+      "title": "Stage 2 sampler (high-res, continues the schedule to 0)",
       "properties": {
         "Node name for S&R": "SamplerCustomAdvanced"
       }
@@ -734,7 +987,7 @@
       "id": 17,
       "type": "VAEDecode",
       "pos": [
-        1712.798828125,
+        2173,
         176
       ],
       "size": [
@@ -742,26 +995,29 @@
         46
       ],
       "flags": {},
-      "order": 16,
+      "order": 20,
       "mode": 0,
       "inputs": [
         {
+          "localized_name": "samples",
           "name": "samples",
           "type": "LATENT",
-          "link": 20
+          "link": 32
         },
         {
+          "localized_name": "vae",
           "name": "vae",
           "type": "VAE",
-          "link": 21
+          "link": 33
         }
       ],
       "outputs": [
         {
+          "localized_name": "IMAGE",
           "name": "IMAGE",
           "type": "IMAGE",
           "links": [
-            24
+            36
           ]
         }
       ],
@@ -773,7 +1029,7 @@
       "id": 18,
       "type": "VAEDecodeAudio",
       "pos": [
-        1712.798828125,
+        2173,
         292
       ],
       "size": [
@@ -781,26 +1037,29 @@
         46
       ],
       "flags": {},
-      "order": 17,
+      "order": 21,
       "mode": 0,
       "inputs": [
         {
+          "localized_name": "samples",
           "name": "samples",
           "type": "LATENT",
-          "link": 22
+          "link": 34
         },
         {
+          "localized_name": "vae",
           "name": "vae",
           "type": "VAE",
-          "link": 23
+          "link": 35
         }
       ],
       "outputs": [
         {
+          "localized_name": "AUDIO",
           "name": "AUDIO",
           "type": "AUDIO",
           "links": [
-            25
+            37
           ]
         }
       ],
@@ -812,7 +1071,7 @@
       "id": 19,
       "type": "CreateVideo",
       "pos": [
-        1985.1626953125,
+        2443,
         0
       ],
       "size": [
@@ -820,27 +1079,69 @@
         150
       ],
       "flags": {},
-      "order": 18,
+      "order": 22,
       "mode": 0,
       "inputs": [
         {
+          "localized_name": "images",
           "name": "images",
           "type": "IMAGE",
-          "link": 24
+          "link": 36
         },
         {
+          "localized_name": "audio",
           "name": "audio",
           "shape": 7,
           "type": "AUDIO",
-          "link": 25
+          "link": 37
+        },
+        {
+          "localized_name": "fps",
+          "name": "fps",
+          "type": "FLOAT",
+          "widget": {
+            "name": "fps"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "bit_depth",
+          "name": "bit_depth",
+          "shape": 7,
+          "type": "COMBO",
+          "widget": {
+            "name": "bit_depth"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "color_space",
+          "name": "color_space",
+          "shape": 7,
+          "type": "COMBO",
+          "widget": {
+            "name": "color_space"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "codec",
+          "name": "codec",
+          "shape": 7,
+          "type": "COMBO",
+          "widget": {
+            "name": "codec"
+          },
+          "link": null
         }
       ],
       "outputs": [
         {
+          "localized_name": "VIDEO",
           "name": "VIDEO",
           "type": "VIDEO",
           "links": [
-            26
+            38
           ]
         }
       ],
@@ -864,7 +1165,7 @@
       "id": 20,
       "type": "SaveVideo",
       "pos": [
-        1985.1626953125,
+        2443,
         220
       ],
       "size": [
@@ -872,17 +1173,56 @@
         106
       ],
       "flags": {},
-      "order": 19,
+      "order": 23,
       "mode": 0,
       "inputs": [
         {
+          "localized_name": "video",
           "name": "video",
           "type": "VIDEO",
-          "link": 26
+          "link": 38
+        },
+        {
+          "localized_name": "filename_prefix",
+          "name": "filename_prefix",
+          "type": "STRING",
+          "widget": {
+            "name": "filename_prefix"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "codec",
+          "name": "format.codec",
+          "type": "COMFY_DYNAMICCOMBO_V3",
+          "widget": {
+            "name": "format.codec"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "format",
+          "name": "format",
+          "type": "COMFY_DYNAMICCOMBO_V3",
+          "widget": {
+            "name": "format"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "codec",
+          "name": "codec",
+          "shape": 7,
+          "type": "COMFY_DYNAMICCOMBO_V3",
+          "widget": {
+            "name": "codec"
+          },
+          "link": null
         }
       ],
       "outputs": [
         {
+          "localized_name": "video",
           "name": "video",
           "type": "VIDEO",
           "links": null
@@ -890,188 +1230,349 @@
       ],
       "properties": {},
       "widgets_values": [
-        "video/QuantFunc_H3_ref2va_two_stage",
+        "video/QuantFunc_H3_fl2va_two_stage",
         "auto",
         "auto",
         "auto"
       ],
       "widgets_values_named": {
-        "filename_prefix": "video/QuantFunc_H3_ref2va_two_stage",
+        "filename_prefix": "video/QuantFunc_H3_fl2va_two_stage",
         "format": "auto",
         "format.codec": "auto",
         "codec": "auto"
       }
+    },
+    {
+      "id": 21,
+      "type": "QuantFuncH3LatentUpscale",
+      "pos": [
+        1383,
+        176
+      ],
+      "size": [
+        300,
+        110
+      ],
+      "flags": {},
+      "order": 16,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "samples",
+          "name": "samples",
+          "type": "LATENT",
+          "link": 16
+        },
+        {
+          "localized_name": "scale_by",
+          "name": "scale_by",
+          "type": "FLOAT",
+          "link": null,
+          "widget": {
+            "name": "scale_by"
+          }
+        },
+        {
+          "localized_name": "upscale_method",
+          "name": "upscale_method",
+          "type": "COMBO",
+          "link": null,
+          "widget": {
+            "name": "upscale_method"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "samples",
+          "name": "samples",
+          "type": "LATENT",
+          "links": [
+            21
+          ]
+        },
+        {
+          "localized_name": "width",
+          "name": "width",
+          "type": "INT",
+          "links": [
+            28
+          ]
+        },
+        {
+          "localized_name": "height",
+          "name": "height",
+          "type": "INT",
+          "links": [
+            29
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "QuantFuncH3LatentUpscale"
+      },
+      "widgets_values": [
+        2.0,
+        "bilinear"
+      ],
+      "widgets_values_named": {
+        "scale_by": 2.0,
+        "upscale_method": "bilinear"
+      },
+      "title": "Upscale latent (scale_by = the factor)"
+    },
+    {
+      "id": 26,
+      "type": "MiniMaxH3ImageToVideo",
+      "pos": [
+        1713,
+        0
+      ],
+      "size": [
+        400,
+        220
+      ],
+      "flags": {},
+      "order": 17,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "clip",
+          "name": "clip",
+          "type": "CLIP",
+          "link": 22
+        },
+        {
+          "localized_name": "vae",
+          "name": "vae",
+          "type": "VAE",
+          "link": 23
+        },
+        {
+          "localized_name": "first_frame",
+          "name": "first_frame",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": 24
+        },
+        {
+          "localized_name": "last_frame",
+          "name": "last_frame",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": 25
+        },
+        {
+          "localized_name": "prompt",
+          "name": "prompt",
+          "type": "STRING",
+          "widget": {
+            "name": "prompt"
+          },
+          "link": 26
+        },
+        {
+          "localized_name": "width",
+          "name": "width",
+          "type": "INT",
+          "widget": {
+            "name": "width"
+          },
+          "link": 28
+        },
+        {
+          "localized_name": "height",
+          "name": "height",
+          "type": "INT",
+          "widget": {
+            "name": "height"
+          },
+          "link": 29
+        },
+        {
+          "localized_name": "length",
+          "name": "length",
+          "type": "INT",
+          "widget": {
+            "name": "length"
+          },
+          "link": 27
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "positive",
+          "name": "positive",
+          "type": "CONDITIONING",
+          "links": [
+            31
+          ]
+        },
+        {
+          "localized_name": "LATENT",
+          "name": "LATENT",
+          "type": "LATENT",
+          "links": null
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "MiniMaxH3ImageToVideo"
+      },
+      "widgets_values": [
+        "Cinematic crane shot inside an iridescent translucent pavilion: a red-haired woman in a long black dress stands at the edge of a circular reflecting pool. The camera slowly rises from eye level to a high top-down view as she looks up, the pool reflecting the shimmering walls. Soft ambient hum, gentle water ripples, a distant echo.",
+        1920,
+        1088,
+        124
+      ],
+      "widgets_values_named": {
+        "prompt": "Cinematic crane shot inside an iridescent translucent pavilion: a red-haired woman in a long black dress stands at the edge of a circular reflecting pool. The camera slowly rises from eye level to a high top-down view as she looks up, the pool reflecting the shimmering walls. Soft ambient hum, gentle water ripples, a distant echo.",
+        "width": 1920,
+        "height": 1088,
+        "length": 124
+      },
+      "title": "Stage 2 conditioning (high-res; size from the upscale node)"
+    },
+    {
+      "id": 27,
+      "type": "BasicGuider",
+      "pos": [
+        1713,
+        250
+      ],
+      "size": [
+        160,
+        46
+      ],
+      "flags": {},
+      "order": 18,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "model",
+          "name": "model",
+          "type": "MODEL",
+          "link": 30
+        },
+        {
+          "localized_name": "conditioning",
+          "name": "conditioning",
+          "type": "CONDITIONING",
+          "link": 31
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "GUIDER",
+          "name": "GUIDER",
+          "type": "GUIDER",
+          "links": [
+            18
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "BasicGuider"
+      },
+      "title": "Stage 2 guider"
+    },
+    {
+      "id": 30,
+      "type": "PrimitiveStringMultiline",
+      "pos": [
+        580,
+        344
+      ],
+      "size": [
+        283,
+        200
+      ],
+      "flags": {},
+      "order": 9,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "value",
+          "name": "value",
+          "type": "STRING",
+          "link": null,
+          "widget": {
+            "name": "value"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "STRING",
+          "name": "STRING",
+          "type": "STRING",
+          "links": [
+            5,
+            26
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "PrimitiveStringMultiline"
+      },
+      "widgets_values": [
+        "Cinematic crane shot inside an iridescent translucent pavilion: a red-haired woman in a long black dress stands at the edge of a circular reflecting pool. The camera slowly rises from eye level to a high top-down view as she looks up, the pool reflecting the shimmering walls. Soft ambient hum, gentle water ripples, a distant echo."
+      ],
+      "widgets_values_named": {
+        "value": "Cinematic crane shot inside an iridescent translucent pavilion: a red-haired woman in a long black dress stands at the edge of a circular reflecting pool. The camera slowly rises from eye level to a high top-down view as she looks up, the pool reflecting the shimmering walls. Soft ambient hum, gentle water ripples, a distant echo."
+      },
+      "title": "Prompt"
+    },
+    {
+      "id": 31,
+      "type": "PrimitiveInt",
+      "pos": [
+        580,
+        614
+      ],
+      "size": [
+        270,
+        82
+      ],
+      "flags": {},
+      "order": 10,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "value",
+          "name": "value",
+          "type": "INT",
+          "link": null,
+          "widget": {
+            "name": "value"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "INT",
+          "name": "INT",
+          "type": "INT",
+          "links": [
+            6,
+            27
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "PrimitiveInt"
+      },
+      "widgets_values": [
+        124,
+        "fixed"
+      ],
+      "widgets_values_named": {
+        "value": 124,
+        "control_after_generate": "fixed"
+      },
+      "title": "Length (frames)"
     }
   ],
   "links": [
-    [
-      6,
-      2,
-      0,
-      10,
-      0,
-      "MODEL"
-    ],
-    [
-      7,
-      8,
-      0,
-      10,
-      1,
-      "CONDITIONING"
-    ],
-    [
-      8,
-      2,
-      0,
-      12,
-      0,
-      "MODEL"
-    ],
-    [
-      9,
-      9,
-      0,
-      13,
-      0,
-      "NOISE"
-    ],
-    [
-      10,
-      10,
-      0,
-      13,
-      1,
-      "GUIDER"
-    ],
-    [
-      11,
-      11,
-      0,
-      13,
-      2,
-      "SAMPLER"
-    ],
-    [
-      12,
-      8,
-      1,
-      13,
-      4,
-      "LATENT"
-    ],
-    [
-      13,
-      12,
-      0,
-      14,
-      0,
-      "SIGMAS"
-    ],
-    [
-      14,
-      14,
-      0,
-      13,
-      3,
-      "SIGMAS"
-    ],
-    [
-      15,
-      15,
-      0,
-      16,
-      0,
-      "NOISE"
-    ],
-    [
-      16,
-      10,
-      0,
-      16,
-      1,
-      "GUIDER"
-    ],
-    [
-      17,
-      11,
-      0,
-      16,
-      2,
-      "SAMPLER"
-    ],
-    [
-      18,
-      14,
-      1,
-      16,
-      3,
-      "SIGMAS"
-    ],
-    [
-      19,
-      13,
-      0,
-      16,
-      4,
-      "LATENT"
-    ],
-    [
-      20,
-      16,
-      0,
-      17,
-      0,
-      "LATENT"
-    ],
-    [
-      21,
-      4,
-      0,
-      17,
-      1,
-      "VAE"
-    ],
-    [
-      22,
-      16,
-      0,
-      18,
-      0,
-      "LATENT"
-    ],
-    [
-      23,
-      5,
-      0,
-      18,
-      1,
-      "VAE"
-    ],
-    [
-      24,
-      17,
-      0,
-      19,
-      0,
-      "IMAGE"
-    ],
-    [
-      25,
-      18,
-      0,
-      19,
-      1,
-      "AUDIO"
-    ],
-    [
-      26,
-      19,
-      0,
-      20,
-      0,
-      "VIDEO"
-    ],
     [
       1,
       3,
@@ -1090,15 +1591,15 @@
     ],
     [
       3,
-      5,
+      6,
       0,
       8,
       2,
-      "VAE"
+      "IMAGE"
     ],
     [
       4,
-      6,
+      7,
       0,
       8,
       3,
@@ -1106,24 +1607,287 @@
     ],
     [
       5,
-      7,
+      30,
       0,
       8,
       4,
+      "STRING"
+    ],
+    [
+      6,
+      31,
+      0,
+      8,
+      7,
+      "INT"
+    ],
+    [
+      7,
+      2,
+      0,
+      10,
+      0,
+      "MODEL"
+    ],
+    [
+      8,
+      8,
+      0,
+      10,
+      1,
+      "CONDITIONING"
+    ],
+    [
+      9,
+      2,
+      0,
+      12,
+      0,
+      "MODEL"
+    ],
+    [
+      10,
+      12,
+      0,
+      14,
+      0,
+      "SIGMAS"
+    ],
+    [
+      11,
+      9,
+      0,
+      13,
+      0,
+      "NOISE"
+    ],
+    [
+      12,
+      10,
+      0,
+      13,
+      1,
+      "GUIDER"
+    ],
+    [
+      13,
+      11,
+      0,
+      13,
+      2,
+      "SAMPLER"
+    ],
+    [
+      14,
+      14,
+      0,
+      13,
+      3,
+      "SIGMAS"
+    ],
+    [
+      15,
+      8,
+      1,
+      13,
+      4,
+      "LATENT"
+    ],
+    [
+      16,
+      13,
+      1,
+      21,
+      0,
+      "LATENT"
+    ],
+    [
+      17,
+      9,
+      0,
+      16,
+      0,
+      "NOISE"
+    ],
+    [
+      18,
+      27,
+      0,
+      16,
+      1,
+      "GUIDER"
+    ],
+    [
+      19,
+      11,
+      0,
+      16,
+      2,
+      "SAMPLER"
+    ],
+    [
+      20,
+      14,
+      1,
+      16,
+      3,
+      "SIGMAS"
+    ],
+    [
+      21,
+      21,
+      0,
+      16,
+      4,
+      "LATENT"
+    ],
+    [
+      22,
+      3,
+      0,
+      26,
+      0,
+      "CLIP"
+    ],
+    [
+      23,
+      4,
+      0,
+      26,
+      1,
+      "VAE"
+    ],
+    [
+      24,
+      6,
+      0,
+      26,
+      2,
       "IMAGE"
+    ],
+    [
+      25,
+      7,
+      0,
+      26,
+      3,
+      "IMAGE"
+    ],
+    [
+      26,
+      30,
+      0,
+      26,
+      4,
+      "STRING"
+    ],
+    [
+      27,
+      31,
+      0,
+      26,
+      7,
+      "INT"
+    ],
+    [
+      28,
+      21,
+      1,
+      26,
+      5,
+      "INT"
+    ],
+    [
+      29,
+      21,
+      2,
+      26,
+      6,
+      "INT"
+    ],
+    [
+      30,
+      2,
+      0,
+      27,
+      0,
+      "MODEL"
+    ],
+    [
+      31,
+      26,
+      0,
+      27,
+      1,
+      "CONDITIONING"
+    ],
+    [
+      32,
+      16,
+      0,
+      17,
+      0,
+      "LATENT"
+    ],
+    [
+      33,
+      4,
+      0,
+      17,
+      1,
+      "VAE"
+    ],
+    [
+      34,
+      16,
+      0,
+      18,
+      0,
+      "LATENT"
+    ],
+    [
+      35,
+      5,
+      0,
+      18,
+      1,
+      "VAE"
+    ],
+    [
+      36,
+      17,
+      0,
+      19,
+      0,
+      "IMAGE"
+    ],
+    [
+      37,
+      18,
+      0,
+      19,
+      1,
+      "AUDIO"
+    ],
+    [
+      38,
+      19,
+      0,
+      20,
+      0,
+      "VIDEO"
     ]
   ],
   "groups": [],
   "config": {},
   "extra": {
     "ds": {
-      "scale": 1.0629366000000005,
+      "scale": 0.6,
       "offset": [
-        648.4276351829916,
-        112.90651914586525
+        120,
+        90
       ]
-    },
-    "frontendVersion": "1.53.6"
+    }
   },
   "version": 0.4
 }
