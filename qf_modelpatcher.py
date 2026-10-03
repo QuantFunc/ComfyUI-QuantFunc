@@ -55,6 +55,7 @@ import comfy.conds
 import comfy.patcher_extension
 
 from . import qf_engine as qfe
+from . import qf_sol
 
 
 # Request metadata, not a memory ledger. Context-local so nested calls/clones
@@ -325,13 +326,17 @@ class QFSessionModelMixin:
         self._attn_backend = v
 
     def set_sol_tau(self, v):
-        # [sol-tau dial 2026-08-31] the ONE user-facing attention dial (user "就一个
-        # 就好"). LOWER = closer to exact (<= -8 = exact), HIGHER = faster. Same
-        # rides-residency_opts session-knob class as set_attn_backend.
+        # Compatibility entry: the old value is a keep ratio, not new tau.
+        self._sol_options = None
         try:
             self._sol_tau = float(v)
         except (TypeError, ValueError):
             self._sol_tau = 1.0
+
+    def set_sol_options(self, options):
+        if not isinstance(options, qf_sol.Options):
+            raise TypeError("Sol options must be normalized before applying them")
+        self._sol_options = options  # frozen value; safe to share with LoRA clones
 
     def set_video_enhance(self, on):
         # [quality_enhance 2026-09-25] the loaders' switch → the engine's `video_enhance` (OFF = the engine's faster default for
@@ -342,7 +347,7 @@ class QFSessionModelMixin:
     # rule in loader_dispatch_test checks the setters, subclasses included). A QuantFuncNativeLoRA rebuild hands back a
     # NEW model, so QFModelPatcher.adopt_comfy_state_from carries these; a dial missing here would make the LoRA'd model
     # run that dial's default without a word.
-    _SESSION_DIALS = ("_step_cache", "_block_cache", "_sparse", "_attn_backend", "_sol_tau", "_video_enhance")
+    _SESSION_DIALS = ("_step_cache", "_block_cache", "_sparse", "_attn_backend", "_sol_tau", "_sol_options", "_video_enhance")
 
     def _stage_schedule(self, transformer_options, tag):
         """The ONE sampler-schedule rule of the video families (LTX, H3). Their external session is driven one sampler
@@ -402,14 +407,6 @@ class QFSessionModelMixin:
         # Engine-side: every session-capable video pipeline accepts the key
         # (begin capability gate), and this mixin is video-family-only.
         o["sparse_cdf"] = sp
-        # [sol-tau dial] omitted at the 1.0 default (old-engine compatible: an older
-        # .so refuses unknown keys LOUD, and default users never send it). Ghost-proof
-        # despite the omission: the ENGINE resets an absent sol_tau to 1.0 at every
-        # begin (absent = reset-to-default, not keep-current) — so dialing back to
-        # 1.0 truly restores the default even on a reused engine-resident pipeline.
-        st = float(getattr(self, "_sol_tau", 1.0) or 1.0)
-        if abs(st - 1.0) > 1e-6:
-            o["sol_tau"] = st
         o.update(self.dial_opts())
         return o
 
@@ -426,7 +423,14 @@ class QFSessionModelMixin:
         if on is None:
             raise RuntimeError("QuantFunc: this model has no quality_enhance setting (the loader sets one on every model it "
                                "builds; set_video_enhance was never called)")
-        return {"attention_backend": str(getattr(self, "_attn_backend", "auto") or "auto"), "video_enhance": on}
+        out = {"attention_backend": str(getattr(self, "_attn_backend", "auto") or "auto"), "video_enhance": on}
+        options = getattr(self, "_sol_options", None)
+        if options is None:
+            options = qf_sol.from_loader(sol_tau=getattr(self, "_sol_tau", None))
+        sol = options.native(getattr(self, "model_sampling", None))
+        if sol is not None:
+            out["sol"] = sol
+        return out
 
     # ── comfy's per-model VRAM interface (2026-09-19, user: 「与 comfyui 打通,让它知道我们需要多少显存、当前占了多少」) ──
     # comfy asks a model TWO numbers and does the rest itself: `memory_required(shape)` — how much MORE VRAM one

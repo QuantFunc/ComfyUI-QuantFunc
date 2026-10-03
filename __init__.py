@@ -40,6 +40,7 @@ try:
     import comfy.model_management
     import comfy.supported_models
     from . import qf_modelpatcher as qfmp
+    from . import qf_sol
     from .qf_modelpatcher import QFModelPatcher
     _IMPORT_OK = True
 except Exception as _exc:  # noqa: BLE001 - never break registration; report loudly
@@ -878,15 +879,18 @@ if _IMPORT_OK:
                                 "Most useful with fast turbo settings; it has no effect at long, high-quality settings. "
                                 "Not supported in two-stage (double-sampling) workflows: ignored there."})
 
-    # [sol-tau dial 2026-08-31] the ONE user-facing attention dial (user "就一个就好"). Applies to
-    # the flash/sage backends — the engine applies it regardless of attention_backend (it is NOT
-    # tied to a removed backend choice). Same
-    # runtime-session-knob class as step_cache/sparse: re-sent each run, no rebuild; 1.0 default is
-    # omitted (older engines refuse unknown keys loud) and the engine resets an absent key to 1.0.
-    _SOL_TAU_INPUT = ("FLOAT", {"default": 1.0, "min": 0.02, "max": 1.0, "step": 0.01,
-                     "tooltip": "Attention speed-up. 1.0 (default) turns it off. Lower values are faster and give up "
-                                "some quality: 0.15-0.2 is a good start, below 0.1 check the result carefully, 0.3-0.5 "
-                                "keeps more quality. Takes effect on the next run."})
+    # Sol policy is re-applied per session. Explicit enable separates the new
+    # statistical tau from the versioned migration of old keep-ratio workflows.
+    _SOL_TAU_INPUT = ("FLOAT", {"default": 1.3, "min": -4.0, "max": 4.0, "step": 0.05,
+                     "tooltip": "Sol statistical threshold. Higher keeps fewer exact blocks. "
+                                "Negative values preserve migrated workflows with a high keep ratio."})
+    _SOL_ENABLED_INPUT = ("BOOLEAN", {"default": False})
+    _SOL_WINDOW_INPUT = ("BOOLEAN", {"default": True, "tooltip": "Limit Sol to the selected sampling interval."})
+    _SOL_START_INPUT = ("FLOAT", {"default": 0.2, "min": 0.0, "max": 1.0, "step": 0.01})
+    _SOL_END_INPUT = ("FLOAT", {"default": 0.9, "min": 0.0, "max": 1.0, "step": 0.01})
+    _SOL_MIN_INPUT = ("INT", {"default": 12288, "min": 0, "max": 1048576, "step": 512})
+    _SOL_SINK_INPUT = (["exact_kv_and_rows", "exact_kv", "off"], {"default": "exact_kv_and_rows"})
+    _SOL_VERSION_INPUT = ("INT", {"default": 2, "min": 1, "max": 2, "hidden": True, "socketless": True})
 
     def _arm_session_caches(_mm, step_cache, block_cache):
         """Arm the step-cache and block-cache session knobs on a loaded model.
@@ -962,8 +966,15 @@ if _IMPORT_OK:
                 "model_config": _model_config_input("ltx2"),   # hidden; widget index 1 (see _model_config_input)
                 "attention_backend": _attn_backend_input(),
                 "sol_tau": _SOL_TAU_INPUT,
+                "sol_start_percent": _SOL_START_INPUT,
+                "sol_end_percent": _SOL_END_INPUT,
+                "sol_min_tokens": _SOL_MIN_INPUT,
+                "sol_sink_conditioning": _SOL_SINK_INPUT,
+                "sol_version": _SOL_VERSION_INPUT,
                 "step_cache": _STEP_CACHE_INPUT,
                 "block_cache": _BLOCK_CACHE_INPUT,
+                "sol_enabled": _SOL_ENABLED_INPUT,
+                "sol_window_enabled": _SOL_WINDOW_INPUT,
                 "quality_enhance": _QUALITY_ENHANCE_INPUT,   # the switches last (_LOADER_LAYOUT)
                 "pinned_memory": _PINNED_MEMORY_INPUT_LTX,
             }, "hidden": dict(_QUALITY_LEGACY_HIDDEN)}
@@ -976,8 +987,9 @@ if _IMPORT_OK:
                        "the latent input. " + _COMMON_LIMITS)
 
         def load(self, transformer, model_config=None,
-                 attention_backend="auto", sol_tau=1.0, quality_enhance=None, step_cache=0.0, block_cache=0.0, quality=None,
-                 pinned_memory=True):   # LTX-2.5: ON by default (_PINNED_MEMORY_INPUT_LTX)
+                 attention_backend="auto", sol_tau=None, quality_enhance=None, step_cache=0.0, block_cache=0.0, quality=None,
+                 pinned_memory=True, sol_version=None, sol_enabled=None, sol_window_enabled=None,
+                 sol_start_percent=None, sol_end_percent=None, sol_min_tokens=None, sol_sink_conditioning=None):   # LTX-2.5: ON by default (_PINNED_MEMORY_INPUT_LTX)
             # NO aux file widgets and NO image socket (user 2026-08-22 "只保留
             # transformer/block/model_config … 只关注latent"): i2v is the workflow's own latent
             # conditioning (LTXVImgToVideoInplace).
@@ -985,8 +997,11 @@ if _IMPORT_OK:
             _mm = getattr(_p, "model", None)
             if _mm is not None and hasattr(_mm, "set_attn_backend"):
                 _mm.set_attn_backend(_attn_backend_to_engine(attention_backend))
-            if _mm is not None and hasattr(_mm, "set_sol_tau"):
-                _mm.set_sol_tau(sol_tau)
+            _mm.set_sol_options(qf_sol.from_loader(
+                sol_version=sol_version, sol_tau=sol_tau, sol_enabled=sol_enabled,
+                sol_window_enabled=sol_window_enabled, sol_start_percent=sol_start_percent,
+                sol_end_percent=sol_end_percent, sol_min_tokens=sol_min_tokens,
+                sol_sink_conditioning=sol_sink_conditioning))
             _mm.set_video_enhance(_quality_enhance_on(quality_enhance, quality))   # mandatory + unguarded: a patcher without it is a wiring error
             _arm_session_caches(_mm, step_cache, block_cache)
             return (_p,)
@@ -1006,6 +1021,14 @@ if _IMPORT_OK:
             }, "optional": {
                 "model_config": _model_config_input("krea2"),   # hidden; widget index 1 (see _model_config_input)
                 "attention_backend": _attn_backend_input(),
+                "sol_tau": _SOL_TAU_INPUT,
+                "sol_start_percent": _SOL_START_INPUT,
+                "sol_end_percent": _SOL_END_INPUT,
+                "sol_min_tokens": _SOL_MIN_INPUT,
+                "sol_sink_conditioning": _SOL_SINK_INPUT,
+                "sol_version": _SOL_VERSION_INPUT,
+                "sol_enabled": _SOL_ENABLED_INPUT,
+                "sol_window_enabled": _SOL_WINDOW_INPUT,
                 "quality_enhance": _QUALITY_ENHANCE_INPUT,
                 "pinned_memory": _PINNED_MEMORY_INPUT,
             }, "hidden": dict(_QUALITY_LEGACY_HIDDEN)}
@@ -1017,13 +1040,19 @@ if _IMPORT_OK:
                        "place of the usual diffusion-model loader. " + _COMMON_LIMITS)
 
         def load(self, transformer, model_config=None, attention_backend="auto",
-                 quality_enhance=None, quality=None, pinned_memory=False):
+                 quality_enhance=None, quality=None, pinned_memory=False, sol_tau=None, sol_version=None, sol_enabled=None, sol_window_enabled=None,
+                 sol_start_percent=None, sol_end_percent=None, sol_min_tokens=None, sol_sink_conditioning=None):
             # [runtime dials] backend + quality_enhance are SESSION knobs (NOT create keys — a widget change never re-keys the
             # engine = no rebuild).
             _p = _run_family_load(self.QF_FAMILY, transformer, model_config, pinned_memory)
             _mm = getattr(_p, "model", None)
             if _mm is not None and hasattr(_mm, "set_attn_backend"):
                 _mm.set_attn_backend(_attn_backend_to_engine(attention_backend))
+            _mm.set_sol_options(qf_sol.from_loader(
+                sol_version=sol_version, sol_tau=sol_tau, sol_enabled=sol_enabled,
+                sol_window_enabled=sol_window_enabled, sol_start_percent=sol_start_percent,
+                sol_end_percent=sol_end_percent, sol_min_tokens=sol_min_tokens,
+                sol_sink_conditioning=sol_sink_conditioning))
             _mm.set_video_enhance(_quality_enhance_on(quality_enhance, quality))   # mandatory + unguarded: a patcher without it is a wiring error
             return (_p,)
 
@@ -1043,6 +1072,14 @@ if _IMPORT_OK:
             }, "optional": {
                 "model_config": _model_config_input("qwenimage21"),   # hidden; widget index 1 (see _model_config_input)
                 "attention_backend": _attn_backend_input(),
+                "sol_tau": _SOL_TAU_INPUT,
+                "sol_start_percent": _SOL_START_INPUT,
+                "sol_end_percent": _SOL_END_INPUT,
+                "sol_min_tokens": _SOL_MIN_INPUT,
+                "sol_sink_conditioning": _SOL_SINK_INPUT,
+                "sol_version": _SOL_VERSION_INPUT,
+                "sol_enabled": _SOL_ENABLED_INPUT,
+                "sol_window_enabled": _SOL_WINDOW_INPUT,
                 "quality_enhance": _QUALITY_ENHANCE_INPUT,
                 "pinned_memory": _PINNED_MEMORY_INPUT,
             }, "hidden": dict(_QUALITY_LEGACY_HIDDEN)}
@@ -1055,13 +1092,19 @@ if _IMPORT_OK:
                        "Save Image keep the transparency. " + _COMMON_LIMITS)
 
         def load(self, transformer, model_config=None, attention_backend="auto", quality_enhance=None, quality=None,
-                 pinned_memory=False):
+                 pinned_memory=False, sol_tau=None, sol_version=None, sol_enabled=None, sol_window_enabled=None,
+                 sol_start_percent=None, sol_end_percent=None, sol_min_tokens=None, sol_sink_conditioning=None):
             # [runtime dials] backend + quality_enhance are SESSION knobs (NOT create keys — a widget change never re-keys the engine =
             # no rebuild), exactly like the Krea2 node.
             _p = _run_family_load(self.QF_FAMILY, transformer, model_config, pinned_memory)
             _mm = getattr(_p, "model", None)
             if _mm is not None and hasattr(_mm, "set_attn_backend"):
                 _mm.set_attn_backend(_attn_backend_to_engine(attention_backend))
+            _mm.set_sol_options(qf_sol.from_loader(
+                sol_version=sol_version, sol_tau=sol_tau, sol_enabled=sol_enabled,
+                sol_window_enabled=sol_window_enabled, sol_start_percent=sol_start_percent,
+                sol_end_percent=sol_end_percent, sol_min_tokens=sol_min_tokens,
+                sol_sink_conditioning=sol_sink_conditioning))
             _mm.set_video_enhance(_quality_enhance_on(quality_enhance, quality))   # mandatory + unguarded: a patcher without it is a wiring error
             return (_p,)
 
@@ -1082,8 +1125,15 @@ if _IMPORT_OK:
                 # auto never picks, for this model, the backend measured broken at large sizes (#659).
                 "attention_backend": _attn_backend_input(),
                 "sol_tau": _SOL_TAU_INPUT,
+                "sol_start_percent": _SOL_START_INPUT,
+                "sol_end_percent": _SOL_END_INPUT,
+                "sol_min_tokens": _SOL_MIN_INPUT,
+                "sol_sink_conditioning": _SOL_SINK_INPUT,
+                "sol_version": _SOL_VERSION_INPUT,
                 "step_cache": _STEP_CACHE_INPUT,
                 "block_cache": _BLOCK_CACHE_INPUT,
+                "sol_enabled": _SOL_ENABLED_INPUT,
+                "sol_window_enabled": _SOL_WINDOW_INPUT,
                 "quality_enhance": _QUALITY_ENHANCE_INPUT,   # the switches last (_LOADER_LAYOUT)
                 "audio_enhance": _AUDIO_ENHANCE_INPUT,
                 "pinned_memory": _PINNED_MEMORY_INPUT,
@@ -1096,15 +1146,19 @@ if _IMPORT_OK:
                        "place of the usual diffusion-model loader. " + _COMMON_LIMITS)
 
         def load(self, transformer, model_config=None,
-                 attention_backend="auto", sol_tau=1.0, quality_enhance=None, audio_enhance=False,
+                 attention_backend="auto", sol_tau=None, quality_enhance=None, audio_enhance=False,
                  step_cache=0.0, block_cache=0.0, quality=None,
-                 pinned_memory=False):
+                 pinned_memory=False, sol_version=None, sol_enabled=None, sol_window_enabled=None,
+                 sol_start_percent=None, sol_end_percent=None, sol_min_tokens=None, sol_sink_conditioning=None):
             _p = _run_family_load(self.QF_FAMILY, transformer, model_config, pinned_memory)
             _mm = getattr(_p, "model", None)
             if _mm is not None and hasattr(_mm, "set_attn_backend"):
                 _mm.set_attn_backend(_attn_backend_to_engine(attention_backend))
-            if _mm is not None and hasattr(_mm, "set_sol_tau"):
-                _mm.set_sol_tau(sol_tau)
+            _mm.set_sol_options(qf_sol.from_loader(
+                sol_version=sol_version, sol_tau=sol_tau, sol_enabled=sol_enabled,
+                sol_window_enabled=sol_window_enabled, sol_start_percent=sol_start_percent,
+                sol_end_percent=sol_end_percent, sol_min_tokens=sol_min_tokens,
+                sol_sink_conditioning=sol_sink_conditioning))
             _mm.set_video_enhance(_quality_enhance_on(quality_enhance, quality))   # mandatory + unguarded: a patcher without it is a wiring error
             if _mm is not None and hasattr(_mm, "set_audio_enhance"):
                 _mm.set_audio_enhance(audio_enhance)

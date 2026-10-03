@@ -29,8 +29,11 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+import sys
 
 PLUGIN = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PLUGIN))
+from qf_sol import from_loader, legacy_tau
 LOADERS = ("QuantFuncLTXLoader", "QuantFuncH3Loader", "QuantFuncKrea2Loader", "QuantFuncQwenImage21Loader")
 
 
@@ -48,8 +51,8 @@ def current_orders():
 
 
 ORDERS = current_orders()
-BOOLEANS = {"quality_enhance", "audio_enhance", "pinned_memory"}
-NUMBERS = {"sol_tau", "step_cache", "block_cache"}
+BOOLEANS = {"quality_enhance", "audio_enhance", "pinned_memory", "sol_enabled", "sol_window_enabled"}
+NUMBERS = {"sol_tau", "step_cache", "block_cache", "sol_start_percent", "sol_end_percent", "sol_min_tokens", "sol_version"}
 
 # Saved exactly as the earlier plugins saved them (the orders of 863c2ac, published, and 61f7076, the release
 # candidate), with values that differ per widget so a misplaced value shows.
@@ -83,9 +86,24 @@ WANT = {
                 "quality_enhance": False, "pinned_memory": "DEFAULT_PINNED"},
 }
 
+for label, (cls, saved) in list(SAVED.items()):
+    if label.endswith("_published"):
+        order = (["transformer", "model_config", "attention_backend", "sol_tau", "step_cache", "block_cache",
+                  "quality_enhance"] + (["audio_enhance"] if "H3" in cls else []) + ["pinned_memory"])
+        SAVED[label + "_layout2"] = (cls, [WANT[label][key] for key in order])
+        WANT[label + "_layout2"] = WANT[label].copy()
+for cls, label in [("QuantFuncKrea2Loader", "krea2"), ("QuantFuncQwenImage21Loader", "qi21")]:
+    SAVED[label + "_layout2"] = (cls, ["m.safetensors", "model", "sage", True, False])
+    WANT[label + "_layout2"] = dict(zip(["transformer", "model_config", "attention_backend", "quality_enhance", "pinned_memory"], SAVED[label + "_layout2"][1]))
+for want in WANT.values():
+    opt = from_loader(sol_tau=want.get("sol_tau"))
+    want.update(sol_version=2, sol_enabled=opt.enabled, sol_tau=opt.tau if opt.enabled else 1.3,
+                sol_window_enabled=opt.window_enabled, sol_start_percent=opt.start_percent,
+                sol_end_percent=opt.end_percent, sol_min_tokens=opt.min_tokens, sol_sink_conditioning=opt.sink_conditioning)
+
 _APP_STUB = "export const app = { extensions: [], registerExtension(e) { this.extensions.push(e); } };\n"
 _DRIVER = """const { app } = await import("./scripts/app.js");
-const { remappedValues } = await import("./extensions/ComfyUI-QuantFunc/quantfunc_loader_layout.js");
+const { remappedValues, legacyTau } = await import("./extensions/ComfyUI-QuantFunc/quantfunc_loader_layout.js");
 const ORDERS = %s, SAVED = %s, DEFAULTS = %s;
 const out = { remapped: {}, loaded: {}, stamped: {}, untouched: {} };
 // the loader node as the frontend builds it: one widget per input, the API key row (never saved) above the switches
@@ -98,7 +116,7 @@ function widgets(cls) {
 const types = {};
 for (const cls of [...Object.keys(ORDERS), "KSampler"]) {
   const got = [];
-  types[cls] = { prototype: { configure(info) { got.push(info.widgets_values); } } };
+  types[cls] = { prototype: { configure(info) { got.push(info); } } };
   types[cls].got = got;
   for (const e of app.extensions) e.beforeRegisterNodeDef?.(types[cls], { name: cls });
 }
@@ -106,9 +124,14 @@ const values = (cls, ws, v) => Object.fromEntries(ws.filter(w => w.serialize !==
 for (const [label, [cls, saved]] of Object.entries(SAVED)) {
   const ws = widgets(cls);
   const node = { comfyClass: cls, widgets: ws, properties: {} };
-  types[cls].prototype.configure.call(node, { widgets_values: saved, properties: {} });
-  const got = types[cls].got.at(-1);
-  out.loaded[label] = { values: values(cls, ws, got), length: got.length, stamp: node.properties.qf_layout };
+  const original = { widgets_values: saved, properties: label.endsWith("layout2") ? { qf_layout: 2 } : {} };
+  const before = JSON.stringify(original);
+  types[cls].prototype.configure.call(node, original);
+  const info = types[cls].got.at(-1), got = info.widgets_values;
+  out.loaded[label] = { values: values(cls, ws, got), length: got.length, stamp: node.properties.qf_layout,
+    named: info.widgets_values_named, version: info.properties.qf_sol_version, inputUnchanged: before === JSON.stringify(original) };
+  types[cls].prototype.configure.call(node, info);
+  if (JSON.stringify(types[cls].got.at(-1)) !== JSON.stringify(info)) throw Error("Migration is not idempotent");
 }
 // L2: saved by name, in any order
 const byName = { widgets_values: [], widgets_values_named: { block_cache: 0.5, transformer: "n.safetensors",
@@ -116,17 +139,34 @@ const byName = { widgets_values: [], widgets_values_named: { block_cache: 0.5, t
 out.named = remappedValues("QuantFuncLTXLoader", widgets("QuantFuncLTXLoader"), byName);
 // L3
 const current = ORDERS.QuantFuncLTXLoader.map(n => (%s.includes(n) ? false : %s.includes(n) ? 0.5 : "x"));
+current[ORDERS.QuantFuncLTXLoader.indexOf("sol_version")] = 2;
+current[ORDERS.QuantFuncLTXLoader.indexOf("sol_tau")] = 0.25;
 out.untouched.marked = remappedValues("QuantFuncLTXLoader", widgets("QuantFuncLTXLoader"),
-                                      { widgets_values: SAVED.ltx_published[1], properties: { qf_layout: 2 } });
+                                      { widgets_values: current, properties: { qf_layout: 3, qf_sol_version: 2 } });
 out.untouched.currentShape = remappedValues("QuantFuncLTXLoader", widgets("QuantFuncLTXLoader"),
                                             { widgets_values: current, properties: {} });
-out.untouched.unknownShape = remappedValues("QuantFuncH3Loader", widgets("QuantFuncH3Loader"),
-                                            { widgets_values: ["h3.safetensors", "minimax-h3"], properties: {} });
+try { remappedValues("QuantFuncH3Loader", widgets("QuantFuncH3Loader"),
+  { widgets_values: ["h3.safetensors", "minimax-h3"], properties: {} }); out.untouched.unknownShape = false; }
+catch { out.untouched.unknownShape = true; }
 out.untouched.otherNode = remappedValues("KSampler", [{ name: "seed", value: 1 }], { widgets_values: [5] });
 const k = { comfyClass: "KSampler", widgets: [], properties: {} };
 types.KSampler.prototype.configure.call(k, { widgets_values: [5], properties: {} });
 out.untouched.otherNodeStamp = k.properties.qf_layout ?? null;
-out.untouched.otherNodeGot = types.KSampler.got.at(-1);
+out.untouched.otherNodeGot = types.KSampler.got.at(-1).widgets_values;
+out.current = current;
+out.golden = Array.from({ length: 1001 }, (_, i) => legacyTau((i + 0.01) / 1001));
+out.markers = [];
+for (const [prop, widget] of [[2, undefined], [undefined, 2], [2, 2], [1, 2], [2, 1], [3, 2], [2, 3]]) {
+  try {
+    const got = remappedValues("QuantFuncLTXLoader", widgets("QuantFuncLTXLoader"), {
+      properties: { qf_sol_version: prop }, widgets_values_named: { sol_version: widget, sol_tau: 0.25 } });
+    out.markers.push(values("QuantFuncLTXLoader", widgets("QuantFuncLTXLoader"), got).sol_tau);
+  } catch { out.markers.push("error"); }
+}
+out.missingMarker = false;
+try { remappedValues("QuantFuncLTXLoader", widgets("QuantFuncLTXLoader"),
+  { widgets_values_named: { sol_tau: 0.25, sol_enabled: true } }); }
+catch { out.missingMarker = true; }
 // L4
 for (const cls of [...Object.keys(ORDERS), "KSampler"]) {
   const n = { comfyClass: cls, properties: {} };
@@ -181,23 +221,37 @@ class LoaderLayout(unittest.TestCase):
                 got = self.out["loaded"][label]
                 self.assertEqual(got["values"], want)
                 self.assertEqual(got["length"], len(ORDERS[cls]))
-                self.assertEqual(got.get("stamp"), 2)
+                self.assertEqual(got.get("stamp"), 3)
+                self.assertEqual(got["named"], want)
+                self.assertEqual(got["version"], 2)
+                self.assertTrue(got["inputUnchanged"])
+                self.assertNotIn("api_key", got["named"])
 
     def test_l2_a_node_saved_by_name_is_placed_by_name(self):
         self.assertIsNotNone(self.out["named"])
         by_name = dict(zip(ORDERS["QuantFuncLTXLoader"], self.out["named"]))
         self.assertEqual(by_name["transformer"], "n.safetensors")
-        self.assertEqual(by_name["sol_tau"], 0.9)
+        self.assertEqual(by_name["sol_tau"], legacy_tau(0.9))
         self.assertEqual(by_name["block_cache"], 0.5)
         self.assertIs(by_name["quality_enhance"], True)
         self.assertEqual(by_name["step_cache"], "DEFAULT_step_cache")
 
     def test_l3_nothing_else_is_remapped(self):
-        self.assertEqual(self.out["untouched"], {"marked": None, "currentShape": None, "unknownShape": None,
+        self.assertEqual(self.out["untouched"], {"marked": self.out["current"], "currentShape": self.out["current"], "unknownShape": True,
                                                  "otherNode": None, "otherNodeStamp": None, "otherNodeGot": [5]})
 
     def test_l4_loader_nodes_are_stamped_when_created(self):
-        self.assertEqual(self.out["stamped"], {**{cls: 2 for cls in LOADERS}, "KSampler": None})
+        self.assertEqual(self.out["stamped"], {**{cls: 3 for cls in LOADERS}, "KSampler": None})
+
+    def test_sol_markers_and_exact_numeric_migration(self):
+        self.assertEqual(self.out["markers"], [0.25, 0.25, 0.25, "error", "error", "error", "error"])
+        self.assertTrue(self.out["missingMarker"])
+        self.assertEqual(self.out["golden"], [legacy_tau((i + 0.01) / 1001) for i in range(1001)])
+        legacy = self.out["loaded"]["ltx_published"]["values"]
+        self.assertIs(legacy["sol_enabled"], True)
+        self.assertIs(legacy["sol_window_enabled"], False)
+        self.assertEqual(legacy["sol_min_tokens"], 0)
+        self.assertEqual(legacy["sol_sink_conditioning"], "off")
 
 
 if __name__ == "__main__":
