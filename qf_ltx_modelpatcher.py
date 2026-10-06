@@ -388,6 +388,11 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
         self._sess_denoise = 0
         qfe.info(f"[qf_native] LTX SESSION OPEN handle={session.value:#x} steps={self._num_steps} "
               f"cond={tuple(vemb_group.shape)} frames={self._num_frames}", flush=True)
+        if _mask_opt.get("audio_frame_t_scale"):
+            # [issue #15] per-SESSION receipt (one per begin => a two-stage graph logs one per stage),
+            # where the engine's own receipt is once-per-process (ENGINE repo, not this tree;
+            # src/gemm/lighting/LTX2VideoTransformerLighting.cpp:3017-3019, `s_a_pt_logged` exchange).
+            qfe.info(f"qf_native LTX-AV audio mask: {len(_mask_opt['audio_frame_t_scale'])} rows", flush=True)
 
 
 # ── LTX-2.5 joint audio+video (c5.8b) ────────────────────────────────────────────────

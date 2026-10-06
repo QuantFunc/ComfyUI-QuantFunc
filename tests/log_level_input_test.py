@@ -212,7 +212,8 @@ def main():
           heard == {"never set": "", "warning": "", "info": "[qf_native] detail 7\n"})
     # L11: the per-run detail lines reach the console ONLY through that helper (AST over every plugin module): a bare
     #      print / logging.info of one of them would print at the production level again.
-    tokens = ("loaded QuantFuncNativeLoader", "SESSION OPEN", "SESSION CLOSED", "VRAM ledger", "engine lib:")
+    tokens = ("loaded QuantFuncNativeLoader", "SESSION OPEN", "SESSION CLOSED", "VRAM ledger", "engine lib:",
+              "audio mask:")
     bare = []
     for fn in sorted(os.listdir(_PLUGIN)):
         if not fn.endswith(".py"):
