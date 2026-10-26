@@ -543,6 +543,29 @@ def _install_host_ram_release():
     cmm.extra_ram_release = extra_ram_release
 
 
+def _load_time_lora_content_identity(create_cfg):
+    """Bind baked adapter cache identity to actual bytes, preserving stack order."""
+    import hashlib
+    import stat
+    identity = []
+    for entry in (create_cfg or {}).get("lora", []):
+        path = entry["path"]
+        with open(path, "rb") as source:
+            before = os.fstat(source.fileno())
+            if not stat.S_ISREG(before.st_mode):
+                raise ValueError("Load-time LoRA must be a regular file")
+            digest = hashlib.sha256()
+            for block in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(block)
+            after = os.fstat(source.fileno())
+        current = os.stat(path)
+        stamp = lambda st: (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+        if stamp(before) != stamp(after) or stamp(after) != stamp(current):
+            raise RuntimeError("Load-time LoRA changed while computing its identity")
+        identity.append((os.path.realpath(path), after.st_size, digest.hexdigest()))
+    return tuple(identity)
+
+
 def _engine_recipe(model_dir, create_cfg=None, device_idx=0, transformer_path=None):
     """Resolve immutable create inputs without entering a cache critical section."""
     lib = qfe.load_lib()
@@ -551,6 +574,8 @@ def _engine_recipe(model_dir, create_cfg=None, device_idx=0, transformer_path=No
     # key: the transformer weight file too, so two weight files never share one pipeline.
     ckey = (qfe.loaded_so_path(), model_dir, transformer_path, "svdq", int(device_idx),
             json.dumps(create_cfg or {}, sort_keys=True))
+    if (create_cfg or {}).get("lora"):
+        ckey += (_load_time_lora_content_identity(create_cfg),)
     return lib, ckey, (qfe.library_identity(lib), ckey), create_cfg
 
 
@@ -667,8 +692,8 @@ def _get_engine(model_dir, create_cfg=None, device_idx=0, api_key=None, transfor
     a PREQUANT svdq package carries its own layout/precision in its metadata; anything
     supplied on top competes with it and loses. transformer_path: the transformer weight file
     (the engine's create input); None = the weights inside the package (model_dir/transformer/).
-    create_cfg carries the per-family create keys only: never a LoRA set or a session setting, so
-    every setting of one model's weights shares one cached pipeline. api_key (the loader field's key, or None) is not a
+    create_cfg carries immutable family keys and optional load-time LoRA, never session settings.
+    Runtime LoRA sets share the base pipeline; baked stacks have separate content-bound cache identities. api_key (the loader field's key, or None) is not a
     create key either: it signs in the create of a missed pipeline, and QFLazyEngine switches a cached one in place."""
     # [session-knobs] the session-knob-≠-create-key guard is sealed INSIDE
     # qf_engine.create_pipeline (the real quantfunc_create boundary — construction-enforced,
@@ -882,8 +907,8 @@ if _IMPORT_OK:
     # Sol policy is re-applied per session. Explicit enable separates the new
     # statistical tau from the versioned migration of old keep-ratio workflows.
     _SOL_TAU_INPUT = ("FLOAT", {"default": 1.3, "min": -4.0, "max": 4.0, "step": 0.05,
-                     "tooltip": "Sol statistical threshold. Higher keeps fewer exact blocks. "
-                                "Negative values preserve migrated workflows with a high keep ratio."})
+                     "tooltip": "Higher values favor speed; lower values favor detail. "
+                                "Negative values saved in older workflows remain supported."})
     _SOL_ENABLED_INPUT = ("BOOLEAN", {"default": False})
     _SOL_WINDOW_INPUT = ("BOOLEAN", {"default": True, "tooltip": "Limit Sol to the selected sampling interval."})
     _SOL_START_INPUT = ("FLOAT", {"default": 0.2, "min": 0.0, "max": 1.0, "step": 0.01})
@@ -1173,6 +1198,9 @@ if _IMPORT_OK:
         model shares it, and the chained set is applied in place before each run (one declarative
         quantfunc_pipeline_update {"lora": [...]}; QFLazyEngine._apply_runtime_lora). The create is deferred
         (QFLazyEngine), so a chain of N nodes builds at most ONE pipeline.
+        The optional load_time mode applies the complete stack during BF16 pipeline creation. It uses a
+        separate content-bound pipeline identity and an empty runtime overlay; changing that stack reloads.
+        The default runtime mode above retains its in-place behavior and snapshot-budget refusal.
         Comfy-level patches applied upstream (ModelSampling*, set_model_* …) are TRANSPLANTED onto
         the rebuilt patcher, so this node may sit anywhere in the chain.
         """
@@ -1184,6 +1212,9 @@ if _IMPORT_OK:
                 "model": ("MODEL",),
                 "lora_name": (_lora_choices(),),
                 "strength": ("FLOAT", {"default": 1.0, "min": -100.0, "max": 100.0, "step": 0.01}),
+            }, "optional": {
+                "application": (["runtime", "load_time"], {"default": "runtime", "tooltip":
+                    "Applies to the complete chained LoRA stack. Runtime changes in place; load_time creates a separate BF16 pipeline and reloads when the stack changes. Keep selected model and LoRA files unchanged while prepared or loaded; the content digest identifies bytes at acquisition and does not lock files."}),
             }}
 
         RETURN_TYPES = ("MODEL",)
@@ -1193,7 +1224,7 @@ if _IMPORT_OK:
         # nodes. (ModelSampling* use "model/patch*", so the rule is per-precedent, not universal.)
         CATEGORY = "model/loaders"
         DESCRIPTION = ("Applies a LoRA to a QuantFunc model (connect it after a QuantFunc loader; chain "
-                       "several to stack them). Changing or removing a LoRA keeps the loaded model (no reload).")
+                       "several to stack them). Runtime mode changes in place. Load-time mode creates a separate BF16 pipeline for the complete stack.")
 
         @staticmethod
         def _refuse_foreign_lora_format(path):
@@ -1238,7 +1269,7 @@ if _IMPORT_OK:
                     "lora_down/lora_up) in this file - not a LoRA, or an unsupported "
                     f"format. If it is a LoRA, convert it: python3 {conv} --in ... --out ...")
 
-        def apply(self, model, lora_name, strength):
+        def apply(self, model, lora_name, strength, application="runtime"):
             rebuild = qfmp.rebuild_of(model)
             if rebuild is None:
                 raise RuntimeError(
@@ -1255,7 +1286,14 @@ if _IMPORT_OK:
             stack = qfmp.lora_stack_of(model)
             stack.append({"path": _resolve_lora(lora_name), "scale": float(strength),
                           "target": "all"})
-            rebuilt = rebuild(stack)
+            if application == "runtime":
+                rebuilt = rebuild(stack)
+            elif application == "load_time":
+                if not getattr(rebuild, "supports_load_time_lora", False):
+                    raise RuntimeError("QuantFuncNativeLoRA: load_time requires a native BF16 model supporting create-time LoRA")
+                rebuilt = rebuild(stack, application="load_time")
+            else:
+                raise ValueError("QuantFuncNativeLoRA: unknown application mode")
             # CR regression fix: carry the UPSTREAM comfy state (ModelSampling* object patches,
             # set_model_* options, callbacks/wrappers/hooks) onto the re-created patcher, so a
             # LoRA node placed after a ModelSampling node cannot silently drop its shift.

@@ -177,6 +177,8 @@ def _ltx_mock_factory(src, comfy):
     def mk(**attrs):
         me = _mock_self(**attrs)
         me._native_frame_rate = types.MethodType(nfr, me)
+        ref, _ = _bind(src, "_reference_audio_cond")
+        me._reference_audio_cond = types.MethodType(ref, me)
         return me
     return mk
 

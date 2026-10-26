@@ -617,6 +617,8 @@ class QFSessionModelMixin:
         if st != qfe.QUANTFUNC_OK:
             err = qfe.last_err(lib)
             self._qf.end_session_if_open()
+            if mp.base.options_json and ("options_json" in err or "audio_reference_active" in err):
+                err += "; update the QuantFunc engine library for LTX reference audio selection"
             raise RuntimeError(f"{fail_prefix} failed: {err}")
 
 
@@ -993,6 +995,26 @@ class QFLazyEngine:
         self.ensure().current_session = v
 
     # ---- lifecycle: all no-ops while unmaterialized (nothing exists to close/free/destroy) ----
+    def retain_reference_audio(self, owner):
+        if owner is None:
+            if self._real is not None:
+                self._real.retain_reference_audio(None)
+        else:
+            real = self.ensure()
+            assert real is not None
+            real.retain_reference_audio(owner)
+
+    def unload_sync(self):
+        assert self._real is not None
+        return self._real.unload_sync()
+
+    def reference_audio_pending(self):
+        return self._real is not None and self._real.reference_audio_pending()
+
+    def reference_audio_copy_completed(self):
+        assert self._real is not None
+        self._real.reference_audio_copy_completed()
+
     def end_session_if_open(self):
         return (False, True) if self._real is None else self._real.end_session_if_open()
 
@@ -1170,8 +1192,9 @@ def family_build(deps, model_dir, create_extra, supported_model, unet_config, ma
                  transformer_path=None):
     """The ONE builder every family returns through (it was a closure copied into each family module). build(lora_entries)
     makes a lazy engine for model_dir — the pipeline is created only when a sampler first needs it, and there is ONE per
-    model file whatever the LoRA set: the weights are the cache key, and QFLazyEngine applies this patcher's set in place
-    at run start — the family's comfy model around it, and its patcher, tagged so that QuantFuncNativeLoRA can rebuild the
+    model file in the default runtime mode: QFLazyEngine applies this patcher's set in place at run start.
+    Explicit load_time mode instead carries the complete stack in the create recipe and leaves the runtime overlay
+    empty; a changed stack has a separate pipeline identity — the family's comfy model around it, and its patcher, tagged so that QuantFuncNativeLoRA can rebuild the
     patcher for another set. One device capture per build drives both the logical patcher and the engine identity; the
     engine factory holds the model only weakly (make_engine_factory: a strong capture was a model -> engine -> factory ->
     model cycle, comfy's "Potential memory leak" warning). make_model(model_config, engine, device) returns the family's
@@ -1184,8 +1207,16 @@ def family_build(deps, model_dir, create_extra, supported_model, unet_config, ma
     loader_sig = LOADER_SIG.get()
     api_key = LOADER_API_KEY.get()
 
-    def build(lora_entries):
+    def build(lora_entries, *, application="runtime"):
         create_cfg = dict(create_extra or {}, **({"use_pinned_memory": True} if pinned_memory else {})) or None
+        if application not in ("runtime", "load_time"):
+            raise ValueError("Unknown LoRA application mode")
+        if application == "load_time":
+            if (create_cfg or {}).get("transformer_precision") != "bf16":
+                raise ValueError("Load-time LoRA currently requires the native BF16 source route")
+            if (create_cfg or {}).get("lora"):
+                raise ValueError("Load-time LoRA cannot replace an existing baked adapter recipe")
+            create_cfg = dict(create_cfg or {}, lora=[dict(entry) for entry in lora_entries])
         device, device_idx = current_torch_device()
         factory, register_model = make_engine_factory(
             lambda: get_engine(model_dir, create_cfg=create_cfg, device_idx=device_idx, api_key=api_key,
@@ -1198,7 +1229,13 @@ def family_build(deps, model_dir, create_extra, supported_model, unet_config, ma
         register_model(model)
         patcher = QFModelPatcher(model, load_device=device, offload_device=comfy.model_management.unet_offload_device())
         qfe.info(label)
-        return tag_lora_rebuild(patcher, lora_entries, build)
+        patcher = tag_lora_rebuild(patcher, lora_entries, build)
+        if application == "load_time":
+            # The full stack is already part of the native create recipe. Keep the
+            # public stack for chaining, but never send it again as a runtime update.
+            model._qf._lora = []
+        return patcher
+    build.supports_load_time_lora = (create_extra or {}).get("transformer_precision") == "bf16"
     return build
 
 
@@ -1747,9 +1784,16 @@ class QFModelPatcher(comfy.model_patcher.ModelPatcher):
     @staticmethod
     def _sampling_geometry(executor, *args, **kwargs):
         model = executor.class_obj.model_patcher.model
-        token = _QF_SAMPLING_GEOMETRY.set((model, kwargs.get("latent_shapes")))
+        shapes = kwargs.get("latent_shapes", args[8] if len(args) > 8 else None)
+        token = _QF_SAMPLING_GEOMETRY.set((model, shapes))
         try:
-            return executor(*args, **kwargs)
+            restore = getattr(model, "_qf_restore_frozen_audio", None)
+            if restore is not None and "denoise_mask_function" in executor.class_obj.model_options:
+                restore = None
+            output = executor(*args, **kwargs)
+            if restore is not None and "denoise_mask_function" not in executor.class_obj.model_options:
+                return restore(output, *args, **kwargs)
+            return output
         finally:
             _QF_SAMPLING_GEOMETRY.reset(token)
 

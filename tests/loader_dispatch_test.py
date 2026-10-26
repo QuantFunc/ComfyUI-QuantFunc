@@ -314,20 +314,35 @@ def main():
                 for _n, _v in _real.items()}
     check("with the SHIPPED configs every loader's model_config is hidden with its family's one preset (no dropdown)",
           all(len(c) == 1 and h is True for c, h in _real_mc.values()), f"-> {_real_mc}")
-    # a QI-2.1 workflow saved with the published switch ([transformer, model_config, attention_backend, quality_enhance]) opens
-    # with every value in its slot: widget values are stored by position, and model_config keeps slot 1.
+    # Host declaration contract: the current widget order/defaults, not raw old
+    # serialized positions. Actual legacy migration belongs to loader_layout_test.py;
+    # the historical four-value QI Boolean layout remains a separate unresolved RED.
     _qi_it = _real["QuantFuncQwenImage21Loader"]
-    _old = ["qwen-image-2.1-quantfunc-int4-r128-i8sidecar.qfc.safetensors", "qwen-image-2.1-int4", "auto", False]
     _widgets = list(_qi_it["required"]) + list(_qi_it.get("optional", {}))
     _spec = {**_qi_it["required"], **_qi_it.get("optional", {})}
-    _fits = [w == "transformer" or (isinstance(v, bool) if _spec[w][0] == "BOOLEAN" else v in _spec[w][0])
-             for w, v in zip(_widgets, _old)]
-    check("a saved QI-2.1 workflow's values land on the right widgets (model_config keeps slot 1)",
-          _widgets[:4] == ["transformer", "model_config", "attention_backend", "quality_enhance"] and all(_fits),
-          f"-> {list(zip(_widgets, _old))} fits={_fits}")
+    _saved = [opts.get("default", kind[0] if isinstance(kind, (list, tuple)) and kind else None)
+              for kind, opts in (_spec[w] for w in _widgets)]
+    def _current_widget_fits(name, value):
+        kind = _spec[name][0]
+        if isinstance(kind, (list, tuple)):
+            return value in kind
+        if kind == "BOOLEAN":
+            return type(value) is bool
+        if kind == "FLOAT":
+            return type(value) in (int, float)  # bool must not fit a numeric widget
+        if kind == "INT":
+            return type(value) is int
+        return False
+    _fits = [_current_widget_fits(w, v) for w, v in zip(_widgets, _saved)]
+    check("current QI widget defaults fit their declarations and model_config keeps slot 1",
+          _widgets[:3] == ["transformer", "model_config", "attention_backend"] and all(_fits)
+          and _saved[1] == "qwen-image-2.1-int4",
+          f"-> {list(zip(_widgets, _saved))} fits={_fits}")
+    check("a Boolean saved value does not fit the current Sol FLOAT widget",
+          not _current_widget_fits("sol_tau", False))
     _shifted = [w for w in _widgets if w != "model_config"]
-    check("... and without the model_config slot they would not (the preset name would land in attention_backend)",
-          _old[1] not in _spec[_shifted[1]][0], f"-> {_shifted[1]}")
+    check("without model_config its preset would land in attention_backend and fail its enum",
+          not _current_widget_fits(_shifted[1], _saved[1]), f"-> {_shifted[1]}")
     t1 = KreaL.INPUT_TYPES()["required"]["transformer"][0]
     check("transformer lists .safetensors FILES (and only those)",
           "fx-krea2-turbo-quantfunc-int4.safetensors" in t1 and "not-a-model.txt" not in t1)
@@ -377,20 +392,22 @@ def main():
     # dropdown was withdrawn 2026-09-25]; step_cache +
     # block_cache). Every optional is a session knob (no create key / no rebuild) — sparse is
     # deliberately NOT among them (removed 2026-08-29, only the caches came back).
+    _sol_values = ["sol_tau", "sol_start_percent", "sol_end_percent", "sol_min_tokens",
+                   "sol_sink_conditioning", "sol_version"]
+    _sol_switches = ["sol_enabled", "sol_window_enabled"]
     _lit = LtxL.INPUT_TYPES()
     check("ltx node surface = transformer required + hidden model_config + session-dial optionals (no sparse)",
           list(_lit["required"].keys()) == ["transformer"]
-          and list(_lit.get("optional", {}).keys()) == ["model_config", "attention_backend", "sol_tau", "step_cache",
-                                                        "block_cache", "quality_enhance", "pinned_memory"]
+          and list(_lit.get("optional", {}).keys()) == ["model_config", "attention_backend"] + _sol_values
+          + ["step_cache", "block_cache"] + _sol_switches + ["quality_enhance", "pinned_memory"]
           and "sparse" not in _lit.get("optional", {}),
           f"-> req={list(_lit['required'].keys())} opt={list(_lit.get('optional', {}).keys())}")
     # h3 node surface (same latent-duo + session dials shape as ltx; block-count removed 2026-09)
     _h3it = H3L.INPUT_TYPES()
     check("h3 node surface = transformer required + hidden model_config + session-dial optionals",
           list(_h3it["required"].keys()) == ["transformer"]
-          and list(_h3it.get("optional", {}).keys()) == ["model_config", "attention_backend", "sol_tau", "step_cache",
-                                                          "block_cache", "quality_enhance", "audio_enhance",
-                                                          "pinned_memory"],
+          and list(_h3it.get("optional", {}).keys()) == ["model_config", "attention_backend"] + _sol_values
+          + ["step_cache", "block_cache"] + _sol_switches + ["quality_enhance", "audio_enhance", "pinned_memory"],
           f"-> req={list(_h3it['required'].keys())} opt={list(_h3it.get('optional', {}).keys())}")
     # (B) quality_enhance (user 2026-09-25): ONE switch on the four loaders, the same on every GPU. DEATH RULES: the switch sits
     #     in the widget slot of the earlier `quality` input (where the published loaders had it); the session sends only the
@@ -760,30 +777,58 @@ def main():
     import types as _types
     _red = _qlm.QFLTXModel._frame_scales_from_mask
     _stub = _types.SimpleNamespace(latent_shapes=[[1, 4, 2, 2, 2], [1, 8, 3, 16]])
-    # (a) 5D channel-repeated [B,C,F,H,W]: frame0=0.3, frame1=1.0
+    # The helper returns a (video-frame list, audio-row list) pair, not batch rows.
+    # B2 shares that pair only when every target has the same video/audio mask.
+    # (a) 5D video mask: frame0=0.3, frame1=1.0; no audio-row scales.
     _m5 = _t2.ones(1, 4, 2, 2, 2)
     _m5[:, :, 0] = 0.3
-    check("mask->scales: 5D per-frame reduce",
-          [round(v, 4) for v in _red(_stub, _m5)] == [0.3, 1.0],
-          f"-> {_red(_stub, _m5)}")
-    # (b) packed AV flat [B,1,total]: video part frame0=0.3, audio part all-1.0
+    _video, _audio = _red(_stub, _m5)
+    check("mask->scales: 5D per-frame reduce with explicit empty audio list",
+          [round(v, 4) for v in _video] == [0.3, 1.0] and _audio == [],
+          f"-> {(_video, _audio)}")
+    # (b) packed AV split uses latent_shapes and omits an all-ones audio tail.
     _nv = 4 * 2 * 2 * 2
     _na = 8 * 3 * 16
     _flat = _t2.ones(1, 1, _nv + _na)
     _v = _flat[0, 0, :_nv].reshape(1, 4, 2, 2, 2)
     _v[:, :, 0] = 0.3
-    check("mask->scales: packed AV flat split via latent_shapes",
-          [round(v, 4) for v in _red(_stub, _flat)] == [0.3, 1.0],
-          f"-> {_red(_stub, _flat)}")
-    # (c) AUDIO-lane masking refused loud
+    _video, _audio = _red(_stub, _flat)
+    check("mask->scales: packed AV split returns video/audio pair",
+          [round(v, 4) for v in _video] == [0.3, 1.0] and _audio == [],
+          f"-> {(_video, _audio)}")
+    # (c) uniform audio-ROW masks are supported; variation WITHIN a row is not.
     _flat_am = _flat.clone()
     _flat_am[0, 0, _nv:] = 0.5
-    try:
-        _red(_stub, _flat_am)
-        check("mask->scales: audio-lane mask refused loud", False, "-> no exception")
-    except RuntimeError as _e:
-        check("mask->scales: audio-lane mask refused loud", "AUDIO" in str(_e),
-              f"-> {str(_e)[:60]}")
+    _video, _audio = _red(_stub, _flat_am)
+    check("mask->scales: supported audio-row mask remains separate from video",
+          [round(v, 4) for v in _video] == [0.3, 1.0] and _audio == [0.5] * 3,
+          f"-> {(_video, _audio)}")
+    _row_varying = _flat_am.clone()
+    _row_varying[0, 0, _nv:].reshape(8, 3, 16)[0, 0, 0] = 0.25
+    for _label, _obj, _mask, _message in (
+            ("within-audio-row variation", _stub, _row_varying, "WITHIN an audio row"),
+            ("masked tail without audio shape", _types.SimpleNamespace(latent_shapes=[_stub.latent_shapes[0]]),
+             _flat_am, "AUDIO lane")):
+        try:
+            _red(_obj, _mask)
+            check("mask->scales: " + _label + " refused loud", False, "-> no exception")
+        except RuntimeError as _e:
+            check("mask->scales: " + _label + " refused loud", _message in str(_e), f"-> {str(_e)[:60]}")
+    _batch_stub = _types.SimpleNamespace(latent_shapes=[[2, 4, 2, 2, 2], [2, 8, 3, 16]])
+    _batch_stub._frame_scales_from_mask = _types.MethodType(_red, _batch_stub)
+    _shared = _flat_am.repeat(2, 1, 1)
+    _source = _shared.clone()
+    check("mask->scales: B2 identical masks share the unchanged video/audio pair",
+          _red(_batch_stub, _shared) == (_video, _audio) and _t2.equal(_shared, _source))
+    for _lane, _part in (("video", slice(0, _nv)), ("audio", slice(_nv, None))):
+        _different = _shared.clone()
+        _different[1, 0, _part] = 0.25
+        try:
+            _red(_batch_stub, _different)
+            check("mask->scales: B2 differing " + _lane + " masks refused", False, "-> no exception")
+        except RuntimeError as _e:
+            check("mask->scales: B2 differing " + _lane + " masks refused",
+                  "same per-frame/audio-row timestep scales" in str(_e))
     # (d) frame-INTERNAL variation (spatial inpaint) refused loud
     _m5v = _t2.ones(1, 4, 2, 2, 2)
     _m5v[0, 0, 0, 0, 0] = 0.2
@@ -1777,6 +1822,185 @@ def main():
               "channel count), and a latent with a noise mask", _refused == [True, True, True], f"-> {_refused}")
     except Exception as e:  # noqa: BLE001
         check("H3 latent upscale arm", False, f"-> raised {type(e).__name__}: {e}")
+
+    # Official source entry: production content probe + actual loader/build/create option path.
+    import importlib
+    ltxmod = importlib.import_module(qfn.__name__ + ".qf_ltx_modelpatcher")
+    official = "ltx-2.5-22b-distilled-transformer-comfy-int8-convrot.safetensors"
+    official_path = os.path.join(dm, official)
+    root = "model.diffusion_model."
+    def _int8_source(mutate=None):
+        header, payload = {}, bytearray()
+        def put(key, dtype, shape, data):
+            start = len(payload); payload.extend(data)
+            header[key] = dict(dtype=dtype, shape=shape, data_offsets=[start, len(payload)])
+        for lane in ("attn1", "audio_attn1"):
+            base = root + "transformer_blocks.0." + lane + ".to_q"
+            put(base + ".weight", "I8", [1, 256], bytes(range(256)))
+            put(base + ".weight_scale", "F32", [1, 1], _st.pack("<f", 0.125))
+            desc = json.dumps(dict(format="int8_tensorwise", convrot=True, convrot_groupsize=256)).encode()
+            put(base + ".comfy_quant", "U8", [len(desc)], desc)
+        for lane in ("video", "audio"):
+            put(root + lane + "_embeddings_connector.learnable_registers", "F32", [1], bytes(4))
+        if mutate: mutate(header, payload)
+        encoded = json.dumps(header).encode(); encoded += b" " * ((-len(encoded)) % 8)
+        with open(official_path, "wb") as fh:
+            fh.write(_st.pack("<Q", len(encoded))); fh.write(encoded); fh.write(payload)
+    _int8_source()
+    check("INT8-convrot content selects existing i8 create option",
+          ltxmod._ltx_source_create_options(official_path) == {"transformer_precision": "i8"})
+    check("legacy QuantFunc source keeps create options empty",
+          ltxmod._ltx_source_create_options(os.path.join(dm, "fx-ltx-2.5-quantfunc-4bit.safetensors")) == {})
+    before_official = len(creates)
+    official_patcher = LtxL.load(official, "ltx2-2.5-22b")[0]
+    _ = official_patcher.model._qf.lib
+    check("actual LTX builder forwards i8 at create with no precision map / LoRA rewrite",
+          len(creates) == before_official + 1 and creates[-1].get("transformer_precision") == "i8"
+          and creates[-1].get("denoise_only") is True and "precision_config" not in creates[-1]
+          and "lora" not in creates[-1])
+    # The suite's original fake SDK is the string "LIB": no weight-path capability.
+    # That supported legacy branch must retain BOTH connectors in the staged self-link.
+    legacy_connector = os.path.join(official_patcher.model._qf._ckey[0], "connectors", "model.safetensors")
+    check("official legacy source retains both self-contained connectors",
+          not qfn.qfmp.engine_reads_weight_paths()
+          and os.path.samefile(legacy_connector, official_path)
+          and all(ltxmod._file_has_prefix(legacy_connector, root + lane + "_embeddings_connector.")
+                  for lane in ("video", "audio")))
+    # Also exercise the actual modern capability predicate, not a guessed fallback.
+    _old_sdk_loader = qfn.qfe.load_lib
+    try:
+        _modern_sdk = types.SimpleNamespace(quantfunc_weight_paths=lambda: 1)
+        qfn.qfe.load_lib = lambda *args, **kwargs: _modern_sdk
+        modern_patcher = LtxL.load(official, "ltx2-2.5-22b")[0]
+        _ = modern_patcher.model._qf.lib
+        check("official modern source passes both self-contained connectors and transformer path",
+              qfn.qfmp.engine_reads_weight_paths()
+              and len(creates) == before_official + 2
+              and creates[-1].get("connectors_path") == official_path
+              and modern_patcher.model._qf._ckey[2] == official_path
+              and creates[-1].get("transformer_precision") == "i8"
+              and creates[-1].get("denoise_only") is True
+              and all(ltxmod._file_has_prefix(creates[-1]["connectors_path"], root + lane + "_embeddings_connector.")
+                      for lane in ("video", "audio")))
+    finally:
+        qfn.qfe.load_lib = _old_sdk_loader
+    _official_creates = len(creates)
+    victim = root + "transformer_blocks.0.attn1.to_q"
+    bad_formats = {
+        "missing scale": lambda h,p: h.pop(victim + ".weight_scale"),
+        "wrong scale dtype": lambda h,p: h[victim + ".weight_scale"].update(dtype="BF16"),
+        "wrong scale rows": lambda h,p: h[victim + ".weight_scale"].update(shape=[2,1]),
+        "missing descriptor": lambda h,p: h.pop(victim + ".comfy_quant"),
+        "wrong descriptor dtype": lambda h,p: h[victim + ".comfy_quant"].update(dtype="I8"),
+        "out-of-file descriptor": lambda h,p: h[victim + ".comfy_quant"].update(data_offsets=[10**6,10**6+72]),
+        "wrong input geometry": lambda h,p: h[victim + ".weight"].update(shape=[1,255]),
+        "missing audio lane": lambda h,p: h.pop(root + "transformer_blocks.0.audio_attn1.to_q.weight"),
+        "mixed SVDQ": lambda h,p: h.update({root + "transformer_blocks.0.attn1.to_q.qweight": {}}),
+    }
+    for label, mutation in bad_formats.items():
+        _int8_source(mutation)
+        try:
+            LtxL.load(official, "ltx2-2.5-22b")
+            refused = False
+        except RuntimeError as exc:
+            refused = "INT8-convrot source refused" in str(exc)
+        check("INT8 source fails before engine create: " + label, refused and len(creates) == _official_creates)
+    # A named official file cannot use the legacy no-descriptor fallback.
+    _mini_st(official_path, root + "video_embeddings_connector.learnable_registers",
+             root + "audio_embeddings_connector.learnable_registers")
+    try:
+        LtxL.load(official, "ltx2-2.5-22b")
+        refused = False
+    except RuntimeError as exc:
+        refused = "INT8-convrot source refused" in str(exc)
+    check("forged official filename without transformer descriptors refused", refused)
+    # Same-size normal descriptor mutation, with valid JSON: must not silently decode a foreign scheme.
+    def wrong_desc(h, p):
+        lo, hi = h[victim + ".comfy_quant"]["data_offsets"]
+        text = bytes(p[lo:hi]).replace(b"int8_tensorwise", b"int4_tensorwise")
+        p[lo:hi] = text
+    _int8_source(wrong_desc)
+    try:
+        ltxmod._ltx_source_create_options(official_path)
+        refused = False
+    except RuntimeError:
+        refused = True
+    check("foreign descriptor format refused (not AUTO_4 fallback)", refused)
+    for label, before, after in (("convrot false", b'"convrot": true', b'"convrot":false'),
+                                  ("wrong rotation size", b'256', b'128')):
+        def mutate_desc(h, p, before=before, after=after):
+            lo, hi = h[victim + ".comfy_quant"]["data_offsets"]
+            p[lo:hi] = bytes(p[lo:hi]).replace(before, after)
+        _int8_source(mutate_desc)
+        try:
+            ltxmod._ltx_source_create_options(official_path)
+            refused = False
+        except RuntimeError:
+            refused = True
+        check("INT8 descriptor semantic refusal: " + label, refused)
+    _int8_source()  # keep this unit fixture internally coherent for subsequent consumers
+
+    bf16_name = "ltx-2.5-22b-distilled-transformer-bf16.safetensors"
+    bf16_path = os.path.join(dm, bf16_name)
+    def _bf16_source(mutate=None):
+        header, payload = {}, bytearray()
+        for family in ("transformer_blocks.0.attn1.", "transformer_blocks.0.audio_attn1.",
+                       "video_embeddings_connector.transformer_1d_blocks.0.attn1.",
+                       "audio_embeddings_connector.transformer_1d_blocks.0.attn1."):
+            start = len(payload); payload.extend(bytes(512))
+            header[root + family + "to_q.weight"] = dict(dtype="BF16", shape=[1, 256],
+                                                         data_offsets=[start, len(payload)])
+        if mutate: mutate(header, payload)
+        encoded = json.dumps(header).encode(); encoded += b" " * ((-len(encoded)) % 8)
+        with open(bf16_path, "wb") as fh:
+            fh.write(_st.pack("<Q", len(encoded))); fh.write(encoded); fh.write(payload)
+    _bf16_source()
+    check("BF16 source selects full native BF16 and FlashAttention",
+          ltxmod._ltx_source_create_options(bf16_path) ==
+          {"transformer_precision": "bf16", "attention_backend": "flash"})
+    before_bf16 = len(creates)
+    legacy_bf16 = LtxL.load(bf16_name, "ltx2-2.5-22b", attention_backend="flash", pinned_memory=False)[0]
+    _ = legacy_bf16.model._qf.lib
+    legacy_bf16_connector = os.path.join(legacy_bf16.model._qf._ckey[0], "connectors", "model.safetensors")
+    check("BF16 legacy builder preserves source/connectors and full precision without pinned-memory or quant map",
+          len(creates) == before_bf16 + 1 and creates[-1].get("transformer_precision") == "bf16"
+          and creates[-1].get("attention_backend") == "flash"
+          and not creates[-1].get("use_pinned_memory") and "precision_config" not in creates[-1]
+          and os.path.samefile(legacy_bf16_connector, bf16_path))
+    _old_sdk_loader = qfn.qfe.load_lib
+    try:
+        qfn.qfe.load_lib = lambda *args, **kwargs: types.SimpleNamespace(quantfunc_weight_paths=lambda: 1)
+        modern_bf16 = LtxL.load(bf16_name, "ltx2-2.5-22b", attention_backend="flash", pinned_memory=False)[0]
+        _ = modern_bf16.model._qf.lib
+        check("BF16 modern builder forwards exact source and both connectors with BF16/flash recipe",
+              len(creates) == before_bf16 + 2 and creates[-1].get("transformer_precision") == "bf16"
+              and creates[-1].get("attention_backend") == "flash"
+              and creates[-1].get("connectors_path") == bf16_path
+              and modern_bf16.model._qf._ckey[2] == bf16_path
+              and not creates[-1].get("use_pinned_memory") and "precision_config" not in creates[-1])
+    finally:
+        qfn.qfe.load_lib = _old_sdk_loader
+    _bf16_creates = len(creates)
+    for label, mutate in {
+        "wrong dtype": lambda h,p: h[victim + ".weight"].update(dtype="F16"),
+        "missing transformer lane": lambda h,p: h.pop(root + "transformer_blocks.0.audio_attn1.to_q.weight"),
+        "missing connector": lambda h,p: h.pop(root + "audio_embeddings_connector.transformer_1d_blocks.0.attn1.to_q.weight"),
+        "wrong shape": lambda h,p: h[victim + ".weight"].update(shape=[True, 256]),
+        "out of bounds": lambda h,p: h[victim + ".weight"].update(data_offsets=[0, len(p) + 1]),
+        "wrong payload size": lambda h,p: h[victim + ".weight"].update(shape=[1, 128]),
+        "quant descriptor": lambda h,p: h.update({victim + ".comfy_quant": {}}),
+        "prequant store": lambda h,p: h.update({victim + ".qweight": {}}),
+        "truncated body": lambda h,p: p.pop(),
+    }.items():
+        _bf16_source(mutate)
+        try:
+            ltxmod._ltx_source_create_options(bf16_path)
+            refused = False
+        except RuntimeError:
+            refused = True
+        check("BF16 malformed source is refused without fallback: " + label,
+              refused and len(creates) == _bf16_creates)
+    _bf16_source()
 
     print("LOADER_DISPATCH:", "PASS" if bad == 0 else f"FAIL ({bad} wrong)")
     return 0 if bad == 0 else 1
