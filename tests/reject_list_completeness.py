@@ -73,7 +73,8 @@ _AUDITED_MODELS = (
     #    because the engine step is stateless in x. Unlike WAN (whose override loud-fails), LTX
     #    consumes the mask through comfy's own machinery.
     _Model("LTXV", "qf_ltx_modelpatcher.py",
-           {"attention_mask", "frame_rate", "denoise_mask"},
+           # ref_audio: dedicated base refusal / AV validated CONDConstant hook.
+           {"attention_mask", "frame_rate", "denoise_mask", "ref_audio"},
            ("concat_cond", "encode_adm")),
     # MiniMax-H3 joint-AV (QFH3Model) — this seam was UNAUDITED until the roster scan was repaired
     # (the class pattern stopped matching once the shared mixin was introduced, so the check

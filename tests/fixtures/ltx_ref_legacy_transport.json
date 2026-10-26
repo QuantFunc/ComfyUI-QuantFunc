@@ -1,0 +1,45 @@
+{
+  "source": "/media/jonathan/Data/code/qf-plugin-ltx-audio-ts/qf_ltx_modelpatcher.py",
+  "source_sha256": "12262debcc6e5c1dfc926493faff3c8d29e6f95454d94808e28bb2b77204b358",
+  "fixtures": [
+    {
+      "options_utf8": "{\"num_frames\": 97, \"fps\": 24.0, \"audio_dims\": [1, 101, 128], \"av_unprocessed_ctx\": true}",
+      "width": 512,
+      "height": 288,
+      "num_steps": 8,
+      "max_context_dims": [
+        1,
+        1024,
+        6144
+      ],
+      "max_pooled_dims": [
+        0,
+        0
+      ],
+      "cond_dtype": 2,
+      "producer_stream": 0,
+      "struct_size": 64,
+      "name": "no_ref_default"
+    },
+    {
+      "options_utf8": "{\"num_frames\": 97, \"fps\": 24.0, \"video_frame_t_scale\": [0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0], \"audio_frame_t_scale\": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5], \"audio_dims\": [1, 101, 128], \"av_unprocessed_ctx\": true}",
+      "width": 512,
+      "height": 288,
+      "num_steps": 8,
+      "max_context_dims": [
+        1,
+        1024,
+        6144
+      ],
+      "max_pooled_dims": [
+        0,
+        0
+      ],
+      "cond_dtype": 2,
+      "producer_stream": 0,
+      "struct_size": 64,
+      "name": "mask_only"
+    }
+  ],
+  "scope": "actual frozen producer AST with metadata-only fake native begin; no model/engine/GPU"
+}

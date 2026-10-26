@@ -72,6 +72,15 @@ def main():
     for name in qi:
         check(f"RED control: pre-#713 QI-2.1 hints refuse {name}", not name_matches_hints(name, PRE_713_QI21_HINTS))
 
+    ltx = presets["ltx2-2.5-22b"]["transformer1"]
+    official = "ltx-2.5-22b-distilled-transformer-comfy-int8-convrot.safetensors"
+    check("official distilled INT8-convrot admitted only by LTX preset",
+          [f"{p}:{a}" for p, a, pats in slots if name_matches_hints(official, pats)] ==
+          ["ltx2-2.5-22b:transformer1"])
+    for unsupported in (official.replace("distilled", "dev"), official.replace("2.5", "2.3"),
+                        official.replace("int8-convrot", "fp8"), "unrelated-int8-convrot.safetensors"):
+        check(f"unsupported filename remains refused: {unsupported}", not name_matches_hints(unsupported, ltx))
+
     print("PUBLISHED_NAMES:", "PASS" if bad == 0 else f"FAIL ({bad} wrong)")
     return 0 if bad == 0 else 1
 

@@ -48,6 +48,8 @@ QUANTFUNC_RESOURCE_PHASE_ATTACHED = 3
 QUANTFUNC_RESOURCE_PHASE_CLOSED = 4
 # quantfunc_dtype_t: FP32=0, FP16=1, BF16=2 (matches QF_DTYPE in the harness)
 QF_FP32, QF_FP16, QF_BF16 = 0, 1, 2
+# Pending reference borrows must survive model/handle GC until a positive native cleanup.
+_REFERENCE_AUDIO_PENDING_OWNERS = set()
 
 
 # Platform dispatch — the bundled native library lives in bin/<subdir>/<basename>, so a Windows install
@@ -2188,6 +2190,38 @@ class QFEngineHandle:
         if st != QUANTFUNC_OK:
             raise RuntimeError(f"QuantFunc pipeline_update failed (status {st}): {last_err(self.lib)}")
 
+    def retain_reference_audio(self, owner):
+        # A failed begin may still borrow the upload without publishing a session handle.
+        if getattr(self, "_reference_audio_pending", False):
+            raise RuntimeError("qf_native LTX-AV: prior reference begin has no proven copy completion")
+        self._reference_audio_owner = owner
+        self._reference_audio_pending = owner is not None
+        if owner is not None:
+            _REFERENCE_AUDIO_PENDING_OWNERS.add(self)
+
+    def reference_audio_pending(self):
+        return getattr(self, "_reference_audio_pending", False)
+
+    def reference_audio_copy_completed(self):
+        # Only called after native begin returns OK, whose reference copy has completed.
+        self._reference_audio_pending = False
+        _REFERENCE_AUDIO_PENDING_OWNERS.discard(self)
+
+    def unload_sync(self):
+        """Explicit between-call native fence; never auto-run on a failed begin."""
+        if self.pipeline is None:
+            raise RuntimeError("qf_native: synchronous release needs a live engine owner")
+        function = self.lib.quantfunc_unload_sync
+        function.restype = ctypes.c_int
+        function.argtypes = [ctypes.c_void_p]
+        st = function(self.pipeline)
+        if st != QUANTFUNC_OK:
+            raise RuntimeError(f"qf_native synchronous release failed: {last_err(self.lib)}")
+        # unload_sync OK includes checked device-wide completion, even when it frees zero bytes.
+        self.reference_audio_copy_completed()
+        self._reference_audio_owner = None
+        return st
+
     def end_session_if_open(self):
         """Close the open denoise session if any. Returns (was_open, ok): a NON-OK engine status
         (#2 CR: the int from quantfunc_denoise_end was previously discarded — no ctypes errcheck, so
@@ -2224,6 +2258,8 @@ class QFEngineHandle:
         # overwrites the pointer anyway.
         if ok:
             self.current_session = None
+            self._reference_audio_owner = None
+            self.reference_audio_copy_completed()
         return (True, ok)
 
     def resident_vram_bytes(self):
@@ -2266,6 +2302,8 @@ class QFEngineHandle:
         return int(out.value)
 
     def destroy(self):
+        if self.reference_audio_pending():
+            raise RuntimeError("qf_native LTX-AV: reference copy pending; explicit successful native cleanup required")
         self.end_session_if_open()
         if self.pipeline is not None:
             try:

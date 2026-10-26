@@ -177,6 +177,8 @@ def _ltx_mock_factory(src, comfy):
     def mk(**attrs):
         me = _mock_self(**attrs)
         me._native_frame_rate = types.MethodType(nfr, me)
+        ref, _ = _bind(src, "_reference_audio_cond")
+        me._reference_audio_cond = types.MethodType(ref, me)
         return me
     return mk
 
@@ -496,12 +498,106 @@ def _t_derive_geometry(src):
     return bad
 
 
+def _t_begin_audio_receipt(src):
+    """[issue #15] QFLTXModel._begin emits the LTX-AV audio-mask receipt ONCE PER BEGIN (so a two-stage graph
+    logs one per stage — the plugin-side mirror of the harness case's `min_count: 2` per-session cadence),
+    bound to the count actually SENT (log == payload), silent when no audio-mask key is pending (the no-mask /
+    video-only / all-1.0 callers all reach _begin with the key absent — extra_conds :138-150), and silent on a
+    REFUSED begin (the raise precedes the line). The emission CHANNEL is qfe.info — this stub IS qfe.info, so a
+    bare `print` would not be recorded (the level gate itself is L10's arm in log_level_input_test; the
+    helper-only rule for this new string is L11's, see the extended `tokens`)."""
+    import ctypes as _ct
+    import json as _json
+    import time as _time
+
+    class _Bpx(_ct.Structure):
+        """The subset of qf_engine.DenoiseBeginParams (a ctypes.Structure) that _begin touches."""
+        _fields_ = [("struct_size", _ct.c_size_t), ("width", _ct.c_int), ("height", _ct.c_int),
+                    ("num_steps", _ct.c_int), ("max_context_dims", _ct.c_int * 3),
+                    ("max_pooled_dims", _ct.c_int * 2), ("cond_dtype", _ct.c_int),
+                    ("_opts", _ct.c_char_p), ("options_json", _ct.c_char_p)]
+
+    log = []
+
+    def _info(fmt, *a, **k):
+        log.append(fmt % a if a else fmt)
+
+    qfe = types.SimpleNamespace(DenoiseBeginParams=_Bpx, QUANTFUNC_OK=0,
+                                last_err=lambda lib: "begin refused (test)", info=_info)
+    fn, _ = _bind(src, "_begin", {"ctypes": _ct, "json": _json, "time": _time, "qfe": qfe,
+                                  "_qf_dtype": lambda dt: 0})
+
+    def _mk(audio=None, video=None, accept=True):
+        sent = {}
+
+        def _begin(pipeline, bpx_ref, sess_ref):
+            bpx = bpx_ref._obj
+            sess_ref._obj.value = 0x100000001        # the real begin writes the handle; SESSION OPEN formats it
+            sent.update(_json.loads(bytes(bpx.options_json)) if bpx.options_json else {})
+            return 0 if accept else 7
+        eng = types.SimpleNamespace(lib=types.SimpleNamespace(quantfunc_denoise_begin=_begin),
+                                    pipeline=object(), current_session=None,
+                                    end_session_if_open=lambda: (False, True))
+        me = types.SimpleNamespace(_qf=eng, _ctx_key_assigner=types.SimpleNamespace(reset=lambda: None),
+                                   latent_format=types.SimpleNamespace(spacial_downscale_ratio=32),
+                                   _num_steps=8, _max_ctx_seq=0, _num_frames=97, _fps=24.0,
+                                   _pending_frame_t_scale=video, _pending_audio_frame_t_scale=audio,
+                                   residency_opts=lambda: {}, _begin_extra_opts=lambda: {})
+        return me, sent
+
+    def _receipts():
+        return [s for s in log if "LTX-AV audio mask:" in s]
+
+    x, vemb = torch.zeros(1, 128, 13, 16, 16), torch.zeros(1, 5, 4096)
+    bad = 0
+    # (1) a masked begin: EXACTLY one receipt, and the logged count == the count ACTUALLY SENT.
+    log.clear()
+    me, sent = _mk(audio=[0.5] * 101)
+    fn(me, x, vemb)
+    if len(_receipts()) != 1 or not _receipts()[0].endswith("101 rows"):
+        print(f"  [FAIL] _begin receipts (want one '... 101 rows'): {_receipts()}"); bad += 1
+    if len(sent.get("audio_frame_t_scale") or []) != 101:
+        print(f"  [FAIL] _begin did not SEND the 101-row audio scale: keys={sorted(sent)}"); bad += 1
+    # (2) TWO begins on the SAME mock self => TWO lines. Driving ONE self is load-bearing: production REUSES
+    #     one model instance across both stages (qf_ltx_modelpatcher.py:120 "comfy CACHES+REUSES this model
+    #     instance"), so a per-INSTANCE/class "already logged" dedup WOULD suppress the stage-2 receipt — and
+    #     with one self this arm goes RED on it. (A module-global flag is caught too: `_bind` execs the method
+    #     into a fresh namespace.) Two fresh selves would leave the instance half silently green.
+    log.clear()
+    me2, _ = _mk(audio=[0.5] * 101)
+    fn(me2, x, vemb)
+    fn(me2, x, vemb)
+    if len(_receipts()) != 2:
+        print(f"  [FAIL] two begins logged {len(_receipts())} receipt(s), want 2: {_receipts()}"); bad += 1
+    # (3) no pending audio-mask key (no-mask / video-only / all-1.0) => silent AND no audio_frame_t_scale sent.
+    log.clear()
+    me, sent = _mk(audio=None, video=[0.5] * 13)
+    fn(me, x, vemb)
+    if _receipts():
+        print(f"  [FAIL] a no-audio-mask begin logged a receipt: {_receipts()}"); bad += 1
+    if "audio_frame_t_scale" in sent:
+        print("  [FAIL] a no-audio-mask begin still SENT audio_frame_t_scale"); bad += 1
+    # (4) a REFUSED begin raises BEFORE the receipt (the line sits after the raise) => no line.
+    log.clear()
+    me, _ = _mk(audio=[0.5] * 101, accept=False)
+    try:
+        fn(me, x, vemb)
+        print("  [FAIL] a refused begin did NOT raise"); bad += 1
+    except RuntimeError:
+        pass
+    if _receipts():
+        print(f"  [FAIL] a refused begin logged a receipt: {_receipts()}"); bad += 1
+    print(f"  begin_audio_receipt: {'OK' if bad == 0 else 'FAIL'} (one line per begin; log == payload; silent "
+          "without the key; silent on a refused begin)")
+    return bad
+
+
 def main():
     src = _src_text()
     print(f"=== QFLTXModel safety-layer behavioral test (src={os.path.relpath(_SRC, _HERE)}) ===")
     bad = 0
     for t in (_t_extra_conds, _t_call_fps, _t_max_ctx_seq, _t_scale_latent_inpaint,
-              _t_derive_geometry, _t_shared_interrupt_helper):
+              _t_derive_geometry, _t_shared_interrupt_helper, _t_begin_audio_receipt):
         try:
             bad += t(src)
         except Exception as e:   # noqa: BLE001 — a harness error is a FAIL, not a crash-through
