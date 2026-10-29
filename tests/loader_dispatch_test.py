@@ -522,8 +522,32 @@ def main():
             for _k, _v in _c.INPUT_TYPES().get(_sec, {}).items():
                 if len(_v) > 1 and isinstance(_v[1], dict) and _v[1].get("tooltip"):
                     _texts.append((f"{_n}.{_k}", _v[1]["tooltip"]))
-    _hits = [(w, x) for w, t in _texts for x in _bt.desc_hits(t) + _bt.term_hits(t) + _bt.mode_id_hits(t)]
-    check("the four loaders' user-visible text carries no technique word (DESCRIPTIONs + every tooltip)",
+    # the SM86 default branch ships its own tooltip that the --cpu import above never renders (the
+    # probe returns None there, so only the auto branch is collected). A banned word shipped in
+    # exactly this blind spot once (cluster plugin-sm86-safe-default round 1); the death rule must
+    # see the text SM86 users actually get.
+    import torch as _torch86
+    _dev0, _cap0 = qfn.qfmp.comfy.model_management.get_torch_device, _torch86.cuda.get_device_capability
+    _plat0 = sys.platform
+    try:
+        qfn.qfmp.comfy.model_management.get_torch_device = lambda: _torch86.device("cuda", 0)
+        _torch86.cuda.get_device_capability = lambda _d=None: (8, 6)
+        sys.platform = "win32"   # the SM86 branch renders only under Windows — collect it where it lives
+        qfn._SM86_ATTENTION_DEFAULT_NOTED = True   # the scan must not depend on the notice flag
+        for _n in _FOUR:
+            for _k, _v in qfn.NODE_CLASS_MAPPINGS[_n].INPUT_TYPES().get("optional", {}).items():
+                if _k == "attention_backend" and len(_v) > 1 and isinstance(_v[1], dict) and _v[1].get("tooltip"):
+                    _texts.append((f"{_n}.{_k}[SM86]", _v[1]["tooltip"]))
+    finally:
+        qfn.qfmp.comfy.model_management.get_torch_device, _torch86.cuda.get_device_capability = _dev0, _cap0
+        sys.platform = _plat0
+    # [SM86] exception (user 2026-10-29): the SM86 attention tooltip NAMES the crashing backend
+    # (sage) on user order — the one sanctioned technique word in user-visible text; any OTHER
+    # word on any text still fails.
+    _hits = [(w, x) for w, t in _texts for x in _bt.desc_hits(t) + _bt.term_hits(t) + _bt.mode_id_hits(t)
+             if not (w.endswith("attention_backend[SM86]") and x == "sage")]
+    check("the four loaders' user-visible text carries no technique word (DESCRIPTIONs + every tooltip; "
+          "the [SM86] tooltip's sanctioned 'sage' exempt by user order 2026-10-29)",
           not _hits and len(_texts) > 20, f"-> {len(_texts)} texts, hits {_hits[:4]}")
     _qe_tips = {w: t for w, t in _texts if w.endswith(".quality_enhance")}
     check("every loader's quality_enhance tooltip states the measured trade (OFF keeps the subject and scene, details can "
@@ -575,20 +599,30 @@ def main():
     check("attention_backend choices expose the add-on attention but no other removed/banned backend",
           not any(_bt.h(c) in _bt.WORDS for c in _backend_labels if c != "qfa"),
           f"-> sm80+={qfn._ATTN_BACKEND_SM80PLUS} sm75={qfn._ATTN_BACKEND_SM75}")
-    # attention_backend defaults (user 2026-09-29): auto on every loader and every GPU (the engine resolves auto per GPU).
-    # The add-on attention is user-selectable on the SMs its library ships for (SM75/86/89/120, the engine's AUTO table),
-    # and not offered on SM80/90/100/103. Only the offered list and the default move: a saved value stays as saved.
+    # attention_backend defaults (user 2026-09-29): auto on every loader and every GPU (the engine resolves auto per
+    # GPU) EXCEPT SM86 (user 2026-10-29, cluster plugin-sm86-safe-default): the engine resolves auto to a backend whose
+    # first forward crashes on SM86 under Windows — the only platform where the crash was measured — so the widget default
+    # there is fp16_native. Only the UNSET default moves; a saved or explicitly chosen value stays as saved. The
+    # add-on attention is user-selectable on the SMs its library ships for (SM75/86/89/120, the engine's AUTO table),
+    # and not offered on SM80/90/100/103.
     import inspect as _insp
     import torch as _torch
     _dev0, _cap0 = qfn.qfmp.comfy.model_management.get_torch_device, _torch.cuda.get_device_capability
-    _attn = {}
+    _plat0 = sys.platform
+    _attn, _attn_linux = {}, {}
     try:
         qfn.qfmp.comfy.model_management.get_torch_device = lambda: _torch.device("cuda", 0)
+        sys.platform = "win32"   # the Windows grid: SM86 is the one default that moves
         for _sm in ((7, 5), (8, 0), (8, 6), (8, 9), (9, 0), (10, 0), (10, 3), (12, 0)):
             _torch.cuda.get_device_capability = lambda _d=None, _sm=_sm: _sm
             _attn[_sm] = {n: qfn.NODE_CLASS_MAPPINGS[n].INPUT_TYPES()["optional"]["attention_backend"] for n in _FOUR}
+        sys.platform = "linux"   # the Linux grid: sage kept — every SM defaults to auto
+        for _sm in ((7, 5), (8, 0), (8, 6), (8, 9), (9, 0), (10, 0), (10, 3), (12, 0)):
+            _torch.cuda.get_device_capability = lambda _d=None, _sm=_sm: _sm
+            _attn_linux[_sm] = {n: qfn.NODE_CLASS_MAPPINGS[n].INPUT_TYPES()["optional"]["attention_backend"] for n in _FOUR}
     finally:
         qfn.qfmp.comfy.model_management.get_torch_device, _torch.cuda.get_device_capability = _dev0, _cap0
+        sys.platform = _plat0
     _expected_attn = {
         (7, 5): ["auto", "qfa", "fp16_native"],
         (8, 0): ["auto", "flash", "sage", "fp16_native"],
@@ -599,11 +633,16 @@ def main():
         (10, 3): ["auto", "flash", "sage", "fp16_native"],
         (12, 0): ["auto", "qfa", "flash", "sage", "fp16_native"],
     }
-    check("attention_backend: every loader offers the add-on attention exactly on SM75/86/89/120 and defaults to auto",
-          all(c[0] == _expected_attn[sm] and c[1]["default"] == "auto"
+    check("attention_backend (Windows): every loader offers the add-on attention exactly on SM75/86/89/120; the "
+          "default is auto everywhere except SM86, where it is fp16_native",
+          all(c[0] == _expected_attn[sm] and c[1]["default"] == ("fp16_native" if sm == (8, 6) else "auto")
               for sm, per in _attn.items() for c in per.values()), f"-> {_attn}")
+    check("attention_backend (Linux): the default stays auto on every SM — sage is kept where it works",
+          all(c[1]["default"] == "auto" for per in _attn_linux.values() for c in per.values()),
+          f"-> {sorted(_attn_linux)}")
     _sig = {n: _insp.signature(qfn.NODE_CLASS_MAPPINGS[n].load).parameters["attention_backend"].default for n in _FOUR}
-    check("attention_backend: every loader's load() defaults to auto (an API prompt without the input runs auto)",
+    check("attention_backend: every loader's load() defaults to auto — the UNSET marker; a stored/omitted "
+          "auto re-decides at the resolve face (Windows+SM86 → native)",
           set(_sig.values()) == {"auto"}, f"-> {_sig}")
     # tests-32 2026-09-29: only MiniMax-H3 turns auto into flash on an engine without the H3-safe auto. The one other reader
     # of that export is qf_modelpatcher.engine_routes_attention, which the loaders' add-on attention check calls; the two
@@ -708,7 +747,9 @@ def main():
             _device_patcher = _build_device_case()
             _ = _device_patcher.model._qf.lib
             check(f"device=2 {_label}: one captured device drives logical + native identity",
-                  _device_calls[0] == _calls_before + 1
+                  _device_calls[0] == _calls_before + 2   # +1 the loader's own query, +1 the sanctioned
+                                                          # attention resolve probe (cc∧platform key)
+
                   and _device_patcher.load_device == _device2
                   and _device_patcher.model._qf._ckey[1] == 2
                   and create_devices[_creates_before:] == [2],

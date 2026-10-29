@@ -939,7 +939,13 @@ if _IMPORT_OK:
     # sage backend and NO flash_attn build, so it offers auto, the add-on and fp16_native. The widget VALUE is a
     # display name; _attn_backend_to_engine maps it to the engine's comp_opts string
     # ("fp16_native" -> "native"). "auto" = the engine's per-GPU resolution, the default on every loader and GPU
-    # (user 2026-09-29), and is passed through so the user's choice is always the single source of truth.
+    # (user 2026-09-29) EXCEPT SM86 under Windows (user 2026-10-29, cluster plugin-sm86-safe-default): the engine
+    # resolves auto to sage there and sage's first forward crashes on SM86 under Windows — the only platform where the crash was
+    # measured (Linux SM86 measured sage clean, so Linux keeps auto and is NOT downgraded: fp16_native
+    # would also bypass the engine's per-model auto routing, incl. H3's #659 avoidance). The key is cc ∧ platform,
+    # and it applies at BOTH faces: the widget default AND the resolved value of a saved/omitted "auto" at load time
+    # (auto is not an explicit choice — a saved "auto" re-decides at _attn_backend_to_engine; only an explicitly
+    # chosen backend is preserved). On Windows an unprobeable capability is fail-closed to fp16_native.
     # [a backend REMOVED as a user-facing choice — user 2026-09-13] one engine-internal backend is
     # no longer offered in the dropdown. "auto" is unaffected (the engine may still pick it
     # internally per-SM); only the explicit user choice is gone.
@@ -948,30 +954,109 @@ if _IMPORT_OK:
     _ATTN_BACKEND_SM75 = ["auto", "qfa", "fp16_native"]
     _ATTN_ADDON_SMS = {75, 86, 89, 120}
 
-    def _attn_backend_choices():
-        choices = _ATTN_BACKEND_SM80PLUS
-        try:
-            import torch
-            dev = qfmp.comfy.model_management.get_torch_device()   # the GPU ComfyUI computes on, not GPU 0
-            if getattr(dev, "type", None) == "cuda":
-                maj, _min = torch.cuda.get_device_capability(dev)
-                sm = maj * 10 + _min
-                if sm == 75:  # SM75 Turing: the add-on ships here, sage/flash do not
-                    choices = _ATTN_BACKEND_SM75
-                elif sm in _ATTN_ADDON_SMS:
-                    choices = _ATTN_BACKEND_ADDON
-        except Exception:  # noqa: BLE001 - no torch/CUDA at import -> assume modern; engine validates
-            pass
-        return choices
+    def _attn_backend_choices(cc):
+        if cc is None:
+            return _ATTN_BACKEND_SM80PLUS
+        sm = cc[0] * 10 + cc[1]
+        if sm == 75:  # SM75 Turing: the add-on ships here, sage/flash do not
+            return _ATTN_BACKEND_SM75
+        if sm in _ATTN_ADDON_SMS:
+            return _ATTN_BACKEND_ADDON
+        return _ATTN_BACKEND_SM80PLUS
 
     def _attn_backend_input():
-        return (_attn_backend_choices(), {"default": "auto",
-                "tooltip": "auto (default) picks the best setting for your GPU. Try another setting only if a result "
-                           "looks wrong or a run fails on your GPU. Takes effect on the next run."})
+        global _SM86_ATTENTION_DEFAULT_NOTED
+        cc = _attn_device_cc()
+        default, why = _attn_backend_default(cc, sys.platform)
+        if default == "auto":
+            return (_attn_backend_choices(cc), {"default": "auto",
+                    "tooltip": "auto (default) picks the best setting for your GPU. Try another setting only if a result "
+                               "looks wrong or a run fails on your GPU. Takes effect on the next run."})
+        if cc is None:
+            # fail-closed on an UNPROBEABLE GPU: no crash was measured for a GPU we could not
+            # identify, so the text states the probe fact, never a crash claim.
+            if not _SM86_ATTENTION_DEFAULT_NOTED:
+                _SM86_ATTENTION_DEFAULT_NOTED = True
+                _log.info("[qf_native] attention default: %s (%s; select a backend explicitly to override)",
+                          default, why)
+            tip = f"{default} is the default on this GPU: the attention capability could not be probed, " \
+                  "so the safe default is kept. Try another setting only if a result looks wrong."
+        else:
+            sm_label = f"SM {cc[0]}.{cc[1]}"
+            if not _SM86_ATTENTION_DEFAULT_NOTED:
+                _SM86_ATTENTION_DEFAULT_NOTED = True
+                _log.info("[qf_native] %s detected: default attention = %s (%s; select a backend explicitly to "
+                          "override)", sm_label, default, why)
+            tip = f"{default} is the default on this GPU (SM {cc[0]}.{cc[1]}): sage crashes on Windows, " \
+                  "and the default avoids it. Other backends (sage included) are your call. Takes effect " \
+                  "on the next run."
+        return (_attn_backend_choices(cc), {"default": default, "tooltip": tip})
+
+    _ATTN_AUTO_REDECIDE_NOTED = False   # the load-face re-decision notice: once per process
 
     def _attn_backend_to_engine(v):
-        # widget display name -> engine comp_opts attention_backend string
-        return "native" if v == "fp16_native" else (v or "auto")
+        global _ATTN_AUTO_REDECIDE_NOTED
+        # widget display name -> engine comp_opts attention_backend string. SEMANTICS (locked,
+        # orchestrator 2026-10-29): "auto" is a DELEGATION, not a choice — it means "the engine
+        # decides per model". Under the cc∧platform key that decision is fp16_native on
+        # Windows+SM86 (the engine's own auto answer there is the crashing sage), so re-deciding
+        # "auto" — whether it comes from the default, a saved workflow, or the user's own hand —
+        # is EXECUTING the delegation, not overriding it. Only a concrete backend name
+        # (sage/flash/fp16_native) is a choice and is preserved untouched on every platform.
+        # Do not "fix" this back: preserving a hand-picked auto would preserve a crash.
+        if (v or "auto") != "auto":
+            if v == "sage":
+                # an EXPLICIT sage is preserved (never silently replaced — that is the Q3 line),
+                # but the situation must be announced BEFORE it happens, at the production log
+                # level. The reason must match THIS face (an explicit sage is preserved, so the
+                # default-selection clause "keeping the safe default" would be false here):
+                # measured SM86 says the crash; an unprobeable capability says the probe fact.
+                # Refuse-and-fallback stays a named residual pending support evidence.
+                _cc = _attn_device_cc()
+                default, _why = _attn_backend_default(_cc, sys.platform)
+                if default == "fp16_native":
+                    reason = _why if _cc is not None else \
+                        "the attention capability could not be probed on this machine"
+                    _log.warning("[qf_native] attention backend 'sage' was chosen explicitly: %s; pick a "
+                                 "different backend to avoid it", reason)
+            return "native" if v == "fp16_native" else v
+        default, why = _attn_backend_default(_attn_device_cc(), sys.platform)
+        if default != "auto" and not _ATTN_AUTO_REDECIDE_NOTED:
+            # the re-decision must be visible when it happens at load (a saved or hand-picked
+            # auto), not only at widget definition — orchestrator addendum.
+            _ATTN_AUTO_REDECIDE_NOTED = True
+            _log.info("[qf_native] attention backend 'auto' re-decided to %s (%s; select a backend "
+                      "explicitly to override)", default, why)
+        return "native" if default == "fp16_native" else default
+
+    _SM86_ATTENTION_DEFAULT_NOTED = False   # the SM86 default notice: once per process, not per widget build
+
+    def _attn_backend_default(cc, platform):
+        # cc ∧ platform -> (widget default, why it differs from auto), a data row not a branch: the
+        # next "SM X backend Y crashes" default is one more entry. The key is BOTH halves because the
+        # crash is measured only on SM86 under Windows — Linux SM86 measured sage clean, so it keeps
+        # auto (sage) and is not downgraded without evidence. On Windows an UNPROBEABLE capability is
+        # fail-closed to the safe default: the one platform where the crash is measured must not
+        # silently re-open it because a probe failed. Only an UNSET node takes this; and "auto" is
+        # re-decided at resolve time (_attn_backend_to_engine) — a saved workflow's auto is not an
+        # explicit choice.
+        if platform != "win32":
+            return ("auto", "")
+        if cc is None:
+            return ("fp16_native", "attention capability unavailable; keeping the safe default")
+        return {(8, 6): ("fp16_native", "sage crashes on Windows")}.get(cc, ("auto", ""))
+
+    def _attn_device_cc():
+        # the GPU ComfyUI computes on, not GPU 0 — the same device query this dropdown has always
+        # used. No torch at import, no capability call on a non-CUDA device, None on any failure.
+        try:
+            import torch
+            dev = qfmp.comfy.model_management.get_torch_device()
+            if getattr(dev, "type", None) == "cuda":
+                return torch.cuda.get_device_capability(dev)
+        except Exception:  # noqa: BLE001 - no torch/CUDA at import -> assume modern; engine validates
+            pass
+        return None
 
     # _LOADER_LAYOUT (user 2026-09-28 「要输入的都在上方 开关的统一在下方 所有控件都这样」): on every loader the value inputs come
     # first and the BOOLEAN switches last (the API key row, drawn by web/quantfunc_api_key.js, joins the value inputs).
