@@ -1076,14 +1076,15 @@ if _IMPORT_OK:
                 "model_config": _model_config_input("ltx2"),   # hidden; widget index 1 (see _model_config_input)
                 "attention_backend": _attn_backend_input(),
                 "sol_tau": _SOL_TAU_INPUT,
-                "sol_start_percent": _SOL_START_INPUT,
+                # Sol on from step 0 by default on this family (user 2026-11-13); Krea-2/Qwen stay opt-in.
+                "sol_start_percent": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "sol_end_percent": _SOL_END_INPUT,
                 "sol_min_tokens": _SOL_MIN_INPUT,
                 "sol_sink_conditioning": _SOL_SINK_INPUT,
                 "sol_version": _SOL_VERSION_INPUT,
                 "step_cache": _STEP_CACHE_INPUT,
                 "block_cache": _BLOCK_CACHE_INPUT,
-                "sol_enabled": _SOL_ENABLED_INPUT,
+                "sol_enabled": ("BOOLEAN", {"default": True}),
                 "sol_window_enabled": _SOL_WINDOW_INPUT,
                 "quality_enhance": _QUALITY_ENHANCE_INPUT,   # the switches last (_LOADER_LAYOUT)
                 "pinned_memory": _PINNED_MEMORY_INPUT_LTX,
@@ -1235,14 +1236,15 @@ if _IMPORT_OK:
                 # auto never picks, for this model, the backend measured broken at large sizes (#659).
                 "attention_backend": _attn_backend_input(),
                 "sol_tau": _SOL_TAU_INPUT,
-                "sol_start_percent": _SOL_START_INPUT,
+                # Sol on from step 0 by default on this family (user 2026-11-13); Krea-2/Qwen stay opt-in.
+                "sol_start_percent": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "sol_end_percent": _SOL_END_INPUT,
                 "sol_min_tokens": _SOL_MIN_INPUT,
                 "sol_sink_conditioning": _SOL_SINK_INPUT,
                 "sol_version": _SOL_VERSION_INPUT,
                 "step_cache": _STEP_CACHE_INPUT,
                 "block_cache": _BLOCK_CACHE_INPUT,
-                "sol_enabled": _SOL_ENABLED_INPUT,
+                "sol_enabled": ("BOOLEAN", {"default": True}),
                 "sol_window_enabled": _SOL_WINDOW_INPUT,
                 "quality_enhance": _QUALITY_ENHANCE_INPUT,   # the switches last (_LOADER_LAYOUT)
                 "audio_enhance": _AUDIO_ENHANCE_INPUT,
