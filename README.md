@@ -63,7 +63,7 @@ Reference images included with the example workflows.
 
 ### Engine 0.0.17 · Plugin 0.0.07
 
-- **Built-in attention backends:** architecture-matched attention backends (`auto`, `int8`, `int4`, `fp16`) for Linux and Windows.
+- **Built-in attention backends:** architecture-matched attention backends (`auto`, `int8`, `i4xi8`, `int4`, `fp16`) for Linux and Windows.
 - **SM75 performance:** faster inference on Turing GPUs.
 - **VRAM management:** more efficient memory use and model movement for faster inference.
 - **MiniMax-H3 workflows:** updated single- and double-sampling examples for better image quality and speed.

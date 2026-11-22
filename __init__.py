@@ -589,10 +589,12 @@ if _IMPORT_OK:
         "explains the fix.")
 
     # Unified PC Engine attention backends across all 4 consumer SMs (SM75/86/89/120).
-    _ATTN_BACKENDS = ["auto", "int8", "int4", "fp16"]
+    _ATTN_BACKENDS = ["auto", "int8", "i4xi8", "int4", "fp16"]
     _ATTN_BACKEND_ALIASES = {
         "auto": "auto",
         "int8": "int8",
+        "i4xi8": "i4xi8",
+        "int4_pv8": "i4xi8",
         "int4": "int4",
         "fp16": "fp16",
         "qfa": "int8",
@@ -611,8 +613,8 @@ if _IMPORT_OK:
     def _attn_backend_input():
         return (_attn_backend_choices(), {"default": "auto",
                 "tooltip": "auto (recommended) selects the best built-in attention mode for your GPU. "
-                           "Other options trade accuracy for speed; older workflow values map automatically. "
-                           "Takes effect on the next run."})
+                           "Modes trade accuracy for speed (fp16 is reference; i4xi8 balances speed and quality); "
+                           "older workflow values map automatically. Takes effect on the next run."})
 
     def _attn_backend_to_engine(v):
         if v is None or v == "":

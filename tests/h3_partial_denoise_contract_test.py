@@ -98,7 +98,15 @@ def _load_qf_engine():
     return module
 
 
+def _load_qf_sol():
+    spec = importlib.util.spec_from_file_location("qf_sol_h3_partial_contract", PLUGIN_ROOT / "qf_sol.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 qfe = _load_qf_engine()
+qf_sol = _load_qf_sol()
 
 
 def _load_real_plugin(test_case):
@@ -124,21 +132,16 @@ def _load_real_plugin(test_case):
 
 
 class _HarnessBase:
-    def residency_opts(self):
-        return {"attention_backend": "auto", "cat_keep_ratio": 0.80}
-
     def process_latent_out(self, latent):
         self._base_process_calls += 1
         return latent
 
 
-_mixin_namespace = {"ctypes": ctypes, "qfe": qfe, "os": os}
-_HarnessBase._sigma_step_index = _standalone_method(
-    MIXIN_SOURCE, "QFSessionModelMixin", "_sigma_step_index", _mixin_namespace)
-_HarnessBase._call_denoise_step_av = _standalone_method(
-    MIXIN_SOURCE, "QFSessionModelMixin", "_call_denoise_step_av", _mixin_namespace)
-_HarnessBase._stage_schedule = _standalone_method(
-    MIXIN_SOURCE, "QFSessionModelMixin", "_stage_schedule", _mixin_namespace)
+_mixin_namespace = {"ctypes": ctypes, "qfe": qfe, "qf_sol": qf_sol, "os": os, "_CAT_KEEP_DEFAULT": 0.80}
+for _mname in ("set_attn_backend", "set_video_enhance", "_effective_cat_ratio", "dial_opts", "residency_opts",
+               "_sigma_step_index", "_call_denoise_step_av", "_stage_schedule"):
+    setattr(_HarnessBase, _mname, _standalone_method(
+        MIXIN_SOURCE, "QFSessionModelMixin", _mname, _mixin_namespace))
 
 
 class _ContextKeys:
@@ -331,6 +334,7 @@ def _new_model(audio_enhance=False):
     _h3_namespace["_log"].warnings.clear()
     _h3_namespace["_log"].infos.clear()
     _h3_namespace["_AUDIO_ENHANCE_DEPRECATION_WARNED"] = False
+    model.set_video_enhance(False)
     model.set_audio_enhance(audio_enhance)
     return model, lib
 
@@ -466,10 +470,10 @@ class H3TwoStageContract(unittest.TestCase):
         self.assertEqual((begin["width"], begin["height"]), (6 * 7, 4 * 7))
 
     def test_p11_attention_backend_passes_through_without_legacy_auto_rewrite(self):
-        for chosen in ("auto", "int8", "int4", "fp16"):
+        for chosen in ("auto", "int8", "i4xi8", "int4", "fp16"):
             with self.subTest(chosen=chosen):
                 model, lib = _new_model()
-                model.residency_opts = lambda c=chosen: {"attention_backend": c, "cat_keep_ratio": 0.80}
+                model.set_attn_backend(chosen)
                 _run_stage(model, FULL)
                 self.assertEqual([b["options"]["attention_backend"] for b in _events(lib, "begin")], [chosen])
 

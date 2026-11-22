@@ -2,9 +2,10 @@
 """PC Engine attention backend contract across all 4 consumer SMs (SM75/86/89/120).
 
 QuantFunc PC Engine replaces crashing external backends with unified built-in attention
-choices ["auto", "int8", "int4", "fp16"] (default "auto" on every consumer SM and OS,
+choices ["auto", "int8", "i4xi8", "int4", "fp16"] (default "auto" on every consumer SM and OS,
 including SM86 Windows) plus compatibility aliases for saved workflows:
   legacy int8 aliases -> "int8"
+  "int4_pv8" / "i4xi8" -> "i4xi8"
   "fp16_native" / "native" / "flash" -> "fp16"
   "auto" / None / "" -> "auto"
 Unknown backend names are refused loudly (ValueError).
@@ -87,31 +88,33 @@ def main():
 
     src = _source()
     ns = _policy_namespace(src)
-    check("canonical choices are ['auto', 'int8', 'int4', 'fp16']",
-          ns["_ATTN_BACKENDS"] == ["auto", "int8", "int4", "fp16"])
+    want_choices = ["auto", "int8", "i4xi8", "int4", "fp16"]
+    check(f"canonical choices are {want_choices}",
+          ns["_ATTN_BACKENDS"] == want_choices)
 
     for cc in ((7, 5), (8, 6), (8, 9), (12, 0), None):
         for plat in ("win32", "linux"):
             check(f"default auto on cc={cc} plat={plat}", ns["_attn_backend_default"](cc, plat)[0] == "auto")
-            check(f"choices unified on cc={cc}", ns["_attn_backend_choices"](cc) == ["auto", "int8", "int4", "fp16"])
+            check(f"choices unified on cc={cc}", ns["_attn_backend_choices"](cc) == want_choices)
 
     to_engine = ns["_attn_backend_to_engine"]
     expected = {
         None: "auto", "": "auto", "auto": "auto",
-        "int8": "int8", "int4": "int4", "fp16": "fp16",
+        "int8": "int8", "i4xi8": "i4xi8", "int4_pv8": "i4xi8", "int4": "int4", "fp16": "fp16",
+        "I4XI8": "i4xi8", "INT4_PV8": "i4xi8", "  i4xi8  ": "i4xi8", "  INT4_PV8\t": "i4xi8",
         "qfa": "int8", "sage": "int8",
         "fp16_native": "fp16", "native": "fp16", "flash": "fp16",
     }
     for raw, want in expected.items():
         check(f"alias {raw!r} -> {want!r}", to_engine(raw) == want and ns["_validate_attn_backend"](raw) is True)
 
-    for bad in ("xformers", "triton", "sdpa"):
+    for bad in ("xformers", "triton", "sdpa", "bogus", "   ", 123, False):
         try:
             to_engine(bad)
             ok = False
         except ValueError:
             ok = True
-        check(f"unknown backend {bad!r} refused loudly", ok and isinstance(ns["_validate_attn_backend"](bad), str))
+        check(f"invalid backend {bad!r} refused loudly", ok and isinstance(ns["_validate_attn_backend"](bad), str))
 
     # Tooltip carries no banned terms
     import _banned_terms as bt
@@ -137,12 +140,18 @@ def main():
         for name in loaders:
             cls = plugin.NODE_CLASS_MAPPINGS[name]
             choices, opts = cls.INPUT_TYPES()["optional"]["attention_backend"]
-            check(f"{name} offers ['auto','int8','int4','fp16'] default='auto'",
-                  choices == ["auto", "int8", "int4", "fp16"] and opts["default"] == "auto")
-            check(f"{name}.VALIDATE_INPUTS accepts legacy aliases",
-                  cls.VALIDATE_INPUTS("qfa") is True and cls.VALIDATE_INPUTS("sage") is True
+            check(f"{name} offers {want_choices} default='auto'",
+                  choices == want_choices and opts["default"] == "auto")
+            check(f"{name}.VALIDATE_INPUTS accepts i4xi8/int4_pv8 (cased/padded) + legacy aliases and refuses invalid",
+                  cls.VALIDATE_INPUTS("i4xi8") is True and cls.VALIDATE_INPUTS("int4_pv8") is True
+                  and cls.VALIDATE_INPUTS("I4XI8") is True and cls.VALIDATE_INPUTS("INT4_PV8") is True
+                  and cls.VALIDATE_INPUTS("  i4xi8  ") is True and cls.VALIDATE_INPUTS("  INT4_PV8\t") is True
+                  and cls.VALIDATE_INPUTS("qfa") is True and cls.VALIDATE_INPUTS("sage") is True
                   and cls.VALIDATE_INPUTS("flash") is True and cls.VALIDATE_INPUTS("fp16_native") is True
-                  and isinstance(cls.VALIDATE_INPUTS("bogus"), str))
+                  and isinstance(cls.VALIDATE_INPUTS("bogus"), str)
+                  and isinstance(cls.VALIDATE_INPUTS("   "), str)
+                  and isinstance(cls.VALIDATE_INPUTS(123), str)
+                  and isinstance(cls.VALIDATE_INPUTS(False), str))
 
     print(f"SM86_ATTENTION_DEFAULT: {'PASS' if not failures else 'FAIL'} ({passed[0]} pass, {len(failures)} fail)")
     return 1 if failures else 0

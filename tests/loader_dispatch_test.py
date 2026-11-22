@@ -258,22 +258,36 @@ def main():
              if any(t != "BOOLEAN" for _, t in o[next((i for i, (_, t) in enumerate(o) if t == "BOOLEAN"), len(o)):])}
     check("every loader: all BOOLEAN switches come after all value inputs", not _late, f"-> {_late}")
 
-    # attention_backend: ["auto", "int8", "int4", "fp16"], default "auto", aliases mapped, VALIDATE_INPUTS works
-    check("attention_backend dropdown is ['auto', 'int8', 'int4', 'fp16'] with default 'auto' on all loaders",
-          all(it["optional"]["attention_backend"][0] == ["auto", "int8", "int4", "fp16"]
+    # attention_backend: ["auto", "int8", "i4xi8", "int4", "fp16"], default "auto", aliases mapped, VALIDATE_INPUTS works
+    _want_attn = ["auto", "int8", "i4xi8", "int4", "fp16"]
+    check(f"attention_backend dropdown is {_want_attn} with default 'auto' on all loaders",
+          all(it["optional"]["attention_backend"][0] == _want_attn
               and it["optional"]["attention_backend"][1]["default"] == "auto" for it in _sw.values()))
-    check("attention_backend aliases map cleanly to PC Engine names",
+    check("attention_backend aliases map cleanly to PC Engine names (incl. cased/padded)",
           qfn._attn_backend_to_engine("qfa") == "int8"
           and qfn._attn_backend_to_engine("sage") == "int8"
+          and qfn._attn_backend_to_engine("i4xi8") == "i4xi8"
+          and qfn._attn_backend_to_engine("int4_pv8") == "i4xi8"
+          and qfn._attn_backend_to_engine("I4XI8") == "i4xi8"
+          and qfn._attn_backend_to_engine("INT4_PV8") == "i4xi8"
+          and qfn._attn_backend_to_engine("  i4xi8  ") == "i4xi8"
+          and qfn._attn_backend_to_engine("  INT4_PV8\t") == "i4xi8"
           and qfn._attn_backend_to_engine("fp16_native") == "fp16"
           and qfn._attn_backend_to_engine("native") == "fp16"
           and qfn._attn_backend_to_engine("flash") == "fp16"
           and qfn._attn_backend_to_engine("auto") == "auto"
           and qfn._attn_backend_to_engine("int4") == "int4")
-    check("VALIDATE_INPUTS accepts legacy aliases and refuses unknown backend",
-          all(qfn.NODE_CLASS_MAPPINGS[n].VALIDATE_INPUTS("qfa") is True
+    check("VALIDATE_INPUTS accepts i4xi8/int4_pv8 (cased/padded) + legacy aliases and refuses invalid values",
+          all(qfn.NODE_CLASS_MAPPINGS[n].VALIDATE_INPUTS("i4xi8") is True
+              and qfn.NODE_CLASS_MAPPINGS[n].VALIDATE_INPUTS("int4_pv8") is True
+              and qfn.NODE_CLASS_MAPPINGS[n].VALIDATE_INPUTS("I4XI8") is True
+              and qfn.NODE_CLASS_MAPPINGS[n].VALIDATE_INPUTS("  INT4_PV8\t") is True
+              and qfn.NODE_CLASS_MAPPINGS[n].VALIDATE_INPUTS("qfa") is True
               and qfn.NODE_CLASS_MAPPINGS[n].VALIDATE_INPUTS("sage") is True
-              and isinstance(qfn.NODE_CLASS_MAPPINGS[n].VALIDATE_INPUTS("bogus"), str) for n in _FOUR))
+              and isinstance(qfn.NODE_CLASS_MAPPINGS[n].VALIDATE_INPUTS("bogus"), str)
+              and isinstance(qfn.NODE_CLASS_MAPPINGS[n].VALIDATE_INPUTS("   "), str)
+              and isinstance(qfn.NODE_CLASS_MAPPINGS[n].VALIDATE_INPUTS(123), str)
+              and isinstance(qfn.NODE_CLASS_MAPPINGS[n].VALIDATE_INPUTS(False), str) for n in _FOUR))
 
     # User-visible text check (no banned terms in DESCRIPTION or tooltips)
     _texts = []
@@ -500,6 +514,37 @@ def main():
           and _h3l.model.dial_opts().get("attention_backend") == "int8"
           and _h3l.model.dial_opts().get("cat_keep_ratio") == 1.0
           and _h3l.model._audio_enhance is True)
+    _qi_sage = QiL.load("fx-qwen-image-2.1-quantfunc-int4.safetensors", "qwen-image-2.1-int4",
+                        attention_backend="sage")[0]
+    _all_i4xi8_ok = True
+    for _ldr, _xfm, _cfg in (
+        (QiL, "fx-qwen-image-2.1-quantfunc-int4.safetensors", "qwen-image-2.1-int4"),
+        (KreaL, "fx-krea2-turbo-quantfunc-int4.safetensors", "krea2-turbo-int4"),
+        (H3L, "fx-minimax-h3-quantfunc-int4.safetensors", "minimax-h3-fl2va"),
+        (LtxL, _allin_name, "ltx2-2.5-22b"),
+    ):
+        for _raw in ("i4xi8", "int4_pv8", "  INT4_PV8\t"):
+            _p = _ldr.load(_xfm, _cfg, attention_backend=_raw)[0]
+            if (_p.model.dial_opts().get("attention_backend") != "i4xi8"
+                    or _p.model.residency_opts().get("attention_backend") != "i4xi8"):
+                _all_i4xi8_ok = False
+    _h3_i4xi8 = H3L.load("fx-minimax-h3-quantfunc-int4.safetensors", "minimax-h3-fl2va",
+                         attention_backend="i4xi8")[0]
+    _h3_i4xi8_lora = LoraNode.apply(_h3_i4xi8, "a.safetensors", 0.5)[0]
+    check("all 4 loaders normalize i4xi8/int4_pv8 -> 'i4xi8' in dial_opts & residency_opts, preserved across LoRA",
+          _all_i4xi8_ok
+          and _h3_i4xi8_lora.model.dial_opts().get("attention_backend") == "i4xi8"
+          and _h3_i4xi8_lora.model.residency_opts().get("attention_backend") == "i4xi8"
+          and _qi_sage.model.dial_opts().get("attention_backend") == "int8")
+    _bad_load_refused = []
+    for _bad in ("bogus", "   ", 123, False):
+        try:
+            QiL.load("fx-qwen-image-2.1-quantfunc-int4.safetensors", "qwen-image-2.1-int4", attention_backend=_bad)
+            _bad_load_refused.append(False)
+        except ValueError:
+            _bad_load_refused.append(True)
+    check("load() refuses bogus/whitespace/non-string attention_backend with ValueError",
+          all(_bad_load_refused), f"-> {_bad_load_refused}")
 
     _dmods = {"qf_modelpatcher": qfmp, **{m: sys.modules[f"qfn_test_pkg.{m}"] for m in qfn._FAMILY_MODULES}}
     _dviol, _dseen = [], 0
