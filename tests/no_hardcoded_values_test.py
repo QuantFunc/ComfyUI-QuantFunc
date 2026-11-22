@@ -35,44 +35,49 @@ import sys
 
 PLUGIN = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-_ABI = "C API value, mirrored from include/quantfunc.h (the engine's ABI, not a model fact)"
+_ABI = "C API value, mirrored from include/qf_capi.h (the engine's ABI, not a model fact)"
 ALLOWED = {
+    ("__init__.py", "_MAX_LORA_HEADER_BYTES"): "upper bound on safetensors JSON header read (input validation)",
     ("qf_api_key.py", "_REF_HEX"): "length of the reference token this process issues (its own format)",
     ("qf_api_key.py", "_MAX_FIELD"): "upper bound on the POSTed field (input validation at a trust boundary)",
     **{("qf_engine.py", n): _ABI for n in (
-        "QUANTFUNC_OK", "QUANTFUNC_RESOURCE_ABI_VERSION", "QUANTFUNC_RESOURCE_CREATION_ABI_VERSION",
-        "QUANTFUNC_RESOURCE_RESIDENCY_ABI_VERSION", "QUANTFUNC_RESOURCE_DOMAIN_ABI_VERSION",
-        "QUANTFUNC_RESOURCE_CAPACITY_ABI_VERSION", "QUANTFUNC_RESOURCE_LIFECYCLE_ABI_VERSION",
-        "QUANTFUNC_ERROR_INVALID_ARG", "QUANTFUNC_ERROR_UNSUPPORTED", "QUANTFUNC_RESOURCE_READY",
-        "QUANTFUNC_RESOURCE_BUSY", "QUANTFUNC_RESOURCE_UNKNOWN", "QUANTFUNC_RESOURCE_CLOSED",
-        "QUANTFUNC_RESOURCE_CAPACITY_UNSUPPORTED", "QUANTFUNC_RESOURCE_CAP_QUERY", "QUANTFUNC_RESOURCE_CAP_RELEASE_ALL",
-        "QUANTFUNC_RESOURCE_PHASE_SHARED", "QUANTFUNC_RESOURCE_PHASE_PREPARED", "QUANTFUNC_RESOURCE_PHASE_ATTACHED",
-        "QUANTFUNC_RESOURCE_PHASE_CLOSED", "_LOG_INFO")},
+        "QF_OK", "QF_ERR_INVALID_ARG", "QF_ERR_BACKEND", "QF_ERR_OOM", "QF_ERR_IO",
+        "QF_ERR_INTERNAL", "QF_ERR_BUSY", "QF_ERR_AUTH", "QF_ERR_UNSUPPORTED",
+        "QF_DTYPE_FP32", "QF_DTYPE_FP16", "QF_DTYPE_BF16", "QF_DTYPE_INT8", "QF_DTYPE_INT32",
+        "QF_DTYPE_FP8_E4M3", "QF_DTYPE_INT4_PACKED", "QF_DTYPE_E2M1_PACKED",
+        "QF_ATTN_CAP_FP16", "QF_ATTN_CAP_INT8", "QF_ATTN_CAP_INT4",
+        "QF_MAX_STEP_REFS", "QF_UINT64_MAX", "_LOG_INFO")},
     **{("qf_engine.py", n): "ELF / dlinfo format constant (the library-file format, not a model fact)"
        for n in ("_SHT_DYNAMIC", "_DT_NULL", "_DT_NEEDED", "_RTLD_DI_LINKMAP")},
+    ("qf_engine.py", "_CONSUMER_SMS"): "QuantFunc PC Engine supported consumer GPU SM set (O6 product scope)",
     ("qf_engine.py", "_ENGINE_PLATFORMS"): "the published release layout (CUDA major -> engine library file name)",
     ("qf_engine.py", "_ENGINE_SETS_SCHEMA"): "schema version of the published engine sets.json",
     ("qf_engine.py", "_ENGINE_VERIFY_SCHEMA_MAX"): "newest verify.json schema this plugin reads",
     ("qf_engine.py", "_ENGINE_HTTP_TIMEOUT_S"): "network timeout of the engine download",
     ("qf_engine.py", "_ENGINE_DEVICE"): "placeholder only: start_engine_install sets it to ComfyUI's device",
-    ("qf_h3_modelpatcher.py", "_H3_DENOISED_SIGMA"): "float tolerance: a stage whose last sigma is above it stops early",
-    ("qf_h3_modelpatcher.py", "_H3_FULL_START"): "float tolerance on model_sampling.sigma_max for a full-range start",
-    ("qf_log_level.py", "LOG_LEVELS"): "the engine's log scale for quantfunc_set_log_level (C API), not a model fact",
+    ("qf_h3_modelpatcher.py", "_BUSY_BEGIN_RETRY_S"): "short retry sleep when a previous session is draining",
+    ("qf_log_level.py", "LOG_LEVELS"): "the engine's log scale for qf_set_log_level (C API), not a model fact",
     ("qf_modelpatcher.py", "_KNO_CTX_KEY"): "sentinel context key (no conditioning), not a model value",
-    ("qf_modelpatcher.py", "_NATIVE_BUSY_DEADLINE_S"): "retry policy for a transiently busy engine read",
-    ("qf_modelpatcher.py", "_NATIVE_BUSY_FIRST_BACKOFF_S"): "retry policy for a transiently busy engine read",
-    ("qf_modelpatcher.py", "_NATIVE_BUSY_MAX_BACKOFF_S"): "retry policy for a transiently busy engine read",
-    ("qf_modelpatcher.py", "_MS_PER_S"): "unit conversion (seconds to milliseconds) for message text",
+    ("qf_modelpatcher.py", "_CAT_KEEP_DEFAULT"): "QualityLaw PC Engine default session ratio (quality_enhance=False)",
+    ("qf_modelpatcher.py", "_OUTER_SAMPLE_LATENT_SHAPES_ARG"): "ComfyUI OUTER_SAMPLE positional argument index",
+    ("qf_modelpatcher.py", "_LORA_DRAIN_RETRY_S"): "short retry sleep when draining an open session before LoRA swap",
     ("qf_modelpatcher.py", "_step_cache"): "dial default = the loader input's own default (off)",
     ("qf_modelpatcher.py", "_block_cache"): "dial default = the loader input's own default (off)",
-    ("qf_modelpatcher.py", "_sparse"): "dial default: full attention (off)",
     ("qf_modelpatcher.py", "_QF_COMFY_SIDE_BASE_BYTES"): "estimate of ComfyUI's own sampler buffers (vram_ledger_test pins it)",
     ("qf_modelpatcher.py", "_QF_COMFY_SIDE_LATENT_COPIES"): "estimate of ComfyUI's own sampler buffers (vram_ledger_test pins it)",
     ("qf_modelpatcher.py", "_QF_COMFY_SIDE_COND_COPIES"): "estimate of ComfyUI's own sampler buffers (vram_ledger_test pins it)",
     ("qf_modelpatcher.py", "_QF_COMFY_SIDE_ITEMSIZE"): "estimate of ComfyUI's own sampler buffers (vram_ledger_test pins it)",
+    ("qf_qwenimage21_modelpatcher.py", "_CAT_KEEP_QI21"): "QualityLaw PC Engine QI-2.1 t2i single-cond ratio (edit/CFG>1/B>1 stay 1.0)",
     **{("qf_ltx_modelpatcher.py", n): "refusal only: the LTX-2 audio lane's input layout as comfy's LTXAVModel writes "
        "it; the engine checks the packed width but not the split, data shapes come from the latent"
        for n in ("_LTXAV_AUDIO_CH", "_LTXAV_AUDIO_MEL")},
+    ("qf_ltx_modelpatcher.py", "_VIDEO_LATENT_NDIM"): "5-D video latent tensor rank [B,C,F,H,W]",
+    ("qf_ltx_modelpatcher.py", "_AUDIO_LATENT_NDIM"): "4-D audio latent tensor rank [B,C,L,F]",
+    ("qf_ltx_modelpatcher.py", "_REF_AUDIO_MAX_NUMEL"): "upper bound on reference audio token buffer (input validation)",
+    ("qf_ltx_modelpatcher.py", "_ST_HEADER_MAX_BYTES"): "upper bound on safetensors JSON header read (input validation)",
+    ("qf_ltx_modelpatcher.py", "_BUSY_BEGIN_RETRY_S"): "short retry sleep when a previous session is draining",
+    **{("qf_sol.py", n): "UI/protocol default for Sol sparse-attention options (not a model fact)"
+       for n in ("start_percent", "end_percent", "min_tokens")},
 }
 
 

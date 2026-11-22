@@ -1,175 +1,113 @@
-"""qf_native.qf_ltx_modelpatcher — the LTX-2 seam: a comfy ModelPatcher whose `.model` is an
-LTXV-shim (disable_unet) that a STOCK KSampler drives, forwarding through the QuantFunc engine's
-LTX-2 external denoise SESSION (quantfunc_denoise_begin/step/finalize/end, the SAME generic ABI the
-wan seam uses — reused from qf_engine.py).
+"""qf_ltx_modelpatcher -- LTX-2.5 joint audio+video family seam for QuantFunc PC Engine.
 
-WHY this is DIFFERENT from the wan seam (design findings, dossier seq-229..234):
-- cfg_context_key: seq-229 established the LTX-2 lighting transformer engages NONE of the
-  key-trusting step caches — historically every step passed
-  cfg_context_key=0 (kNoCtxKey). SINCE the step-cache session gate (merge 516a6d78) the key IS
-  consumed (one EcEntry per cond branch; key=0 force-computes), so BOTH step loops (t2v + AV) now
-  derive uuid-symbolic keys via the shared _CtxKeyAssigner (wan #B3 pattern) — see [step-cache-key]
-  comments at the loops.
-- PACKED latent. The engine session denoises a packed token latent [1,N,128] (N=F_lat*H_lat*W_lat),
-  NOT comfy's 5D [1,128,F,H,W]. seq-230: the mapping is a plain REVERSIBLE reshape+transpose (row-major
-  (F,H,W)), the exact inverse of the engine's pack_video_tokens — nothing inferred.
-
-Landing HELD (build+verify only). Only THIS loader node is swapped into an otherwise-STOCK LTX-2.3 T2V
-workflow.
+Binds frozen 25-symbol qf_* C-API:
+  - session begin: frame_t_scales, audio_frame_t_scales, audio_dims, av_unprocessed_ctx, av_conds
+  - step: QFStepAvParams with audio_reference_active (0 or 1) via qf_xfm_step_av
+  - OUTER_SAMPLE: _qf_restore_frozen_audio preserves zero-mask frozen audio frames
 """
 import ctypes
-import time
 import json
 import math
 import os
+import struct
+import time
 
 import torch
-
-import comfy.model_base
 import comfy.conds
-import comfy.model_management
-import comfy.model_patcher
-import comfy.supported_models
+import comfy.model_base
 import comfy.nested_tensor
+import comfy.supported_models
 
 from . import qf_engine as qfe
-# Reuse the shared model-layer helpers. NOTE: the engine cache (_get_engine + the liveness
-# tracker) lives in __init__.py (which imports THIS file), so those are threaded into register()
-# via deps to avoid a circular import — same seam as every family module.
 from . import qf_modelpatcher as qfmp
-from .qf_modelpatcher import (_qf_dtype, _QFStub,
-                              _interrupt_poll_end_session_on_raise,
-                              QFSessionModelMixin)
+from .qf_modelpatcher import _qf_dtype, _QFStub, _interrupt_poll_end_session_on_raise, QFSessionModelMixin
+
+FAMILY = "ltx2"
+_LTXAV_AUDIO_CH = 8
+_LTXAV_AUDIO_MEL = 16
+_LTXAV_AUDIO_PACK = _LTXAV_AUDIO_CH * _LTXAV_AUDIO_MEL
+_VIDEO_LATENT_NDIM = 5
+_AUDIO_LATENT_NDIM = 4
+_REF_AUDIO_MAX_NUMEL = (1 << 31) - 1
+_ST_HEADER_MAX_BYTES = 1 << 31
+_BUSY_BEGIN_RETRY_S = 2.0
+_CONN_VID_PREFIX = "model.diffusion_model.video_embeddings_connector."
+_CONN_AUD_PREFIX = "model.diffusion_model.audio_embeddings_connector."
 
 
-# The VAE scale factors are the model's comfy latent_format (latent_formats.LTXV / LTXAV), read per run.
-# The frame rate is NOT a constant here: it is the conditioning's, resolved by comfy's own model code
-# (_native_frame_rate); a hardcoded 25 once drove every 24-fps graph off its audio (2026-09-28).
+def _file_has_prefix(path, prefix):
+    try:
+        with open(path, "rb") as fh:
+            n = struct.unpack("<Q", fh.read(8))[0]
+            if n > _ST_HEADER_MAX_BYTES:
+                return False
+            hdr = json.loads(fh.read(n))
+        return any(k.startswith(prefix) for k in hdr)
+    except Exception:  # noqa: BLE001
+        return False
 
 
-@qfe.console_safe_methods   # an exception leaving it is console-safe (#738)
+def matches(pipeline_class, transformer_class=""):
+    return str(pipeline_class) == "LTX2Pipeline"
+
+
+@qfe.console_safe_methods
 class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
-    """LTX-2 svdq pipeline exposed as a native comfy MODEL (native-KSampler seam), t2v + i2v.
+    """LTX base wrapper carrying conditioning safety checks, mask-to-scale extraction, and session begin."""
 
-    i2v is WAN-ALIGNED (user 2026-08-22 "只关注latent"): the model consumes ONLY latents.
-    The workflow's official LTXVImgToVideoInplace node VAE-encodes the image, writes it into
-    the latent's leading frame(s) and sets noise_mask = 1-strength — all comfy-side, zero
-    cond keys. comfy's KSamplerX0Inpaint then blends x against the clean latent per step
-    OUTSIDE this model (via the inherited BaseModel.scale_latent_inpaint — deliberately NOT
-    overridden), which is exact for this seam because the engine step is STATELESS in x
-    (latents in, velocity out; the sampler owns x). No loader image socket, no plugin-side
-    VAE, no engine begin_edit."""
+    _ENGINE_IGNORED_COND_KEYS = (
+        "concat_mask", "keyframe_idxs", "guide_attention_entries",
+        "noise_concat", "cross_attn_controlnet", "concat_latent_image",
+        "generated_keyframes",
+    )
 
-    def __init__(self, model_config, engine, connector, device=None, audio_connector=None):
-        super().__init__(model_config, device=device)   # disable_unet honored in BaseModel.__init__
+    def __init__(self, model_config, engine, device=None):
+        super().__init__(model_config, device=device)
         self.diffusion_model = _QFStub()
-        self._qf = engine                    # QFEngineHandle (lib + pipeline + open session)
-        self._connector = connector          # comfy Embeddings1DConnector (video), weights loaded
-        self._audio_connector = audio_connector  # comfy audio_embeddings_connector (2048); None -> video-only 4096
-        self._num_steps = 0                  # DERIVED per run from sample_sigmas (len-1) at _begin
-        self._num_frames = 0                 # DERIVED per run from the latent: (Tlat-1)*8 + 1
-        self._fps = None                     # the session's fps: this run's frame_rate conditioning (_call_fps)
+        self._qf = engine
+        self._num_steps = 0
+        self._num_frames = 0
+        self._fps = None
         self._step_i = 0
         self._sess_denoise = 0
-        self._out = None                     # reused packed velocity_out buffer [1,N,128]
-        # [step-cache-key] symbolic per-conditioning cfg_context_key (_CtxKeyAssigner; engine lighting CLAUDE.md #B3).
-        # Historically LTX passed 0 (kNoCtxKey) because it engaged NO key-trusting cache
-        # (dossier seq-229) — the merged the step cache session gate NOW trusts the key (its §6.5
-        # no-key guard force-computes at key=0, silently disabling EC). uuid-derived keys give
-        # each cond branch its own EcEntry (no cross-branch collapse) at zero cost when EC off.
+        self._out = None
         self._ctx_key_assigner = qfmp._CtxKeyAssigner()
-        # Max POST-CONNECTOR seq len across a run's cond groups (pos+neg), accumulated in extra_conds and used
-        # to size the engine begin context MAXIMA (see _begin). pos/neg can have
-        # DIFFERENT prompt lengths and reach the engine as SEPARATE B==1 step calls against ONE session, while
-        # _begin runs on the first group only — so it must be sized to the LARGEST group, not just the first.
-        # ★ POST-connector, NOT raw (§6.5 correctness NO-GO): comfy's Embeddings1DConnector does NOT preserve
-        # the seq dim — its forward tail-pads with tiled learnable_registers to
-        # n_reg*ceil(max(1024, S)/n_reg) (MEASURED: S=1200→1280, 2000→2048, ≤1024→1024 at n_reg=128), so a
-        # raw accumulator UNDER-sizes the ceiling whenever a >1024-raw group is not the group that _begins.
         self._max_ctx_seq = 0
-        self._post_seq_cache = {}            # raw S -> measured post-connector S (see _post_connector_seq)
-
-    # ── engine-conditioning safety layer (added for the CR conformance NO-GO) ──
-    # LTXV.extra_conds (+ the LTXV.concat_cond / BaseModel.extra_conds callees) can consume mask / keyframe /
-    # guide / c_concat / controlnet / i2v-concat channels when a corresponding node is wired. This external-
-    # session seam runs the engine's OWN t2v schedule from the loader widgets + the connector video_embeds and
-    # consumes NONE of them, so a bare _apply_model(**kwargs) would SILENTLY drop them → a plausible-but-wrong
-    # video with no warning. FAIL LOUD instead. This is a DEFENSIVE SUPERSET — every
-    # consumable key that is neither emitted (cross_attn) nor documented-accepted (attention_mask/frame_rate);
-    # its completeness against THIS comfy is machine-checked by tests/reject_list_completeness.py (LTXV entry).
-    # denoise_mask is deliberately NOT in this tuple: the Inplace i2v latent route rides it
-    # (comfy's sampler consumes it via KSamplerX0Inpaint + the inherited scale_latent_inpaint;
-    # it never needs the engine) — see the class docstring + reject_list_completeness.py.
-    _ENGINE_IGNORED_COND_KEYS = ("concat_mask", "keyframe_idxs", "guide_attention_entries",
-                                 "noise_concat", "cross_attn_controlnet", "concat_latent_image",
-                                 # ref_audio has a dedicated base refusal / AV consumer below.
-                                 "generated_keyframes")
 
     def _reference_audio_cond(self, payload):
         if payload is not None:
             raise RuntimeError("qf_native LTX: ref_audio needs an AV checkpoint; video-only is unsupported")
         return None
 
+    def _post_connector_seq(self, raw_s):
+        return int(raw_s)
+
+    def _begin_extra_opts(self):
+        return {}
+
     def extra_conds(self, **kwargs):
-        # RUN-START clean slate FIRST (#2 session lifecycle) — BEFORE the loud-fails below, so a rejected
-        # bad-wiring requeue still closes a session STRANDED by a prior Interrupt (else a permanently-erroring
-        # graph leaks a GPU-resident stranded session across requeues). extra_conds is comfy's ONLY hook that
-        # fires at the start of EVERY run even for an EMPTY (denoise=1.0) latent, and comfy CACHES+REUSES this
-        # model instance across a requeue — so closing here forces _apply_model to _begin fresh. Idempotent
-        # across the pos+neg extra_conds calls of a run (the 2nd finds nothing open → no-op).
         was_open, ok = self._qf.end_session_if_open()
-        # Retention (2026-08-24): even a REFUSED close (previous run's step still draining
-        # engine-side) must NOT let this run silently REUSE that session — force the first
-        # _apply_model through _begin (whose materialize-first close + busy-retry recovers
-        # correctly). Cleared at the gate; re-armed every run start.
         self._qf_needs_begin = True
         if hasattr(self, "_clear_audio_reference_after_close"):
             self._clear_audio_reference_after_close(was_open, ok)
         if was_open:
-            qfe.info("[qf_native] LTX: closed a pre-existing session at run start "
-                  f"(prior run interrupted/uncleaned); end ok={ok}", flush=True)
-        # masked-latent i2v (comfy LTXVImgToVideoInplace): capture the run's denoise_mask
-        # as PER-LATENT-FRAME sigma scales for the engine session. This is the comfy
-        # LTXV.process_timestep mechanism (conditioned tokens run at mask*t) — without it
-        # the engine reads the outer-blended near-clean conditioned frames at the GLOBAL
-        # sigma and emits corrupt velocities (measured: red-speckle degeneration, run
-        # b16cbc7f). Cleared per run here; pos+neg extra_conds set identical values.
+            qfe.info("[qf_native] LTX: closed a pre-existing session at run start; end ok=%s", ok)
         self._pending_frame_t_scale = None
         self._pending_audio_frame_t_scale = None
-        _dm = kwargs.get("denoise_mask")
-        if _dm is not None:
-            _scales, _a_scales = self._frame_scales_from_mask(_dm)
-            # Validate the original mask before matching the BF16 conditioning boundary.
-            _scales = torch.tensor(_scales, dtype=torch.bfloat16, device="cpu").float().tolist()
-            _a_scales = torch.tensor(_a_scales, dtype=torch.bfloat16, device="cpu").float().tolist()
-            # all-1.0 = no conditioning anywhere -> omit (keeps the engine's t2v scalar
-            # path byte-identical instead of a mathematically-equal per-token pass).
-            self._pending_frame_t_scale = None if all(v >= 0.9999 for v in _scales) else _scales
-            # [issue #15] audio-lane mask -> per-AUDIO-ROW scales (length = L, the engine's
-            # packed-row order). Same all-1.0 omission rule; [] (no audio lane) -> omitted.
+        dm = kwargs.get("denoise_mask")
+        if dm is not None:
+            scales, a_scales = self._frame_scales_from_mask(dm)
+            scales = torch.tensor(scales, dtype=torch.bfloat16, device="cpu").float().tolist()
+            a_scales = torch.tensor(a_scales, dtype=torch.bfloat16, device="cpu").float().tolist()
+            self._pending_frame_t_scale = None if all(v >= 0.9999 for v in scales) else scales
             self._pending_audio_frame_t_scale = (
-                None if (not _a_scales or all(v >= 0.9999 for v in _a_scales))
-                else _a_scales)
-        # ★ CLOSE THE SILENT-DISCARD CLASS: a wired keyframe / guide-attention / concat node reaches here
-        # as one of these keys and would be dropped — fail loud. (denoise_mask is NOT here: the Inplace
-        # latent route rides it and comfy's sampler consumes it entirely outside this model.)
-        for _k in self._ENGINE_IGNORED_COND_KEYS:
-            if kwargs.get(_k) is not None:
+                None if (not a_scales or all(v >= 0.9999 for v in a_scales)) else a_scales)
+        for k in self._ENGINE_IGNORED_COND_KEYS:
+            if kwargs.get(k) is not None:
                 raise RuntimeError(
-                    f"qf_native LTX: '{_k}' conditioning is wired, but the QuantFunc LTX native session "
-                    f"consumes only latents + the connector video_embeds - it cannot consume comfy's "
-                    f"'{_k}', which would be silently ignored. Remove the node feeding it. For "
-                    f"image-to-video use LTXVImgToVideoInplace on the LATENT path (its noise_mask is "
-                    f"applied by comfy's sampler and IS supported); LTXVAddGuide / keyframe nodes are not.")
-        # MIRROR ONLY c_crossattn (the engine's connector consumes it), building `out` BY HAND —
-        # we deliberately do NOT call super().extra_conds. Reason: emit EXACTLY the one channel the engine takes,
-        # and don't re-enter comfy's cond-building (LTXV.extra_conds + its concat_cond/encode_adm callees), which
-        # would re-populate the very keys we reject. (LTXV does not override concat_cond — the effective
-        # BaseModel.concat_cond is concat_keys-gated and never touches diffusion_model — so calling super() would
-        # not crash here; building by hand keeps the emitted set minimal and explicit.) attention_mask IS consumed
-        # (the connector mask — 19B mask fix), and so is frame_rate: see _call_fps.
-        # frame_rate: comfy's own conditioning of it (_native_frame_rate), which reaches _apply_model with every call
-        # and sets the engine session's fps (_call_fps).
+                    f"qf_native LTX: '{k}' conditioning is wired, but the QuantFunc LTX native session "
+                    f"cannot consume '{k}'. Remove the node feeding it. For image-to-video use "
+                    f"LTXVImgToVideoInplace on the LATENT path.")
         ref_cond = self._reference_audio_cond(kwargs.get("ref_audio"))
         out = {"frame_rate": self._native_frame_rate(kwargs)}
         if ref_cond is not None:
@@ -177,46 +115,14 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
         cross_attn = kwargs.get("cross_attn", None)
         if cross_attn is not None:
             out["c_crossattn"] = comfy.conds.CONDRegular(cross_attn)
-            # [19B mask fix] forward the clip's attention_mask: gemma LEFT-pads, so the connector MUST
-            # mask the pad rows (the engine's own internal path builds a content-tail mask before its
-            # connector forward — "text mask active=N/S"). The old all-ones simplification aggregated
-            # PAD rows into the registers → garbage conditioning → structured-mush output (MEASURED:
-            # stock comfy with the SAME TE chain coherent, this seam mush, fixed by this mask).
             am = kwargs.get("attention_mask", None)
             if am is not None:
                 out["attention_mask"] = comfy.conds.CONDRegular(am)
-            # Accumulate the max POST-CONNECTOR seq len across this run's cond groups (pos+neg BOTH call
-            # extra_conds before sampling). ★ POST, not raw (§6.5 correctness NO-GO — an earlier revision
-            # claimed "the connector PRESERVES the seq dim"; FALSE: comfy's Embeddings1DConnector tail-pads
-            # to n_reg*ceil(max(1024, S)/n_reg), so raw 1200 becomes vemb 1280). _begin sizes the session
-            # context maxima from this accumulator vs the FIRST group's actual vemb; a raw accumulator
-            # under-sizes it whenever a >1024-raw group (a long negative) is NOT the group that _begins —
-            # that group's step then exceeds the begin maxima and the engine LOUD-REJECTS
-            # (quantfunc_api.cpp "positive and per-dim <= the begin maxima"; correctness, not silent).
-            # _post_connector_seq MEASURES the length from the real loaded connector (cached).
             self._max_ctx_seq = max(self._max_ctx_seq, self._post_connector_seq(int(cross_attn.shape[1])))
         return out
 
     def _frame_scales_from_mask(self, dm):
-        """denoise_mask -> (per-LATENT-frame video scales, per-AUDIO-ROW scales).
-
-        Two shapes reach this seam (MEASURED):
-        - video-only 5D channel-repeated [B,C,F,H,W] (plain latent path; the mask is
-          channel-uniform so channel 0 is representative) -> (scales, []);
-        - joint-AV FLAT [B,1,total] — comfy packs the nested (video, audio) latent and
-          flattens the mask alike (total = video_elems + audio_elems; measured
-          1,818,368 = 128*16*22*40 + 8*126*16). Split via self.latent_shapes. The AUDIO
-          part (second latent shape [B,Ca,La,Fa]) -> one scale per audio ROW (dim La =
-          the engine's packed [1,L,128] row order), mirroring comfy
-          model_base.LTXAV.process_timestep (a_patchifier.patchify "b c t f -> b t (c f)"
-          of the audio mask). comfy itself reads only channel 0 / mel 0 of its audio
-          slice; this seam REFUSES a mask that varies WITHIN an audio row (the engine
-          scales per ROW only) instead of silently reading one slice.
-        Inplace masks are FRAME-uniform; a mask varying within a VIDEO frame (spatial
-        inpaint) is refused loud; a masked audio tail with no audio latent shape is
-        refused loud (nothing could carry it)."""
-        import math as _m
-        if dm.ndim in (3, 5) and int(dm.shape[0]) > 1:
+        if dm.ndim in (3, _VIDEO_LATENT_NDIM) and int(dm.shape[0]) > 1:
             scales = [self._frame_scales_from_mask(dm[i:i + 1]) for i in range(int(dm.shape[0]))]
             if any(value != scales[0] for value in scales[1:]):
                 raise RuntimeError("qf_native LTX: target batches need the same per-frame/audio-row timestep scales")
@@ -228,181 +134,117 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
         if m.ndim == 3:
             ls = getattr(self, "latent_shapes", None)
             if not ls or len(ls) < 1:
-                raise RuntimeError(
-                    "qf_native LTX: flat denoise_mask but the model carries no "
-                    "latent_shapes to split it - unsupported mask source.")
-            n_video = int(_m.prod(ls[0][1:]))
+                raise RuntimeError("qf_native LTX: flat denoise_mask but model carries no latent_shapes.")
+            n_video = int(math.prod(ls[0][1:]))
             flat = m.reshape(-1)
             if int(flat.shape[0]) < n_video:
                 raise RuntimeError(
                     f"qf_native LTX: flat denoise_mask has {int(flat.shape[0])} elements "
-                    f"but the video latent needs {n_video} - geometry mismatch.")
+                    f"but video latent needs {n_video} - geometry mismatch.")
             audio_part = flat[n_video:]
             if audio_part.numel() and float(audio_part.min()) < 0.9999:
                 if len(ls) < 2:
                     raise RuntimeError(
-                        "qf_native LTX: the denoise_mask masks the AUDIO lane but this "
-                        "model carries no audio latent shape - cannot carry the mask.")
-                n_audio = int(_m.prod(ls[1][1:]))
+                        "qf_native LTX: denoise_mask masks AUDIO lane but model carries no audio latent shape.")
+                n_audio = int(math.prod(ls[1][1:]))
                 if int(audio_part.shape[0]) != n_audio:
                     raise RuntimeError(
-                        f"qf_native LTX: flat denoise_mask audio part has "
-                        f"{int(audio_part.shape[0])} elements but the audio latent needs "
-                        f"{n_audio} - geometry mismatch.")
-                # [B,Ca,La,Fa] -> per-row (La) scales; a row varying within itself is refused.
+                        f"qf_native LTX: flat denoise_mask audio part has {int(audio_part.shape[0])} elements "
+                        f"but audio latent needs {n_audio} - geometry mismatch.")
                 a = flat[n_video:n_video + n_audio].reshape(list(ls[1][1:]))
-                for l in range(int(a.shape[1])):
-                    al = a[:, l]                       # [Ca, Fa] for this audio row
+                for row in range(int(a.shape[1])):
+                    al = a[:, row]
                     lo, hi = float(al.min()), float(al.max())
                     if hi - lo > 1e-4:
                         raise RuntimeError(
-                            "qf_native LTX: denoise_mask varies WITHIN an audio row - "
-                            "the engine session scales the audio timestep per ROW "
-                            "(per-audio-frame masks only); channel/mel-varying audio "
-                            "masks are not supported on this seam.")
+                            "qf_native LTX: denoise_mask varies WITHIN an audio row; per-audio-frame masks only.")
                     audio_rows.append(max(0.0, min(1.0, hi)))
-            m = flat[:n_video].reshape(list(ls[0][1:]))      # [C,F,H,W]
-            m = m.movedim(1, 0)                             # [F,C,H,W]
-        elif m.ndim == 5:
-            m = m[0, 0]                                     # [F,H,W]
+            m = flat[:n_video].reshape(list(ls[0][1:])).movedim(1, 0)
+        elif m.ndim == _VIDEO_LATENT_NDIM:
+            m = m[0, 0]
         else:
             raise RuntimeError(
-                f"qf_native LTX: denoise_mask with shape {tuple(dm.shape)} is not a "
-                f"[B,C,F,H,W] latent mask nor the packed AV flat form - unsupported "
-                f"mask source.")
+                f"qf_native LTX: denoise_mask shape {tuple(dm.shape)} is not [B,C,F,H,W] or packed AV flat.")
         per_frame = []
         for f in range(int(m.shape[0])):
             mf = m[f]
             lo, hi = float(mf.min()), float(mf.max())
             if hi - lo > 1e-4:
                 raise RuntimeError(
-                    "qf_native LTX: denoise_mask varies WITHIN a latent frame - the "
-                    "engine session scales the timestep per FRAME (Inplace-style masks "
-                    "only); spatial inpaint masks are not supported on this seam.")
+                    "qf_native LTX: denoise_mask varies WITHIN a latent frame; per-frame Inplace masks only.")
             per_frame.append(max(0.0, min(1.0, hi)))
         return per_frame, audio_rows
 
-    # scale_latent_inpaint is deliberately INHERITED (comfy BaseModel), NOT loud-failed (2026-08-22
-    # wan-align pivot): comfy's KSamplerX0Inpaint calls it only when a denoise/noise mask is wired
-    # (LTXVImgToVideoInplace's frame-0 conditioning, or SetLatentNoiseMask) and blends x against the
-    # clean latent per step OUTSIDE _apply_model. That blend is EXACT for this seam because the
-    # engine step is stateless in x (latents in, velocity out — the sampler owns x), so masked
-    # conditioning needs zero engine involvement. This is the i2v mechanism now.
-
     def _derive_geometry(self, xin, transformer_options):
-        """DERIVE the session geometry from the graph (official-loader shape — the loader has no
-        geometry widgets). xin: [B,C,F_lat,H_lat,W_lat]; the VAE scales are self.latent_format's.
-        Step count from the sampler's own sigma schedule. PARTIAL / TRIMMED ranges are
-        ACCEPTED (two-stage official workflows: stage-A 1.0->0.975 low-res, stage-B
-        0.85->0 refine after the x2 latent upsample): the external session is PURELY
-        sigma-driven — the engine's session step consumes the driver's sigma each call
-        and its session path has ZERO num_steps / step-index consumption (verified by
-        source sweep + c5.8 legC bit-identical under a full external Euler drive). The
-        old refusal's rationale ("engine runs its OWN internal schedule") described the
-        INTERNAL generate_video loop, not this seam. Only pathological schedules
-        (fewer than 2 sigmas / non-decreasing) are refused: the mixin's _stage_schedule, shared with H3."""
-        Tlat = int(xin.shape[2])
-        self._num_frames = (Tlat - 1) * int(self.latent_format.temporal_downscale_ratio) + 1
+        t_lat = int(xin.shape[2])
+        self._num_frames = (t_lat - 1) * int(self.latent_format.temporal_downscale_ratio) + 1
         self._stage_schedule(transformer_options, "LTX")
 
     def _native_frame_rate(self, kwargs):
-        """ComfyUI's own conditioning of the frame rate, EXECUTED rather than copied: comfy.model_base.LTXV.extra_conds
-        (the native class this model derives from; model_base.LTXAV resolves frame_rate the same way) run on this
-        model for the frame_rate channel only. So the conditioning's value (LTXVConditioning), or comfy's own
-        default when the graph has none, is native behaviour byte for byte and follows comfy if it ever changes.
-        This seam holds no frame-rate value of its own: when comfy cannot answer, the run is refused."""
         try:
-            fr = comfy.model_base.LTXV.extra_conds(
+            return comfy.model_base.LTXV.extra_conds(
                 self, **({"frame_rate": kwargs["frame_rate"]} if "frame_rate" in kwargs else {}))["frame_rate"]
-        except Exception as e:  # noqa: BLE001 - any failure to resolve is a refusal, never a local default
+        except Exception as e:  # noqa: BLE001
             raise RuntimeError(
-                "qf_native LTX: ComfyUI's LTX model code did not resolve a frame_rate for this conditioning "
-                f"({type(e).__name__}: {e}). Wire LTXVConditioning: its frame_rate sets the video<->audio "
-                "timing.") from e
-        return fr
+                f"qf_native LTX: ComfyUI's LTX model code did not resolve a frame_rate ({type(e).__name__}: {e}). "
+                f"Wire LTXVConditioning.") from e
 
     def _call_fps(self, kwargs, opening):
-        """The session's fps = this call's frame_rate conditioning (extra_conds emits comfy's own, see
-        _native_frame_rate). The engine builds the video self-RoPE and the video<->audio cross-RoPE time grid as
-        frame_time/fps, exactly as comfy's LTXAV does with frame_rate, while the audio grid is hop/sample-rate time —
-        a wrong fps skews the two lanes apart, more with every second of clip (measured: a 24-fps official graph
-        driven at the old hardcoded 25 = dead audio at 97 frames). Opening a session adopts it; an open session has
-        one time grid, so a call with another frame_rate is refused, and so is a call that carries none."""
         fr = kwargs.get("frame_rate")
         if fr is None:
-            raise RuntimeError("qf_native LTX: this model call carries no frame_rate conditioning (extra_conds emits "
-                               "it), so the video<->audio timing is unknown - refused rather than guessed.")
+            raise RuntimeError("qf_native LTX: model call carries no frame_rate conditioning.")
         fps = float(fr)
         if opening:
             self._fps = fps
         elif fps != self._fps:
-            raise RuntimeError(f"qf_native LTX: this sampling run's conditionings carry different frame rates "
-                               f"({self._fps:g} and {fps:g}); the session has one time grid - give every "
-                               "conditioning the same frame_rate (LTXVConditioning).")
+            raise RuntimeError(
+                f"qf_native LTX: conditionings carry different frame rates ({self._fps:g} vs {fps:g}).")
 
     def _begin(self, x_group, vemb_group):
-        """Open the t2v external denoise session. x_group = [1,128,F,H,W] latent; vemb_group =
-        [1,S,4096] POST-connector video_embeds. Geometry: engine derives F_lat/H_lat/W_lat from
-        num_frames + width/height (spatial 32, temporal 8)."""
-        lib = self._qf.lib   # MATERIALIZE FIRST (see qf_h3_modelpatcher._begin: a deferred wrapper
-        # no-ops the close while the cached engine still holds an interrupted run's open session)
+        lib = self._qf.lib
         _, close_ok = self._qf.end_session_if_open()
         ref_enabled = getattr(self, "_audio_reference", None) is not None
         if getattr(self._qf, "reference_audio_pending", lambda: False)():
             raise RuntimeError("qf_native LTX-AV: previous reference begin has no proven copy completion")
         if ref_enabled and not close_ok:
             raise RuntimeError("qf_native LTX-AV: previous reference session close refused; retry after drain")
-        self._ctx_key_assigner.reset()   # per-generation uuid->key numbering (no cross-gen leak)
-        bpx = qfe.DenoiseBeginParams()
+        self._ctx_key_assigner.reset()
+        bpx = qfe.QFSessionBeginParams()
         ctypes.memset(ctypes.byref(bpx), 0, ctypes.sizeof(bpx))
         bpx.struct_size = ctypes.sizeof(bpx)
-        # latent is [1, C, F_lat, H_lat, W_lat]; target pixels = latent * the model's latent_format spatial scale.
-        _s = int(self.latent_format.spacial_downscale_ratio)
-        bpx.width = int(x_group.shape[-1]) * _s
-        bpx.height = int(x_group.shape[-2]) * _s
+        scale = int(self.latent_format.spacial_downscale_ratio)
+        bpx.width = int(x_group.shape[-1]) * scale
+        bpx.height = int(x_group.shape[-2]) * scale
         bpx.num_steps = self._num_steps
-        # Size the context MAXIMA to the LARGEST POST-CONNECTOR vemb seq across this run's cond groups
-        # (accumulated in extra_conds for pos+neg via _post_connector_seq — same quantity as this group's
-        # vemb.shape[1], so the max compares like with like), NOT just this first group's — a longer
-        # different-length negative reaches the engine as a SEPARATE B==1 step against this SAME session and
-        # must fit the begin maxima. max(...) with this group is the safe fallback if the accumulator was
-        # never populated (cross_attn-less flow). (POST-length fix per §6.5.)
-        _max_seq = max(self._max_ctx_seq, int(vemb_group.shape[1]))
-        bpx.max_context_dims = (ctypes.c_int * 3)(int(vemb_group.shape[0]), _max_seq,
-                                                  int(vemb_group.shape[2]))
-        self._max_ctx_seq = 0             # reset for the next run's extra_conds accumulation
-        # LTX takes NO pooled cond.
-        bpx.max_pooled_dims = (ctypes.c_int * 2)(0, 0)
+        max_seq = max(self._max_ctx_seq, int(vemb_group.shape[1]))
+        bpx.max_context_dims = (ctypes.c_int32 * 3)(int(vemb_group.shape[0]), max_seq, int(vemb_group.shape[2]))
+        self._max_ctx_seq = 0
         bpx.cond_dtype = _qf_dtype(vemb_group.dtype)
-        _mask_opt = {}
+        mask_opt = {}
         if getattr(self, "_pending_frame_t_scale", None):
-            _mask_opt["video_frame_t_scale"] = self._pending_frame_t_scale
+            mask_opt["frame_t_scales"] = self._pending_frame_t_scale
         if getattr(self, "_pending_audio_frame_t_scale", None):
-            # [issue #15] audio-lane mask: per-AUDIO-ROW scales (count == L at _begin).
-            _mask_opt["audio_frame_t_scale"] = self._pending_audio_frame_t_scale
-        bpx._opts = json.dumps({**{"num_frames": self._num_frames, "fps": float(self._fps)},
-                                **self.residency_opts(),
-                                **_mask_opt,
-                                **self._begin_extra_opts()}).encode()
+            mask_opt["audio_frame_t_scales"] = self._pending_audio_frame_t_scale
+        bpx._opts = json.dumps({
+            "num_frames": self._num_frames,
+            "fps": float(self._fps),
+            **self.residency_opts(),
+            **mask_opt,
+            **self._begin_extra_opts(),
+        }).encode("utf-8")
         bpx.options_json = bpx._opts
         session = ctypes.c_void_p()
-        # ONE begin path (wan-align 2026-08-22): the session is ALWAYS a plain t2v-shape begin.
-        # i2v conditioning is entirely comfy-side (LTXVImgToVideoInplace latent + noise_mask via
-        # KSamplerX0Inpaint) — the engine never sees an image or a cond latent.
         self._begin_keep = bpx
         if ref_enabled:
             self._qf.retain_reference_audio(self._audio_reference)
             self._audio_reference_begin_failed = True
-        st = lib.quantfunc_denoise_begin(self._qf.pipeline, ctypes.byref(bpx), ctypes.byref(session))
-        if not ref_enabled and st != qfe.QUANTFUNC_OK and "busy" in (qfe.last_err(lib) or ""):
-            # ONE bounded recovery (2026-08-24 busy incident): a just-interrupted run's final
-            # step may still be draining engine-side — its refused end RETAINED our pointer,
-            # so an end+retry can win once the step lands. Non-busy refusals fall through.
-            time.sleep(2.0)
+        st = lib.qf_xfm_session_begin(self._qf.xfm, ctypes.byref(bpx), ctypes.byref(session))
+        if not ref_enabled and st != qfe.QF_OK and "busy" in (qfe.last_err(lib) or ""):
+            time.sleep(_BUSY_BEGIN_RETRY_S)
             self._qf.end_session_if_open()
-            st = lib.quantfunc_denoise_begin(self._qf.pipeline, ctypes.byref(bpx), ctypes.byref(session))
-        if st != qfe.QUANTFUNC_OK:
-            raise RuntimeError(f"denoise_begin (LTX) failed: {qfe.last_err(lib)}")
+            st = lib.qf_xfm_session_begin(self._qf.xfm, ctypes.byref(bpx), ctypes.byref(session))
+        if st != qfe.QF_OK:
+            raise RuntimeError(f"qf_xfm_session_begin (LTX) failed: {qfe.last_err(lib)}")
         self._qf.current_session = session
         if ref_enabled:
             self._qf.reference_audio_copy_completed()
@@ -411,63 +253,24 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
         self._step_i = 0
         self._sess_denoise = 0
         qfe.info(f"[qf_native] LTX SESSION OPEN handle={session.value:#x} steps={self._num_steps} "
-              f"cond={tuple(vemb_group.shape)} frames={self._num_frames}", flush=True)
-        if _mask_opt.get("audio_frame_t_scale"):
-            # [issue #15] per-SESSION receipt (one per begin => a two-stage graph logs one per stage),
-            # where the engine's own receipt is once-per-process (ENGINE repo, not this tree;
-            # src/gemm/lighting/LTX2VideoTransformerLighting.cpp:3017-3019, `s_a_pt_logged` exchange).
-            qfe.info(f"qf_native LTX-AV audio mask: {len(_mask_opt['audio_frame_t_scale'])} rows", flush=True)
+                 f"cond={tuple(vemb_group.shape)} frames={self._num_frames}", flush=True)
+        if mask_opt.get("audio_frame_t_scales"):
+            qfe.info(f"qf_native LTX-AV audio mask: {len(mask_opt['audio_frame_t_scales'])} rows", flush=True)
 
 
-# ── LTX-2.5 joint audio+video (c5.8b) ────────────────────────────────────────────────
-# Audio packing: comfy audio latent [B,C,L,F] <-> engine rows [1,L,C*F] with d = c*F + f (engine diffusers
-# _unpack_audio_latents order), i.e. permute(0,2,1,3).reshape. Every shape comes from the latent itself.
-# The layout below is used ONLY to refuse a mis-wired latent: it is the LTX-2 audio lane's input layout as ComfyUI's
-# own LTXAVModel writes it (comfy/ldm/lightricks/av_model.py num_audio_channels / audio_frequency_bins; no comfy
-# object hands it to a model patcher). The engine checks the packed width C*F at begin but cannot see the split,
-# so a latent with the right width and the wrong split would otherwise pass as wrong audio.
-_LTXAV_AUDIO_CH = 8
-_LTXAV_AUDIO_MEL = 16
-
-
-@qfe.console_safe_methods   # an exception leaving it is console-safe (#738)
+@qfe.console_safe_methods
 class QFLTXAVModel(QFLTXModel):
-    """LTX-2.5 JOINT AUDIO+VIDEO through the native session (t2av).
-
-    Differences vs the video-only QFLTXModel base:
-    - The comfy latent is the AV pair (video [B,128,F,H,W], audio [B,8,L,16]) — nested or
-      sampler-packed flat (split via self.latent_shapes, the H3-measured dual form).
-    - NO plugin-side connector: the LTX-2.5 'with-proj' TE emits the UNPROCESSED dual-proj
-      concat (extra unprocessed_ltxav_embeds=True) and the ENGINE runs its own checkpoint-
-      loaded connector tail (begin av_unprocessed_ctx=true →
-      LTX2TextConnectors::forwardProjected) — one connector implementation, the
-      7-tier-verified internal one.
-    - Every step drives BOTH lanes via quantfunc_denoise_step_multi at the SAME sigma (the
-      LTX co-denoise contract — no H3-style shift/carry; audio_scale is inert at 1.0).
-    BASE-CLASS note: deliberately QFLTXModel-only (NOT + comfy.model_base.LTXAV) —
-    model_base.{LTXV,LTXAV} are BaseModel SIBLINGS whose __init__ super()-chains pass
-    different unet_model kwargs, so a diamond MRO crashes ("unexpected keyword argument
-    'unet_model'", MEASURED first run). Nothing needs the LTXAV model class here: the
-    AV latent_format + memory factor ride the supported_models.LTXAV CONFIG the loader
-    passes; comfy's nested-latent packing is model-agnostic (samplers.py pack_latents +
-    inner_model.latent_shapes); the only comfy isinstance on model_base.LTXAV
-    (lora.py:371) tests (LTXV, LTXAV) — satisfied via the LTXV base."""
+    """LTX-2.5 joint audio+video wrapper driving qf_xfm_session_begin + qf_xfm_step_av."""
 
     def __init__(self, model_config, engine, device=None):
-        # i2v-AV (wan-align 2026-08-22 "只关注latent"): NO image/vae plumbing here — the
-        # workflow's LTXVImgToVideoInplace conditions the VIDEO half of the joint latent
-        # (encode + frame-0 write + noise_mask), and comfy's sampler applies the mask
-        # outside the model. The session begin is identical to t2av.
-        QFLTXModel.__init__(self, model_config, engine, connector=None,
-                            device=device, audio_connector=None)
-        self._out_audio = None            # reused packed audio velocity buffer [1,L,128] fp32
-        self._ctx_unprocessed = False     # set per run by extra_conds from the TE's marker
-        self._audio_rows = 0              # L, set from the actual audio latent at _apply_model
-        self._audio_pack = 0              # C*F, the packed row width, set from the same latent
+        QFLTXModel.__init__(self, model_config, engine, device=device)
+        self._out_audio = None
+        self._ctx_unprocessed = False
+        self._audio_rows = 0
+        self._audio_pack = 0
 
     @staticmethod
     def _reference_activation_dtype(_device):
-        # LTX2FactoryConfig::kLTX2BodyDtype is BF16 on every SM, independent of options.dtype.
         return torch.bfloat16
 
     @staticmethod
@@ -476,8 +279,8 @@ class QFLTXAVModel(QFLTXModel):
             raise RuntimeError("qf_native LTX-AV: ref_audio must contain exactly tokens")
         tokens = payload["tokens"]
         if (not torch.is_tensor(tokens) or tokens.ndim != 3 or tokens.shape[0] != 1
-                or tokens.shape[1] <= 0 or tokens.shape[2] != 128
-                or tokens.numel() > 2**31 - 1):
+                or tokens.shape[1] <= 0 or tokens.shape[2] != _LTXAV_AUDIO_PACK
+                or tokens.numel() > _REF_AUDIO_MAX_NUMEL):
             raise RuntimeError("qf_native LTX-AV: ref_audio tokens must be [1,N,128], N>0 (one clip)")
         if tokens.dtype not in (torch.float16, torch.bfloat16, torch.float32):
             raise RuntimeError("qf_native LTX-AV: ref_audio needs FP16/BF16/FP32 tokens")
@@ -494,8 +297,7 @@ class QFLTXAVModel(QFLTXModel):
     def _clear_audio_reference_after_close(self, was_open, ok):
         if getattr(self, "_audio_reference", None) is None or not ok:
             return
-        if (getattr(self, "_audio_reference_begin_failed", False)
-                and self._qf.reference_audio_pending()):
+        if getattr(self, "_audio_reference_begin_failed", False) and self._qf.reference_audio_pending():
             return
         self._qf.retain_reference_audio(None)
         self._audio_reference = None
@@ -521,7 +323,6 @@ class QFLTXAVModel(QFLTXModel):
                 raise RuntimeError("qf_native LTX-AV: ref_audio changed; start a new session")
             return True
         shape, dtype = tuple(tokens.shape), tokens.dtype
-        # Clone ALL sources: .data/view aliases evade ordinary tensor version counters too.
         snapshot = tokens.detach().to(device="cpu").clone()
         upload = snapshot.to(device=device, dtype=activation_dtype).contiguous()
         if not torch.isfinite(upload).all().item():
@@ -531,241 +332,156 @@ class QFLTXAVModel(QFLTXModel):
         self._audio_reference_begin_failed = False
         return True
 
-    def _post_connector_seq(self, raw_s):
-        # The ENGINE connector tail preserves S (registers REPLACE pad rows — no comfy-style
-        # tail-pad), and this seam sizes the begin maxima on the RAW ctx it actually sends.
-        return int(raw_s)
-
     def extra_conds(self, **kwargs):
         out = super().extra_conds(**kwargs)
-        # The LTXAV 'with-proj' TE marks its output UNPROCESSED (dual-proj concat, connector
-        # NOT run). Required by this seam — checked fail-loud at _begin_extra_opts.
         self._ctx_unprocessed = bool(kwargs.get("unprocessed_ltxav_embeds", False))
         return out
-
-    def _run_connector(self, c_crossattn, attention_mask=None):
-        # AV seam: pass the RAW dual-proj concat through — the engine connector tail runs
-        # per distinct cond (see the class docstring). attention_mask is unused: the comfy
-        # LTXAV TE already TRIMS the left-pad to the active tail before projection
-        # (lt.py encode_token_weights `out[:, :, -sum(mask):]`), so every row is valid.
-        return c_crossattn
 
     def _begin_extra_opts(self):
         if not self._ctx_unprocessed:
             raise RuntimeError(
-                "qf_native LTX-AV: the wired text encoder did not mark its output "
-                "unprocessed_ltxav_embeds - this loader needs the LTX-2.5 'with-proj' TE "
-                "(gemma4-12b-with-proj-*.safetensors through the comfy LTXAV clip), whose "
-                "connector runs ENGINE-side. A 19B/2.3 connector-file TE chain belongs on "
-                "the video-only QuantFuncNativeLoader path.")
+                "qf_native LTX-AV: wired text encoder did not mark output unprocessed_ltxav_embeds - "
+                "use the LTX-2.5 'with-proj' TE through ComfyUI's LTXAV clip.")
         if self._audio_rows <= 0:
             raise RuntimeError("qf_native LTX-AV: audio latent rows unset at begin - wiring error")
-        opts = {"audio_dims": [1, int(self._audio_rows), int(self._audio_pack)],
-                "av_unprocessed_ctx": True}
+        opts = {"audio_dims": [1, int(self._audio_rows), int(self._audio_pack)], "av_unprocessed_ctx": True}
         reference = getattr(self, "_audio_reference", None)
         if reference is not None:
             upload = reference[-1]
             if not torch.isfinite(upload).all().item():
                 raise RuntimeError("qf_native LTX-AV: normalized ref_audio must be finite")
-            opts["av_conds"] = [{"kind": "audio", "audio_latent_ptr": hex(upload.data_ptr()),
-                                 "audio_latent_dims": list(upload.shape),
-                                 "audio_latent_dtype": int(_qf_dtype(upload.dtype))}]
+            opts["av_conds"] = [{
+                "kind": "audio",
+                "audio_latent_ptr": hex(upload.data_ptr()),
+                "audio_latent_dims": list(upload.shape),
+                "audio_latent_dtype": int(_qf_dtype(upload.dtype)),
+            }]
         return opts
 
     def _apply_model(self, x, t, c_concat=None, c_crossattn=None, control=None,
                      transformer_options={}, **kwargs):
-        return self._apply_model_timed(x, t, c_concat=c_concat, c_crossattn=c_crossattn,
-                                       control=control, transformer_options=transformer_options,
-                                       **kwargs)
-
-    def _apply_model_timed(self, x, t, c_concat=None, c_crossattn=None, control=None,
-                     transformer_options={}, **kwargs):
         sigma = t
         if c_crossattn is None:
-            raise RuntimeError("qf_native LTX-AV: no c_crossattn cond - wire the LTX-2.5 "
-                               "gemma4 'with-proj' TE (CLIPTextEncode -> LTXVConditioning)")
+            raise RuntimeError("qf_native LTX-AV: no c_crossattn cond - wire the LTX-2.5 TE.")
         if control is not None:
-            raise RuntimeError("qf_native LTX-AV: a ControlNet is wired, but this seam does "
-                               "not consume comfy control hints - remove it.")
-        # AV latent arrives nested OR sampler-packed flat (the H3-measured dual form).
-        _nested = getattr(x, "is_nested", False)
-        if _nested:
+            raise RuntimeError("qf_native LTX-AV: ControlNet is wired, but this seam does not consume control hints.")
+        nested = getattr(x, "is_nested", False)
+        if nested:
             streams = x.unbind()
-            x_video, x_audio = streams[0], streams[1]          # [B,128,F,H,W], [B,8,L,16]
+            x_video, x_audio = streams[0], streams[1]
         else:
             ls = getattr(self, "latent_shapes", None)
             if not ls or len(ls) < 2:
-                raise RuntimeError(f"qf_native LTX-AV: packed latent (type={type(x).__name__} "
-                                   f"shape={tuple(getattr(x, 'shape', ()))}) but model.latent_shapes "
-                                   "is unset - cannot unpack the AV pair.")
+                raise RuntimeError(
+                    f"qf_native LTX-AV: packed latent (shape={tuple(getattr(x, 'shape', ()))}) "
+                    f"but model.latent_shapes is unset.")
             n = int(math.prod(ls[0][1:]))
             xf = x.reshape(int(x.shape[0]), -1)
             video_shape, audio_shape = list(ls[0]), list(ls[1])
             video_shape[0] = audio_shape[0] = int(x.shape[0])
             x_video = xf[:, :n].reshape(video_shape)
             x_audio = xf[:, n:].reshape(audio_shape)
-        if x_audio.ndim != 4 or int(x_audio.shape[1]) != _LTXAV_AUDIO_CH \
-                or int(x_audio.shape[3]) != _LTXAV_AUDIO_MEL:
-            raise RuntimeError(f"qf_native LTX-AV: audio latent shape {tuple(x_audio.shape)} - "
-                               f"expected [B,{_LTXAV_AUDIO_CH},L,{_LTXAV_AUDIO_MEL}] "
-                               "(LTXVEmptyLatentAudio / LTXVConcatAVLatent)")
+        if (x_audio.ndim != _AUDIO_LATENT_NDIM or int(x_audio.shape[1]) != _LTXAV_AUDIO_CH
+                or int(x_audio.shape[3]) != _LTXAV_AUDIO_MEL):
+            raise RuntimeError(
+                f"qf_native LTX-AV: audio latent shape {tuple(x_audio.shape)} - "
+                f"expected [B,{_LTXAV_AUDIO_CH},L,{_LTXAV_AUDIO_MEL}].")
         dev = x_video.device
-        xin = x_video.to(torch.bfloat16).contiguous()          # [B,128,F,H,W]
-        B = int(xin.shape[0])
+        xin = x_video.to(torch.bfloat16).contiguous()
+        batch = int(xin.shape[0])
         cou = transformer_options.get("cond_or_uncond") if isinstance(transformer_options, dict) else None
-        if B > 1 and (cou is None or len(cou) == 0 or B % len(cou) != 0):
-            raise RuntimeError(f"qf_native LTX-AV: engine forward is B==1 per cond group but got "
-                               f"batch={B} with cond_or_uncond={cou}")
-        targets_per_group = B // len(cou) if B > 1 else 1
+        if batch > 1 and (cou is None or len(cou) == 0 or batch % len(cou) != 0):
+            raise RuntimeError(
+                f"qf_native LTX-AV: engine forward is B==1 per cond group (got batch={batch}, cou={cou})")
+        targets_per_group = batch // len(cou) if batch > 1 else 1
         self._derive_geometry(xin, transformer_options)
-        _, Ca, La, Fa = (int(d) for d in x_audio.shape)
-        self._audio_rows = La
-        self._audio_pack = Ca * Fa
-        # RAW dual-proj ctx (no plugin connector — see _run_connector).
-        vemb = self._run_connector(c_crossattn, attention_mask=kwargs.get("attention_mask")
-                                   ).to(dev, dtype=torch.bfloat16).contiguous()
-        if int(vemb.shape[0]) != B:
-            raise RuntimeError("qf_native LTX-AV: context batch must match the flattened target batch")
-        _opening = self._qf.current_session is None or getattr(self, "_qf_needs_begin", False)
-        self._call_fps(kwargs, _opening)   # before _begin: the session's fps is this run's frame_rate
-        ref_active = self._prepare_audio_reference(kwargs.get("ref_audio"), dev,
-                                                  (self._reference_activation_dtype(dev)
-                                                   if _opening and kwargs.get("ref_audio") is not None else None),
-                                                  _opening)
-        if _opening:
+        _, ca, la, fa = (int(d) for d in x_audio.shape)
+        self._audio_rows = la
+        self._audio_pack = ca * fa
+        vemb = c_crossattn.to(dev, dtype=torch.bfloat16).contiguous()
+        if int(vemb.shape[0]) != batch:
+            raise RuntimeError("qf_native LTX-AV: context batch must match flattened target batch")
+        opening = self._qf.current_session is None or getattr(self, "_qf_needs_begin", False)
+        self._call_fps(kwargs, opening)
+        ref_active = self._prepare_audio_reference(
+            kwargs.get("ref_audio"), dev,
+            (self._reference_activation_dtype(dev) if opening and kwargs.get("ref_audio") is not None else None),
+            opening)
+        if opening:
             self._qf_needs_begin = False
-            # shared black-video guard (see qf_modelpatcher.refuse_all_zero_initial_latent).
             qfmp.refuse_all_zero_initial_latent(xin, "LTX-AV")
             self._begin(xin[0:1].contiguous(), vemb[0:1].contiguous())
-        _, C, F, H, W = xin.shape
-        N = F * H * W
-        if self._out is None or self._out.shape != (1, N, C):
-            self._out = torch.empty((1, N, C), dtype=xin.dtype, device=dev)
-        if self._out_audio is None or self._out_audio.shape != (1, La, Ca * Fa):
-            self._out_audio = torch.empty((1, La, Ca * Fa), dtype=torch.float32, device=dev)
+        _, c, f_dim, h, w = xin.shape
+        n_tok = f_dim * h * w
+        if self._out is None or self._out.shape != (1, n_tok, c):
+            self._out = torch.empty((1, n_tok, c), dtype=xin.dtype, device=dev)
+        if self._out_audio is None or self._out_audio.shape != (1, la, ca * fa):
+            self._out_audio = torch.empty((1, la, ca * fa), dtype=torch.float32, device=dev)
         sig_all = sigma.reshape(-1) if torch.is_tensor(sigma) else None
         step_index = self._sigma_step_index(sigma, sig_all, transformer_options)
-        # [step-cache-key] the AV class has its OWN step loop (this one), so the base t2v
-        # loop's uuid-derived key never runs here — extract uuids for THIS loop too (the
-        # e1_w2-measured miss: AV sessions kept passing key=0 → EC silently disabled).
         cuuids = transformer_options.get("uuids") if isinstance(transformer_options, dict) else None
         out5d = torch.empty_like(xin)
         out_audio = torch.empty_like(x_audio)
-        for i in range(B):
+        for i in range(batch):
             _interrupt_poll_end_session_on_raise(self._qf)
             xi = xin[i:i + 1].contiguous()
-            tokens = xi.reshape(1, C, N).transpose(1, 2).contiguous()          # [1,N,128]
-            # pack audio [1,C,L,F] -> rows [1,L,C*F] (d = c*F + f - engine unpack order)
-            arows = (x_audio[i:i + 1].float().permute(0, 2, 1, 3)
-                     .reshape(1, La, Ca * Fa).contiguous())
+            tokens = xi.reshape(1, c, n_tok).transpose(1, 2).contiguous()
+            arows = x_audio[i:i + 1].float().permute(0, 2, 1, 3).reshape(1, la, ca * fa).contiguous()
             vi = vemb[i:i + 1].contiguous()
-            sig_i = float(sig_all[i].item()) if (sig_all is not None and sig_all.numel() >= B) else \
-                (float(sig_all[0].item()) if sig_all is not None else float(sigma))
-            p = qfe.DenoiseStepParams()
+            sig_i = (float(sig_all[i].item()) if (sig_all is not None and sig_all.numel() >= batch)
+                     else (float(sig_all[0].item()) if sig_all is not None else float(sigma)))
+            p = qfe.QFStepParams()
             ctypes.memset(ctypes.byref(p), 0, ctypes.sizeof(p))
             p.struct_size = ctypes.sizeof(p)
             p.latent_in = tokens.data_ptr()
             p.velocity_out = self._out.data_ptr()
             p.velocity_out_capacity = self._out.numel() * self._out.element_size()
-            p.dims = (ctypes.c_int * 5)(1, N, C, 0, 0)
+            p.dims = (ctypes.c_int32 * 5)(1, n_tok, c, 0, 0)
             p.dtype = _qf_dtype(tokens.dtype)
             p.sigma = sig_i
             p.step_index = step_index
             p.total_steps = self._num_steps
             p.context = vi.data_ptr()
-            p.context_dims = (ctypes.c_int * 3)(*vi.shape)
+            p.context_dims = (ctypes.c_int32 * 3)(*vi.shape)
             p.context_dtype = _qf_dtype(vi.dtype)
-            # [step-cache-key] uuid-symbolic key (was constant 0 = kNoCtxKey; the EC session
-            # gate force-computes at 0 — the AV loop was the measured miss, see loop head).
             group = i // targets_per_group
             cuid = cuuids[group] if (cuuids is not None and group < len(cuuids)) else None
-            # Different targets have independent stateful cache trajectories under the same conditioning.
             if targets_per_group > 1 and cuid is not None:
                 cuid = (cuid, i % targets_per_group)
             p.cfg_context_key = self._ctx_key_assigner.key(cuid)
-            if getattr(self, "_audio_reference_bound", False):
-                p._opts = json.dumps({"audio_reference_active": ref_active}).encode()
-                p.options_json = p._opts
-            mp = qfe.DenoiseStepMultiParams()
+            mp = qfe.QFStepAvParams()
             ctypes.memset(ctypes.byref(mp), 0, ctypes.sizeof(mp))
             mp.struct_size = ctypes.sizeof(mp)
             mp.base = p
             mp.audio_latent_in = arows.data_ptr()
             mp.audio_velocity_out = self._out_audio.data_ptr()
             mp.audio_velocity_out_capacity = self._out_audio.numel() * self._out_audio.element_size()
-            mp.audio_dims = (ctypes.c_int * 4)(1, La, Ca * Fa, 0)
+            mp.audio_dims = (ctypes.c_int32 * 4)(1, la, ca * fa, 0)
             mp.audio_dtype = _qf_dtype(arows.dtype)
-            mp.audio_scale = 1.0            # LTX co-denoise: same-sigma, no carried variable
-            self._call_denoise_step_multi(mp, f"LTX-AV denoise_step_multi[step={step_index},group={i}]")
-            out5d[i:i + 1] = self._out.transpose(1, 2).reshape(1, C, F, H, W).to(xin.dtype)
-            # unpack audio velocity rows [1,L,C*F] -> [1,C,L,F] (exact inverse of the pack)
-            out_audio[i:i + 1] = (self._out_audio.reshape(1, La, Ca, Fa)
-                                  .permute(0, 2, 1, 3).to(out_audio.dtype))
+            mp.audio_scale = 1.0
+            mp.audio_reference_active = 1 if (getattr(self, "_audio_reference_bound", False) and ref_active) else 0
+            self._call_denoise_step_av(mp, f"LTX-AV qf_xfm_step_av[step={step_index},group={i}]")
+            out5d[i:i + 1] = self._out.transpose(1, 2).reshape(1, c, f_dim, h, w).to(xin.dtype)
+            out_audio[i:i + 1] = self._out_audio.reshape(1, la, ca, fa).permute(0, 2, 1, 3).to(out_audio.dtype)
             self._qf.step_count += 1
             self._sess_denoise += 1
         self._step_i += 1
         self._qf.sampler_step_count += 1
-        # calculate_denoised per lane on the SAME sigma (LTX joint schedule), returned in the
-        # SAME form the sampler handed us (the H3-measured contract).
-        if _nested:
+        if nested:
             den_v = self.model_sampling.calculate_denoised(sigma, out5d.float(), x_video)
             den_a = self.model_sampling.calculate_denoised(sigma, out_audio.float(), x_audio)
             return comfy.nested_tensor.NestedTensor((den_v, den_a))
-        Bx = int(x.shape[0])
-        vel_flat = torch.cat([out5d.reshape(Bx, -1), out_audio.reshape(Bx, -1)], dim=1).reshape(x.shape)
+        vel_flat = torch.cat([out5d.reshape(batch, -1), out_audio.reshape(batch, -1)], dim=1).reshape(x.shape)
         return self.model_sampling.calculate_denoised(sigma, vel_flat.float(), x)
 
     def process_latent_out(self, latent):
-        # Finalize on the VIDEO half (the session's step pin is the packed video tokens;
-        # t2av: engine finalize early-returns — buffer read-not-written), close the session,
-        # then hand the ORIGINAL joint latent to comfy's LTXAV post-processing untouched.
         if self._qf.current_session is not None:
             try:
-                # The final latent arrives NESTED or sampler-PACKED flat (the same dual form
-                # _apply_model handles — MEASURED: process_latent_out runs BEFORE comfy's
-                # un-pack, so the packed [B,1,N_total] shape reaches here). Extract the video
-                # half either way.
-                if getattr(latent, "is_nested", False):
-                    lv = latent.unbind()[0]
-                elif latent.ndim == 5:
-                    lv = latent
-                else:
-                    ls = getattr(self, "latent_shapes", None)
-                    if not ls or len(ls) < 2:
-                        raise RuntimeError(f"qf_native LTX-AV: finalize got a non-nested ndim="
-                                           f"{latent.ndim} latent and model.latent_shapes is "
-                                           "unset - cannot extract the video half")
-                    n = int(math.prod(ls[0][1:]))
-                    lv = latent.reshape(int(latent.shape[0]), -1)[:, :n].reshape(list(ls[0]))
-                if lv.ndim != 5:
-                    raise RuntimeError(f"qf_native LTX-AV: finalize expected the 5D video latent, "
-                                       f"got ndim={lv.ndim} (nested={getattr(latent, 'is_nested', False)})")
-                lat5 = (lv[0:1] if lv.shape[0] > 1 else lv)
-                Bc, C, F, H, W = lat5.shape
-                N = F * H * W
-                tokens = (lat5.reshape(1, C, N).transpose(1, 2)
-                          .to(torch.bfloat16).contiguous())
-                lib = self._qf.lib
-                fp = qfe.DenoiseFinalizeParams()
-                ctypes.memset(ctypes.byref(fp), 0, ctypes.sizeof(fp))
-                fp.struct_size = ctypes.sizeof(fp)
-                fp.latent = tokens.data_ptr()
-                fp.latent_capacity = tokens.numel() * tokens.element_size()
-                fp.dims = (ctypes.c_int * 5)(1, N, C, 0, 0)
-                fp.dtype = _qf_dtype(tokens.dtype)
-                fst = lib.quantfunc_denoise_finalize(self._qf.current_session, ctypes.byref(fp))
-                if fst != qfe.QUANTFUNC_OK:
-                    raise RuntimeError(f"qf_native: LTX-AV denoise_finalize failed: {qfe.last_err(lib)}")
                 qfe.info(f"[qf_native] LTX-AV SESSION CLOSED after {self._step_i} sampler steps, "
-                      f"{self._sess_denoise} denoise_step_multi calls, finalize=OK", flush=True)
+                         f"{self._sess_denoise} qf_xfm_step_av calls", flush=True)
             finally:
                 self._qf.end_session_if_open()
-        # No comfy-side frame-0 pin here (wan-align 2026-08-22): i2v conditioning is the
-        # Inplace latent + noise_mask, and KSamplerX0Inpaint's per-step blend already leaves
-        # the final x's conditioned frames at the clean latent — the decode input is right
-        # by construction.
         return super(QFLTXModel, self).process_latent_out(latent)
-
 
     def _qf_restore_frozen_audio(self, output, noise, latent_image, sampler, sigmas,
                                  denoise_mask=None, callback=None, disable_pbar=False,
@@ -774,7 +490,7 @@ class QFLTXAVModel(QFLTXModel):
             return output
         if (not isinstance(latent_shapes, (list, tuple)) or len(latent_shapes) != 2
                 or not all(isinstance(s, (list, tuple)) for s in latent_shapes)
-                or len(latent_shapes[0]) != 5 or len(latent_shapes[1]) != 4
+                or len(latent_shapes[0]) != _VIDEO_LATENT_NDIM or len(latent_shapes[1]) != _AUDIO_LATENT_NDIM
                 or not all(isinstance(d, int) and not isinstance(d, bool) and d > 0
                            for s in latent_shapes for d in s)
                 or latent_shapes[0][0] != latent_shapes[1][0]):
@@ -789,301 +505,58 @@ class QFLTXAVModel(QFLTXModel):
         frozen = denoise_mask.reshape(batch, -1)[:, video_size:] == 0
         if not bool(frozen.any()):
             return output
-        # Euler's final subtraction can round even an exactly frozen denoised value.
         clean = latent_image.reshape(batch, -1)[:, video_size:].to(device=output.device, dtype=output.dtype)
         restored = output.reshape(batch, -1).clone()
         restored[:, video_size:] = torch.where(frozen.to(device=output.device), clean, restored[:, video_size:])
         return restored.reshape(output.shape)
 
 
-FAMILY = "ltx2"
+def _resolve_ltx_connectors(transformer1_path):
+    """Locate the joint-AV connectors safetensors source (self-contained or same-dir sibling)."""
+    def _qualifies(path):
+        return _file_has_prefix(path, _CONN_VID_PREFIX) and _file_has_prefix(path, _CONN_AUD_PREFIX)
 
-def _file_has_prefix(path, prefix):
-    """Cheap safetensors HEADER probe: does any key start with `prefix`? Unreadable/not a
-    safetensors => False. Module-level: used by the AV discriminant (vocoder.*) AND the
-    [ltx25-allin] te_file relaxation (text_embedding_projection.*)."""
-    import struct as _st
+    if _qualifies(transformer1_path):
+        return transformer1_path
+    parent = os.path.dirname(transformer1_path)
     try:
-        with open(path, "rb") as fh:
-            n = _st.unpack("<Q", fh.read(8))[0]
-            if n > (1 << 31):
-                return False
-            hdr = json.loads(fh.read(n))
-        return any(k.startswith(prefix) for k in hdr)
-    except Exception:  # noqa: BLE001 - unreadable = no keys
-        return False
-
-
-
-
-
-def _ltx_source_create_options(path):
-    """Validate official source CONTENT before selecting native precision.
-
-    The filename only admits the supported official file through file_hints. It is
-    never sufficient proof of format. No weight data is decoded here: read the
-    bounded safetensors header and small JSON descriptors; the shared native
-    Int8ConvrotDequantProvider owns the actual decode/unrotation.
-    """
-    import struct
-    official = os.path.basename(path).lower() == (
-        "ltx-2.5-22b-distilled-transformer-comfy-int8-convrot.safetensors")
-    official_bf16 = os.path.basename(path).lower() in (
-        "ltx-2.5-22b-distilled-transformer-bf16.safetensors",
-        "ltx-2.5-22b-dev-transformer-bf16.safetensors")
-    prefix = "model.diffusion_model."
-    blocks = prefix + "transformer_blocks."
-    families = (blocks, prefix + "video_embeddings_connector.", prefix + "audio_embeddings_connector.")
-    try:
-        with open(path, "rb") as fh:
-            size = os.fstat(fh.fileno()).st_size
-            raw = fh.read(8)
-            n = struct.unpack("<Q", raw)[0]
-            if not 0 < n <= min(64 << 20, size - 8):
-                raise ValueError("invalid safetensors header length")
-            header = json.loads(fh.read(n))
-            if not isinstance(header, dict):
-                raise ValueError("safetensors header is not an object")
-            if official_bf16:
-                import math
-                weights = {k: v for k, v in header.items() if k.endswith(".weight")}
-                required = [blocks + "0." + lane + ".to_q.weight" for lane in ("attn1", "audio_attn1")]
-                if (not all(k in weights for k in required)
-                        or not all(any(k.startswith(family) for k in weights) for family in families)
-                        or any(k.endswith((".qweight", ".comfy_quant")) for k in header)):
-                    raise ValueError("BF16 source requires both transformer lanes and connectors without quantized stores")
-                for key, tensor in weights.items():
-                    shape, offsets = tensor.get("shape"), tensor.get("data_offsets")
-                    if (tensor.get("dtype") != "BF16" or not isinstance(shape, list) or not shape
-                            or not all(type(dim) is int and dim > 0 for dim in shape)
-                            or not isinstance(offsets, list) or len(offsets) != 2
-                            or not all(type(off) is int for off in offsets)
-                            or not 0 <= offsets[0] <= offsets[1] <= size - 8 - n
-                            or offsets[1] - offsets[0] != math.prod(shape) * 2):
-                        raise ValueError(f"{key}: expected complete BF16 weight data")
-                return {"transformer_precision": "bf16", "attention_backend": "flash"}
-            tagged = any(k.startswith(blocks) and k.endswith(".comfy_quant") for k in header)
-            if not tagged:
-                if official:
-                    raise ValueError("official INT8-convrot filename has no transformer format descriptors")
-                return {}  # existing QuantFunc/SVDQ or BF16 path: unchanged create options
-            weights = {k: v for k, v in header.items() if k.startswith(families)
-                       and isinstance(v, dict) and v.get("dtype") == "I8"}
-            required = [blocks + "0." + lane + ".to_q.weight" for lane in ("attn1", "audio_attn1")]
-            if any(k not in weights for k in required) or any(
-                    k.startswith(blocks) and k.endswith(".qweight") for k in header):
-                raise ValueError("expected both video/audio INT8 transformer weights, without SVDQ qweight")
-            tags = {k[:-len(".comfy_quant")] + ".weight" for k in header
-                    if k.startswith(families) and k.endswith(".comfy_quant")}
-            if tags != set(weights):
-                raise ValueError("every INT8 source weight needs exactly its own format descriptor")
-            for key, entry in weights.items():
-                shape = entry.get("shape", [])
-                if (len(shape) != 2 or any(type(x) is not int or x <= 0 for x in shape)
-                        or shape[1] % 256):
-                    raise ValueError(f"{key}: expected 2-D I8 with input width divisible by 256")
-                base = key[:-len(".weight")]
-                scale, blob = header.get(base + ".weight_scale", {}), header.get(base + ".comfy_quant", {})
-                if scale.get("dtype") != "F32" or scale.get("shape") != [shape[0], 1]:
-                    raise ValueError(f"{key}: expected F32 [output,1] weight_scale")
-                offsets = blob.get("data_offsets", [])
-                if (blob.get("dtype") != "U8" or len(offsets) != 2
-                        or any(type(x) is not int for x in offsets)
-                        or not 0 <= offsets[0] < offsets[1] <= size - 8 - n
-                        or offsets[1] - offsets[0] > 4096
-                        or blob.get("shape") != [offsets[1] - offsets[0]]):
-                    raise ValueError(f"{key}: invalid bounded U8 format descriptor")
-                fh.seek(8 + n + offsets[0])
-                desc = json.loads(fh.read(offsets[1] - offsets[0]))
-                if (not isinstance(desc, dict) or desc.get("format") != "int8_tensorwise"
-                        or desc.get("convrot") is not True or type(desc.get("convrot_groupsize")) is not int
-                        or desc["convrot_groupsize"] != 256):
-                    raise ValueError(f"{key}: expected int8_tensorwise, convrot=true, groupsize=256")
-    except (OSError, ValueError, TypeError, AttributeError, struct.error) as exc:
-        # Legacy name paths retain their old header/connector error behavior. Once
-        # INT8 was declared by content or the newly admitted name, never guess AUTO_4.
-        if official_bf16:
-            raise RuntimeError(f"LTX2 BF16 source refused: {exc}") from exc
-        if official or locals().get("tagged", False):
-            raise RuntimeError(f"LTX2 INT8-convrot source refused: {exc}") from exc
-        return {}
-    return {"transformer_precision": "i8"}
-
-
-def matches(pipeline_class, transformer_class=""):
-    """The ENGINE's own detector (src/LTX2VideoPipeline.cpp ltx2_pipeline_detect):
-        pipeline_class == "LTX2Pipeline"
-    — an EXACT match with no transformer_class half, so this seam has none either."""
-    return str(pipeline_class) == "LTX2Pipeline"
+        sibs = sorted(f for f in os.listdir(parent)
+                      if f.lower().endswith(".safetensors") and "connector" in f.lower())
+    except OSError:
+        sibs = []
+    qualified = [os.path.join(parent, f) for f in sibs
+                 if os.path.join(parent, f) != transformer1_path and _qualifies(os.path.join(parent, f))]
+    if qualified:
+        if len(qualified) > 1:
+            qfe.info(f"[qf_native] ltx2: {len(qualified)} qualifying connectors files in {parent!r}; "
+                     f"using {os.path.basename(qualified[0])}", flush=True)
+        return qualified[0]
+    why = ("packs video_embeddings_connector but NOT audio_embeddings_connector - LTX-2.5 needs BOTH - "
+           if _file_has_prefix(transformer1_path, _CONN_VID_PREFIX) else "is a transformer-only export ")
+    raise RuntimeError(
+        f"qf_native ltx2: {os.path.basename(transformer1_path)} {why}"
+        f"and no connectors completion file was found next to it (probed {parent!r} for "
+        f"*connector*.safetensors packing BOTH {_CONN_VID_PREFIX}* and {_CONN_AUD_PREFIX}*).")
 
 
 def register(deps):
-    """Return the ltx2 family BUILDER. `deps` gives the package-level helpers (engine cache,
-    liveness registry) without importing __init__."""
-
-
     def build(transformer1_path, bundle_dir=None, lora_entries=(), pinned_memory=False):
-        """File-based (ComfyUI single-file) loading for LTX-2.5 — the shared staging pattern.
-        CONNECTORS-SOURCE contract (user 2026-08-31 — fully support the transformer-only
-        export; supersedes the 2026-08-22 one-file-only ruling):
-        - transformer/  <- the transformer export (ALL-IN or transformer-only);
-        - connectors/   <- resolved in priority order (a QUALIFYING source packs BOTH
-          modality blocks — model.diffusion_model.{video,audio}_embeddings_connector.* —
-          the joint-AV discriminant; a video-only source is rejected, see below):
-            (1) the transformer file itself, when it qualifies (ALL-IN — the
-                official-comfy-single-file mirror; byte-identical to the old path);
-            (2) a same-dir sibling `*connector*.safetensors` that qualifies —
-                the shared, recipe-independent completion file (extracted VERBATIM from
-                the official comfy model file's connector keys; one copy serves every
-                quantized transformer variant).
-          NEITHER found -> fail loud naming the dir probed, the BOTH-modality
-          requirement, and both remedies (a video-only-connector source additionally
-          gets the joint-AV explanation — it must not fall through to the retired 2.3
-          video-only path whose connector_ckpt widget no longer exists). The engine
-          #565 comfy25 branch consumes either source identically (prefix detect ->
-          rename+strip).
-        text_embedding_projection is deliberately NOT required from the model file: the
-        workflow's with-proj clip applies it TE-side (comfy lt.py dual_linear), the
-        session cond arrives post-projection, and the engine loads it opportunistically
-        (single-file first, te-dir fallback, else skip — LTX2VideoPipeline.cpp:376-397).
-        AV capability = the packed audio_embeddings_connector in the RESOLVED connectors
-        source (the engine's denoise_only has_audio_ probe + the _is_av discriminant
-        below both read that source; every resolved source qualifies -> file-mode
-        always arms AV); audio decode is the workflow's own audio
-        VAELoader, never engine-side.
-        Engine create runs denoise_only=True (VAE decode weights skipped; TE lazy)."""
-        # CONNECTORS-SOURCE resolution (user 2026-08-31). The engine applies the
-        # embeddings-connector tail itself on the unprocessed dual-proj cond — the
-        # official comfy contract (lt.py marks TE output `unprocessed_ltxav_embeds`;
-        # the model side owns the connector) — so a weight source MUST exist; no
-        # workflow module can substitute it (the TE-side compat branch is legacy-shape
-        # only and upstream-marked TODO:remove). The probe is CONTENT-based (header
-        # prefix via _file_has_prefix), never name-based trust; the name filter merely
-        # bounds which siblings get their header read.
-        # A QUALIFYING source packs BOTH modality blocks (video AND audio) — the same
-        # joint-AV discriminant `_is_av` reads downstream. LTX-2.5 file-mode is
-        # joint-AV; a video-only-connector source cannot arm it, and accepting one
-        # would fall through to the retired 2.3 video-only path whose connector_ckpt
-        # widget no longer exists (an unactionable dead-letter refusal) — so it is
-        # rejected HERE with an accurate message instead.
-        _CONN_VID = "model.diffusion_model.video_embeddings_connector."
-        _CONN_AUD = "model.diffusion_model.audio_embeddings_connector."
-        def _qualifies(path):
-            return (_file_has_prefix(path, _CONN_VID)
-                    and _file_has_prefix(path, _CONN_AUD))
-        conn_src = None
-        if _qualifies(transformer1_path):
-            conn_src = transformer1_path   # ALL-IN: self-link, byte-identical to the old path
-        else:
-            _dir = os.path.dirname(transformer1_path)
-            try:
-                _sibs = sorted(f for f in os.listdir(_dir)
-                               if f.lower().endswith(".safetensors")
-                               and "connector" in f.lower())
-            except OSError:  # unreadable dir = no siblings; the raise below names it
-                _sibs = []
-            _qualified = [os.path.join(_dir, _f) for _f in _sibs
-                          if os.path.join(_dir, _f) != transformer1_path
-                          and _qualifies(os.path.join(_dir, _f))]
-            if _qualified:
-                conn_src = _qualified[0]   # deterministic: sorted-first
-                if len(_qualified) > 1:
-                    qfe.info(f"[qf_native] ltx2: {len(_qualified)} qualifying connectors "
-                          f"completion files in {_dir!r}; using the alphabetically-first "
-                          f"{os.path.basename(conn_src)} (others: "
-                          f"{', '.join(os.path.basename(p) for p in _qualified[1:])})",
-                          flush=True)
-            if conn_src is None:
-                _why = ("packs the video_embeddings_connector but NOT the audio one - "
-                        "LTX-2.5 file-mode is joint-AV and needs BOTH - "
-                        if _file_has_prefix(transformer1_path, _CONN_VID)
-                        else "is a transformer-only export ")
-                raise RuntimeError(
-                    f"qf_native ltx2: {os.path.basename(transformer1_path)} {_why}"
-                    f"and no connectors completion file was found "
-                    f"next to it (probed {_dir!r} for *connector*.safetensors packing "
-                    f"BOTH {_CONN_VID}* and {_CONN_AUD}*). The engine applies the "
-                    f"embeddings-connector tail "
-                    f"itself (official comfy contract: TE output is unprocessed_ltxav_embeds), "
-                    f"so a source is required. Fix: place the shared ltx-2.5-connectors file "
-                    f"in the same folder, or use an ALL-IN export (*-allin-*.safetensors).")
-            qfe.info(f"[qf_native] ltx2: transformer-only export - connectors completion file: "
-                  f"{os.path.basename(conn_src)}", flush=True)
-        source_options = _ltx_source_create_options(transformer1_path)
-        extra = {"connectors": conn_src}
-        if qfmp.engine_reads_weight_paths():   # 0.0.17+: weights from paths, the package holds configs only (#777)
-            model_dir = qfmp.stage_config_package(bundle_dir, transformer1_path, extra_links=extra)
-            create_extra, weights = {"denoise_only": True, "connectors_path": conn_src}, transformer1_path
-        else:
-            model_dir = qfmp.stage_denoise_only_package(bundle_dir, transformer1_path, extra_links=extra)
-            create_extra, weights = {"denoise_only": True}, None
-        create_extra.update(source_options)
-        if source_options.get("transformer_precision") == "bf16":
-            qfe.info("[qf_native] LTX2 source=BF16; native BF16 blocks, no weight quantization; attention=flash", flush=True)
-        elif source_options:
-            qfe.info("[qf_native] LTX2 source=INT8-convrot; decode/unrotate BF16 -> native INT8 runtime "
-                     "(transformer_precision=i8; not INT8 passthrough)", flush=True)
-        return _build_from_package(model_dir, os.path.basename(transformer1_path), conn_src,
-                                   lora_entries=lora_entries,
-                                   # pinned memory is the loaders' pinned_memory switch (user 2026-09-26); the
-                                   # LTX-2.5 loader defaults it ON (every other family OFF), as a recorded temporary
-                                   # exception until the compute/transfer overlap no longer needs it
-                                   create_extra=create_extra, pinned_memory=pinned_memory, transformer_path=weights)
-
-    def _build_from_package(model_dir, model_name, conn_src, lora_entries=(), create_extra=None, pinned_memory=False,
-                            transformer_path=None):
-        # NOTE (CR simplicity): the joint audio+video (a2v) path needs an engine external-step
-        # split (makeExternalStepFn) this seam does not implement, and since the widget was
-        # removed there is no way to request it — so the old join_audio_prompt flag and its two
-        # refusal branches are GONE (structurally unreachable code is not a guard). The AV path
-        # below is LTX-2.5's own engine-side joint AV, which is a different mechanism.
-        # ── LTX-2.5 JOINT-AV auto-detect (c5.8b): the SAME discriminant the engine's own
-        # has_audio_ uses — the engine model_dir ships audio_vae/ weights (the video-only
-        # 19B staging deliberately omits it) — so plugin and engine agree by construction.
-        # AV → QFLTXAVModel (t2av; engine-side connector via av_unprocessed_ctx; NO
-        # connector_ckpt needed). A package that is not AV is refused below.
-        # CR conf-1: mirror the engine's FULL has_audio_ discriminant (LTX2VideoPipeline
-        # :440): the audio DECODE chain staged (audio_vae weights + a vocoder — 2.3
-        # separate dir or 2.5 bundled vocoder.* keys), OR — the denoise_only AV-lane
-        # probe (user 2026-08-22 "官方工作流都是独立组件"): the staged connectors source
-        # packs the audio_embeddings_connector blocks (the all-in single file, exactly
-        # like the official comfy single-file; the split-layout connectors file carries
-        # them too). The native seam never decodes audio engine-side (comfy's own
-        # LTXVAudioVAEDecode does), so audio-VAE staging is NOT required for AV.
-        # A mismatch either way would hit the engine's begin-time audio-lane refusal
-        # (loud, but confusing); agreeing by construction avoids it. Decided once per staged package: a LoRA rebuild
-        # of the same package gets the same answer.
-        _avae_dir = os.path.join(model_dir, "audio_vae")
-        _avae_files = ([os.path.join(_avae_dir, f) for f in os.listdir(_avae_dir)
-                        if f.endswith(".safetensors")]
-                       if os.path.isdir(_avae_dir) else [])
-        _voc_dir = os.path.join(model_dir, "vocoder")
-        _voc_ok = os.path.isdir(_voc_dir) and any(
-            f.endswith(".safetensors") for f in os.listdir(_voc_dir))
-        _voc_bundled = (not _voc_ok) and any(
-            _file_has_prefix(f, "vocoder.") for f in _avae_files)
-        # the connectors source itself (the link in the package points at it; a config-only package has no link)
-        _is_av = (bool(_avae_files) and (_voc_ok or _voc_bundled)) or (
-            _file_has_prefix(conn_src,
-                             "model.diffusion_model.audio_embeddings_connector.")
-            or _file_has_prefix(conn_src, "audio_embeddings_connector."))
-        # LTX svdq is PRE-quantized: pass the MINIMUM to create (minimal=True → empty config_json).
-        # The svdquant metadata carries the layout/precision (embedded config: cross_attn_mod=True /
-        # audio_cross_attn_mod=True / cross_attention_dim 4096 / num_heads 32 → 9-mod). ANYTHING
-        # supplied on top (auto_optimize / height / width / a precision map) competes with it and the
-        # engine resolves to the 19b default (connector 3840 / transformer 6-mod — the E2E run-1..8
-        # create mis-size). The harness's whole svdq entry is {backend:svdq, model_dir}; mirror that.
-        if _is_av:
-            weight_mode = {"i8": "lighting INT8 from Comfy INT8-convrot",
-                           "bf16": "lighting BF16 from BF16 source"}.get(
-                               (create_extra or {}).get("transformer_precision"), "svdq")
-            return qfmp.family_build(
-                deps, model_dir, create_extra, comfy.supported_models.LTXAV,
-                {"image_model": "ltxav", "disable_unet_model_creation": True}, QFLTXAVModel,
-                f"[qf_native] loaded QuantFuncNativeLoader (LTX-2.5 JOINT-AV {weight_mode}) package={model_name} "
-                f"capacity=native Prepared query (create deferred)", pinned_memory,
-                transformer_path=transformer_path)(list(lora_entries))
-        raise RuntimeError("QuantFuncNativeLoader: connector_ckpt (comfy LTX-2.3 ckpt with the "
-                           "video_embeddings_connector) is required")
+        config_path = os.path.join(bundle_dir, "transformer", "config.json") if bundle_dir else ""
+        if not os.path.isfile(config_path):
+            raise RuntimeError(f"qf_native ltx2: transformer config missing: {config_path}")
+        conn_src = _resolve_ltx_connectors(transformer1_path)
+        create_extra = {
+            "model_arch": "ltx25",
+            "config_path": config_path,
+            "connectors_path": conn_src,
+        }
+        return qfmp.family_build(
+            deps, transformer1_path, create_extra,
+            comfy.supported_models.LTXAV,
+            {"image_model": "ltxav", "disable_unet_model_creation": True},
+            QFLTXAVModel,
+            f"[qf_native] loaded QuantFuncLTXLoader package={os.path.basename(transformer1_path)} (create deferred)",
+            pinned_memory=pinned_memory,
+        )(list(lora_entries))
 
     return build

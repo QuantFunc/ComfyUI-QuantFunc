@@ -60,12 +60,10 @@ _AUDITED_MODELS = (
     #    (QFLTXModel._call_fps) — the engine's video + video<->audio RoPE time grid.
     #    (It was once read as metadata after the loader's fps widget went away; the session then ran every 24-fps
     #    graph at a hardcoded 25 and the audio died, 2026-09-28.) It is ALWAYS emitted, so it must NOT be rejected.
-    #  • attention_mask — the TE PADDING mask. The plugin runs comfy's connector on the FULL cross_attn
-    #    sequence (the shipped _run_connector); it is infra present on normal runs, NOT user-wired
-    #    conditioning, so rejecting it would break normal generation. HONEST RESIDUAL: if a future validation
-    #    shows the reference connector masks padding, attention_mask must become a HANDLED channel (an LTX
-    #    follow-up) — it is NOT a NEW silent-drop introduced here (the shipped _run_connector already ignored
-    #    it). Listing it here makes the acceptance EXPLICIT + auditable, not silent.
+    #  • attention_mask — the TE PADDING mask. The engine runs the connector internally on the full
+    #    c_crossattn sequence; it is infra present on normal runs, NOT user-wired conditioning, so
+    #    rejecting it would break normal generation. Listing it here makes the acceptance EXPLICIT +
+    #    auditable, not silent.
     #  • denoise_mask — ACCEPTED BY INHERITANCE (wan-align 2026-08-22 "只关注latent"): the Inplace
     #    i2v latent route rides it. It reaches the SAMPLER (KSamplerX0Inpaint), not extra_conds, and
     #    QFLTXModel deliberately INHERITS BaseModel.scale_latent_inpaint (no loud-fail override) so
@@ -103,7 +101,7 @@ _AUDITED_MODELS = (
     # controlnet/noise_concat/concat channels. Documented-ACCEPTED keys:
     #  • image_slots + reference_latents — CONSUMED: the edit channel. extra_conds keeps comfy's own processing
     #    (process_latent_in on the references, CONDConstant slots) and _apply_model forwards both per step
-    #    through quantfunc_denoise_step_refs (the engine's forwardEdit = comfy build_sequence).
+    #    through qf_xfm_step_refs (the engine's forwardEdit = comfy build_sequence).
     #  • denoise_mask — SAMPLER-honoured: KSamplerX0Inpaint blends outside the model; comfy's QwenImage21 has no
     #    concat keys, so its concat_cond never reads it — SetLatentNoiseMask inpainting behaves as in comfy, with
     #    the engine's own quality_enhance behaviour applied to the model output exactly as on plain t2i.

@@ -455,16 +455,16 @@ def _console_child(job):
         qfe._LOG_LEVEL = qfe._LOG_INFO
         out["console say"] = out["console logger"] = out["console exception"] = missing
         out["console info"] = _outcome(qfe.info, "[info] " + _CONSOLE_TEXT)
-    if qfe is not None and hasattr(qfe, "create_pipeline"):
+    if qfe is not None and hasattr(qfe, "create_transformer"):
         import types
         engine = types.SimpleNamespace(   # an engine whose create fails, with an error text the code page may not hold
-            quantfunc_create=lambda params, handle: 3,
-            quantfunc_last_error=lambda: ("[engine] " + _CONSOLE_TEXT).encode("utf-8"))
+            qf_xfm_create=lambda params, handle: 3,
+            qf_last_error=lambda: ("[engine] " + _CONSOLE_TEXT).encode("utf-8"))
 
         def comfy_logs_an_engine_error():   # ComfyUI execution.py:637-638, around the plugin's real raise of engine text
             import traceback
             try:
-                qfe.create_pipeline(engine, create_params=qfe.InitParams())
+                qfe.create_transformer(engine, create_params=qfe.QFXfmCreateParams())
             except Exception as ex:  # noqa: BLE001
                 logging.getLogger().error(f"!!! Exception during processing !!! {ex}")
                 logging.getLogger().error(traceback.format_exc())

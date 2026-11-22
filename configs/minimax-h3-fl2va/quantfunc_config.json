@@ -1,6 +1,0 @@
-{
- "method": "minimax_h3_fl2va",
- "transformer_precision": "svdq",
- "text_encoder_precision": "int8_convrot",
- "vae_precision": "fp16"
-}

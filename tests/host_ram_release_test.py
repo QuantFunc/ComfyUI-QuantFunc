@@ -30,7 +30,7 @@ class Handle:
     """A cached engine handle: only what _retire_handle and the release read."""
 
     def __init__(self, events, capacity):
-        self.lib, self.resource, self.pipeline, self.events = object(), None, object(), events
+        self.lib, self.xfm, self.events = object(), object(), events
         self.capacity_bytes = capacity
 
     def destroy(self):
@@ -272,9 +272,9 @@ class HostRamRelease(unittest.TestCase):
         built = []
 
         def builder(transformer1_path, bundle_dir, pinned_memory):
-            patcher = qfmp.family_build(deps, "/nowhere", {"denoise_only": True}, supported.Krea2,
-                                        {"image_model": "krea2", "disable_unet_model_creation": True}, krea2.QFKrea2Model,
-                                        "[test] krea2", pinned_memory)([])
+            patcher = qfmp.family_build(deps, transformer1_path, {"model_arch": "krea2", "config_path": "/c"},
+                                        supported.Krea2, {"image_model": "krea2", "disable_unet_model_creation": True},
+                                        krea2.QFKrea2Model, "[test] krea2", pinned_memory)([])
             built.append(patcher)
             return patcher
         with mock.patch.dict(plugin._FAMILY_BUILDERS, {"krea2": builder}), \

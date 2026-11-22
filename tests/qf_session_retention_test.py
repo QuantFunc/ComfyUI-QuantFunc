@@ -44,14 +44,14 @@ class _StubLib:
         self.raise_on_end = raise_on_end
         self.end_calls = 0
 
-    def quantfunc_denoise_end(self, sess):
+    def qf_xfm_session_end(self, sess):
         self.end_calls += 1
         if self.raise_on_end:
             raise OSError("stub ctypes failure")
         return self.end_rc
 
-    def quantfunc_last_error(self):
-        return b"denoise end refused: session is not in an endable state (stub)"
+    def qf_last_error(self):
+        return b"session end refused: session is not in an endable state (stub)"
 
 
 
@@ -59,7 +59,7 @@ def _handle(lib):
     h = object.__new__(qfe.QFEngineHandle)
     h.lib = lib
     h.current_session = ctypes.c_void_p(0xDEAD)
-    h.pipeline = ctypes.c_void_p(0xBEEF)
+    h.xfm = ctypes.c_void_p(0xBEEF)
     return h
 
 

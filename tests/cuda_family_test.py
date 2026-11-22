@@ -194,24 +194,30 @@ def arm_no_torch_and_unshipped(tmp):
 
 
 def arm_closure(tmp):
+    """PC Engine O1: zero-CUDA host + selected per-SM kernel plugin (no libquantfunc_attention.so)."""
     d = os.path.join(tmp, "engine")
     host = _touch(d, "libquantfunc-12.so")
-    _touch(d, "libquantfunc_kernels-12.so")
-    _touch(d, "libquantfunc_attention.so")
+    _touch(d, "libquantfunc_kernels_cuda_sm89.so")
     needed = {
-        "libquantfunc-12.so": ["libquantfunc_kernels-12.so", "libquantfunc_attention.so", "libcudart.so.12",
-                               "libcusolver.so.11", "libcuda.so.1", "libstdc++.so.6"],
-        "libquantfunc_kernels-12.so": ["libcudart.so.12", "libcublasLt.so.12", "libcudnn.so.9", "libcuda.so.1"],
-        "libquantfunc_attention.so": ["libcublas.so.12", "libquantfunc-12.so"],
+        "libquantfunc-12.so": ["libstdc++.so.6", "libpthread.so.0", "libc.so.6"],
+        "libquantfunc_kernels_cuda_sm89.so": [
+            "libcudart.so.12", "libcublas.so.12", "libcublasLt.so.12",
+            "libcusolver.so.11", "libcudnn.so.9", "libcuda.so.1",
+        ],
     }
-    orig = qfe._elf_needed
+    orig_needed, orig_sm, orig_maj = qfe._elf_needed, qfe._gpu_sm, qfe._torch_cuda_major
     qfe._elf_needed = lambda p: needed.get(os.path.basename(p), [])
+    qfe._gpu_sm = lambda _idx: 89
+    qfe._torch_cuda_major = lambda: 12
     try:
         got = qfe._engine_cuda_needs(host)
+        leaked = qfe._host_forbidden_cuda(host)
     finally:
-        qfe._elf_needed = orig
-    return _check("(E) closure = host + kernel + sidecar CUDA sonames, never the driver", got == _ENGINE_CU12,
-                  f"got={sorted(got)}")
+        qfe._elf_needed, qfe._gpu_sm, qfe._torch_cuda_major = orig_needed, orig_sm, orig_maj
+    bad = _check("(E) host libquantfunc has zero CUDA DT_NEEDED imports", leaked == [], f"leaked={leaked}")
+    bad += _check("(E) closure = selected per-SM kernel plugin CUDA sonames, never the driver",
+                  got == _ENGINE_CU12, f"got={sorted(got)}")
+    return bad
 
 
 def arm_real_linker(tmp):

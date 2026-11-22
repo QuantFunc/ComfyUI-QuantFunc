@@ -1,20 +1,22 @@
 #!/usr/bin/env python3
-"""Death rules for the enhance SWITCHES (user rule 2026-09-19: the engine's methods stay inside the engine API, which offers
-only switches; the plugin layer carries no implementation detail. The quality switch, user 2026-09-25: ONE quality_enhance
-switch; what each state does per model family is engine law):
+"""Death rules for the enhance SWITCHES and dual-layer QualityLaw guard (PC Engine Rev 4.2):
 
-  1. the plugin's production code carries NO retired option key or helper — no source file (outside tests/) uses one of the
-     keys in tests/_banned_terms.py (KEYS, compared as SHA-256) as a CODE constant or one of its retired NAMES as a name or
-     attribute (comments/docstrings are covered by tests/shipped_terms_test.py), and each of the four loaders hands its run
-     the engine's switch (set_video_enhance);
-  1b. user-visible text: no "almost the same" claim anywhere; the switch's texts (the README, the five QI-2.1 workflow notes)
-     describe the switch and carry no banned term, number or earlier option name;
-  2. QFSessionModelMixin.residency_opts ALWAYS sends `video_enhance` (both states) and never `quality` or a retired key; a
-     model its loader never configured refuses to begin;
-  3. the audio switch setter is a boolean: set_audio_enhance stores bool(...).
+  1. Production code carries NO retired option key or helper (tests/_banned_terms.py KEYS/NAMES) and all
+     four family loaders wire quality_enhance via _apply_common_loader_dials -> set_video_enhance;
+  1b. User-visible text: no "almost the same" claim anywhere; the 5 QI-2.1 workflow notes and README
+     describe quality_enhance cleanly;
+  2. QFSessionModelMixin.dial_opts() ALWAYS sends the canonical session ratio dial (False -> 0.80, True -> 1.0)
+     and NEVER sends retired video_enhance / quality / banned keys; an unconfigured model refuses;
+  2b. Dual-layer QualityLaw guard on QFQwenImage21Model:
+     - quality_enhance=False + t2i (no refs, batch==1, single cond group) -> 0.85
+     - quality_enhance=True  + t2i -> 1.0
+     - quality_enhance=False + edit (reference_latents / ref_latents non-empty) -> 1.0
+     - quality_enhance=False + CFG > 1 (single_cond_group=False) -> 1.0
+     - quality_enhance=False + batch > 1 -> 1.0
+  3. QuantFuncH3Loader.audio_enhance is a compatibility-only boolean: set_audio_enhance stores bool(...),
+     emits a deprecation warning once when True, and NEVER forwards audio_enhance to the engine.
 
-Run:  python tests/enhance_switch_test.py   (arms 1-1b are pure-python; arms 2-3 need comfy importable (COMFY_ROOT) → SKIP (77)
-without it)
+Run: python3 tests/enhance_switch_test.py
 """
 import ast
 import glob
@@ -30,6 +32,8 @@ sys.path.insert(0, _HERE)
 import _banned_terms as bt  # noqa: E402
 
 fails = 0
+
+
 def check(cond, msg):
     global fails
     print(("  PASS " if cond else "  FAIL ") + msg)
@@ -37,7 +41,7 @@ def check(cond, msg):
         fails += 1
 
 
-# ---- arm 1: AST scan — retired keys and helpers are unreachable from the plugin path ---------------------------------------
+# ---- arm 1: AST scan — retired keys and helpers are unreachable from the plugin path ----
 hits, trees = [], {}
 for root, _dirs, files in os.walk(_PLUGIN):
     if "/tests" in root or "/.git" in root:
@@ -47,27 +51,31 @@ for root, _dirs, files in os.walk(_PLUGIN):
             continue
         path = os.path.join(root, fn)
         try:
-            tree = trees[os.path.relpath(path, _PLUGIN)] = ast.parse(open(path, encoding="utf-8").read(), filename=path)
+            with open(path, encoding="utf-8") as fh:
+                tree = trees[os.path.relpath(path, _PLUGIN)] = ast.parse(fh.read(), filename=path)
         except SyntaxError as e:
             hits.append(f"{path}: SyntaxError {e}")
             continue
         for node in ast.walk(tree):
             if isinstance(node, ast.Constant) and isinstance(node.value, str) and bt.h(node.value) in bt.KEYS:
-                # a docstring is an Expr(Constant) statement — prose, not code; an exact-match constant is code
                 hits.append(f"{path}:{node.lineno}: retired key constant")
             if isinstance(node, ast.Name) and bt.h(node.id) in bt.NAMES:
                 hits.append(f"{path}:{node.lineno}: retired name {node.id}")
             if isinstance(node, ast.Attribute) and bt.h(node.attr) in bt.NAMES:
                 hits.append(f"{path}:{node.lineno}: retired attribute .{node.attr}")
 check(not hits, "arm1: no retired option key or helper reachable from the plugin path (%s)" % (hits or "clean"))
-_sets = [c for c in ast.walk(trees["__init__.py"]) if isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
-         and c.func.attr == "set_video_enhance"]
-check(len(_sets) == 4, f"arm1: each of the four loaders hands its run the engine's switch (set_video_enhance x{len(_sets)})")
 
-# ---- arm 1b: user-visible text ------------------------------------------------------------------------------------------
-# (tests-07 re-CR rounds 4-5): the faster default changes details on every family vs maximum quality (QI-2.1 PSNR 23-27 dB,
-# Krea-2 20.7-22 dB, LTX-2.5 15.8 dB), so no text may claim "almost the same" / "nearly the same" / "closer" / "the picture
-# stays the same": not a tooltip or description (every string constant in the plugin's code), not the README, not a note.
+_init_tree = trees["__init__.py"]
+_common_calls = [c for c in ast.walk(_init_tree)
+                 if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
+                 and c.func.id == "_apply_common_loader_dials"]
+_sets = [c for c in ast.walk(_init_tree)
+         if isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
+         and c.func.attr == "set_video_enhance"]
+check(len(_common_calls) == 4 and len(_sets) == 1,
+      f"arm1: all 4 loaders apply common dials (x{len(_common_calls)}) wiring set_video_enhance (x{len(_sets)})")
+
+# ---- arm 1b: user-visible text ----
 _CLAIM = ("almost the same", "nearly the same", "closer to best", "picture stays the same")
 _claims = []
 for _root, _dirs, _files in os.walk(_PLUGIN):
@@ -76,23 +84,27 @@ for _root, _dirs, _files in os.walk(_PLUGIN):
     for _fn in _files:
         _path = os.path.join(_root, _fn)
         if _fn.endswith(".py"):
-            for _node in ast.walk(ast.parse(open(_path, encoding="utf-8").read(), filename=_path)):
-                if isinstance(_node, ast.Constant) and isinstance(_node.value, str) \
-                        and any(c in _node.value.lower() for c in _CLAIM):
-                    _claims.append(f"{os.path.relpath(_path, _PLUGIN)}:{_node.lineno}")
+            with open(_path, encoding="utf-8") as _f:
+                for _node in ast.walk(ast.parse(_f.read(), filename=_path)):
+                    if isinstance(_node, ast.Constant) and isinstance(_node.value, str) \
+                            and any(c in _node.value.lower() for c in _CLAIM):
+                        _claims.append(f"{os.path.relpath(_path, _PLUGIN)}:{_node.lineno}")
         elif _fn.endswith((".md", ".json")):
-            _t = open(_path, encoding="utf-8", errors="replace").read().lower()
+            with open(_path, encoding="utf-8", errors="replace") as _f:
+                _t = _f.read().lower()
             _claims += [f"{os.path.relpath(_path, _PLUGIN)}: {c!r}" for c in _CLAIM if c in _t]
 check(not _claims, "arm1b: no text claims the faster default gives almost / nearly the same result (%s)" % (_claims or "clean"))
-# the switch's texts: the five QI-2.1 workflow notes and the README describe it, with the measured trade, and carry no banned
-# term and neither NOTE_PARTS word (both hashed), no fraction (a version is not one) or percentage and no earlier option name
+
 _PLAIN = re.compile(r"(?<![\d.])0\.\d+\b(?!\.)|\d\s*%|\bquality`? option", re.I)
 _notes = []
 for _wf in sorted(glob.glob(os.path.join(_PLUGIN, "example_workflows", "QuantFunc-QwenImage21-*.json"))):
-    _txt = " ".join(str(v) for n in json.load(open(_wf, encoding="utf-8")).get("nodes", [])
+    with open(_wf, encoding="utf-8") as _f:
+        _doc = json.load(_f)
+    _txt = " ".join(str(v) for n in _doc.get("nodes", [])
                     for v in (n.get("widgets_values") or []) if isinstance(v, str) and "`quality_enhance`" in v)
     _notes.append((os.path.basename(_wf), _txt))
-_readme = open(os.path.join(_PLUGIN, "README.md"), encoding="utf-8").read()
+with open(os.path.join(_PLUGIN, "README.md"), encoding="utf-8") as _f:
+    _readme = _f.read()
 _readme_qe = [p for p in re.split(r"\n\s*\n", _readme) if "quality_enhance" in p]
 _bad = [(w, t[:80]) for w, t in _notes if not t or "subject and scene stay the same" not in t or "highest quality" not in t]
 for _w, _t in _notes + [("README.md", p) for p in _readme_qe]:
@@ -103,53 +115,94 @@ check(len(_notes) == 5 and not _bad, "arm1b: the 5 QI-2.1 workflow notes and the
       "measured trade and carry no banned term, number or earlier option name (%s)" % (_bad or "clean"))
 
 try:
-    # Fake-engine test: run ComfyUI in its own --cpu mode (the contract tests' idiom), so a box with no visible GPU
-    # (the CPU suite hides CUDA) imports comfy instead of skipping every arm. Must precede the first comfy import.
     sys.argv = [sys.argv[0], "--cpu"]
     if os.environ.get("COMFY_ROOT"):
         sys.path.insert(0, os.environ["COMFY_ROOT"])
     import comfy.options
     comfy.options.enable_args_parsing()
     import comfy.model_management  # noqa: F401
+    import torch
     _pkg = os.path.basename(_PLUGIN)
     sys.path.insert(0, os.path.dirname(_PLUGIN))
     qfmp = __import__(f"{_pkg}.qf_modelpatcher", fromlist=["QFSessionModelMixin"])
+    qfq = __import__(f"{_pkg}.qf_qwenimage21_modelpatcher", fromlist=["QFQwenImage21Model"])
+    qfh3 = __import__(f"{_pkg}.qf_h3_modelpatcher", fromlist=["QFH3Model"])
 except Exception as e:  # noqa: BLE001
     print(f"ENHANCE_SWITCH: arms 2-3 SKIP — comfy/plugin not importable here ({e!r})")
     print("ENHANCE_SWITCH: %s (%d failing checks)" % ("PASS" if fails == 0 else "FAIL", fails))
     sys.exit(77 if fails == 0 else 1)
 
-Mixin = qfmp.QFSessionModelMixin
 
-
-class _Model(Mixin):
+class _Model(qfmp.QFSessionModelMixin):
     pass
 
 
-# ---- arm 2: residency_opts sends the engine's switch, never `quality` or a retired key -------------------------------------
+# ---- arm 2: dial_opts sends canonical session ratio dial, never retired video_enhance / quality ----
 sent = {}
 for on in (False, True):
-    m = _Model(); m._qf = SimpleNamespace(current_session=None)
+    m = _Model()
+    m._qf = SimpleNamespace(current_session=None)
     m.set_video_enhance(on)
-    sent[on] = m.residency_opts()
-check(all(o.get("video_enhance") is on and not any(k == "quality" or bt.h(k) in bt.KEYS for k in o) for on, o in sent.items()),
-      f"arm2: video_enhance is SENT in both states, never `quality` or a retired key (-> {sent})")
-m2 = _Model(); m2._qf = SimpleNamespace(current_session=None)
+    sent[on] = m.dial_opts()
+check(sent[False].get("cat_keep_ratio") == 0.80 and sent[True].get("cat_keep_ratio") == 1.0
+      and all("video_enhance" not in o and "quality" not in o
+              and not any(bt.h(k) in bt.KEYS for k in o) for o in sent.values()),
+      f"arm2: dial_opts emits canonical session ratio (False->0.80, True->1.0), never video_enhance/quality (-> {sent})")
+
+m2 = _Model()
+m2._qf = SimpleNamespace(current_session=None)
 try:
-    m2.residency_opts()
+    m2.dial_opts()
     refused = False
 except RuntimeError:
     refused = True
-check(refused, "arm2: a model its loader never configured refuses to begin (a wiring error, never a silent default)")
+check(refused, "arm2: a model its loader never configured refuses to begin (never a silent default)")
 
-# ---- arm 3: the audio switch setter is a boolean --------------------------------------------------------------------
-try:
-    h3 = __import__(f"{_pkg}.qf_h3_modelpatcher", fromlist=["QFH3Model"])
-    h = h3.QFH3Model.__new__(h3.QFH3Model)
-    h.set_audio_enhance("yes")
-    check(h._audio_enhance is True, "arm3: set_audio_enhance stores bool")
-except Exception as e:  # noqa: BLE001
-    print(f"  SKIP arm3 H3: {e!r}")
+# ---- arm 2b: QI-2.1 plugin-layer QualityLaw guard ----
+def _qi21_ratio(quality_enhance, *, has_refs=False, batch=1, cond_or_uncond=(0,),
+                uuids=("a",), cond_groups=1, via_extra_conds=False):
+    qm = qfq.QFQwenImage21Model.__new__(qfq.QFQwenImage21Model)
+    qm._qf = SimpleNamespace(current_session=None)
+    qm._run_has_refs = False
+    qm._run_batch = 1
+    qm._run_single_cond_group = True
+    qm._run_cond_groups = cond_groups
+    qm.set_video_enhance(quality_enhance)
+    x = torch.zeros(batch, 16, 1, 8, 8, dtype=torch.bfloat16)
+    ctx = torch.zeros(batch, 4, 16, dtype=torch.bfloat16)
+    opts = {"cond_or_uncond": list(cond_or_uncond), "uuids": list(uuids)}
+    kw = {}
+    if via_extra_conds:
+        qm._run_has_refs = True
+    elif has_refs:
+        kw["ref_latents"] = [torch.zeros(batch, 16, 1, 8, 8, dtype=torch.bfloat16)]
+    qm._prepare_begin_context(x, ctx, opts, kw)
+    return qm.dial_opts().get("cat_keep_ratio")
+
+
+check(_qi21_ratio(False) == 0.85,
+      f"arm2b: QI-2.1 t2i (no refs, B=1, single cond, quality_enhance=False) -> 0.85 (got {_qi21_ratio(False)})")
+check(_qi21_ratio(True) == 1.0,
+      "arm2b: QI-2.1 quality_enhance=True -> 1.0")
+check(_qi21_ratio(False, has_refs=True) == 1.0,
+      "arm2b: QI-2.1 edit (ref_latents) -> 1.0 even when quality_enhance=False")
+check(_qi21_ratio(False, via_extra_conds=True) == 1.0,
+      "arm2b: QI-2.1 edit (extra_conds reference_latents) -> 1.0 even when quality_enhance=False")
+check(_qi21_ratio(False, cond_or_uncond=(0, 1), uuids=("a", "b")) == 1.0,
+      "arm2b: QI-2.1 CFG>1 (cond_or_uncond=[0,1]) -> 1.0")
+check(_qi21_ratio(False, cond_groups=2) == 1.0,
+      "arm2b: QI-2.1 multi-cond-group -> 1.0")
+check(_qi21_ratio(False, batch=2) == 1.0,
+      "arm2b: QI-2.1 batch>1 (B=2) -> 1.0")
+
+# ---- arm 3: H3 audio_enhance compatibility switch never reaches engine ----
+h = qfh3.QFH3Model.__new__(qfh3.QFH3Model)
+h._qf = SimpleNamespace(current_session=None)
+h.set_video_enhance(False)
+h.set_audio_enhance("yes")
+h_opts = h.dial_opts()
+check(h._audio_enhance is True and "audio_enhance" not in h_opts,
+      f"arm3: set_audio_enhance stores bool and never sends audio_enhance to engine (opts={h_opts})")
 
 print("ENHANCE_SWITCH: %s (%d failing checks)" % ("PASS" if fails == 0 else "FAIL", fails))
 sys.exit(0 if fails == 0 else 1)

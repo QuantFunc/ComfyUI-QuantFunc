@@ -173,6 +173,51 @@ for (const cls of [...Object.keys(ORDERS), "KSampler"]) {
   for (const e of app.extensions) e.nodeCreated?.(n);
   out.stamped[cls] = n.properties.qf_layout ?? null;
 }
+// L5: anomalous qf_layout: 2 shifted tails + block_cache=0.9 reset vs normal unshifted layout 2 preservation
+function realWidgets(cls) {
+  const ws = ORDERS[cls].map(name => ({
+    name,
+    value: name === "pinned_memory" ? (cls === "QuantFuncLTXLoader")
+      : (%s.includes(name) ? false : name === "block_cache" ? 0.03 : "DEFAULT_" + name),
+  }));
+  ws.push({ name: "api_key", value: "qf_0123\\u2026cdef", serialize: false });
+  return ws;
+}
+out.anomalous = {};
+const anomalousCases = {
+  ltx_shifted: ["QuantFuncLTXLoader",
+    ["ltx.safetensors", "ltx2-2.5-22b", "auto", 1.3, 0.0, 0.9, 12288, "exact_kv_and_rows", 2, 0.0, 0.9, true, true, 12288, "exact_kv_and_rows"]],
+  h3_shifted: ["QuantFuncH3Loader",
+    ["h3.safetensors", "minimax-h3-fl2va", "int8", 1.3, 0.0, 0.9, 12288, "exact_kv_and_rows", 2, 0.0, 0.9, true, true, 12288, "exact_kv_and_rows", 2]],
+  h3_unshifted_high_bc: ["QuantFuncH3Loader",
+    ["h3.safetensors", "minimax-h3-fl2va", "int8", 1.3, 0.0, 0.9, 12288, "exact_kv_and_rows", 2, 0.0, 0.8, true, true, false, false, true]],
+};
+for (const [label, [cls, vals]] of Object.entries(anomalousCases)) {
+  const ws = realWidgets(cls);
+  const node = { comfyClass: cls, widgets: ws, properties: {} };
+  types[cls].prototype.configure.call(node, { widgets_values: vals, properties: { qf_layout: 2 } });
+  const info = types[cls].got.at(-1);
+  out.anomalous[label] = { values: values(cls, ws, info.widgets_values), stamp: node.properties.qf_layout };
+}
+// L6: all 12 real shipped example_workflows/*.json migrated end-to-end
+out.workflows = {};
+for (const [wfName, nodes] of Object.entries(%s)) {
+  out.workflows[wfName] = nodes.map(({ id, type, properties, widgets_values }) => {
+    const ws = realWidgets(type);
+    const node = { comfyClass: type, widgets: ws, properties: {} };
+    types[type].prototype.configure.call(node, { widgets_values, properties: properties ?? {} });
+    const info1 = types[type].got.at(-1);
+    types[type].prototype.configure.call(node, info1);
+    const info2 = types[type].got.at(-1);
+    return {
+      id, type,
+      values: values(type, ws, info1.widgets_values),
+      stamp: node.properties.qf_layout,
+      solVersion: info1.properties.qf_sol_version,
+      idempotent: JSON.stringify(info1) === JSON.stringify(info2),
+    };
+  });
+}
 console.log(JSON.stringify(out));
 """
 
@@ -193,9 +238,18 @@ class LoaderLayout(unittest.TestCase):
             ext.mkdir(parents=True)
             shutil.copy(PLUGIN / "web" / "quantfunc_loader_layout.js", ext)
             switches = json.dumps(sorted(BOOLEANS))
+            wf_data = {}
+            for wf in sorted((PLUGIN / "example_workflows").glob("*.json")):
+                doc = json.loads(wf.read_text(encoding="utf-8"))
+                wf_data[wf.name] = [
+                    {"id": n.get("id"), "type": n.get("type"), "properties": n.get("properties", {}),
+                     "widgets_values": n.get("widgets_values")}
+                    for n in doc.get("nodes", [])
+                    if n.get("type") in LOADERS
+                ]
             (Path(d) / "driver.mjs").write_text(
                 _DRIVER % (json.dumps(ORDERS), json.dumps(SAVED), json.dumps(DEFAULTS), switches, switches,
-                           json.dumps(sorted(NUMBERS))), encoding="utf-8")
+                           json.dumps(sorted(NUMBERS)), switches, json.dumps(wf_data)), encoding="utf-8")
             r = subprocess.run([node, "driver.mjs"], cwd=d, capture_output=True, encoding="utf-8", timeout=60)
             if r.returncode != 0:
                 raise AssertionError(f"node driver failed: {r.stderr[-2000:]}")
@@ -252,6 +306,50 @@ class LoaderLayout(unittest.TestCase):
         self.assertIs(legacy["sol_window_enabled"], False)
         self.assertEqual(legacy["sol_min_tokens"], 0)
         self.assertEqual(legacy["sol_sink_conditioning"], "off")
+
+    def test_l5_anomalous_layout2_tail_coercion_and_block_cache_reset(self):
+        ltx = self.out["anomalous"]["ltx_shifted"]
+        self.assertEqual(ltx["stamp"], 3)
+        self.assertIs(ltx["values"]["quality_enhance"], False)
+        self.assertIs(ltx["values"]["pinned_memory"], True)
+        self.assertAlmostEqual(ltx["values"]["block_cache"], 0.03, places=6)
+
+        h3 = self.out["anomalous"]["h3_shifted"]
+        self.assertEqual(h3["stamp"], 3)
+        self.assertIs(h3["values"]["quality_enhance"], False)
+        self.assertIs(h3["values"]["audio_enhance"], False)
+        self.assertIs(h3["values"]["pinned_memory"], False)
+        self.assertAlmostEqual(h3["values"]["block_cache"], 0.03, places=6)
+
+        unshifted = self.out["anomalous"]["h3_unshifted_high_bc"]
+        self.assertEqual(unshifted["stamp"], 3)
+        self.assertAlmostEqual(unshifted["values"]["block_cache"], 0.8, places=6)
+        self.assertIs(unshifted["values"]["pinned_memory"], True)
+
+    def test_l6_all_12_shipped_example_workflows_migrate_cleanly(self):
+        workflows = self.out["workflows"]
+        self.assertEqual(len(workflows), 12)
+        shifted_files = {
+            "QuantFunc-LTX25-t2v.json",
+            "QuantFunc-MiniMaxH3-ref2va.json",
+            "QuantFunc-MiniMaxH3-ref2va-double-sampling.json",
+        }
+        for wf_name, nodes in workflows.items():
+            self.assertTrue(nodes, f"{wf_name} has no QuantFunc loader node")
+            for entry in nodes:
+                with self.subTest(workflow=wf_name, node_id=entry["id"]):
+                    vals = entry["values"]
+                    self.assertEqual(entry["stamp"], 3)
+                    self.assertEqual(entry["solVersion"], 2)
+                    self.assertTrue(entry["idempotent"])
+                    for sw in ("quality_enhance", "audio_enhance", "pinned_memory",
+                               "sol_enabled", "sol_window_enabled"):
+                        if sw in vals:
+                            self.assertIsInstance(vals[sw], bool, f"{wf_name}.{sw}={vals[sw]!r}")
+                    if "block_cache" in vals:
+                        self.assertLessEqual(vals["block_cache"], 0.5, f"{wf_name}.block_cache={vals['block_cache']!r}")
+                        if wf_name in shifted_files:
+                            self.assertAlmostEqual(vals["block_cache"], 0.03, places=6)
 
 
 if __name__ == "__main__":

@@ -83,25 +83,44 @@ def build_stage(staged, stage, version, plugin_req, fixer_verify):
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             shutil.copyfile(os.path.join(root, n), dst)
             body[rel] = sha256(dst)
-    # Every staged DLL's CUDA major, read from its PE imports by the plugin's own reader, must be the one its name
-    # promises (quantfunc.dll = CUDA 13, quantfunc-12.dll = CUDA 12): a mislabeled build is caught here, for every set,
-    # not only by FORK-2 on the one GPU class this box has.
+    # PC Engine O1 Windows split layout:
+    #   - Host DLLs (quantfunc.dll / quantfunc-12.dll) MUST have zero CUDA PE imports.
+    #   - Per-SM kernel plugins (sm*/cu<major>/libquantfunc_kernels_cuda_sm<arch>.dll or sm*/...)
+    #     MUST carry their expected CUDA major in their PE imports.
     spec = importlib.util.spec_from_file_location("qf_engine_stage", os.path.join(PLUGIN, "qf_engine.py"))
     qfe = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(qfe)
-    promised = {dll: major for major, dll in qfe._ENGINE_PLATFORMS["windows"]["hosts"].items()}
-    wrong = []
+    hosts_by_name = {dll: major for major, dll in qfe._ENGINE_PLATFORMS["windows"]["hosts"].items()}
+    valid_majors = set(qfe._ENGINE_PLATFORMS["windows"]["hosts"])
+    wrong_hosts, wrong_kernels, found_hosts, found_kernels = [], [], set(), set()
     for rel in sorted(body):
-        name = rel.rsplit("/", 1)[-1]
-        if name in promised:
-            got = qfe._so_cuda_major(os.path.join(stage, version, "windows", *rel.split("/")))
-            print(f"   {rel}: CUDA {got} from its imports (its name says {promised[name]})")
-            if got != promised[name]:
-                wrong.append(rel)
-    if wrong:
-        sys.exit(f"staged DLLs whose imports do not carry their CUDA major: {wrong}")
+        parts = rel.split("/")
+        name = parts[-1]
+        fpath = os.path.join(stage, version, "windows", *parts)
+        if name in hosts_by_name:
+            leaked = qfe._host_forbidden_cuda_pe(fpath)
+            print(f"   host {rel}: forbidden CUDA PE imports = {leaked} (expected [])")
+            if leaked:
+                wrong_hosts.append(f"{rel} ({', '.join(leaked)})")
+            found_hosts.add(hosts_by_name[name])
+        elif qfe._ENGINE_KERNEL_WIN_RE.fullmatch(name):
+            want = next((int(seg[2:]) for seg in parts[:-1] if seg.startswith("cu") and seg[2:].isdigit()), None)
+            got = qfe._so_cuda_major(fpath)
+            print(f"   kernel {rel}: CUDA {got} from its imports (expected {want or sorted(valid_majors)})")
+            if (want is not None and got != want) or (want is None and got not in valid_majors):
+                wrong_kernels.append(rel)
+            if got in valid_majors:
+                found_kernels.add(got)
+    if wrong_hosts:
+        sys.exit(f"staged host DLLs unexpectedly import CUDA (O1 zero-CUDA host required): {wrong_hosts}")
+    if wrong_kernels:
+        sys.exit(f"staged kernel DLLs whose imports do not carry their expected CUDA major: {wrong_kernels}")
+    matched_majors = sorted(found_hosts & found_kernels)
+    if not matched_majors:
+        sys.exit(f"staged release incomplete: hosts={sorted(found_hosts)} kernels={sorted(found_kernels)}")
     if fixer_verify:
-        theirs = json.load(open(fixer_verify, encoding="utf-8")).get("win32", {})
+        with open(fixer_verify, encoding="utf-8") as fv:
+            theirs = json.load(fv).get("win32", {})
         bad = sorted(k for k in body if theirs.get(k) != body[k])
         if bad:
             sys.exit(f"the staged files do not match the builder's verify.json: {bad}")
@@ -114,11 +133,22 @@ def build_stage(staged, stage, version, plugin_req, fixer_verify):
         origin = "the live version.json"
     except Exception as e:  # noqa: BLE001 — offline: a minimal document still exercises the pick
         doc, origin = {"linux": {}, "win32": {}}, f"a minimal version.json (live one unreachable: {type(e).__name__})"
-    doc.setdefault("win32", {})[version] = {"comfy": plugin_req, "comfy-12": plugin_req, "lib": version,
-                                            "lib-12": version, "kernel_so": True}
+    win32 = {k: v for k, v in (doc.get("win32") or {}).items()
+             if not (isinstance(v, dict) and v.get("kernel_so"))}
+    win32[version] = {"comfy": plugin_req, "comfy-12": plugin_req, "lib": version,
+                      "lib-12": version, "kernel_so": True}
+    doc["win32"] = win32
     with open(os.path.join(stage, "version.json"), "w", encoding="utf-8") as f:
         json.dump(doc, f)
+    with open(os.path.join(stage, version, "windows", "sets.json"), encoding="utf-8") as sf:
+        sets_doc = json.load(sf).get("sets", {})
+    sms = sorted({s for v in sets_doc.values() for s in v if s in qfe._CONSUMER_SMS})
+    if not sms:
+        sys.exit("staged sets.json has no consumer SM architecture")
+    dry_major = 13 if 13 in matched_majors else matched_majors[-1]
+    dry_sm = 89 if 89 in sms else sms[0]
     print(f"   stage: {origin} + win32 {version}; files: {sorted(body)}")
+    return dry_major, dry_sm
 
 
 def make_tls(d):
@@ -201,14 +231,19 @@ FETCH = "import sys, urllib.request\ntry:\n    urllib.request.urlopen(sys.argv[1
         "except Exception as e:\n    print('refused:', type(e).__name__, str(e)[:120])\n"
 
 STEP_A = r'''
-import hashlib, importlib.util, json, os, sys, time, types
+import hashlib, importlib.util, json, os, shutil, sys, time, types
 plugin, base, dry = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
+dry_major, dry_sm, dry_bin = int(sys.argv[4]), int(sys.argv[5]), sys.argv[6]
 spec = importlib.util.spec_from_file_location("qf_engine_e2e", os.path.join(plugin, "qf_engine.py"))
 qfe = importlib.util.module_from_spec(spec); spec.loader.exec_module(qfe)
 if dry:   # no GPU / not Windows: stub what only the box can answer; the installer, HTTPS and FORK-2 stay real
+    os.makedirs(dry_bin, exist_ok=True)
+    shutil.copyfile(os.path.join(plugin, "bin", "windows", "version.json"), os.path.join(dry_bin, "version.json"))
+    qfe._engine_bin_dir = lambda: dry_bin
     qfe._BIN_SUBDIR, qfe._LIB_BASENAME = "windows", "quantfunc.dll"
     qfe.platform.machine = lambda: "AMD64"
-    qfe._torch_cuda_major, qfe._driver_cuda_major, qfe._gpu_sm = (lambda: 12), (lambda: 12), (lambda idx=0: 89)
+    qfe._torch_cuda_major, qfe._driver_cuda_major, qfe._gpu_sm = (
+        (lambda: dry_major), (lambda: dry_major), (lambda idx=0: dry_sm))
     if "msvcrt" not in sys.modules:
         ms = types.ModuleType("msvcrt"); ms.LK_UNLCK, ms.LK_LOCK, ms.LK_NBLCK = 0, 1, 2
         ms.locking = lambda fd, mode, n: print(f"   lock call: {'lock' if mode else 'unlock'} {n} byte")
@@ -221,12 +256,20 @@ t0 = time.time(); m = qfe.install_engine(0)
 print(f"install_engine: {time.time() - t0:.1f} s, status {qfe.engine_install_status()}")
 print("marker:", json.dumps(m, sort_keys=True))
 man = json.loads(qfe._engine_http_get(f"{base}/{m['version']}/verify.json"))["win32"]
-dll = os.path.join(qfe._engine_bin_dir(), f"{m['version']}-{m['set']}-cu{m['cuda']}", m["host"])
-b = open(dll, "rb").read()
-print(f"{m['set']}/{m['host']}: {len(b)} B md5 {hashlib.md5(b).hexdigest()} sha256==verify.json "
-      f"{hashlib.sha256(b).hexdigest() == man.get(m['set'] + '/' + m['host'])}")
-print("PE imports:", qfe._pe_imports(dll))
-print("CUDA major from the DLL:", qfe._so_cuda_major(dll)); qfe.assert_toolchain_compatible(dll)
+pair_dir = os.path.join(qfe._engine_bin_dir(), f"{m['version']}-{m['set']}-cu{m['cuda']}")
+host_dll = os.path.join(pair_dir, m["host"])
+kern_dll = os.path.join(pair_dir, m["kernel"])
+for label, path, fname in (("host", host_dll, m["host"]), ("kernel", kern_dll, m["kernel"])):
+    with open(path, "rb") as fh:
+        b = fh.read()
+    key = qfe._manifest_key(m["set"], fname, m["cuda"], man)
+    ok = hashlib.sha256(b).hexdigest() == man.get(key)
+    print(f"{label} {key}: {len(b)} B md5 {hashlib.md5(b).hexdigest()} sha256==verify.json {ok}")
+    if not ok:
+        sys.exit(f"{label} sha256 mismatch for {key}")
+print("host PE imports:", qfe._pe_imports(host_dll), "forbidden CUDA:", qfe._host_forbidden_cuda_pe(host_dll))
+print("kernel PE imports:", qfe._pe_imports(kern_dll), "CUDA major:", qfe._so_cuda_major(kern_dll))
+qfe.assert_toolchain_compatible(host_dll)
 print("FORK-2 guard: passed")
 t0 = time.time(); print(f"re-run: same marker {qfe.install_engine(0) == m} in {time.time() - t0:.1f} s")
 print("resolve_so_path:", qfe.resolve_so_path())
@@ -290,8 +333,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--staged", required=True)
     ap.add_argument("--comfy")
-    ap.add_argument("--version", default="0.0.13")
-    ap.add_argument("--plugin-req", default="0.0.07")
+    ap.add_argument("--version", default="0.0.14")
+    ap.add_argument("--plugin-req", default="0.0.08")
     ap.add_argument("--fixer-verify")
     ap.add_argument("--xfm", default=PROMPT["2"]["inputs"]["transformer"])
     ap.add_argument("--port", type=int, default=18913)
@@ -308,7 +351,7 @@ def main():
     print(f"plugin {PLUGIN} | out {out} | bin\\windows holds {sorted(os.listdir(os.path.join(PLUGIN, 'bin', 'windows')))}")
     try:
         print("== stage (the QuantFunc/Plugin layout, local only)")
-        build_stage(a.staged, stage, a.version, a.plugin_req, a.fixer_verify)
+        dry_major, dry_sm = build_stage(a.staged, stage, a.version, a.plugin_req, a.fixer_verify)
         ca, crt, key, how = make_tls(tls)
         srv, base = serve(stage, crt, key)
         print(f"   serving {base} (throwaway CA via {how}); the CA is trusted only by the install process below")
@@ -318,7 +361,9 @@ def main():
                                capture_output=True, encoding="utf-8", errors="replace")
             print(f"   urllib default context {label}: {r.stdout.strip()}")
         print("== A: the plugin's installer against the local stage")
-        r = subprocess.run([sys.executable, "-c", STEP_A, PLUGIN, base, "1" if a.dry_run else "0"], env=trusted)
+        dry_bin = os.path.join(out, "dry-bin")
+        r = subprocess.run([sys.executable, "-c", STEP_A, PLUGIN, base, "1" if a.dry_run else "0",
+                            str(dry_major), str(dry_sm), dry_bin], env=trusted)
         srv.shutdown()
         if r.returncode:
             sys.exit(f"STEP A FAILED (rc {r.returncode})")

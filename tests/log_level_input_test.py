@@ -191,7 +191,7 @@ def main():
         eng.resolve_so_path = lambda: os.path.join(d, "engine-under-test")
         eng.assert_toolchain_compatible = lambda so_path: None
         eng.ctypes = types.SimpleNamespace(RTLD_GLOBAL=0, RTLD_LOCAL=0, CDLL=lambda *a, **k: object())
-        eng._bind = lambda raw: types.SimpleNamespace(quantfunc_set_log_level=applied.append)
+        eng._bind = lambda raw: types.SimpleNamespace(qf_set_log_level=applied.append)
         eng.load_lib()
     check("L7 load_lib applies the recorded level right after loading", applied == [2])
     eng.set_log_level(3)
@@ -237,7 +237,7 @@ def main():
         eng2.resolve_so_path = lambda: os.path.join(d, "engine-under-test")
         eng2.assert_toolchain_compatible = lambda so_path: None
         eng2.ctypes = types.SimpleNamespace(RTLD_GLOBAL=0, RTLD_LOCAL=0, CDLL=lambda *a, **k: object())
-        eng2._bind = lambda raw: types.SimpleNamespace(quantfunc_set_log_level=lambda level: None)
+        eng2._bind = lambda raw: types.SimpleNamespace(qf_set_log_level=lambda level: None)
         seen = []
         for step in ("load", "warning", "info", "info again"):
             buf = io.StringIO()
@@ -262,7 +262,7 @@ def main():
             eng3.resolve_so_path = lambda f=lib_file: f
             eng3.assert_toolchain_compatible = lambda so_path: None
             eng3.ctypes = types.SimpleNamespace(RTLD_GLOBAL=0, RTLD_LOCAL=0, CDLL=lambda *a, **k: object())
-            eng3._bind = lambda raw: types.SimpleNamespace(quantfunc_set_log_level=lambda level: None)
+            eng3._bind = lambda raw: types.SimpleNamespace(qf_set_log_level=lambda level: None)
             eng3.load_lib()
             if case == "moved in":
                 open(lib_file + ".new", "wb").write(b"ANOTHER-ENGINE")
@@ -298,7 +298,7 @@ def main():
             eng4.resolve_so_path = lambda f=lib_file: f
             eng4.assert_toolchain_compatible = lambda so_path: None
             eng4.ctypes = types.SimpleNamespace(RTLD_GLOBAL=0, RTLD_LOCAL=0, CDLL=cdll)
-            eng4._bind = lambda raw: types.SimpleNamespace(quantfunc_set_log_level=lambda level: None)
+            eng4._bind = lambda raw: types.SimpleNamespace(qf_set_log_level=lambda level: None)
             if case == "identity unavailable":
                 eng4._file_identity = lambda path: None
             eng4.load_lib()

@@ -69,7 +69,7 @@ class Options:
             if not math.isfinite(start) or not math.isfinite(end) or start < end:
                 raise ValueError("Sol model sampling returned invalid sigma window bounds")
             window = {"sigma_start": start, "sigma_end": end}
-        return {"enabled": True, "tau": self.tau, "window": window,
+        return {"enabled": True, "selector": "svg2", "tau": self.tau, "window": window,
                 "min_tokens": self.min_tokens, "sink_conditioning": self.sink_conditioning}
 
 
@@ -82,13 +82,13 @@ def from_loader(*, sol_version=None, sol_tau=None, sol_enabled=None,
         raise ValueError("Unsupported Sol parameter version")
     if sol_version != 2:
         if any(v is not None for v in new_values):
-            raise ValueError("New Sol options require sol_version=2; legacy sol_tau is a keep ratio")
-        ratio = _number(sol_tau, 1.0, "legacy keep ratio")
+            raise ValueError("New Sol options require sol_version=2; legacy sol_tau is a fraction")
+        ratio = _number(sol_tau, 1.0, "legacy fraction")
         # The old client used `float(value or 1.0)` and this double off epsilon.
         if ratio == 0.0 or abs(ratio - 1.0) <= 1e-6:
             return Options()
         if not 0.0 < ratio < 1.0:
-            raise ValueError("Legacy Sol keep ratio must be between 0 and 1")
+            raise ValueError("Legacy Sol fraction must be between 0 and 1")
         return Options(True, legacy_tau(ratio), False, 0.0, 1.0, 0, "off")
     tau = _number(sol_tau, 1.3, "tau")
     start = _number(sol_start_percent, 0.2, "start percent")

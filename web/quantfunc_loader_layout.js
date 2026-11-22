@@ -43,6 +43,28 @@ const isLoader = (name) => typeof name === "string" && name.startsWith("QuantFun
 const own = (object, key) => Object.prototype.hasOwnProperty.call(object, key);
 const SOL_DEFAULTS = { sol_version: 2, sol_enabled: false, sol_tau: 1.3, sol_window_enabled: true,
   sol_start_percent: 0.2, sol_end_percent: 0.9, sol_min_tokens: 12288, sol_sink_conditioning: "exact_kv_and_rows" };
+const TRAILING_SWITCHES = ["quality_enhance", "audio_enhance", "pinned_memory"];
+
+function coerceTrailingSwitches(comfyClass, serialized, byName, savedLayout) {
+  if ((savedLayout ?? 0) >= LAYOUT) return;
+  const widgetByName = Object.fromEntries(serialized.map(w => [w.name, w]));
+  let coerced = false;
+  for (const name of TRAILING_SWITCHES) {
+    if (!own(byName, name) || byName[name] === undefined || typeof byName[name] === "boolean") continue;
+    const raw = byName[name];
+    if (raw === widgetByName[name]?.value) continue;
+    const fallback = typeof widgetByName[name]?.value === "boolean"
+      ? widgetByName[name].value
+      : (name === "pinned_memory" && comfyClass === "QuantFuncLTXLoader");
+    console.warn(`[QuantFunc] migrated non-boolean ${comfyClass}.${name}=${JSON.stringify(raw)} -> ${fallback}`);
+    byName[name] = fallback;
+    coerced = true;
+  }
+  if (coerced && typeof byName.block_cache === "number" && byName.block_cache > 0.5) {
+    console.warn(`[QuantFunc] reset shifted ${comfyClass}.block_cache=${byName.block_cache} -> 0.03`);
+    byName.block_cache = 0.03;
+  }
+}
 
 // Same capped inverse-normal approximation and FP32 boundaries as qf_sol.legacy_tau.
 export function legacyTau(ratio) {
@@ -77,9 +99,9 @@ function migrateSol(byName, propertyVersion) {
   if (Object.keys(SOL_DEFAULTS).some(k => k !== "sol_version" && k !== "sol_tau" && own(byName, k)))
     throw new Error("New Sol options require a saved version marker");
   const ratio = byName.sol_tau ?? 1;
-  if (typeof ratio !== "number" || !Number.isFinite(ratio)) throw new Error("Invalid legacy Sol keep ratio");
+  if (typeof ratio !== "number" || !Number.isFinite(ratio)) throw new Error("Invalid legacy Sol fraction");
   const enabled = ratio !== 0 && Math.abs(ratio - 1) > 1e-6;
-  if (enabled && !(ratio > 0 && ratio < 1)) throw new Error("Legacy Sol keep ratio must be between 0 and 1");
+  if (enabled && !(ratio > 0 && ratio < 1)) throw new Error("Legacy Sol fraction must be between 0 and 1");
   return { ...byName, ...SOL_DEFAULTS, ...(enabled ? { sol_enabled: true, sol_tau: legacyTau(ratio),
     sol_window_enabled: false, sol_start_percent: 0, sol_end_percent: 1, sol_min_tokens: 0,
     sol_sink_conditioning: "off" } : {}) };
@@ -109,6 +131,7 @@ function migratedInfo(comfyClass, widgets, info) {
   if (typeof byName.quality === "string" && !own(byName, "quality_enhance")) {
     byName.quality_enhance = byName.quality === "best_quality";
   }
+  coerceTrailingSwitches(comfyClass, serialized, byName, info.properties?.qf_layout);
   byName = migrateSol(byName, info.properties?.qf_sol_version);
   // Update both formats: another extension must not restore the old ratio from the named map.
   const current = Object.fromEntries(serialized.map(w => [w.name, own(byName, w.name) ? byName[w.name] : w.value]));

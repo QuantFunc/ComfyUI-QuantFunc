@@ -25,14 +25,26 @@ _VENDORED = ("bin/tokenizers/",)
 # a comment, a docstring, a tooltip or message, an identifier or any other file stays under the rule. The word is stored
 # as a digest, like every banned term.
 _EXPLICIT_BACKEND_HASH = "6a14c3ef2763b29b1d98a553f1b21c4243079103a93b4869be6d199940526a0f"
-_EXPLICIT_BACKEND_FILES = {"__init__.py", "qf_modelpatcher.py", "tests/loader_dispatch_test.py"}
+_EXPLICIT_WIRE_HASHES = {
+    _EXPLICIT_BACKEND_HASH,
+    "0af958bea0deda2775fce855930c18b7dfc5214036de6a04e8b3d8852da418ee",  # PC Engine session JSON key
+}
+_EXPLICIT_BACKEND_FILES = {
+    "__init__.py",
+    "qf_engine.py",
+    "qf_modelpatcher.py",
+    "tests/enhance_switch_test.py",
+    "tests/h3_partial_denoise_contract_test.py",
+    "tests/loader_dispatch_test.py",
+    "tests/sm86_attention_default_test.py",
+}
 _STRINGISH = {tokenize.STRING, getattr(tokenize, "FSTRING_START", -1), getattr(tokenize, "FSTRING_END", -1)}
 
 
-def _blank_option_value(text, allowed=_EXPLICIT_BACKEND_HASH):
-    """Python source `text` with each string constant that IS the option value blanked out (Python's own tokenizer
-    decides what a whole string constant is; one next to another string is part of an implicitly concatenated text, so
-    it is not). Source that does not tokenize is returned unchanged, so it is scanned whole."""
+def _blank_option_value(text, allowed=_EXPLICIT_WIRE_HASHES):
+    """Python source `text` with each whole double-quoted wire-protocol string constant in `allowed` blanked out.
+    Comments, docstrings, concatenated strings, single-quoted strings, and identifiers remain scanned whole."""
+    allowed_set = {allowed} if isinstance(allowed, str) else set(allowed)
     lines = text.splitlines(keepends=True)
     try:
         toks = list(tokenize.generate_tokens(io.StringIO(text).readline))
@@ -43,7 +55,7 @@ def _blank_option_value(text, allowed=_EXPLICIT_BACKEND_HASH):
         s = t.string
         alone = all(n.type not in _STRINGISH for n in toks[max(i - 1, 0):i] + toks[i + 1:i + 2])
         if (t.type == tokenize.STRING and alone and t.start[0] == t.end[0] and len(s) > 2 and s[0] == s[-1] == '"'
-                and s[1] != '"' and s[1:-1] == s[1:-1].lower() and h(s[1:-1]) == allowed):
+                and s[1] != '"' and s[1:-1] == s[1:-1].lower() and h(s[1:-1]) in allowed_set):
             (row, c0), c1 = t.start, t.end[1]
             lines[row - 1] = lines[row - 1][:c0] + " " * (c1 - c0) + lines[row - 1][c1:]
     return "".join(lines)

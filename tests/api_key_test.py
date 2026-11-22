@@ -325,7 +325,6 @@ class Retrofit(unittest.TestCase):
 _COMFY = os.environ.get("COMFY_ROOT")
 if _COMFY and (Path(_COMFY) / "comfy/model_management.py").is_file():
     from host_loader_contract_test import plugin, torch   # imports ComfyUI (--cpu) and the plugin package
-    from canonical_resource_integration_test import Library
 
     qfe, qfmp = plugin.qfe, plugin.qfmp
     mm = qfmp.comfy.model_management
@@ -412,7 +411,7 @@ if _COMFY and (Path(_COMFY) / "comfy/model_management.py").is_file():
         def model(self):
             calls = []
             m = types.SimpleNamespace()
-            for setter in ("set_attn_backend", "set_sol_tau", "set_video_enhance", "set_audio_enhance",
+            for setter in ("set_attn_backend", "set_sol_options", "set_sol_tau", "set_video_enhance", "set_audio_enhance",
                            "set_allow_partial_denoise", "set_step_cache", "set_block_cache"):
                 setattr(m, setter, lambda *a, _s=setter: calls.append(_s))
             return m
@@ -453,15 +452,16 @@ if _COMFY and (Path(_COMFY) / "comfy/model_management.py").is_file():
             import comfy.supported_models as supported
             krea2 = sys.modules[plugin.__name__ + ".qf_krea2_modelpatcher"]
             asked, lib = [], PipelineLib()
-            handle = qfe.QFEngineHandle(lib, ctypes.c_void_p(9), resource=object(), capacity_bytes=4096)
+            handle = qfe.QFEngineHandle(lib, ctypes.c_void_p(9), capacity_bytes=4096)
 
-            def get_engine(model_dir, create_cfg=None, device_idx=0, api_key=None, transformer_path=None):
+            def get_engine(weights_path, create_cfg=None, device_id=0, api_key=None):
                 asked.append((api_key, create_cfg))
                 return handle, "ck"
             deps = {"get_engine": get_engine, "bind_pipeline_model": lambda *a: None, "read_auth": None}
 
             def builder(transformer1_path, bundle_dir, pinned_memory):
-                return qfmp.family_build(deps, "/nowhere", {"denoise_only": True}, supported.Krea2,
+                return qfmp.family_build(deps, transformer1_path, {"model_arch": "krea2", "config_path": "/c"},
+                                         supported.Krea2,
                                          {"image_model": "krea2", "disable_unet_model_creation": True},
                                          krea2.QFKrea2Model, "[test] krea2", pinned_memory)([])
             with mock.patch.dict(plugin._FAMILY_BUILDERS, {"krea2": builder}), \
@@ -473,23 +473,40 @@ if _COMFY and (Path(_COMFY) / "comfy/model_management.py").is_file():
             rebuilt = qfmp.rebuild_of(patcher)([{"path": "a.safetensors", "scale": 1.0}])   # outside the loader
             patcher.model._qf.ensure()
             rebuilt.model._qf.ensure()
-            self.assertEqual(asked, [(KEY, {"denoise_only": True})] * 2)   # beside the create keys, never among them
-            self.assertEqual(lib.keys, [KEY])        # the first run signed the pipeline in; the second found it so
+            self.assertEqual(asked, [(KEY, {"model_arch": "krea2", "config_path": "/c"})] * 2)
+            self.assertEqual(lib.keys, [KEY])        # the first run signed the transformer in; the second found it so
 
-    class PipelineLib(Library):
-        """The native double plus the two runtime mutations a live pipeline takes."""
+    class PipelineLib:
+        """Minimal PC Engine C-API double for auth & LoRA hot-swap."""
         def __init__(self):
-            super().__init__()
             self.keys, self.updates, self.key_status = [], [], []
-            self.quantfunc_set_api_key = lambda pipeline, key: self._set_key(key)
-            self.quantfunc_pipeline_update = lambda pipeline, payload: self.updates.append(payload) or 0
+            self.qf_last_error = lambda: b"auth refused"
 
-        def _set_key(self, key):
+        def qf_auth_set_api_key(self, xfm, key):
             self.keys.append(key.decode())
             return self.key_status.pop(0) if self.key_status else 0
 
+        def qf_xfm_set_loras(self, xfm, payload):
+            self.updates.append(json.loads(payload.decode()))
+            return 0
+
+        def qf_xfm_estimate_vram(self, params_ptr, out_ptr):
+            out_ptr._obj.resident_weight_bytes = 4096
+            return 0
+
+        def qf_xfm_resident_vram_bytes(self, xfm, out_ptr):
+            out_ptr._obj.value = 0
+            return 0
+
+        def qf_xfm_unload_vram(self, xfm, req, out_ptr):
+            out_ptr._obj.value = 0
+            return 0
+
+        def qf_xfm_destroy(self, xfm):
+            return None
+
     class Engines(unittest.TestCase):
-        """The real _get_engine / QFLazyEngine over the native double."""
+        """The real _get_engine / QFLazyEngine over the PC Engine C-API double."""
         def setUp(self):
             self.lib = PipelineLib()
             d = tempfile.mkdtemp(prefix="qf_apikey_")
@@ -500,10 +517,9 @@ if _COMFY and (Path(_COMFY) / "comfy/model_management.py").is_file():
             self.read_auth = mock.Mock(wraps=plugin._read_auth)
             for patch in (
                     clean_env(**{qfe._ENV_KEYFILE_OVERRIDE: keyfile}),
-                    mock.patch.dict(qfmp._RESOURCE_DOMAINS, {}, clear=True),
                     mock.patch.dict(plugin._PIPELINE_CACHE, {}, clear=True),
                     mock.patch.dict(plugin._PIPELINE_MODELS, {}, clear=True),
-                    mock.patch.dict(plugin._PREPARED_CACHE, {}, clear=True),
+                    mock.patch.dict(plugin._CREATE_LOCKS, {}, clear=True),
                     mock.patch.object(qfe, "load_lib", return_value=self.lib),
                     mock.patch.object(qfe, "loaded_so_path", return_value="contract.so"),
                     mock.patch.object(plugin, "_read_auth", self.read_auth),
@@ -513,9 +529,9 @@ if _COMFY and (Path(_COMFY) / "comfy/model_management.py").is_file():
                 self.addCleanup(patch.stop)
             self.creates = []
 
-            def create(lib, *, capacity_bytes, prepared_resource, create_params):
+            def create(lib, *, create_params, capacity_bytes=0):
                 self.creates.append(json.loads(create_params.config_json))
-                return qfe.QFEngineHandle(lib, ctypes.c_void_p(70 + len(self.creates)), resource=prepared_resource,
+                return qfe.QFEngineHandle(lib, ctypes.c_void_p(70 + len(self.creates)),
                                           capacity_bytes=capacity_bytes)
             patch = mock.patch.object(qfe.QFEngineHandle, "create", side_effect=create)
             patch.start()
@@ -525,18 +541,19 @@ if _COMFY and (Path(_COMFY) / "comfy/model_management.py").is_file():
             return sum(1 for c in self.read_auth.call_args_list if not (c.args and c.args[0]))
 
         def consumer(self, key, read_auth=None):
-            return qfmp.QFLazyEngine(lambda: plugin._get_engine("pkg", {"denoise_only": True}, api_key=key),
+            return qfmp.QFLazyEngine(lambda: plugin._get_engine("m.safetensors", {"model_arch": "krea2"}, api_key=key),
                                      api_key=key, read_auth=read_auth or (lambda: plugin._read_auth()))
 
         def test_the_key_reaches_the_create_and_never_the_pipeline_cache_key(self):
             a, b = self.consumer(KEY), self.consumer(KEY2)
-            entry_a, ck_a = a.prepare_resource()
-            entry_b, ck_b = b.prepare_resource()
-            self.assertIs(entry_a, entry_b)                      # one prepared pipeline for both keys
-            self.assertEqual(ck_a, ck_b)
-            self.assertNotIn(KEY, json.dumps(ck_a))
-            recipe = json.loads(entry_a.create_params.config_json)
-            self.assertEqual((recipe["api_key"], recipe["server_url"]), (KEY, DEFAULT_URL))
+            real_a = a.ensure()
+            real_b = b.ensure()
+            self.assertIs(real_a, real_b)
+            self.assertEqual(len(plugin._PIPELINE_CACHE), 1)
+            ckey = next(iter(plugin._PIPELINE_CACHE))
+            self.assertNotIn(KEY, json.dumps(ckey))
+            self.assertNotIn(KEY2, json.dumps(ckey))
+            self.assertEqual((self.creates[0]["api_key"], self.creates[0]["server_url"]), (KEY, DEFAULT_URL))
             self.assertEqual(self.config_reads(), 0)             # a field key never reads config.json
 
         def test_another_key_switches_the_live_pipeline_in_place(self):
@@ -575,16 +592,13 @@ if _COMFY and (Path(_COMFY) / "comfy/model_management.py").is_file():
             self.assertEqual(self.lib.keys, [KEY2, KEY2])
 
         def test_a_create_refused_once_takes_the_field_key_at_the_next_run(self):
-            # config.json's key is refused at the first create; the key then typed into the field must reach the retried
-            # create (the refused identity is retired), not be replaced by the cached recipe's key again
             keys = []
 
-            def create(lib, *, capacity_bytes, prepared_resource, create_params):
+            def create(lib, *, create_params, capacity_bytes=0):
                 keys.append(json.loads(create_params.config_json)["api_key"])
                 if len(keys) == 1:
                     raise RuntimeError("QuantFunc create failed (status 7): auth")
-                return qfe.QFEngineHandle(lib, ctypes.c_void_p(90), resource=prepared_resource,
-                                          capacity_bytes=capacity_bytes)
+                return qfe.QFEngineHandle(lib, ctypes.c_void_p(90), capacity_bytes=capacity_bytes)
             with mock.patch.object(qfe.QFEngineHandle, "create", side_effect=create):
                 first = self.consumer(None)                      # the field is empty: config.json's key
                 with self.assertRaises(RuntimeError):

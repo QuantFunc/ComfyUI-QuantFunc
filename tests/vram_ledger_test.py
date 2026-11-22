@@ -85,15 +85,14 @@ class _Model(Mixin, _TorchBase):
     pass
 
 
-def _engine(need_mb=None, hold_mb=0, footprint_mb=13694, raise_need=False):
+def _engine(need_mb=None, hold_mb=0, raise_need=False):
     def need(shape):
         if raise_need:
             raise RuntimeError("boom")
         need.asked.append(list(shape))
         return (need_mb or 0) * MB
     need.asked = []
-    return SimpleNamespace(vram_need_bytes=need, resident_vram_bytes=lambda: hold_mb * MB,
-                           footprint_bytes=footprint_mb * MB, current_session=None)
+    return SimpleNamespace(vram_need_bytes=need, resident_vram_bytes=lambda: hold_mb * MB, current_session=None)
 
 
 def _quiet(fn, *a, **k):
@@ -156,12 +155,12 @@ check(r == side and "nothing measured yet" in log, "arm2: engine 0 → comfy-sid
 #  room being made. The proxy discovers cache hits through the canonical
 #  prepare_resource/Prepared cache path.)
 real = _engine(need_mb=9000)
-proxy = SimpleNamespace(vram_need_bytes=lambda s: 0, footprint_bytes=1, ensure_if_cached=lambda: real, current_session=None)
+proxy = SimpleNamespace(vram_need_bytes=lambda s: 0, ensure_if_cached=lambda: real, current_session=None)
 m = _Model(); m._qf = proxy
 r, _ = _quiet(m.memory_required, SHAPE, cond_shapes=COND)
 check(r == side + 9000 * MB and real.vram_need_bytes.asked == [SHAPE], "arm4a: cache HIT → the REAL handle's need is used")
 created = []
-proxy = SimpleNamespace(vram_need_bytes=lambda s: 0, footprint_bytes=1, ensure_if_cached=lambda: None,
+proxy = SimpleNamespace(vram_need_bytes=lambda s: 0, ensure_if_cached=lambda: None,
                         ensure=lambda: created.append(1), current_session=None,
                         cold_vram_need_bytes=lambda: qfmp.qfe.ColdNeed(None, None))   # an engine without the entry
 m = _Model(); m._qf = proxy
@@ -184,7 +183,7 @@ Lazy = qfmp.QFLazyEngine
 calls = []
 def _fac():
     calls.append(1)
-    return SimpleNamespace(pipeline=1, footprint_bytes=14380 * MB, step_count=0, sampler_step_count=0,
+    return SimpleNamespace(pipeline=1, step_count=0, sampler_step_count=0,
                            current_session=None, vram_need_bytes=lambda s: 7 * MB), "ckey"
 lz = Lazy(_fac)
 lz.ensure_if_cached = lambda: None
@@ -204,16 +203,23 @@ except RuntimeError as error:
 else:
     check(False, "arm5: engine demand failure was hidden")
 
-# ---- arm 6: logical patchers own only ordinary Torch bytes ------------------------------------------------------
+# ---- arm 6: direct QFModelPatcher VRAM coexistence (PC Engine: loaded_size/model_size/partially_unload) --------
 logical = torch.nn.Module()
 logical.weight = torch.nn.Parameter(torch.ones(4, dtype=torch.float32))
-logical._qf = _engine(hold_mb=23000, footprint_mb=14380)
+unloaded = []
+eng6 = _engine(hold_mb=23000)
+eng6.capacity_bytes = 23000 * MB
+eng6.unload_vram = lambda n: (unloaded.append(int(n)), min(int(n), 23000 * MB))[1]
+logical._qf = eng6
 p = _patcher(logical)
-check(p.model_size() == 16 and p.loaded_size() == 0,
-      "arm6a: logical patcher reports Torch parameters, not native capacity/residency")
+check(p.model_size() == 16 + 23000 * MB and p.loaded_size() == 23000 * MB,
+      "arm6a: QFModelPatcher reports Torch + native resident/capacity directly")
 logical.model_loaded_weight_memory = 8
-check(p.model_size() == 16 and p.loaded_size() == 8,
-      "arm6b: logical loaded_size follows the official Torch loaded-weight ledger")
+check(p.model_size() == 16 + 23000 * MB and p.loaded_size() == 8 + 23000 * MB,
+      "arm6b: loaded_size combines Torch loaded weight memory + native resident VRAM")
+freed6 = p.partially_unload(logical.device, 1024 * MB)
+check(freed6 >= 1024 * MB and unloaded == [1024 * MB],
+      "arm6c: partially_unload delegates directly to qf_xfm_unload_vram")
 
 # ---- arm 7: ONE source of truth — no family overrides the ledger interface; H3 (packed AV) gets exactly base ---------
 # (self-CR P-1 on 1d51182 found QFH3Model.memory_required stacking a 2026-08-24 heuristic ON TOP of the base's real

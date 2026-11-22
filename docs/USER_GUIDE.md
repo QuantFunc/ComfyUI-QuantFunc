@@ -45,7 +45,7 @@ ComfyUI/
 
 | Requirement | Minimum |
 |-------------|---------|
-| **GPU** | NVIDIA, on an x86_64 host. Linux: compute capability 7.5 / 8.0 / 8.6 / 8.9 / 9.0 / 10.0 / 10.3 / 12.0 (RTX 20/30/40/50, T4, A100, A10/A40, L4/L40, H100/H200, B200, B300, RTX PRO 6000 Blackwell). Windows: 7.5 / 8.6 / 8.9 / 12.0 (RTX 20/30/40/50, T4, A10/A40, L4/L40, RTX PRO 6000 Blackwell). Not published: 8.7, 11.0, 12.1 and Grace (aarch64) systems such as GB200/GB300 |
+| **GPU** | NVIDIA, on an x86_64 host. Linux and Windows: consumer compute capability 7.5 / 8.6 / 8.9 / 12.0 (RTX 20/30/40/50, T4, A10/A40, L4/L40, RTX PRO 6000 Blackwell). Not published: server SM 8.0/9.0/10.0/10.3, embedded 8.7/11.0/12.1, and Grace (aarch64) systems |
 | **VRAM** | 8 GB |
 | **Driver** | NVIDIA ≥ 575 (CUDA 12 engine) or ≥ 580 (CUDA 13 engine) |
 | **CUDA Runtime** | PyTorch built for CUDA 12.6 or newer (CUDA 12 engine) or CUDA 13.0 or newer (CUDA 13 engine); the engine matches PyTorch's CUDA major |
@@ -92,9 +92,8 @@ background, it:
 1. reads the release list on [ModelScope `QuantFunc/Plugin`](https://www.modelscope.cn/models/QuantFunc/Plugin) (HTTPS
    only) and picks the newest engine compatible with this plugin;
 2. picks the engine for your setup, for torch's CUDA version (12 or 13) and your GPU's architecture (the GPU ComfyUI runs
-   on), from the release's `sets.json`. An engine holds exactly one architecture; an architecture the release does not
-   publish is refused with its SM number, never given another's. On Linux that is a host library plus the kernel library
-   of your architecture; on Windows one DLL;
+   on), from the release's `sets.json`. An engine holds exactly one consumer architecture (`sm_75`/`sm_86`/`sm_89`/`sm_120`); an architecture the release does not
+   publish is refused with its SM number, never given another's. On both Linux and Windows that is a zero-CUDA host library (`libquantfunc.so` / `quantfunc.dll`) plus the single-architecture CUDA kernel plugin (`libquantfunc_kernels_cuda_sm<arch>.{so,dll}`);
 3. downloads it, checks each file's SHA-256 against the release's `verify.json` (on Linux also that host and kernel come
    from one build), and installs it into `bin/<linux|windows>/<version>-<architecture>-cu<major>/` — all or nothing.
    A new version goes into a new folder. A version republished under the same number is downloaded again into
@@ -181,9 +180,9 @@ the model is loaded; on a PC with little RAM this can make the system unstable. 
 to the whole ComfyUI session: once any loader has turned it on (the LTX-2.5 loader does by default), it stays on for every
 model until ComfyUI restarts.
 The MiniMax-H3 and LTX-2.5 loaders accept two-stage (double-sampling) workflows as they are. The MiniMax-H3
-`audio_enhance` switch is not supported in two-stage (double-sampling) workflows: it is ignored there.
+`audio_enhance` switch is deprecated and ignored by the PC Engine (retained only so older saved workflows continue to load cleanly).
 Several loaders that name the same transformer file share one copy of the model in memory. `quality_enhance`,
-`attention_backend`, `sol_tau`, `step_cache`, `block_cache` and `audio_enhance` apply per loader, at each run, so a
+`attention_backend`, `sol_tau`, `step_cache`, and `block_cache` apply per loader, at each run, so a
 two-pass workflow can use a fast loader for the first pass and a quality loader for the second without loading the model
 twice. A different transformer file or `pinned_memory` setting loads a second copy.
 
