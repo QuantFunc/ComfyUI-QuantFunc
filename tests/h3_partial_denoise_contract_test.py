@@ -224,9 +224,14 @@ class _ContextKeys:
 
 
 class _FakeLib:
-    def __init__(self):
+    def __init__(self, identity_audio=False):
         self.events = []
         self._next_token = 0x1000
+        self._identity_audio = identity_audio
+        self._last_error = b""
+
+    def qf_last_error(self):
+        return self._last_error
 
     @property
     def begin_calls(self):
@@ -255,14 +260,48 @@ class _FakeLib:
         video_value = float(base.step_index) + 0.25
         audio_value = float(base.step_index) + 0.75
         self._write_float_buffer(base.velocity_out, base.velocity_out_capacity, video_value)
-        self._write_float_buffer(params.audio_velocity_out, params.audio_velocity_out_capacity, audio_value)
+        raw_audio_dims = tuple(int(d) for d in params.audio_dims)
+        active_audio_dims = self._active_dims(raw_audio_dims)
+        aud_tok = None
+        if self._identity_audio:
+            cap = int(params.audio_velocity_out_capacity)
+            item_size = ctypes.sizeof(ctypes.c_float)
+            if len(active_audio_dims) not in (3, 4):
+                self._last_error = f"unexpected audio_dims rank: {active_audio_dims}".encode("utf-8")
+                return qfe.QF_ERR_INVALID_ARG
+            need_numel = math.prod(active_audio_dims)
+            if cap <= 0 or cap % item_size != 0 or need_numel <= 0 or need_numel * item_size > cap:
+                self._last_error = (
+                    f"audio_dims {active_audio_dims} byte size {need_numel * item_size} exceeds capacity {cap}"
+                ).encode("utf-8")
+                return qfe.QF_ERR_INVALID_ARG
+            raw_in = self._read_float_buffer(params.audio_latent_in, need_numel * item_size, max_capacity=cap)
+            if need_numel != cap // item_size:
+                self._last_error = (
+                    f"active audio_dims {active_audio_dims} product {need_numel} != buffer numel {cap // item_size}"
+                ).encode("utf-8")
+                return qfe.QF_ERR_INVALID_ARG
+            if len(active_audio_dims) == 3:
+                # 3D [1, n_rows, ca]: already token-major; engine executes zero transposeAxes12.
+                aud_tok = raw_in.reshape(active_audio_dims)
+                out_tensor = aud_tok
+            else:
+                # 4D [1, ca, ka, ta]: engine assumes planar 4D and executes transposeAxes12 on input & output.
+                _, ca_d, ka_d, ta_d = active_audio_dims
+                aud_tok = raw_in.reshape(1, ca_d, ka_d * ta_d).transpose(1, 2).contiguous()
+                out_tensor = aud_tok.transpose(1, 2).contiguous()
+            self._write_float_tensor(params.audio_velocity_out, cap, out_tensor)
+        else:
+            self._write_float_buffer(params.audio_velocity_out, params.audio_velocity_out_capacity, audio_value)
         self.events.append(("step", {
             "token": int(session.value),
             "sigma": float(base.sigma),
             "step_index": int(base.step_index),
             "total_steps": int(base.total_steps),
             "dims": tuple(base.dims),
-            "audio_dims": tuple(params.audio_dims),
+            "audio_dims": raw_audio_dims,
+            "active_audio_dims": active_audio_dims,
+            "aud_tok": None if aud_tok is None else aud_tok.detach().clone(),
             "audio_velocity_out_capacity": int(params.audio_velocity_out_capacity),
             "audio_reference_active": int(params.audio_reference_active),
             "video_value": video_value,
@@ -275,12 +314,40 @@ class _FakeLib:
         return qfe.QF_OK
 
     @staticmethod
-    def _write_float_buffer(address, capacity, value):
+    def _active_dims(dims):
+        active = []
+        for dim in dims:
+            if int(dim) <= 0:
+                break
+            active.append(int(dim))
+        return tuple(active)
+
+    @staticmethod
+    def _float_buffer_view(address, capacity):
         item_size = ctypes.sizeof(ctypes.c_float)
         if not address or capacity <= 0 or capacity % item_size:
-            raise AssertionError(f"invalid float output buffer address={address} capacity={capacity}")
-        output = (ctypes.c_float * (capacity // item_size)).from_address(int(address))
+            raise AssertionError(f"invalid float buffer address={address} capacity={capacity}")
+        return (ctypes.c_float * (capacity // item_size)).from_address(int(address))
+
+    @classmethod
+    def _write_float_buffer(cls, address, capacity, value):
+        output = cls._float_buffer_view(address, capacity)
         for index in range(len(output)):
+            output[index] = value
+
+    @classmethod
+    def _read_float_buffer(cls, address, capacity, max_capacity=None):
+        if max_capacity is not None and capacity > max_capacity:
+            raise AssertionError(f"float buffer read {capacity} exceeds capacity {max_capacity}")
+        return torch.tensor(list(cls._float_buffer_view(address, capacity)), dtype=torch.float32)
+
+    @classmethod
+    def _write_float_tensor(cls, address, capacity, tensor):
+        output = cls._float_buffer_view(address, capacity)
+        flat = tensor.contiguous().reshape(-1).to(torch.float32).tolist()
+        if len(output) != len(flat):
+            raise AssertionError(f"float buffer len={len(output)} != tensor numel={len(flat)}")
+        for index, value in enumerate(flat):
             output[index] = value
 
 
@@ -315,9 +382,46 @@ def _pack_audio(value):
     return value[0].permute(1, 2, 0).reshape(-1, value.shape[1])
 
 
-def _unpack_audio(value):
-    time = value.shape[0] // 2
-    return value.reshape(2, time, value.shape[1]).permute(2, 0, 1).unsqueeze(0)
+def _unpack_audio(value, ch=2):
+    time = value.shape[0] // ch
+    return value.reshape(ch, time, value.shape[1]).permute(2, 0, 1).unsqueeze(0)
+
+
+_AUDIO_GEOMETRIES = ((32, 2, 3), (16, 2, 5), (32, 2, 2), (32, 1, 3), (32, 4, 3))
+
+
+def _asymmetric_audio(batch, ca, ka, ta, dtype=torch.float32):
+    # Every element is a multiple of 0.5 in (-90, 90), so float32 / bfloat16 / float16 represent it bit-exactly.
+    sign_b = 1.0 - 2.0 * torch.arange(batch, dtype=torch.float32).reshape(batch, 1, 1, 1)
+    k_term = (torch.arange(ka, dtype=torch.float32).reshape(1, 1, ka, 1) + 1.0) * 16.0
+    t_term = (torch.arange(ta, dtype=torch.float32).reshape(1, 1, 1, ta) + 1.0) * 2.0
+    c_term = torch.arange(ca, dtype=torch.float32).reshape(1, ca, 1, 1) * 0.5
+    return (sign_b * (k_term + t_term + c_term)).to(dtype)
+
+
+def _noncontig_4d(tensor):
+    nc = tensor.permute(0, 3, 1, 2).contiguous().permute(0, 2, 3, 1)
+    assert not nc.is_contiguous()
+    return nc
+
+
+def _noncontig_5d(tensor):
+    nc = tensor.permute(0, 2, 3, 4, 1).contiguous().permute(0, 4, 1, 2, 3)
+    assert not nc.is_contiguous()
+    return nc
+
+
+def _assert_same_shape_asymmetry(test_case, tensor):
+    if tensor.shape[0] >= 2:
+        test_case.assertFalse(torch.equal(tensor[0], tensor[1]))
+    if tensor.shape[1] >= 2:
+        test_case.assertFalse(torch.equal(tensor[:, 0, :, :], tensor[:, -1, :, :]))
+    if tensor.shape[2] >= 2:
+        test_case.assertFalse(torch.equal(tensor[:, :, 0, :], tensor[:, :, 1, :]))
+    if tensor.shape[3] >= 2:
+        test_case.assertFalse(torch.equal(tensor[:, :, :, 0], tensor[:, :, :, -1]))
+    if tensor.shape[2] == tensor.shape[3] and tensor.shape[2] >= 2:
+        test_case.assertFalse(torch.equal(tensor, tensor.transpose(2, 3)))
 
 
 class _Log:
@@ -386,8 +490,8 @@ class _Sampling:
         return velocity
 
 
-def _new_model(audio_enhance=False):
-    lib = _FakeLib()
+def _new_model(audio_enhance=False, identity_audio=False):
+    lib = _FakeLib(identity_audio=identity_audio)
     model = H3ContractModel.__new__(H3ContractModel)
     model._qf = _FakeEngine(lib)
     model.model_sampling = _Sampling()
@@ -585,13 +689,165 @@ class H3TwoStageContract(unittest.TestCase):
             packed, torch.tensor([1.0, 1.0], dtype=torch.float32),
             c_crossattn=context, transformer_options=options)
         self.assertEqual(tuple(out.shape), tuple(packed.shape))
+        begins = _events(lib, "begin")
+        self.assertEqual(len(begins), 1)
+        self.assertEqual(begins[0]["options"]["audio_dims"], [1, audio_shape[1], audio_shape[2], audio_shape[3]])
         steps = _events(lib, "step")
         self.assertEqual(len(steps), 2)
-        want_audio_cap = 1 * (audio_shape[2] * audio_shape[3]) * audio_shape[1] * ctypes.sizeof(ctypes.c_float)
+        n_rows = audio_shape[2] * audio_shape[3]
+        want_audio_cap = 1 * n_rows * audio_shape[1] * ctypes.sizeof(ctypes.c_float)
         for step in steps:
             self.assertEqual(step["dims"][0], 1)
-            self.assertEqual(step["audio_dims"], (1, audio_shape[1], audio_shape[2], audio_shape[3]))
+            self.assertEqual(step["audio_dims"], (1, n_rows, audio_shape[1], 0))
+            self.assertEqual(step["active_audio_dims"], (1, n_rows, audio_shape[1]))
             self.assertEqual(step["audio_velocity_out_capacity"], want_audio_cap)
+
+    def test_p12b_audio_asymmetric_gradient_roundtrip_no_double_transpose(self):
+        ca, ka, ta = 32, 2, 3
+        n_rows = ka * ta
+        video_shape = (1, 24, 2, 2, 2)
+        for batch in (1, 2):
+            with self.subTest(batch=batch):
+                model, lib = _new_model(identity_audio=True)
+                audio_shape = (1, ca, ka, ta)
+                model.latent_shapes = [list(video_shape), list(audio_shape)]
+                x_video = torch.arange(1, batch * 24 * 2 * 2 * 2 + 1, dtype=torch.float32).reshape(
+                    batch, *video_shape[1:])
+                x_audio = _asymmetric_audio(batch, ca, ka, ta, dtype=torch.float32)
+                vid_numel = int(torch.tensor(video_shape[1:]).prod())
+                packed = torch.cat([x_video.reshape(batch, -1), x_audio.reshape(batch, -1)], dim=1).unsqueeze(1)
+                context = torch.ones((batch, 3, 4), dtype=torch.float32)
+                options = {
+                    "sample_sigmas": torch.tensor([1.0, 0.5], dtype=torch.float32),
+                    "cond_or_uncond": list(range(batch)),
+                    "uuids": [f"g{i}" for i in range(batch)],
+                }
+                out = model._apply_model(
+                    packed, torch.ones((batch,), dtype=torch.float32),
+                    c_crossattn=context, transformer_options=options)
+                begins = _events(lib, "begin")
+                self.assertEqual(len(begins), 1)
+                self.assertEqual(begins[0]["options"]["audio_dims"], [1, ca, ka, ta])
+                steps = _events(lib, "step")
+                self.assertEqual(len(steps), batch)
+                for i, step in enumerate(steps):
+                    want_xi_audio = _pack_audio(x_audio[i:i + 1]).unsqueeze(0)
+                    self.assertEqual(step["active_audio_dims"], tuple(want_xi_audio.shape))
+                    self.assertEqual(step["audio_dims"], (1, n_rows, ca, 0))
+                    self.assertEqual(torch.max(torch.abs(step["aud_tok"] - want_xi_audio)).item(), 0.0)
+                    self.assertTrue(torch.equal(step["aud_tok"], want_xi_audio))
+                out_audio = out.reshape(batch, -1)[:, vid_numel:].reshape(batch, ca, ka, ta)
+                _assert_same_shape_asymmetry(self, out_audio)
+                self.assertEqual(torch.max(torch.abs(out_audio - x_audio)).item(), 0.0)
+                self.assertTrue(torch.equal(out_audio, x_audio))
+
+    def test_p12c_multi_geometry_noncontig_nested_and_dtypes(self):
+        video_shape = (1, 24, 2, 2, 2)
+        for ca, ka, ta in _AUDIO_GEOMETRIES:
+            n_rows = ka * ta
+            for batch in (1, 2):
+                for dtype in (torch.float32, torch.bfloat16, torch.float16):
+                    with self.subTest(geom=(ca, ka, ta), batch=batch, dtype=dtype):
+                        model, lib = _new_model(identity_audio=True)
+                        x_video = _noncontig_5d(
+                            torch.arange(1, batch * 24 * 2 * 2 * 2 + 1, dtype=torch.float32)
+                            .reshape(batch, *video_shape[1:])
+                            .to(dtype))
+                        x_audio = _noncontig_4d(_asymmetric_audio(batch, ca, ka, ta, dtype=dtype))
+                        nested = _NestedStub((x_video, x_audio))
+                        context = torch.ones((batch, 3, 4), dtype=dtype)
+                        options = {
+                            "sample_sigmas": torch.tensor([1.0, 0.5], dtype=torch.float32),
+                            "cond_or_uncond": list(range(batch)),
+                            "uuids": [f"n{i}" for i in range(batch)],
+                        }
+                        out = model._apply_model(
+                            nested, torch.ones((batch,), dtype=torch.float32),
+                            c_crossattn=context, transformer_options=options)
+                        self.assertTrue(getattr(out, "is_nested", False))
+                        begins = _events(lib, "begin")
+                        self.assertEqual(len(begins), 1)
+                        self.assertEqual(begins[0]["options"]["audio_dims"], [1, ca, ka, ta])
+                        steps = _events(lib, "step")
+                        self.assertEqual(len(steps), batch)
+                        for i, step in enumerate(steps):
+                            want_xi = _pack_audio(x_audio[i:i + 1].float()).unsqueeze(0)
+                            self.assertEqual(step["active_audio_dims"], (1, n_rows, ca))
+                            self.assertEqual(step["audio_dims"], (1, n_rows, ca, 0))
+                            self.assertEqual(torch.max(torch.abs(step["aud_tok"] - want_xi)).item(), 0.0)
+                        _den_v, den_a = out.unbind()
+                        _assert_same_shape_asymmetry(self, den_a)
+                        self.assertEqual(torch.max(torch.abs(den_a - x_audio.float())).item(), 0.0)
+                        _out_v, out_a = model._av_step_tensors(
+                            x_video, x_audio, context.to(torch.bfloat16), None, 0.5, None, options, {}, 1)
+                        self.assertEqual(out_a.dtype, dtype)
+                        self.assertTrue(torch.equal(out_a, x_audio))
+                        model.process_latent_out(out)
+
+    def test_p12d_audio_step_av_negative_arms(self):
+        ca, ka, ta = 32, 2, 3
+        video_shape = (1, 24, 2, 2, 2)
+        audio_shape = (1, ca, ka, ta)
+        model, lib = _new_model(identity_audio=True)
+        model.latent_shapes = [list(video_shape), list(audio_shape)]
+        x_video = torch.arange(1, 24 * 2 * 2 * 2 + 1, dtype=torch.float32).reshape(video_shape)
+        x_audio = _asymmetric_audio(1, ca, ka, ta, dtype=torch.float32)
+        packed = torch.cat([x_video.reshape(1, -1), x_audio.reshape(1, -1)], dim=1).unsqueeze(1)
+        context = torch.ones((1, 3, 4), dtype=torch.float32)
+        options = {"sample_sigmas": torch.tensor([1.0, 0.5], dtype=torch.float32), "cond_or_uncond": [0], "uuids": ["c"]}
+
+        orig_exec = model._execute_av_group_step
+
+        def force_4d_exec(**kw):
+            kw["aud_dims"] = (1, ca, ka, ta)
+            return orig_exec(**kw)
+
+        with mock.patch.object(model, "_execute_av_group_step", side_effect=force_4d_exec):
+            model._apply_model(packed, torch.tensor([1.0]), c_crossattn=context, transformer_options=options)
+        bad_step = _events(lib, "step")[0]
+        want_xi_audio = _pack_audio(x_audio).unsqueeze(0)
+        self.assertEqual(bad_step["active_audio_dims"], (1, ca, ka, ta))
+        self.assertFalse(torch.equal(bad_step["aud_tok"], want_xi_audio))
+        self.assertGreater(torch.max(torch.abs(bad_step["aud_tok"] - want_xi_audio)).item(), 1.0)
+
+        vid_buf = torch.ones((1, 8, 96), dtype=torch.float32)
+        vid_out = torch.empty_like(vid_buf)
+        aud_buf = _pack_audio(x_audio).unsqueeze(0).contiguous()
+        aud_out = torch.empty_like(aud_buf)
+        vi = torch.ones((1, 3, 4), dtype=torch.float32)
+
+        for bad_dims, err_pat in (
+            ((1, 6), "unexpected audio_dims rank"),
+            ((6,), "unexpected audio_dims rank"),
+            ((1, 99, ca), "exceeds capacity"),
+            ((1, 3, ca), "product .* != buffer numel"),
+        ):
+            with self.subTest(bad_dims=bad_dims):
+                neg_model, neg_lib = _new_model(identity_audio=True)
+                neg_model._num_steps = 2
+                neg_model._qf.current_session = ctypes.c_void_p(0x3000)
+                with self.assertRaisesRegex(RuntimeError, f"qf_xfm_step_av.*{err_pat}"):
+                    neg_model._execute_av_group_step(
+                        vid_in=vid_buf, vid_dims=(1, 8, 96), vid_out=vid_out,
+                        aud_in=aud_buf, aud_dims=bad_dims, aud_out=aud_out,
+                        vi=vi, sig_i=1.0, step_index=0, ctx_key=1,
+                        audio_scale=1.0, ref_active=False, group_i=0)
+                self.assertIsNone(neg_model._qf.current_session)
+
+                # Direct C-style call returns non-zero QF_ERR_INVALID_ARG without out-of-bounds read.
+                mp = qfe.QFStepAvParams()
+                ctypes.memset(ctypes.byref(mp), 0, ctypes.sizeof(mp))
+                mp.struct_size = ctypes.sizeof(mp)
+                mp.base.struct_size = ctypes.sizeof(qfe.QFStepParams)
+                mp.base.velocity_out = vid_out.data_ptr()
+                mp.base.velocity_out_capacity = vid_out.numel() * vid_out.element_size()
+                mp.audio_latent_in = aud_buf.data_ptr()
+                mp.audio_velocity_out = aud_out.data_ptr()
+                mp.audio_velocity_out_capacity = aud_out.numel() * aud_out.element_size()
+                mp.audio_dims[:len(bad_dims)] = list(bad_dims)
+                rc = neg_lib.qf_xfm_step_av(ctypes.c_void_p(0x3000), ctypes.byref(mp))
+                self.assertEqual(rc, qfe.QF_ERR_INVALID_ARG)
+                self.assertRegex(neg_lib.qf_last_error().decode("utf-8"), err_pat)
 
     def test_t13_extra_conds_error_rollback_and_presession_abort(self):
         model, lib = _new_model()
@@ -706,6 +962,56 @@ class H3ProductionPathContract(unittest.TestCase):
             patcher.model._av_prepare_session(xv, xa, vemb, to, {}, opening=False)
             self.assertEqual(patcher.model._qf_av_geom, ((24, 2, 2, 2), (32, 2, 3)))
             self.assertGreater(patcher.model._num_frames, 0)
+
+            NestedTensor = plugin.qfmp.comfy.nested_tensor.NestedTensor
+            orig_qf = patcher.model._qf
+            try:
+                for ca, ka, ta in _AUDIO_GEOMETRIES:
+                    n_rows = ka * ta
+                    for batch in (1, 2):
+                        for dtype in (torch.float32, torch.bfloat16, torch.float16):
+                            with self.subTest(geom=(ca, ka, ta), batch=batch, dtype=dtype):
+                                fake_lib = _FakeLib(identity_audio=True)
+                                patcher.model._qf = _FakeEngine(fake_lib)
+                                patcher.model._qf_needs_begin = True
+                                xv_nc = _noncontig_5d(
+                                    torch.arange(1, batch * 24 * 2 * 2 * 2 + 1, dtype=torch.float32)
+                                    .reshape(batch, 24, 2, 2, 2)
+                                    .to(dtype))
+                                xa_nc = _noncontig_4d(_asymmetric_audio(batch, ca, ka, ta, dtype=dtype))
+                                vemb_b = torch.ones((batch, 3, 4), dtype=dtype)
+                                to_b = {
+                                    "sample_sigmas": torch.tensor([0.5, 0.25, 0.0], dtype=torch.float32),
+                                    "cond_or_uncond": list(range(batch)),
+                                    "uuids": [f"c{i}" for i in range(batch)],
+                                }
+                                sig_t = torch.full((batch,), 0.5, dtype=torch.float32)
+                                out = patcher.model._apply_model(
+                                    NestedTensor((xv_nc, xa_nc)), sig_t,
+                                    c_crossattn=vemb_b, transformer_options=to_b)
+                                self.assertTrue(getattr(out, "is_nested", False))
+                                begins = _events(fake_lib, "begin")
+                                self.assertEqual(len(begins), 1)
+                                self.assertEqual(begins[0]["options"]["audio_dims"], [1, ca, ka, ta])
+                                steps = _events(fake_lib, "step")
+                                self.assertEqual(len(steps), batch)
+                                for i, step in enumerate(steps):
+                                    self.assertEqual(step["active_audio_dims"], (1, n_rows, ca))
+                                    self.assertEqual(step["audio_dims"], (1, n_rows, ca, 0))
+                                    self.assertEqual(torch.max(torch.abs(
+                                        step["aud_tok"] - _pack_audio(xa_nc[i:i + 1].float()).unsqueeze(0))).item(), 0.0)
+                                _den_v, den_a = out.unbind()
+                                want_den_a = patcher.model.model_sampling.calculate_denoised(
+                                    sig_t, xa_nc.float(), xa_nc)
+                                self.assertEqual(torch.max(torch.abs(den_a - want_den_a)).item(), 0.0)
+                                _out_v, out_a = patcher.model._av_step_tensors(
+                                    xv_nc, xa_nc, vemb_b.to(torch.bfloat16), None, 0.5, None, to_b, {}, 1)
+                                self.assertEqual(out_a.dtype, dtype)
+                                self.assertTrue(torch.equal(out_a, xa_nc))
+                                _assert_same_shape_asymmetry(self, out_a)
+                                patcher.model.process_latent_out(out)
+            finally:
+                patcher.model._qf = orig_qf
         self.assertEqual(engine_create_attempts, [])
 
 

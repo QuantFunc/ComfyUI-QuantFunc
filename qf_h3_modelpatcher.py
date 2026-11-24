@@ -282,13 +282,13 @@ class QFH3Model(qfmp.QFAVSessionModel, comfy.model_base.MiniMaxH3):
             ctx_key = self._ctx_key_assigner.key(cuid)
             self._execute_av_group_step(
                 vid_in=vid_tok, vid_dims=(1, ntok, pch), vid_out=self._out_video,
-                aud_in=xi_audio, aud_dims=(1, ca, ka, ta), aud_out=self._out_audio,
+                aud_in=xi_audio, aud_dims=(1, n_rows, ca), aud_out=self._out_audio,
                 vi=vi, sig_i=sig_i, step_index=step_index, ctx_key=ctx_key,
                 audio_scale=audio_scale, ref_active=False, group_i=i,
             )
             out_video[i:i + 1] = unpatchify_video(
                 self._out_video.reshape(ntok, pch), tt, th, tw, cv, patch_size=_H3_PATCH).to(out_video.dtype)
-            out_audio[i:i + 1] = unpack_audio(self._out_audio[0]).to(out_audio.dtype)
+            out_audio[i:i + 1] = unpack_audio(self._out_audio[0], ch=ka).to(out_audio.dtype)
         return out_video, out_audio
 
 

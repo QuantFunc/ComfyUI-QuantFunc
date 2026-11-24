@@ -211,8 +211,10 @@ check(_qi21_ratio(False, via_extra_conds=True) == 1.0,
       "arm2b: QI-2.1 edit (extra_conds reference_latents) -> 1.0 even when quality_enhance=False")
 check(_qi21_ratio(False, cond_or_uncond=(0, 1), uuids=("a", "b")) == 1.0,
       "arm2b: QI-2.1 CFG>1 (cond_or_uncond=[0,1]) -> 1.0")
-check(_qi21_ratio(False, cond_groups=2) == 1.0,
-      "arm2b: QI-2.1 multi-cond-group -> 1.0")
+check(_qi21_ratio(False, cond_or_uncond=(0,), uuids=("a", "b")) == 1.0,
+      "arm2b: QI-2.1 multi-uuid -> 1.0")
+check(_qi21_ratio(False, cond_groups=2) == 0.85,
+      "arm2b: QI-2.1 KSampler CFG=1.0 (extra_conds called for pos+neg, single active cond) -> 0.85")
 check(_qi21_ratio(False, batch=2) == 1.0,
       "arm2b: QI-2.1 batch>1 (B=2) -> 1.0")
 

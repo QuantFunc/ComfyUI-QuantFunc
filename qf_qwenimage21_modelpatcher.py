@@ -83,11 +83,14 @@ class QFQwenImage21Model(qfmp.QFImageSessionModel, comfy.model_base.QwenImage21)
         cuuids = transformer_options.get("uuids") if isinstance(transformer_options, dict) else None
         self._run_has_refs = bool(kwargs.get("ref_latents")) or getattr(self, "_run_has_refs", False)
         self._run_batch = batch
+        # Note: ComfyUI's stock KSampler(cfg=1.0) calls extra_conds for both positive and negative
+        # before skipping negative in sampling_function, so _run_cond_groups is 2 even for single-pass
+        # CFG=1.0 T2I. Batched CFG>1 is caught here via batch/cond_or_uncond/uuids, and unbatched split
+        # CFG>1 is caught fail-closed by the engine's per-step multi-ctx_key guard before CAT warmup ends.
         self._run_single_cond_group = (
             batch == 1
             and (cou is None or len(cou) <= 1)
             and (cuuids is None or len(cuuids) <= 1)
-            and getattr(self, "_run_cond_groups", 1) <= 1
         )
 
     def _apply_model(self, x, t, c_concat=None, c_crossattn=None, control=None,
