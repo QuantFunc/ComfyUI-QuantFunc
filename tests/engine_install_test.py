@@ -992,6 +992,452 @@ def main():
         check("cu12 without sm89/libquantfunc_kernels-12.so refused (never falls back to cu13)",
               "no per-SM CUDA kernel plugin" in msg and env.marker("sm89", 12) is None and not env.pairs(), msg[:80])
 
+    # 16) T1: POSIX umask 0002 fresh install hardens bin_dir, pair, host, kernel, addon, and .part pre-replace
+    old_umask = os.umask(0o002)
+    try:
+        rel_u = Release()
+        with Env(rel_u, sm=89) as env:
+            os.chmod(env.dir, 0o775)
+            pre_modes, real_replace = [], os.replace
+            qfe.os.replace = lambda a, b: (
+                pre_modes.append((os.path.basename(b), os.stat(a).st_mode & 0o777)),
+                real_replace(a, b),
+            )[1]
+            try:
+                qfe.install_engine()
+            finally:
+                qfe.os.replace = real_replace
+            pair = "0.0.14-sm89-cu13"
+            kname = kernel_for(89, 13)
+            mpath = env.path(".engine-sm89-cu13.json")
+            modes_ok = (
+                (os.stat(env.dir).st_mode & 0o777) == 0o755
+                and (os.stat(env.path(pair)).st_mode & 0o777) == 0o755
+                and (os.stat(env.path(pair, HOSTS[13])).st_mode & 0o777) == 0o755
+                and (os.stat(env.path(pair, kname)).st_mode & 0o777) == 0o755
+                and (os.stat(mpath).st_mode & 0o777) == 0o644
+                and pre_modes == [(kname, 0o755), (HOSTS[13], 0o755), (".engine-sm89-cu13.json", 0o644)]
+            )
+            check("T1a umask 0002: fresh install hardens dir/.so to 0755, marker to 0644, .part pre-replace",
+                  modes_ok, pre_modes)
+
+        rel_ua = with_addons(Release())
+        with Env(rel_ua, sm=89) as env:
+            pre_modes, real_replace = [], os.replace
+            qfe.os.replace = lambda a, b: (
+                pre_modes.append((os.path.basename(b), os.stat(a).st_mode & 0o777)),
+                real_replace(a, b),
+            )[1]
+            try:
+                qfe.install_engine()
+            finally:
+                qfe.os.replace = real_replace
+            addon_mode = os.stat(env.path("0.0.14-sm89-cu13", ADD[13])).st_mode & 0o777
+            check("T1b umask 0002: addon .part hardened to 0755 before os.replace",
+                  addon_mode == 0o755 and (ADD[13], 0o755) in pre_modes, (addon_mode, pre_modes))
+    finally:
+        os.umask(old_umask)
+
+    # 17) T2: 0775/0664 self-heal on skip branch & resolve_so_path; _harden_posix_mode O_NOFOLLOW/OSError/nt; symlink fail-closed
+    rel_heal = with_addons(Release())
+    with Env(rel_heal, sm=89) as env:
+        qfe.install_engine()
+        pair = "0.0.14-sm89-cu13"
+        kname = kernel_for(89, 13)
+        mpath = env.path(".engine-sm89-cu13.json")
+        os.chmod(env.path(pair), 0o775)
+        for fn in (HOSTS[13], kname, ADD[13]):
+            os.chmod(env.path(pair, fn), 0o664)
+        os.chmod(mpath, 0o664)
+        rel_heal.fetched.clear()
+        qfe.install_engine()
+        skip_healed = (
+            not any(f.endswith(".so") for f in rel_heal.fetched)
+            and (os.stat(env.path(pair)).st_mode & 0o777) == 0o755
+            and all((os.stat(env.path(pair, fn)).st_mode & 0o777) == 0o755 for fn in (HOSTS[13], kname, ADD[13]))
+            and (os.stat(mpath).st_mode & 0o777) == 0o644
+        )
+        check("T2a already-matching skip branch heals 0775/0664 dir/.so/addon/marker with 0 binary fetches",
+              skip_healed, rel_heal.fetched)
+
+        os.chmod(env.dir, 0o775)
+        os.chmod(env.path(pair), 0o775)
+        os.chmod(env.path(pair, HOSTS[13]), 0o664)
+        os.chmod(env.path(pair, kname), 0o664)
+        qfe.resolve_so_path()
+        res_healed = (
+            (os.stat(env.dir).st_mode & 0o777) == 0o755
+            and (os.stat(env.path(pair)).st_mode & 0o777) == 0o755
+            and (os.stat(env.path(pair, HOSTS[13])).st_mode & 0o777) == 0o755
+            and (os.stat(env.path(pair, kname)).st_mode & 0o777) == 0o755
+        )
+        check("T2b offline resolve_so_path heals managed 0775/0664 dirs & .so to 0755", res_healed)
+
+        # _harden_posix_mode O_NOFOLLOW symlink refusal, OSError swallow, Windows no-op
+        sym_target = os.path.join(env.parent, "sym_target.so")
+        open(sym_target, "wb").write(b"X")
+        os.chmod(sym_target, 0o664)
+        sym_link = os.path.join(env.parent, "sym_link.so")
+        os.symlink(sym_target, sym_link)
+        qfe._harden_posix_mode(sym_link, 0o755)
+        sym_untouched = (os.stat(sym_target).st_mode & 0o777) == 0o664
+
+        saved_fchmod, saved_name, saved_open = qfe.os.fchmod, qfe.os.name, qfe.os.open
+        try:
+            qfe.os.fchmod = lambda fd, mode: (_ for _ in ()).throw(PermissionError("ro fs"))
+            qfe._harden_posix_mode(sym_target, 0o755)
+            ro_ok = True
+        except OSError:
+            ro_ok = False
+        finally:
+            qfe.os.fchmod = saved_fchmod
+
+        open_calls = []
+        try:
+            qfe.os.name = "nt"
+            qfe.os.open = lambda *a, **k: (open_calls.append(a), saved_open(*a, **k))[1]
+            qfe._harden_posix_mode(sym_target, 0o755)
+            nt_noop = open_calls == []
+        finally:
+            qfe.os.name = saved_name
+            qfe.os.open = saved_open
+        check("T2c _harden_posix_mode refuses symlink via O_NOFOLLOW, swallows OSError, no-op on Windows",
+              sym_untouched and ro_ok and nt_noop, (sym_untouched, ro_ok, nt_noop))
+
+    # Symlinked bin_dir and symlinked pair dir must fail closed
+    with Env(Release(), sm=89) as env:
+        real_bin = os.path.join(env.parent, "real_bin")
+        shutil.move(env.dir, real_bin)
+        os.symlink(real_bin, env.dir)
+        sym_bin_errs = []
+        for fn in (qfe.install_engine, qfe.resolve_so_path):
+            try:
+                fn()
+                sym_bin_errs.append("ok!")
+            except RuntimeError as e:
+                sym_bin_errs.append("refusing symlinked engine bin" in str(e))
+        check("T2d symlinked bin_dir rejected fail-closed by install_engine & resolve_so_path",
+              sym_bin_errs == [True, True] and not qfe.has_ready_so(), sym_bin_errs)
+
+    with Env(Release(), sm=89) as env:
+        qfe.install_engine()
+        pair_path = env.path("0.0.14-sm89-cu13")
+        real_pair = os.path.join(env.parent, "real_pair")
+        shutil.move(pair_path, real_pair)
+        os.symlink(real_pair, pair_path)
+        sym_pair_errs = []
+        for fn in (qfe.install_engine, qfe.resolve_so_path):
+            try:
+                fn()
+                sym_pair_errs.append("ok!")
+            except RuntimeError as e:
+                sym_pair_errs.append("refusing symlinked engine pair" in str(e))
+        check("T2e symlinked pair dir rejected fail-closed by install_engine & resolve_so_path",
+              sym_pair_errs == [True, True] and not qfe.has_ready_so(), sym_pair_errs)
+
+    # 18) T3: Non-managed paths (QF_NATIVE_SO_PATH, .dev_lib_lock, QF_KERNEL_PLUGIN_DIR) ZERO chmod/fchmod
+    with Env(Release(), sm=89) as env:
+        unm_dir = os.path.join(env.parent, "unmanaged")
+        os.makedirs(unm_dir, exist_ok=True)
+        os.chmod(unm_dir, 0o775)
+        unm_host = os.path.join(unm_dir, HOSTS[13])
+        unm_kern = os.path.join(unm_dir, kernel_for(89, 13))
+        open(unm_host, "wb").write(b"UNM-HOST")
+        open(unm_kern, "wb").write(b"UNM-KERN")
+        os.chmod(unm_host, 0o664)
+        os.chmod(unm_kern, 0o664)
+        os.chmod(env.dir, 0o775)
+        dev_host = env.path(HOSTS[13])
+        open(dev_host, "wb").write(b"DEV-HOST")
+        os.chmod(dev_host, 0o664)
+        open(env.path(qfe._ENGINE_LOCAL_BUILD_LOCK), "w", encoding="utf-8").close()
+
+        chmod_log = []
+        real_chmod, real_fchmod = qfe.os.chmod, qfe.os.fchmod
+        qfe.os.chmod = lambda p, m: (chmod_log.append(("chmod", p, m)), real_chmod(p, m))[1]
+        qfe.os.fchmod = lambda fd, m: (chmod_log.append(("fchmod", fd, m)), real_fchmod(fd, m))[1]
+        saved_kdir = os.environ.get(qfe._ENV_KERNEL_PLUGIN_DIR)
+        try:
+            os.environ[qfe._ENV_SO_OVERRIDE] = unm_host
+            r1 = qfe.resolve_so_path()
+            os.environ.pop(qfe._ENV_SO_OVERRIDE, None)
+
+            r2 = qfe.resolve_so_path()
+
+            os.environ[qfe._ENV_KERNEL_PLUGIN_DIR] = unm_dir
+            r3 = qfe._select_kernel_plugin(unm_host)
+
+            unm_ok = (
+                chmod_log == []
+                and r1 == os.path.realpath(unm_host)
+                and r2 == os.path.realpath(dev_host)
+                and r3 == unm_kern
+                and (os.stat(unm_dir).st_mode & 0o777) == 0o775
+                and (os.stat(unm_host).st_mode & 0o777) == 0o664
+                and (os.stat(unm_kern).st_mode & 0o777) == 0o664
+                and (os.stat(env.dir).st_mode & 0o777) == 0o775
+                and (os.stat(dev_host).st_mode & 0o777) == 0o664
+            )
+            check("T3 unmanaged paths (QF_NATIVE_SO_PATH, .dev_lib_lock, QF_KERNEL_PLUGIN_DIR): 0 chmod/fchmod calls",
+                  unm_ok, chmod_log)
+        finally:
+            qfe.os.chmod, qfe.os.fchmod = real_chmod, real_fchmod
+            os.environ.pop(qfe._ENV_SO_OVERRIDE, None)
+            if saved_kdir is None:
+                os.environ.pop(qfe._ENV_KERNEL_PLUGIN_DIR, None)
+            else:
+                os.environ[qfe._ENV_KERNEL_PLUGIN_DIR] = saved_kdir
+
+    # 19) T4: Same-version SHA reinstall pre-replace failure, mid-replace rollback, and rollback failure
+    def _new_sha_release(tag="v2"):
+        r = Release("0.0.14")
+        h2 = f"HOST-0.0.14-{tag}-cu13".encode()
+        k2 = f"KERNEL-0.0.14-sm89-{tag}-cu13".encode()
+        r.files[f"0.0.14/linux/{HOSTS[13]}"] = h2
+        r.files[f"0.0.14/linux/sm89/{kernel_for(89, 13)}"] = k2
+        r.manifest["linux"][HOSTS[13]] = sha(h2)
+        r.manifest["linux"][f"sm89/{kernel_for(89, 13)}"] = sha(k2)
+        r.publish()
+        return r
+
+    def _no_bak_left(env_obj):
+        return not any(".part" in f or ".bak-" in f for _r, _d, fs in os.walk(env_obj.dir) for f in fs)
+
+    with Env(Release("0.0.14"), sm=89) as env:
+        qfe.install_engine()
+        pair = "0.0.14-sm89-cu13"
+        kname = kernel_for(89, 13)
+        orig_h = env.read(pair, HOSTS[13])
+        orig_k = env.read(pair, kname)
+        orig_m = env.marker()
+
+        # Pre-replace failure (tampered SHA on new download) preserves old files & marker verbatim
+        bad_r = _new_sha_release("badsha")
+        bad_r.files[f"0.0.14/linux/{HOSTS[13]}"] = b"CORRUPTED"
+        qfe._engine_http_open = bad_r.open
+        try:
+            qfe.install_engine()
+            msg = "installed!"
+        except RuntimeError as e:
+            msg = str(e)
+        check("T4a same-version pre-replace failure preserves old binaries & marker",
+              "existing installation was preserved" in msg
+              and env.read(pair, HOSTS[13]) == orig_h
+              and env.read(pair, kname) == orig_k
+              and env.marker() == orig_m
+              and _no_bak_left(env), msg[:100])
+
+        # Mid-replace failure: os.replace(host) fails AFTER os.replace(kernel) succeeded
+        qfe._engine_http_open = _new_sha_release("midhost").open
+        real_replace = qfe.os.replace
+
+        def _fail_host_replace(src, dst):
+            if os.path.basename(dst) == HOSTS[13] and ".part" in os.path.basename(src):
+                raise OSError("injected host replace failure")
+            return real_replace(src, dst)
+
+        qfe.os.replace = _fail_host_replace
+        try:
+            qfe.install_engine()
+            msg = "installed!"
+        except RuntimeError as e:
+            msg = str(e)
+        finally:
+            qfe.os.replace = real_replace
+        check("T4b mid-replace os.replace(host) failure rolls back kernel & preserves marker",
+              "existing installation was preserved" in msg
+              and env.read(pair, HOSTS[13]) == orig_h
+              and env.read(pair, kname) == orig_k
+              and env.marker() == orig_m
+              and _no_bak_left(env), msg[:100])
+
+        # Mid-replace failure: _claim() fails AFTER BOTH kernel and host were replaced
+        qfe._engine_http_open = _new_sha_release("midclaim").open
+        real_write = qfe._engine_write_file
+
+        def _fail_claim_write(path, data):
+            if os.path.basename(path) == ".engine-sm89-cu13.json":
+                raise OSError("injected claim failure")
+            return real_write(path, data)
+
+        qfe._engine_write_file = _fail_claim_write
+        try:
+            qfe.install_engine()
+            msg = "installed!"
+        except RuntimeError as e:
+            msg = str(e)
+        finally:
+            qfe._engine_write_file = real_write
+        check("T4c mid-replace _claim() failure rolls back both kernel & host and preserves marker",
+              "existing installation was preserved" in msg
+              and env.read(pair, HOSTS[13]) == orig_h
+              and env.read(pair, kname) == orig_k
+              and env.marker() == orig_m
+              and _no_bak_left(env), msg[:100])
+
+        # Rollback failure: os.replace(host) fails AND restoring kernel backup fails -> removes stale marker
+        qfe._engine_http_open = _new_sha_release("rbfail").open
+
+        def _fail_host_and_rollback(src, dst):
+            if os.path.basename(dst) == HOSTS[13] and ".part" in os.path.basename(src):
+                raise OSError("injected host replace failure")
+            if ".bak-" in os.path.basename(src):
+                raise OSError("injected rollback failure")
+            return real_replace(src, dst)
+
+        qfe.os.replace = _fail_host_and_rollback
+        try:
+            qfe.install_engine()
+            msg = "installed!"
+        except RuntimeError as e:
+            msg = str(e)
+        finally:
+            qfe.os.replace = real_replace
+        check("T4d rollback failure deletes stale marker and never claims preserved",
+              "rollback failed; stale marker removed" in msg
+              and "existing installation was preserved" not in msg
+              and env.marker() is None
+              and _no_bak_left(env), msg[:120])
+
+    # Fresh-install (bak is None) mid-replace failure removes half-installed kernel and leaves no marker
+    with Env(Release("0.0.14"), sm=89) as env:
+        real_replace = qfe.os.replace
+
+        def _fail_fresh_host_replace(src, dst):
+            if os.path.basename(dst) == HOSTS[13] and ".part" in os.path.basename(src):
+                raise OSError("injected fresh host replace failure")
+            return real_replace(src, dst)
+
+        qfe.os.replace = _fail_fresh_host_replace
+        try:
+            qfe.install_engine()
+            fresh_rb = False
+        except OSError as e:
+            fresh_rb = "injected fresh host replace failure" in str(e)
+        finally:
+            qfe.os.replace = real_replace
+        pair_dir = env.path("0.0.14-sm89-cu13")
+        leftover = os.listdir(pair_dir) if os.path.isdir(pair_dir) else []
+        check("T4e fresh-install mid-replace removes half-installed kernel & leaves no marker",
+              fresh_rb and leftover == [] and env.marker() is None and _no_bak_left(env),
+              (fresh_rb, leftover, env.marker()))
+
+    # 20) T8: Real (unmocked) has_ready_so(device_id) 6+ paths & headless heterogeneous multi-GPU load_lib(device_id=1)
+    with Env(Release(), sm={0: 89, 1: 86}) as env:
+        qfe.install_engine(1)  # only sm86 installed
+        saved_lib = (qfe._LIB, qfe._LIB_PATH, qfe._FINGERPRINT_PENDING, qfe._ENGINE_DEVICE,
+                     qfe._engine_platform, qfe.assert_toolchain_compatible, qfe._engine_cuda_needs,
+                     qfe.ctypes.CDLL, qfe._bind, qfe._engine_load_ok, qfe._log_lib_fingerprint)
+        try:
+            qfe._LIB = object()
+            p_loaded = qfe.has_ready_so() is True
+            qfe._LIB = None
+
+            os.environ[qfe._ENV_SO_OVERRIDE] = env.path("does_not_exist.so")
+            p_override_miss = qfe.has_ready_so(device_id=1) is False
+            os.environ[qfe._ENV_SO_OVERRIDE] = env.path("0.0.14-sm86-cu13", HOSTS[13])
+            p_override_hit = qfe.has_ready_so(device_id=1) is True
+            os.environ.pop(qfe._ENV_SO_OVERRIDE, None)
+
+            orig_plat = qfe._engine_platform
+            qfe._engine_platform = lambda: None
+            p_plat_none_miss = qfe.has_ready_so(device_id=1) is False
+            local_p = env.path(HOSTS[13])
+            open(local_p, "wb").write(b"LOCAL")
+            p_plat_none_hit = qfe.has_ready_so(device_id=1) is True
+            os.remove(local_p)
+            qfe._engine_platform = orig_plat
+
+            lock_p = env.path(qfe._ENGINE_LOCAL_BUILD_LOCK)
+            open(lock_p, "w", encoding="utf-8").close()
+            p_lock_miss = qfe.has_ready_so(device_id=1) is False
+            local_p = env.path(HOSTS[13])
+            open(local_p, "wb").write(b"LOCAL")
+            p_lock_hit = qfe.has_ready_so(device_id=1) is True
+            os.remove(local_p)
+            os.remove(lock_p)
+
+            p_dev0 = qfe.has_ready_so(device_id=0) is False
+            p_dev1 = qfe.has_ready_so(device_id=1) is True
+
+            # Tamper sm86 kernel -> has_ready_so returns False, NEVER deletes marker, NEVER calls start_engine_install
+            started_probe = []
+            qfe.start_engine_install = lambda device_idx=None: started_probe.append(device_idx)
+            k86_path = env.path("0.0.14-sm86-cu13", kernel_for(86, 13))
+            orig_k86 = open(k86_path, "rb").read()
+            open(k86_path, "wb").write(b"TAMPERED")
+            p_tamper = qfe.has_ready_so(device_id=1) is False
+            p_no_side_fx = env.marker("sm86") is not None and started_probe == []
+            open(k86_path, "wb").write(orig_k86)
+
+            # OSError inside probe -> False
+            orig_bindir = qfe._engine_bin_dir
+            qfe._engine_bin_dir = lambda: (_ for _ in ()).throw(OSError("io fail"))
+            p_oserr = qfe.has_ready_so(device_id=1) is False
+            qfe._engine_bin_dir = orig_bindir
+
+            check("T8a real has_ready_so all paths (loaded, override-miss/hit, plat-none, lock-miss/hit, multi-gpu, tamper, OSError)",
+                  all((p_loaded, p_override_miss, p_override_hit, p_plat_none_miss, p_plat_none_hit,
+                       p_lock_miss, p_lock_hit, p_dev0, p_dev1, p_tamper, p_no_side_fx, p_oserr)),
+                  (p_loaded, p_override_miss, p_override_hit, p_plat_none_miss, p_plat_none_hit,
+                   p_lock_miss, p_lock_hit, p_dev0, p_dev1, p_tamper, p_no_side_fx, p_oserr))
+
+            # Headless heterogeneous multi-GPU load_lib(device_id=1) when _ENGINE_DEVICE == 0
+            qfe._ENGINE_DEVICE = 0
+            qfe._LIB = qfe._LIB_PATH = None
+            qfe.assert_toolchain_compatible = lambda p: None
+            qfe._engine_cuda_needs = lambda p: set()
+            loaded_paths = []
+            qfe.ctypes.CDLL = lambda p, mode=0: (loaded_paths.append(p), object())[1]
+            qfe._bind = lambda lib: types.SimpleNamespace(qf_set_log_level=lambda level: None)
+            qfe._engine_load_ok = lambda p: None
+            qfe._log_lib_fingerprint = lambda lib, p, ident: None
+
+            qfe.load_lib(device_id=1)
+            dev1_ok = (
+                qfe._ENGINE_DEVICE == 1
+                and len(loaded_paths) == 1
+                and os.path.basename(os.path.dirname(loaded_paths[0])) == "0.0.14-sm86-cu13"
+            )
+
+            # Failure rollback of _ENGINE_DEVICE when load_lib(device_id=1) raises
+            qfe._LIB = qfe._LIB_PATH = None
+            qfe._ENGINE_DEVICE = 0
+            qfe.ctypes.CDLL = lambda p, mode=0: (_ for _ in ()).throw(OSError("dlopen fail"))
+            try:
+                qfe.load_lib(device_id=1)
+                rb_ok = False
+            except RuntimeError:
+                rb_ok = qfe._ENGINE_DEVICE == 0
+            check("T8b multi-GPU load_lib(device_id=1) resolves sm86 and rolls back _ENGINE_DEVICE on error",
+                  dev1_ok and rb_ok, (dev1_ok, rb_ok, loaded_paths, qfe._ENGINE_DEVICE))
+        finally:
+            os.environ.pop(qfe._ENV_SO_OVERRIDE, None)
+            (qfe._LIB, qfe._LIB_PATH, qfe._FINGERPRINT_PENDING, qfe._ENGINE_DEVICE,
+             qfe._engine_platform, qfe.assert_toolchain_compatible, qfe._engine_cuda_needs,
+             qfe.ctypes.CDLL, qfe._bind, qfe._engine_load_ok, qfe._log_lib_fingerprint) = saved_lib
+
+    # 21) T19: Exact 35-symbol qf_capi.py standalone & package re-export verification
+    capi_spec = importlib.util.spec_from_file_location("qf_capi_check", os.path.join(_PLUGIN, "qf_capi.py"))
+    capi_mod = importlib.util.module_from_spec(capi_spec)
+    capi_spec.loader.exec_module(capi_mod)
+    pkg_tmp = types.ModuleType("qf_pkg_capi_test")
+    pkg_tmp.__path__ = [_PLUGIN]
+    sys.modules[pkg_tmp.__name__] = pkg_tmp
+    try:
+        pkg_qfe = __import__(f"{pkg_tmp.__name__}.qf_engine", fromlist=["qf_engine"])
+        all_35 = list(capi_mod.__all__)
+        check("T19 qf_capi exposes exact 35 symbols across standalone & package qf_engine plus library_identity",
+              len(all_35) == 35
+              and all(hasattr(qfe, s) and hasattr(pkg_qfe, s) for s in all_35)
+              and callable(getattr(qfe, "library_identity", None))
+              and callable(getattr(pkg_qfe, "library_identity", None)),
+              (len(all_35), [s for s in all_35 if not (hasattr(qfe, s) and hasattr(pkg_qfe, s))]))
+    finally:
+        sys.modules.pop(pkg_tmp.__name__, None)
+        sys.modules.pop(f"{pkg_tmp.__name__}.qf_engine", None)
+        sys.modules.pop(f"{pkg_tmp.__name__}.qf_capi", None)
+
     print("ENGINE_INSTALL:", "PASS" if bad == 0 else f"FAIL ({bad} wrong)")
     return 1 if bad else 0
 

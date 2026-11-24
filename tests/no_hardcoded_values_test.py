@@ -40,13 +40,14 @@ ALLOWED = {
     ("__init__.py", "_MAX_LORA_HEADER_BYTES"): "upper bound on safetensors JSON header read (input validation)",
     ("qf_api_key.py", "_REF_HEX"): "length of the reference token this process issues (its own format)",
     ("qf_api_key.py", "_MAX_FIELD"): "upper bound on the POSTed field (input validation at a trust boundary)",
-    **{("qf_engine.py", n): _ABI for n in (
+    **{("qf_capi.py", n): _ABI for n in (
         "QF_OK", "QF_ERR_INVALID_ARG", "QF_ERR_BACKEND", "QF_ERR_OOM", "QF_ERR_IO",
         "QF_ERR_INTERNAL", "QF_ERR_BUSY", "QF_ERR_AUTH", "QF_ERR_UNSUPPORTED",
         "QF_DTYPE_FP32", "QF_DTYPE_FP16", "QF_DTYPE_BF16", "QF_DTYPE_INT8", "QF_DTYPE_INT32",
         "QF_DTYPE_FP8_E4M3", "QF_DTYPE_INT4_PACKED", "QF_DTYPE_E2M1_PACKED",
         "QF_ATTN_CAP_FP16", "QF_ATTN_CAP_INT8", "QF_ATTN_CAP_INT4",
-        "QF_MAX_STEP_REFS", "QF_UINT64_MAX", "_LOG_INFO")},
+        "QF_MAX_STEP_REFS", "QF_UINT64_MAX")},
+    ("qf_engine.py", "_LOG_INFO"): _ABI,
     **{("qf_engine.py", n): "ELF / dlinfo format constant (the library-file format, not a model fact)"
        for n in ("_SHT_DYNAMIC", "_DT_NULL", "_DT_NEEDED", "_RTLD_DI_LINKMAP")},
     ("qf_engine.py", "_CONSUMER_SMS"): "QuantFunc PC Engine supported consumer GPU SM set (O6 product scope)",
@@ -55,11 +56,11 @@ ALLOWED = {
     ("qf_engine.py", "_ENGINE_VERIFY_SCHEMA_MAX"): "newest verify.json schema this plugin reads",
     ("qf_engine.py", "_ENGINE_HTTP_TIMEOUT_S"): "network timeout of the engine download",
     ("qf_engine.py", "_ENGINE_DEVICE"): "placeholder only: start_engine_install sets it to ComfyUI's device",
-    ("qf_h3_modelpatcher.py", "_BUSY_BEGIN_RETRY_S"): "short retry sleep when a previous session is draining",
     ("qf_log_level.py", "LOG_LEVELS"): "the engine's log scale for qf_set_log_level (C API), not a model fact",
     ("qf_modelpatcher.py", "_KNO_CTX_KEY"): "sentinel context key (no conditioning), not a model value",
     ("qf_modelpatcher.py", "_CAT_KEEP_DEFAULT"): "QualityLaw PC Engine default session ratio (quality_enhance=False)",
     ("qf_modelpatcher.py", "_OUTER_SAMPLE_LATENT_SHAPES_ARG"): "ComfyUI OUTER_SAMPLE positional argument index",
+    ("qf_modelpatcher.py", "_BUSY_BEGIN_RETRY_S"): "short retry sleep when a previous session is draining",
     ("qf_modelpatcher.py", "_LORA_DRAIN_RETRY_S"): "short retry sleep when draining an open session before LoRA swap",
     ("qf_modelpatcher.py", "_step_cache"): "dial default = the loader input's own default (off)",
     ("qf_modelpatcher.py", "_block_cache"): "dial default = the loader input's own default (off)",
@@ -75,7 +76,6 @@ ALLOWED = {
     ("qf_ltx_modelpatcher.py", "_AUDIO_LATENT_NDIM"): "4-D audio latent tensor rank [B,C,L,F]",
     ("qf_ltx_modelpatcher.py", "_REF_AUDIO_MAX_NUMEL"): "upper bound on reference audio token buffer (input validation)",
     ("qf_ltx_modelpatcher.py", "_ST_HEADER_MAX_BYTES"): "upper bound on safetensors JSON header read (input validation)",
-    ("qf_ltx_modelpatcher.py", "_BUSY_BEGIN_RETRY_S"): "short retry sleep when a previous session is draining",
     **{("qf_sol.py", n): "UI/protocol default for Sol sparse-attention options (not a model fact)"
        for n in ("start_percent", "end_percent", "min_tokens")},
 }

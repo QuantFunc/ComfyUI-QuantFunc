@@ -33,8 +33,8 @@ class QFQwenImage21Model(qfmp.QFImageSessionModel, comfy.model_base.QwenImage21)
         "noise_concat", "concat_latent_image", "concat_mask",
     )
 
-    def __init__(self, model_config, engine, device=None):
-        super().__init__(model_config, engine, device=device)
+    def _reset_run_cond_state(self):
+        super()._reset_run_cond_state()
         self._run_has_refs = False
         self._run_batch = 1
         self._run_single_cond_group = True
@@ -58,17 +58,21 @@ class QFQwenImage21Model(qfmp.QFImageSessionModel, comfy.model_base.QwenImage21)
         return _CAT_KEEP_QI21
 
     def extra_conds(self, **kwargs):
-        if not getattr(self, "_qf_needs_begin", False):
-            self._run_has_refs = False
-            self._run_cond_groups = 0
         out = super().extra_conds(**kwargs)
-        self._run_cond_groups = getattr(self, "_run_cond_groups", 0) + 1
-        if kwargs.get("reference_latents") is not None:
-            self._run_has_refs = True
-        return out
+        try:
+            self._run_cond_groups = getattr(self, "_run_cond_groups", 0) + 1
+            if kwargs.get("reference_latents") is not None:
+                self._run_has_refs = True
+            return out
+        except BaseException:
+            self._reset_run_cond_state()
+            self._qf_conds_done = True
+            raise
 
     def _check_conds(self, kwargs):
-        if kwargs.get("reference_latents") is not None and not hasattr(qfe.load_lib(), "qf_xfm_step_refs"):
+        dev = getattr(self, "device", None)
+        dev_id = dev.index if getattr(dev, "type", None) == "cuda" and dev.index is not None else None
+        if kwargs.get("reference_latents") is not None and not hasattr(qfe.load_lib(device_id=dev_id), "qf_xfm_step_refs"):
             raise RuntimeError(
                 "qf_native qwenimage21: reference images are wired (TextEncodeQwenImage21 images + vae), but "
                 "the loaded QuantFunc engine has no qf_xfm_step_refs - update the QuantFunc engine.")
@@ -128,13 +132,6 @@ class QFQwenImage21Model(qfmp.QFImageSessionModel, comfy.model_base.QwenImage21)
         self._call_denoise_step(
             rp, f"qwenimage21 qf_xfm_step_refs[step={step_index},group={i},key={ctx_key},refs={n}]",
             fn_name="qf_xfm_step_refs")
-
-    def process_latent_out(self, latent):
-        self._run_has_refs = False
-        self._run_batch = 1
-        self._run_single_cond_group = True
-        self._run_cond_groups = 0
-        return super().process_latent_out(latent)
 
 
 def register(deps):

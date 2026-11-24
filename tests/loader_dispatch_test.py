@@ -86,6 +86,9 @@ def main():
     from comfy_extras.nodes_minimax_h3 import CANVAS_MULTIPLE as _CM
     from qfn_test_pkg import qf_modelpatcher as qfmp
     from qfn_test_pkg import qf_ltx_modelpatcher as qlm
+    from qfn_test_pkg import qf_h3_modelpatcher as qh3
+    from qfn_test_pkg import qf_krea2_modelpatcher as qk2
+    from qfn_test_pkg import qf_qwenimage21_modelpatcher as qq21
 
     sys.path.insert(0, _HERE)
     import _banned_terms as _bt
@@ -578,7 +581,8 @@ def main():
           and (_p_vram.detach(unpatch_all=True), _p_vram.loaded_size() == 0)[1])
 
     _viol = []
-    _scan_files = ["__init__.py", "qf_modelpatcher.py", "qf_engine.py"] + [m + ".py" for m in qfn._FAMILY_MODULES]
+    _scan_files = ["__init__.py", "qf_capi.py", "qf_modelpatcher.py", "qf_engine.py"] + [
+        m + ".py" for m in qfn._FAMILY_MODULES]
     for _fn in _scan_files:
         _tree = ast.parse(open(os.path.join(_PLUGIN, _fn), encoding="utf-8").read())
         _allowed = set()
@@ -645,6 +649,38 @@ def main():
     check("QuantFuncH3LatentUpscale snaps to canvas multiple and preserves audio latent",
           (_w2, _h2) == (1920, 1088) and _w2 % _CM == 0 and _h2 % _CM == 0
           and (_v2.shape[-2] * _px, _v2.shape[-1] * _px) == (_h2, _w2) and torch.equal(_a2, _aud))
+
+    # ── 9) T17 + T19 + T13(fresh LTX): mm=None dial guard, polymorphism MRO, loader base inheritance ──
+    _dials_none = qfn._apply_common_loader_dials(
+        types.SimpleNamespace(model=None), "auto", False, None, None, None, None, None, None, None, None, None)
+    try:
+        qfn._apply_common_loader_dials(
+            types.SimpleNamespace(model=None), "bogus", False, None, None, None, None, None, None, None, None, None)
+        _bogus_none_ok = False
+    except ValueError:
+        _bogus_none_ok = True
+    check("T17 _apply_common_loader_dials handles mm is None safely yet still refuses bogus backend",
+          _dials_none is None and _bogus_none_ok)
+
+    _ltx_plain_cfg = qfmp.ensure_model_config_attrs(
+        __import__("comfy").supported_models.LTXV({"image_model": "ltxv", "disable_unet_model_creation": True}))
+    _ltx_plain = qlm.QFLTXModel(_ltx_plain_cfg, _DummyEngine(), device=torch.device("cpu"))
+    _ltx_plain.extra_conds(frame_rate=24)
+    _load_sigs_ok = all(
+        list(inspect.signature(qfn.NODE_CLASS_MAPPINGS[n].load).parameters)[:3] == ["self", "transformer", "model_config"]
+        and inspect.signature(qfn.NODE_CLASS_MAPPINGS[n].load).parameters["pinned_memory"].default is (n == "QuantFuncLTXLoader")
+        for n in _FOUR
+    )
+    check("T13/T19 polymorphism MRO, loader base inheritance & fresh QFLTXModel _pending_frame_t_scale is None",
+          issubclass(qh3.QFH3Model, qfmp.QFAVSessionModel)
+          and issubclass(qlm.QFLTXAVModel, qfmp.QFAVSessionModel)
+          and not issubclass(qlm.QFLTXModel, qfmp.QFAVSessionModel)
+          and not hasattr(qlm.QFLTXModel, "_qf_restore_frozen_audio")
+          and issubclass(qk2.QFKrea2Model, qfmp.QFImageSessionModel)
+          and issubclass(qq21.QFQwenImage21Model, qfmp.QFImageSessionModel)
+          and all(issubclass(qfn.NODE_CLASS_MAPPINGS[n], qfn._QuantFuncLoaderBase) for n in _FOUR)
+          and _load_sigs_ok
+          and _ltx_plain._pending_frame_t_scale is None and _ltx_plain._pending_audio_frame_t_scale is None)
 
     shutil.rmtree(tmp, ignore_errors=True)
     print("LOADER_DISPATCH:", "PASS" if bad == 0 else f"FAIL ({bad} wrong)")

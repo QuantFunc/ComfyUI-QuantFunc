@@ -74,7 +74,47 @@ class MaskPrecisionTests(unittest.TestCase):
         self.conds(m, self.mask(True, 1.0, 1.0))
         self.assertIsNone(m._pending_frame_t_scale)
         self.assertIsNone(m._pending_audio_frame_t_scale)
+
+        # Positive CFG control: same-run sibling cond without denoise_mask preserves Cond 1 masks.
         self.conds(m, self.mask(True, 0.3, 0.3))
+        m.extra_conds(frame_rate=24, unprocessed_ltxav_embeds=True)
+        self.assertEqual(m._pending_frame_t_scale, self.expected(0.3, torch.float32, 3))
+        self.assertEqual(m._pending_audio_frame_t_scale, self.expected(0.3, torch.float32, 4))
+
+        # Across real run boundary (_begin / sampling / process_latent_out), Run 2 without mask resets scales.
+        m._begin(torch.ones(1, 128, 3, 2, 2), torch.ones(1, 2, 4096))
+        opts = json.loads(m._qf.lib.calls[-1]["options_utf8"])
+        self.assertEqual(opts.get("frame_t_scales"), self.expected(0.3, torch.float32, 3))
+        self.assertEqual(opts.get("audio_frame_t_scales"), self.expected(0.3, torch.float32, 4))
+        m.extra_conds(frame_rate=24, unprocessed_ltxav_embeds=True)
+        self.assertIsNone(m._pending_frame_t_scale)
+        self.assertIsNone(m._pending_audio_frame_t_scale)
+
+    def test_t13_cfg_sibling_and_abort_reset_boundaries(self):
+        m = self.make()
+        # Same OUTER_SAMPLE run_id preserves Cond 1 mask across Cond 2 without mask
+        tok = self.ns["_QF_RUN_ID"].set(101)
+        try:
+            self.conds(m, self.mask(True, 0.3, 0.3))
+            m.extra_conds(frame_rate=24, unprocessed_ltxav_embeds=True)
+            self.assertEqual(m._pending_frame_t_scale, self.expected(0.3, torch.float32, 3))
+            self.assertEqual(m._pending_audio_frame_t_scale, self.expected(0.3, torch.float32, 4))
+        finally:
+            self.ns["_QF_RUN_ID"].reset(tok)
+
+        # New OUTER_SAMPLE run_id cleanly resets masks when Run 2 omits denoise_mask
+        tok2 = self.ns["_QF_RUN_ID"].set(102)
+        try:
+            m.extra_conds(frame_rate=24, unprocessed_ltxav_embeds=True)
+            self.assertIsNone(m._pending_frame_t_scale)
+            self.assertIsNone(m._pending_audio_frame_t_scale)
+        finally:
+            self.ns["_QF_RUN_ID"].reset(tok2)
+
+        # Pre-session _apply_model abort (c_crossattn=None) marks _qf_conds_done=True so Run 2 clears scales
+        self.conds(m, self.mask(True, 0.3, 0.3))
+        with self.assertRaises(RuntimeError):
+            m._apply_model(torch.ones(1, 1, 1600), torch.ones(1), c_crossattn=None)
         m.extra_conds(frame_rate=24, unprocessed_ltxav_embeds=True)
         self.assertIsNone(m._pending_frame_t_scale)
         self.assertIsNone(m._pending_audio_frame_t_scale)

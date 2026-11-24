@@ -304,6 +304,18 @@ def _sweep_dead_pipelines(keep_key):
             qfe.info("[qf_native] host-RAM sweep: destroyed cached transformer whose model was GC'd", flush=True)
 
 
+def _coerce_bool_switch(value, default, name, *, allow_none=False, warn=True):
+    """Safely coerce corrupted non-boolean trailing switches from qf_layout: 2 workflows."""
+    if value is None:
+        return None if allow_none else default
+    if isinstance(value, bool):
+        return value
+    if warn:
+        _log.warning("[qf_native] migrated non-boolean %s=%r -> %s (legacy qf_layout: 2 workflow)",
+                     name, value, default)
+    return default
+
+
 def _loader_sig(family, transformer, model_config, pinned_memory):
     return family, transformer, model_config, pinned_memory
 
@@ -333,9 +345,12 @@ def _pending_loader_sigs():
                                          for k in ("transformer", "model_config", "pinned_memory")):
                     continue
                 defaults = inspect.signature(cls.load).parameters
+                pinned_default = defaults["pinned_memory"].default
+                pinned = _coerce_bool_switch(
+                    ins.get("pinned_memory", pinned_default), pinned_default, "pinned_memory", warn=False)
                 sigs.add(_loader_sig(family, ins.get("transformer"),
                                      ins.get("model_config", defaults["model_config"].default),
-                                     ins.get("pinned_memory", defaults["pinned_memory"].default)))
+                                     pinned))
     except Exception as exc:  # noqa: BLE001
         _log.warning("[qf_native] running prompt unreadable from ComfyUI queue (%s)", ascii(exc))
         return set()
@@ -356,7 +371,14 @@ def _dead_keys():
 def _dead_pipelines():
     dead = _dead_keys()
     with _ENGINE_IDENTITY_LOCK:
-        return len(dead), sum(int(getattr(_PIPELINE_CACHE.get(k), "capacity_bytes", 0) or 0) for k in dead)
+        total = 0
+        for k in dead:
+            h = _PIPELINE_CACHE.get(k)
+            total += max(
+                int(getattr(h, "host_weight_bytes", 0) or 0),
+                int(getattr(h, "capacity_bytes", 0) or 0),
+            )
+        return len(dead), total
 
 
 def _install_host_ram_release():
@@ -385,7 +407,7 @@ def _install_host_ram_release():
 
 
 def _engine_recipe(weights_path, create_cfg=None, device_id=0):
-    lib = qfe.load_lib()
+    lib = qfe.load_lib(device_id=device_id)
     ckey = (qfe.loaded_so_path(), weights_path, int(device_id),
             json.dumps(create_cfg or {}, sort_keys=True))
     return lib, ckey, create_cfg
@@ -413,11 +435,26 @@ def _peek_engine(weights_path, create_cfg=None, device_id=0):
     return None
 
 
+def _should_autoload_for_estimate():
+    """True only when ComfyUI's target compute device is CUDA (never headless --cpu)."""
+    try:
+        import comfy.model_management as cmm
+        return getattr(cmm.get_torch_device(), "type", None) == "cuda"
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _estimate_engine(weights_path, create_cfg=None, device_id=0, api_key=None):
     """Non-creating header-only VRAM estimate via qf_xfm_estimate_vram."""
     lib = qfe._LIB
     if lib is None:
-        return qfe.ColdNeed(None, None)
+        if _should_autoload_for_estimate() and qfe.has_ready_so(device_id=device_id):
+            try:
+                lib = qfe.load_lib(device_id=device_id)
+            except Exception as exc:  # noqa: BLE001
+                return qfe.ColdNeed(None, f"engine library not ready ({type(exc).__name__}: {exc})")
+        else:
+            return qfe.ColdNeed(None, None)
     params = _prepare_params(weights_path, create_cfg, device_id, api_key)
     return qfe.estimate_vram(lib, params)
 
@@ -443,8 +480,21 @@ def _get_engine(weights_path, create_cfg=None, device_id=0, api_key=None):
         _sweep_dead_pipelines(ckey)
         params = _prepare_params(weights_path, create_cfg, device_id, api_key)
         cold = qfe.estimate_vram(lib, params)
-        eng = qfe.QFEngineHandle.create(lib, create_params=params, capacity_bytes=int(cold.bytes or 0))
+        cold_bytes = int(cold.bytes or 0)
+        min_off = int(getattr(cold, "min_offload_bytes", None) or 0)
+        rec_mode = getattr(cold, "recommended_offload_mode", None)
+        eng = qfe.QFEngineHandle.create(lib, create_params=params, capacity_bytes=cold_bytes)
         eng.applied_api_key = api_key
+        eng.host_weight_bytes = cold_bytes
+        actual_res = 0
+        res_fn = getattr(eng, "resident_vram_bytes", None)
+        if callable(res_fn):
+            try:
+                actual_res = int(res_fn() or 0)
+            except Exception:  # noqa: BLE001
+                actual_res = 0
+        if cold_bytes > 0 and ((0 < actual_res < cold_bytes) or (rec_mode == 1 and (actual_res > 0 or min_off > 0))):
+            eng.capacity_bytes = min(cold_bytes, max(actual_res, min_off))
         with _ENGINE_IDENTITY_LOCK:
             _PIPELINE_CACHE[ckey] = eng
             _pin_pipeline_consumer_locked(ckey)
@@ -477,16 +527,6 @@ if _IMPORT_OK:
                 _log.warning("[qf_native] family module %s not registered: %s", mod_name, ascii(exc))
 
     _register_families()
-
-    def _coerce_bool_switch(value, default, name, *, allow_none=False):
-        """Safely coerce corrupted non-boolean trailing switches from qf_layout: 2 workflows."""
-        if value is None:
-            return None if allow_none else default
-        if isinstance(value, bool):
-            return value
-        _log.warning("[qf_native] migrated non-boolean %s=%r -> %s (legacy qf_layout: 2 workflow)",
-                     name, value, default)
-        return default
 
     def _run_family_load(expect_family, transformer1, model_config=None, pinned_memory=False):
         sig = _loader_sig(expect_family, transformer1, model_config, pinned_memory)
@@ -635,21 +675,54 @@ if _IMPORT_OK:
     def _apply_common_loader_dials(patcher, attention_backend, quality_enhance, quality,
                                    sol_version, sol_tau, sol_enabled, sol_window_enabled,
                                    sol_start_percent, sol_end_percent, sol_min_tokens, sol_sink_conditioning):
-        mm = getattr(patcher, "model", None)
-        if mm is not None and hasattr(mm, "set_attn_backend"):
-            mm.set_attn_backend(_attn_backend_to_engine(attention_backend))
-        mm.set_sol_options(qf_sol.from_loader(
+        attn = _attn_backend_to_engine(attention_backend)
+        sol = qf_sol.from_loader(
             sol_version=sol_version, sol_tau=sol_tau, sol_enabled=sol_enabled,
             sol_window_enabled=sol_window_enabled, sol_start_percent=sol_start_percent,
             sol_end_percent=sol_end_percent, sol_min_tokens=sol_min_tokens,
-            sol_sink_conditioning=sol_sink_conditioning))
-        mm.set_video_enhance(_quality_enhance_on(quality_enhance, quality))
+            sol_sink_conditioning=sol_sink_conditioning)
+        enhance = _quality_enhance_on(quality_enhance, quality)
+        mm = getattr(patcher, "model", None)
+        if mm is None:
+            return None
+        if hasattr(mm, "set_attn_backend"):
+            mm.set_attn_backend(attn)
+        if hasattr(mm, "set_sol_options"):
+            mm.set_sol_options(sol)
+        if hasattr(mm, "set_video_enhance"):
+            mm.set_video_enhance(enhance)
         return mm
 
-    class QuantFuncLTXLoader:
+    class _QuantFuncLoaderBase:
+        """Shared base for the four QuantFunc model loader nodes (never registered)."""
+
+        QF_FAMILY = ""
+        _DEFAULT_PINNED_MEMORY = False
+        RETURN_TYPES = ("MODEL",)
+        FUNCTION = "load"
+        CATEGORY = "loaders"
+
+        @classmethod
+        def VALIDATE_INPUTS(cls, attention_backend="auto"):
+            return _validate_attn_backend(attention_backend)
+
+        def _load_common(self, transformer, model_config, attention_backend, quality_enhance, quality,
+                         pinned_memory, sol_tau, sol_version, sol_enabled, sol_window_enabled,
+                         sol_start_percent, sol_end_percent, sol_min_tokens, sol_sink_conditioning):
+            pinned_memory = _coerce_bool_switch(pinned_memory, self._DEFAULT_PINNED_MEMORY, "pinned_memory")
+            quality_enhance = _coerce_bool_switch(quality_enhance, False, "quality_enhance", allow_none=True)
+            p = _run_family_load(self.QF_FAMILY, transformer, model_config, pinned_memory)
+            mm = _apply_common_loader_dials(
+                p, attention_backend, quality_enhance, quality,
+                sol_version, sol_tau, sol_enabled, sol_window_enabled,
+                sol_start_percent, sol_end_percent, sol_min_tokens, sol_sink_conditioning)
+            return p, mm
+
+    class QuantFuncLTXLoader(_QuantFuncLoaderBase):
         """LTX-2.5 joint audio+video loader."""
 
         QF_FAMILY = "ltx2"
+        _DEFAULT_PINNED_MEMORY = True
 
         @classmethod
         def INPUT_TYPES(cls):
@@ -673,13 +746,6 @@ if _IMPORT_OK:
                 "pinned_memory": _PINNED_MEMORY_INPUT_LTX,
             }, "hidden": dict(_QUALITY_LEGACY_HIDDEN)}
 
-        @classmethod
-        def VALIDATE_INPUTS(cls, attention_backend="auto"):
-            return _validate_attn_backend(attention_backend)
-
-        RETURN_TYPES = ("MODEL",)
-        FUNCTION = "load"
-        CATEGORY = "loaders"
         DESCRIPTION = (
             "Loads a QuantFunc LTX-2 model (video with sound) for ComfyUI's standard samplers - use it in place "
             "of the usual diffusion-model loader. For image-to-video, add the official LTXVImgToVideoInplace node on "
@@ -689,17 +755,14 @@ if _IMPORT_OK:
                  attention_backend="auto", sol_tau=None, quality_enhance=None, step_cache=0.0, block_cache=0.0,
                  quality=None, pinned_memory=True, sol_version=None, sol_enabled=None, sol_window_enabled=None,
                  sol_start_percent=None, sol_end_percent=None, sol_min_tokens=None, sol_sink_conditioning=None):
-            pinned_memory = _coerce_bool_switch(pinned_memory, True, "pinned_memory")
-            quality_enhance = _coerce_bool_switch(quality_enhance, False, "quality_enhance", allow_none=True)
-            p = _run_family_load(self.QF_FAMILY, transformer, model_config, pinned_memory)
-            mm = _apply_common_loader_dials(
-                p, attention_backend, quality_enhance, quality,
-                sol_version, sol_tau, sol_enabled, sol_window_enabled,
+            p, mm = self._load_common(
+                transformer, model_config, attention_backend, quality_enhance, quality, pinned_memory,
+                sol_tau, sol_version, sol_enabled, sol_window_enabled,
                 sol_start_percent, sol_end_percent, sol_min_tokens, sol_sink_conditioning)
             _arm_session_caches(mm, step_cache, block_cache)
             return (p,)
 
-    class QuantFuncKrea2Loader:
+    class QuantFuncKrea2Loader(_QuantFuncLoaderBase):
         """Krea-2 Turbo image t2i loader."""
 
         QF_FAMILY = "krea2"
@@ -724,13 +787,6 @@ if _IMPORT_OK:
                 "pinned_memory": _PINNED_MEMORY_INPUT,
             }, "hidden": dict(_QUALITY_LEGACY_HIDDEN)}
 
-        @classmethod
-        def VALIDATE_INPUTS(cls, attention_backend="auto"):
-            return _validate_attn_backend(attention_backend)
-
-        RETURN_TYPES = ("MODEL",)
-        FUNCTION = "load"
-        CATEGORY = "loaders"
         DESCRIPTION = ("Loads a QuantFunc Krea-2 Turbo model (text-to-image) for ComfyUI's standard samplers - use it in "
                        "place of the usual diffusion-model loader. " + _COMMON_LIMITS)
 
@@ -738,16 +794,13 @@ if _IMPORT_OK:
                  quality_enhance=None, quality=None, pinned_memory=False, sol_tau=None, sol_version=None,
                  sol_enabled=None, sol_window_enabled=None, sol_start_percent=None, sol_end_percent=None,
                  sol_min_tokens=None, sol_sink_conditioning=None):
-            pinned_memory = _coerce_bool_switch(pinned_memory, False, "pinned_memory")
-            quality_enhance = _coerce_bool_switch(quality_enhance, False, "quality_enhance", allow_none=True)
-            p = _run_family_load(self.QF_FAMILY, transformer, model_config, pinned_memory)
-            _apply_common_loader_dials(
-                p, attention_backend, quality_enhance, quality,
-                sol_version, sol_tau, sol_enabled, sol_window_enabled,
+            p, _ = self._load_common(
+                transformer, model_config, attention_backend, quality_enhance, quality, pinned_memory,
+                sol_tau, sol_version, sol_enabled, sol_window_enabled,
                 sol_start_percent, sol_end_percent, sol_min_tokens, sol_sink_conditioning)
             return (p,)
 
-    class QuantFuncQwenImage21Loader:
+    class QuantFuncQwenImage21Loader(_QuantFuncLoaderBase):
         """Qwen-Image-2.1 (text-to-image + reference edit) loader."""
 
         QF_FAMILY = "qwenimage21"
@@ -772,13 +825,6 @@ if _IMPORT_OK:
                 "pinned_memory": _PINNED_MEMORY_INPUT,
             }, "hidden": dict(_QUALITY_LEGACY_HIDDEN)}
 
-        @classmethod
-        def VALIDATE_INPUTS(cls, attention_backend="auto"):
-            return _validate_attn_backend(attention_backend)
-
-        RETURN_TYPES = ("MODEL",)
-        FUNCTION = "load"
-        CATEGORY = "loaders"
         DESCRIPTION = (
             "Loads a QuantFunc Qwen-Image-2.1 model for ComfyUI's standard samplers: text-to-image, and image "
             "editing with TextEncodeQwenImage21 reference images (plus its VAE). Transparent images: VAE Decode + "
@@ -787,16 +833,13 @@ if _IMPORT_OK:
         def load(self, transformer, model_config=None, attention_backend="auto", quality_enhance=None, quality=None,
                  pinned_memory=False, sol_tau=None, sol_version=None, sol_enabled=None, sol_window_enabled=None,
                  sol_start_percent=None, sol_end_percent=None, sol_min_tokens=None, sol_sink_conditioning=None):
-            pinned_memory = _coerce_bool_switch(pinned_memory, False, "pinned_memory")
-            quality_enhance = _coerce_bool_switch(quality_enhance, False, "quality_enhance", allow_none=True)
-            p = _run_family_load(self.QF_FAMILY, transformer, model_config, pinned_memory)
-            _apply_common_loader_dials(
-                p, attention_backend, quality_enhance, quality,
-                sol_version, sol_tau, sol_enabled, sol_window_enabled,
+            p, _ = self._load_common(
+                transformer, model_config, attention_backend, quality_enhance, quality, pinned_memory,
+                sol_tau, sol_version, sol_enabled, sol_window_enabled,
                 sol_start_percent, sol_end_percent, sol_min_tokens, sol_sink_conditioning)
             return (p,)
 
-    class QuantFuncH3Loader:
+    class QuantFuncH3Loader(_QuantFuncLoaderBase):
         """MiniMax-H3 joint audio+video loader."""
 
         QF_FAMILY = "minimax-h3"
@@ -824,13 +867,6 @@ if _IMPORT_OK:
                 "pinned_memory": _PINNED_MEMORY_INPUT,
             }, "hidden": dict(_QUALITY_LEGACY_HIDDEN)}
 
-        @classmethod
-        def VALIDATE_INPUTS(cls, attention_backend="auto"):
-            return _validate_attn_backend(attention_backend)
-
-        RETURN_TYPES = ("MODEL",)
-        FUNCTION = "load"
-        CATEGORY = "loaders"
         DESCRIPTION = ("Loads a QuantFunc MiniMax-H3 model (video with sound) for ComfyUI's standard samplers - use it in "
                        "place of the usual diffusion-model loader. " + _COMMON_LIMITS)
 
@@ -839,13 +875,10 @@ if _IMPORT_OK:
                  step_cache=0.0, block_cache=0.0, quality=None,
                  pinned_memory=False, sol_version=None, sol_enabled=None, sol_window_enabled=None,
                  sol_start_percent=None, sol_end_percent=None, sol_min_tokens=None, sol_sink_conditioning=None):
-            pinned_memory = _coerce_bool_switch(pinned_memory, False, "pinned_memory")
-            quality_enhance = _coerce_bool_switch(quality_enhance, False, "quality_enhance", allow_none=True)
             audio_enhance = _coerce_bool_switch(audio_enhance, False, "audio_enhance")
-            p = _run_family_load(self.QF_FAMILY, transformer, model_config, pinned_memory)
-            mm = _apply_common_loader_dials(
-                p, attention_backend, quality_enhance, quality,
-                sol_version, sol_tau, sol_enabled, sol_window_enabled,
+            p, mm = self._load_common(
+                transformer, model_config, attention_backend, quality_enhance, quality, pinned_memory,
+                sol_tau, sol_version, sol_enabled, sol_window_enabled,
                 sol_start_percent, sol_end_percent, sol_min_tokens, sol_sink_conditioning)
             if mm is not None and hasattr(mm, "set_audio_enhance"):
                 mm.set_audio_enhance(audio_enhance)

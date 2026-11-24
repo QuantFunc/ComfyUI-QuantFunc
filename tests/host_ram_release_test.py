@@ -9,6 +9,7 @@ capacity_bytes), and only for handles whose every consumer is gone. Run with COM
 mode).
 """
 import gc
+import logging
 import os
 import re
 import sys
@@ -286,6 +287,82 @@ class HostRamRelease(unittest.TestCase):
         rebuilt = qfmp.rebuild_of(patcher)([{"path": "a.safetensors", "scale": 1.0}])   # the LoRA node's rebuild
         want = ("krea2", "k2.safetensors", None, True)
         self.assertEqual([p.model._qf_loader_sig for p in (patcher, rebuilt)], [want, want])
+
+    def test_t10_get_engine_decouples_capacity_and_dead_pipelines_uses_host_weight_bytes(self):
+        dead_h, _ = self.cached("dead_decoupled", alive=False, capacity=3 * GiB)
+        dead_h.host_weight_bytes = 23 * GiB
+        # 10 GiB free RAM is > 3 GiB headroom + 3 GiB capacity, yet < 3 GiB headroom + 23 GiB host weights -> MUST reclaim!
+        self.stage(10 * GiB)
+        self.assertNotIn("dead_decoupled", plugin._PIPELINE_CACHE)
+        self.assertIn("destroy", self.events)
+
+        saved_cache = dict(plugin._PIPELINE_CACHE)
+        plugin._PIPELINE_CACHE.clear()
+        try:
+            for res_val, raise_res, want_cap in (
+                (5 * GiB, False, 5 * GiB),
+                (0, False, 3 * GiB),
+                (0, True, 3 * GiB),
+            ):
+                with self.subTest(res_val=res_val, raise_res=raise_res):
+                    plugin._PIPELINE_CACHE.clear()
+                    fake_lib = object()
+
+                    class _Eng:
+                        def __init__(self):
+                            self.xfm = object()
+                            self.lib = fake_lib
+                            self.capacity_bytes = 23 * GiB
+                            self.host_weight_bytes = 23 * GiB
+
+                        def resident_vram_bytes(self):
+                            if raise_res:
+                                raise RuntimeError("busy")
+                            return res_val
+
+                    with mock.patch.object(plugin.qfe, "_LIB", fake_lib), \
+                         mock.patch.object(plugin.qfe, "library_identity", return_value=("id", 1)), \
+                         mock.patch.object(plugin, "_prepare_params", return_value=object()), \
+                         mock.patch.object(plugin.qfe, "estimate_vram",
+                                           return_value=plugin.qfe.ColdNeed(23 * GiB, None, 3 * GiB, 1 * GiB, 1)), \
+                         mock.patch.object(plugin.qfe.QFEngineHandle, "create", return_value=_Eng()):
+                        eng, _ = plugin._get_engine("/m.safetensors", {"model_arch": "minimax_h3"}, device_id=0)
+                    self.assertEqual(eng.capacity_bytes, want_cap)
+                    self.assertEqual(eng.host_weight_bytes, 23 * GiB)
+        finally:
+            plugin._PIPELINE_CACHE.clear()
+            plugin._PIPELINE_CACHE.update(saved_cache)
+
+    def test_t17_pending_loader_sigs_coerces_dirty_and_none_pinned_memory_silently(self):
+        class _Cap(logging.Handler):
+            def __init__(self):
+                super().__init__(logging.WARNING)
+                self.msgs = []
+
+            def emit(self, record):
+                self.msgs.append(record.getMessage())
+
+        for cls_name, family, default_pm in (
+            ("QuantFuncLTXLoader", "ltx2", True),
+            ("QuantFuncH3Loader", "minimax-h3", False),
+        ):
+            for dirty in ("exact_kv_and_rows", 2, None):
+                with self.subTest(cls=cls_name, dirty=dirty):
+                    prompt = {
+                        "1": {"class_type": cls_name,
+                              "inputs": {"transformer": "m.safetensors", "pinned_memory": dirty}},
+                        "8": {"class_type": "KSampler", "inputs": {"model": ["1", 0]}},
+                        "9": {"class_type": "SaveImage", "inputs": {"images": ["8", 0]}},
+                    }
+                    self.running(prompt)
+                    cap = _Cap()
+                    plugin._log.addHandler(cap)
+                    try:
+                        sigs = plugin._pending_loader_sigs()
+                    finally:
+                        plugin._log.removeHandler(cap)
+                    self.assertEqual(sigs, {(family, "m.safetensors", None, default_pm)})
+                    self.assertEqual(cap.msgs, [])
 
 
 if __name__ == "__main__":

@@ -16,11 +16,13 @@ test is able-to-FAIL (a green test that can't go red proves nothing).
 Run: python3 tests/qfltx_safety_layer_test.py     # exit 0 = pass, non-zero = fail (run_plugin_tests picks it up)
      QF_LTXSAFETY_TEST_SRC=<mutant> python3 tests/qfltx_safety_layer_test.py   # prove able-to-fail
 """
+from contextvars import ContextVar
 import ast
 import os
 import sys
 import textwrap
 import types
+import weakref
 
 import torch  # available on this box (torchvision/torchaudio are ABI-broken, but torch itself imports)
 
@@ -171,14 +173,46 @@ _QFE_STUB = types.SimpleNamespace(info=lambda *a, **k: None)
 
 
 def _ltx_mock_factory(src, comfy):
-    """A mock-`self` maker for extra_conds: the REAL _native_frame_rate body is bound on it (extra_conds calls it)."""
-    nfr, _ = _bind(src, "_native_frame_rate", {"comfy": comfy})
+    """A mock-`self` maker for extra_conds: binds real QFSessionModelMixin guards and QFLTXModel hooks."""
+    shared_src = _shared_src_text()
+    mixin_ns = {
+        "ContextVar": ContextVar,
+        "weakref": weakref,
+        "qfe": _QFE_STUB,
+        "_QF_RUN_ID": ContextVar("quantfunc_run_id", default=None),
+    }
+    for mname in ("_reset_run_cond_state", "_begin_extra_conds_guard", "_reject_ignored_conds"):
+        exec(_extract_method(shared_src, "QFSessionModelMixin", mname), mixin_ns)  # noqa: S102
+
+    class _MixinBase:
+        _reset_run_cond_state = mixin_ns["_reset_run_cond_state"]
+        _begin_extra_conds_guard = mixin_ns["_begin_extra_conds_guard"]
+        _reject_ignored_conds = mixin_ns["_reject_ignored_conds"]
+
+    ltx_ns = {"_MixinBase": _MixinBase, "comfy": comfy}
+    ltx_body = "\n".join([
+        "class _LTXStub(_MixinBase):",
+        '    _TAG = "LTX"',
+        '    _REFUSED_HINT = ""',
+        textwrap.indent(_extract_method(src, "QFLTXModel", "_reset_run_cond_state"), "    "),
+        textwrap.indent(_extract_method(src, "QFLTXModel", "_native_frame_rate"), "    "),
+        textwrap.indent(_extract_method(src, "QFLTXModel", "_reference_audio_cond"), "    "),
+    ])
+    exec(ltx_body, ltx_ns)  # noqa: S102
+    _LTXStub = ltx_ns["_LTXStub"]
 
     def mk(**attrs):
-        me = _mock_self(**attrs)
-        me._native_frame_rate = types.MethodType(nfr, me)
-        ref, _ = _bind(src, "_reference_audio_cond")
-        me._reference_audio_cond = types.MethodType(ref, me)
+        me = _LTXStub()
+        defaults = {
+            "_qf_conds_done": False,
+            "_qf_conds_run_id": None,
+            "_qf_conds_noise_ref": None,
+            "_pending_frame_t_scale": None,
+            "_pending_audio_frame_t_scale": None,
+        }
+        defaults.update(attrs)
+        for k, v in defaults.items():
+            setattr(me, k, v)
         return me
     return mk
 
@@ -280,12 +314,29 @@ def _t_call_fps(src):
             print(f"  [FAIL] a call without frame_rate was NOT refused (opening={opening})"); bad += 1
         except RuntimeError:
             pass
-    # order in the AV step: _call_fps before _begin (the session options read self._fps)
-    body = _extract_method(src, "QFLTXAVModel", "_apply_model")
-    i_fps, i_begin = body.find("self._call_fps("), body.find("self._begin(")
-    if i_fps < 0 or i_begin < 0 or i_fps > i_begin:
-        print(f"  [FAIL] QFLTXAVModel._apply_model does not call _call_fps before _begin "
-              f"(at {i_fps} / {i_begin})"); bad += 1
+    # order across QFAVSessionModel._apply_model -> QFLTXAVModel._av_prepare_session: _call_fps before _begin
+    shared_src = _shared_src_text()
+    av_apply = ast.parse(_extract_method(shared_src, "QFAVSessionModel", "_apply_model"))
+    av_calls = [ast.unparse(n.func) for n in ast.walk(av_apply)
+                if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                and isinstance(n.func.value, ast.Name) and n.func.value.id == "self"
+                and n.func.attr in ("_av_prepare_session", "_av_step_tensors")]
+    ltxav_cls = next(n for n in ast.parse(src).body if isinstance(n, ast.ClassDef) and n.name == "QFLTXAVModel")
+    ltxav_bases = {ast.unparse(b) for b in ltxav_cls.bases}
+    ltxav_overrides_apply = any(
+        isinstance(m, ast.FunctionDef) and m.name == "_apply_model" for m in ltxav_cls.body)
+    prep_src = _extract_method(src, "QFLTXAVModel", "_av_prepare_session")
+    prep_calls = [(n.lineno, n.col_offset, n.func.attr) for n in ast.walk(ast.parse(prep_src))
+                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                  and isinstance(n.func.value, ast.Name) and n.func.value.id == "self"
+                  and n.func.attr in ("_call_fps", "_begin")]
+    prep_calls.sort()
+    prep_names = [name for _, _, name in prep_calls]
+    if (av_calls != ["self._av_prepare_session", "self._av_step_tensors"]
+            or not any("QFAVSessionModel" in b for b in ltxav_bases) or ltxav_overrides_apply
+            or prep_names != ["_call_fps", "_begin"]):
+        print(f"  [FAIL] QFLTXAVModel._av_prepare_session does not enforce _call_fps before _begin "
+              f"(av={av_calls}, prep={prep_names}, bases={sorted(ltxav_bases)})"); bad += 1
     # _begin hands the engine exactly self._fps (options_json "fps") - where the old code put its local 25
     beg = ast.parse(_extract_method(src, "QFLTXModel", "_begin"))
     fps_vals = [v for d in ast.walk(beg) if isinstance(d, ast.Dict)
@@ -365,18 +416,26 @@ def _t_shared_interrupt_helper(src):
             print(f"  [FAIL] {fam_file} has {raws[fam_file]} raw interrupt-poll call lines, expected 0 "
                   "(a family module must route through the shared helper)"); bad += 1
     helper_call = "_interrupt_poll_end_session_on_raise(self._qf)"
-    # The image families (Krea-2, Qwen-Image-2.1) step in the shared image seam, qf_modelpatcher.QFImageSessionModel:
-    # the seam's step loop must call the helper, and such a family's model must derive from it, with any _apply_model
-    # of its own delegating to super() (so no family can step without the poll).
-    image_seam = "class QFImageSessionModel(QFSessionModelMixin)"
+    # The image and AV families step through qf_modelpatcher.QFImageSessionModel and QFAVSessionModel:
+    # both shared seams must call the interrupt helper, and every family derives from them without
+    # bypassing _apply_model / _execute_av_group_step.
     shared_code = _code_lines(_shared_src_text())
-    if not any(image_seam in ln for ln in shared_code) or sum(helper_call in ln for ln in shared_code) < 1:
-        print("  [FAIL] the shared image seam (QFImageSessionModel) is missing or does not call the interrupt helper")
+    for seam_sig in ("class QFImageSessionModel(QFSessionModelMixin)", "class QFAVSessionModel(QFSessionModelMixin)"):
+        if not any(seam_sig in ln for ln in shared_code):
+            print(f"  [FAIL] shared seam missing: {seam_sig}")
+            bad += 1
+    if sum(helper_call in ln for ln in shared_code) < 2:
+        print("  [FAIL] shared seams (QFImageSessionModel + QFAVSessionModel) do not both call the interrupt helper")
         bad += 1
     for fam_file, fam_src in fam_srcs.items():
         if "(qfmp.QFImageSessionModel," in fam_src:
             if "def _apply_model" in fam_src and "super()._apply_model(" not in fam_src:
                 print(f"  [FAIL] {fam_file} overrides the image seam's _apply_model without delegating to it"); bad += 1
+        elif "(qfmp.QFAVSessionModel," in fam_src:
+            if "def _apply_model" in fam_src and "super()._apply_model(" not in fam_src:
+                print(f"  [FAIL] {fam_file} overrides the AV seam's _apply_model without delegating to it"); bad += 1
+            if "self._execute_av_group_step(" not in fam_src:
+                print(f"  [FAIL] {fam_file} does not route steps through _execute_av_group_step"); bad += 1
         elif sum(helper_call in ln for ln in _code_lines(fam_src)) < 1:
             print(f"  [FAIL] {fam_file} does not call the shared interrupt helper"); bad += 1
     # FUNCTIONAL — the real helper body: interrupt → end + re-raise; no interrupt → no-op.
@@ -522,10 +581,12 @@ def _t_begin_audio_receipt(src):
     def _info(fmt, *a, **k):
         log.append(fmt % a if a else fmt)
 
-    qfe = types.SimpleNamespace(QFSessionBeginParams=_Bpx, QF_OK=0,
+    qfe = types.SimpleNamespace(QFSessionBeginParams=_Bpx, QF_OK=0, QF_ERR_BUSY=6,
                                 last_err=lambda lib: "begin refused (test)", info=_info)
+    ons_ns = {"ctypes": _ct, "json": _json, "time": _time, "qfe": qfe, "_BUSY_BEGIN_RETRY_S": 2.0}
+    exec(_extract_method(_shared_src_text(), "QFSessionModelMixin", "_open_native_session"), ons_ns)  # noqa: S102
     fn, _ = _bind(src, "_begin", {"ctypes": _ct, "json": _json, "time": _time, "qfe": qfe,
-                                  "_qf_dtype": lambda dt: 0, "_BUSY_BEGIN_RETRY_S": 2.0})
+                                  "_qf_dtype": lambda dt: 0})
 
     def _mk(audio=None, video=None, accept=True):
         sent = {}
@@ -543,6 +604,7 @@ def _t_begin_audio_receipt(src):
                                    _num_steps=8, _max_ctx_seq=0, _num_frames=97, _fps=24.0,
                                    _pending_frame_t_scale=video, _pending_audio_frame_t_scale=audio,
                                    residency_opts=lambda: {}, _begin_extra_opts=lambda: {})
+        me._open_native_session = types.MethodType(ons_ns["_open_native_session"], me)
         return me, sent
 
     def _receipts():

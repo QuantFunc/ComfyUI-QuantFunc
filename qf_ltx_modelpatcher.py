@@ -5,22 +5,19 @@ Binds frozen 25-symbol qf_* C-API:
   - step: QFStepAvParams with audio_reference_active (0 or 1) via qf_xfm_step_av
   - OUTER_SAMPLE: _qf_restore_frozen_audio preserves zero-mask frozen audio frames
 """
-import ctypes
 import json
 import math
 import os
 import struct
-import time
 
 import torch
 import comfy.conds
 import comfy.model_base
-import comfy.nested_tensor
 import comfy.supported_models
 
 from . import qf_engine as qfe
 from . import qf_modelpatcher as qfmp
-from .qf_modelpatcher import _qf_dtype, _QFStub, _interrupt_poll_end_session_on_raise, QFSessionModelMixin
+from .qf_modelpatcher import _qf_dtype, QFSessionModelMixin
 
 FAMILY = "ltx2"
 _LTXAV_AUDIO_CH = 8
@@ -30,7 +27,6 @@ _VIDEO_LATENT_NDIM = 5
 _AUDIO_LATENT_NDIM = 4
 _REF_AUDIO_MAX_NUMEL = (1 << 31) - 1
 _ST_HEADER_MAX_BYTES = 1 << 31
-_BUSY_BEGIN_RETRY_S = 2.0
 _CONN_VID_PREFIX = "model.diffusion_model.video_embeddings_connector."
 _CONN_AUD_PREFIX = "model.diffusion_model.audio_embeddings_connector."
 
@@ -55,6 +51,9 @@ def matches(pipeline_class, transformer_class=""):
 class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
     """LTX base wrapper carrying conditioning safety checks, mask-to-scale extraction, and session begin."""
 
+    _TAG = "LTX"
+    _NO_COND_HINT = "wire the LTX-2.5 TE."
+    _REFUSED_HINT = " (for image-to-video use LTXVImgToVideoInplace on the LATENT path)"
     _ENGINE_IGNORED_COND_KEYS = (
         "concat_mask", "keyframe_idxs", "guide_attention_entries",
         "noise_concat", "cross_attn_controlnet", "concat_latent_image",
@@ -63,16 +62,14 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
 
     def __init__(self, model_config, engine, device=None):
         super().__init__(model_config, device=device)
-        self.diffusion_model = _QFStub()
-        self._qf = engine
-        self._num_steps = 0
+        self._init_session_state(engine)
         self._num_frames = 0
         self._fps = None
-        self._step_i = 0
-        self._sess_denoise = 0
-        self._out = None
-        self._ctx_key_assigner = qfmp._CtxKeyAssigner()
-        self._max_ctx_seq = 0
+
+    def _reset_run_cond_state(self):
+        super()._reset_run_cond_state()
+        self._pending_frame_t_scale = None
+        self._pending_audio_frame_t_scale = None
 
     def _reference_audio_cond(self, payload):
         if payload is not None:
@@ -86,40 +83,37 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
         return {}
 
     def extra_conds(self, **kwargs):
-        was_open, ok = self._qf.end_session_if_open()
-        self._qf_needs_begin = True
-        if hasattr(self, "_clear_audio_reference_after_close"):
-            self._clear_audio_reference_after_close(was_open, ok)
-        if was_open:
-            qfe.info("[qf_native] LTX: closed a pre-existing session at run start; end ok=%s", ok)
-        self._pending_frame_t_scale = None
-        self._pending_audio_frame_t_scale = None
-        dm = kwargs.get("denoise_mask")
-        if dm is not None:
-            scales, a_scales = self._frame_scales_from_mask(dm)
-            scales = torch.tensor(scales, dtype=torch.bfloat16, device="cpu").float().tolist()
-            a_scales = torch.tensor(a_scales, dtype=torch.bfloat16, device="cpu").float().tolist()
-            self._pending_frame_t_scale = None if all(v >= 0.9999 for v in scales) else scales
-            self._pending_audio_frame_t_scale = (
-                None if (not a_scales or all(v >= 0.9999 for v in a_scales)) else a_scales)
-        for k in self._ENGINE_IGNORED_COND_KEYS:
-            if kwargs.get(k) is not None:
-                raise RuntimeError(
-                    f"qf_native LTX: '{k}' conditioning is wired, but the QuantFunc LTX native session "
-                    f"cannot consume '{k}'. Remove the node feeding it. For image-to-video use "
-                    f"LTXVImgToVideoInplace on the LATENT path.")
-        ref_cond = self._reference_audio_cond(kwargs.get("ref_audio"))
-        out = {"frame_rate": self._native_frame_rate(kwargs)}
-        if ref_cond is not None:
-            out["ref_audio"] = ref_cond
-        cross_attn = kwargs.get("cross_attn", None)
-        if cross_attn is not None:
-            out["c_crossattn"] = comfy.conds.CONDRegular(cross_attn)
-            am = kwargs.get("attention_mask", None)
-            if am is not None:
-                out["attention_mask"] = comfy.conds.CONDRegular(am)
-            self._max_ctx_seq = max(self._max_ctx_seq, self._post_connector_seq(int(cross_attn.shape[1])))
-        return out
+        self._begin_extra_conds_guard(
+            "LTX",
+            on_close=getattr(self, "_clear_audio_reference_after_close", None),
+            noise=kwargs.get("noise"),
+        )
+        try:
+            dm = kwargs.get("denoise_mask")
+            if dm is not None:
+                scales, a_scales = self._frame_scales_from_mask(dm)
+                scales = torch.tensor(scales, dtype=torch.bfloat16, device="cpu").float().tolist()
+                a_scales = torch.tensor(a_scales, dtype=torch.bfloat16, device="cpu").float().tolist()
+                self._pending_frame_t_scale = None if all(v >= 0.9999 for v in scales) else scales
+                self._pending_audio_frame_t_scale = (
+                    None if (not a_scales or all(v >= 0.9999 for v in a_scales)) else a_scales)
+            self._reject_ignored_conds(kwargs, "LTX", self._REFUSED_HINT)
+            ref_cond = self._reference_audio_cond(kwargs.get("ref_audio"))
+            out = {"frame_rate": self._native_frame_rate(kwargs)}
+            if ref_cond is not None:
+                out["ref_audio"] = ref_cond
+            cross_attn = kwargs.get("cross_attn", None)
+            if cross_attn is not None:
+                out["c_crossattn"] = comfy.conds.CONDRegular(cross_attn)
+                am = kwargs.get("attention_mask", None)
+                if am is not None:
+                    out["attention_mask"] = comfy.conds.CONDRegular(am)
+                self._max_ctx_seq = max(self._max_ctx_seq, self._post_connector_seq(int(cross_attn.shape[1])))
+            return out
+        except BaseException:
+            self._reset_run_cond_state()
+            self._qf_conds_done = True
+            raise
 
     def _frame_scales_from_mask(self, dm):
         if dm.ndim in (3, _VIDEO_LATENT_NDIM) and int(dm.shape[0]) > 1:
@@ -201,57 +195,50 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
                 f"qf_native LTX: conditionings carry different frame rates ({self._fps:g} vs {fps:g}).")
 
     def _begin(self, x_group, vemb_group):
-        lib = self._qf.lib
         _, close_ok = self._qf.end_session_if_open()
         ref_enabled = getattr(self, "_audio_reference", None) is not None
         if getattr(self._qf, "reference_audio_pending", lambda: False)():
             raise RuntimeError("qf_native LTX-AV: previous reference begin has no proven copy completion")
         if ref_enabled and not close_ok:
             raise RuntimeError("qf_native LTX-AV: previous reference session close refused; retry after drain")
-        self._ctx_key_assigner.reset()
-        bpx = qfe.QFSessionBeginParams()
-        ctypes.memset(ctypes.byref(bpx), 0, ctypes.sizeof(bpx))
-        bpx.struct_size = ctypes.sizeof(bpx)
         scale = int(self.latent_format.spacial_downscale_ratio)
-        bpx.width = int(x_group.shape[-1]) * scale
-        bpx.height = int(x_group.shape[-2]) * scale
-        bpx.num_steps = self._num_steps
         max_seq = max(self._max_ctx_seq, int(vemb_group.shape[1]))
-        bpx.max_context_dims = (ctypes.c_int32 * 3)(int(vemb_group.shape[0]), max_seq, int(vemb_group.shape[2]))
-        self._max_ctx_seq = 0
-        bpx.cond_dtype = _qf_dtype(vemb_group.dtype)
         mask_opt = {}
         if getattr(self, "_pending_frame_t_scale", None):
             mask_opt["frame_t_scales"] = self._pending_frame_t_scale
         if getattr(self, "_pending_audio_frame_t_scale", None):
             mask_opt["audio_frame_t_scales"] = self._pending_audio_frame_t_scale
-        bpx._opts = json.dumps({
+        opts = {
             "num_frames": self._num_frames,
             "fps": float(self._fps),
             **self.residency_opts(),
             **mask_opt,
             **self._begin_extra_opts(),
-        }).encode("utf-8")
-        bpx.options_json = bpx._opts
-        session = ctypes.c_void_p()
-        self._begin_keep = bpx
-        if ref_enabled:
-            self._qf.retain_reference_audio(self._audio_reference)
-            self._audio_reference_begin_failed = True
-        st = lib.qf_xfm_session_begin(self._qf.xfm, ctypes.byref(bpx), ctypes.byref(session))
-        if not ref_enabled and st != qfe.QF_OK and "busy" in (qfe.last_err(lib) or ""):
-            time.sleep(_BUSY_BEGIN_RETRY_S)
-            self._qf.end_session_if_open()
-            st = lib.qf_xfm_session_begin(self._qf.xfm, ctypes.byref(bpx), ctypes.byref(session))
-        if st != qfe.QF_OK:
-            raise RuntimeError(f"qf_xfm_session_begin (LTX) failed: {qfe.last_err(lib)}")
-        self._qf.current_session = session
-        if ref_enabled:
-            self._qf.reference_audio_copy_completed()
-            self._audio_reference_bound = True
-            self._audio_reference_begin_failed = False
-        self._step_i = 0
-        self._sess_denoise = 0
+        }
+
+        def _before_ref():
+            if ref_enabled:
+                self._qf.retain_reference_audio(self._audio_reference)
+                self._audio_reference_begin_failed = True
+
+        def _after_ref():
+            if ref_enabled:
+                self._qf.reference_audio_copy_completed()
+                self._audio_reference_bound = True
+                self._audio_reference_begin_failed = False
+
+        session = self._open_native_session(
+            "LTX",
+            (int(vemb_group.shape[0]), max_seq, int(vemb_group.shape[2])),
+            _qf_dtype(vemb_group.dtype),
+            int(x_group.shape[-1]) * scale,
+            int(x_group.shape[-2]) * scale,
+            opts,
+            allow_busy_retry=not ref_enabled,
+            before_begin=_before_ref,
+            after_begin=_after_ref,
+            skip_end_if_open=True,
+        )
         qfe.info(f"[qf_native] LTX SESSION OPEN handle={session.value:#x} steps={self._num_steps} "
                  f"cond={tuple(vemb_group.shape)} frames={self._num_frames}", flush=True)
         if mask_opt.get("audio_frame_t_scales"):
@@ -259,15 +246,20 @@ class QFLTXModel(QFSessionModelMixin, comfy.model_base.LTXV):
 
 
 @qfe.console_safe_methods
-class QFLTXAVModel(QFLTXModel):
+class QFLTXAVModel(qfmp.QFAVSessionModel, QFLTXModel):
     """LTX-2.5 joint audio+video wrapper driving qf_xfm_session_begin + qf_xfm_step_av."""
+
+    _TAG = "LTX-AV"
 
     def __init__(self, model_config, engine, device=None):
         QFLTXModel.__init__(self, model_config, engine, device=device)
         self._out_audio = None
-        self._ctx_unprocessed = False
         self._audio_rows = 0
         self._audio_pack = 0
+
+    def _reset_run_cond_state(self):
+        super()._reset_run_cond_state()
+        self._ctx_unprocessed = False
 
     @staticmethod
     def _reference_activation_dtype(_device):
@@ -334,8 +326,13 @@ class QFLTXAVModel(QFLTXModel):
 
     def extra_conds(self, **kwargs):
         out = super().extra_conds(**kwargs)
-        self._ctx_unprocessed = bool(kwargs.get("unprocessed_ltxav_embeds", False))
-        return out
+        try:
+            self._ctx_unprocessed = bool(kwargs.get("unprocessed_ltxav_embeds", False))
+            return out
+        except BaseException:
+            self._reset_run_cond_state()
+            self._qf_conds_done = True
+            raise
 
     def _begin_extra_opts(self):
         if not self._ctx_unprocessed:
@@ -358,29 +355,8 @@ class QFLTXAVModel(QFLTXModel):
             }]
         return opts
 
-    def _apply_model(self, x, t, c_concat=None, c_crossattn=None, control=None,
-                     transformer_options={}, **kwargs):
-        sigma = t
-        if c_crossattn is None:
-            raise RuntimeError("qf_native LTX-AV: no c_crossattn cond - wire the LTX-2.5 TE.")
-        if control is not None:
-            raise RuntimeError("qf_native LTX-AV: ControlNet is wired, but this seam does not consume control hints.")
-        nested = getattr(x, "is_nested", False)
-        if nested:
-            streams = x.unbind()
-            x_video, x_audio = streams[0], streams[1]
-        else:
-            ls = getattr(self, "latent_shapes", None)
-            if not ls or len(ls) < 2:
-                raise RuntimeError(
-                    f"qf_native LTX-AV: packed latent (shape={tuple(getattr(x, 'shape', ()))}) "
-                    f"but model.latent_shapes is unset.")
-            n = int(math.prod(ls[0][1:]))
-            xf = x.reshape(int(x.shape[0]), -1)
-            video_shape, audio_shape = list(ls[0]), list(ls[1])
-            video_shape[0] = audio_shape[0] = int(x.shape[0])
-            x_video = xf[:, :n].reshape(video_shape)
-            x_audio = xf[:, n:].reshape(audio_shape)
+    def _av_unpack_and_validate(self, x, c_crossattn, transformer_options):
+        nested, x_video, x_audio = self._unpack_av_latent(x)
         if (x_audio.ndim != _AUDIO_LATENT_NDIM or int(x_audio.shape[1]) != _LTXAV_AUDIO_CH
                 or int(x_audio.shape[3]) != _LTXAV_AUDIO_MEL):
             raise RuntimeError(
@@ -394,94 +370,69 @@ class QFLTXAVModel(QFLTXModel):
             raise RuntimeError(
                 f"qf_native LTX-AV: engine forward is B==1 per cond group (got batch={batch}, cou={cou})")
         targets_per_group = batch // len(cou) if batch > 1 else 1
-        self._derive_geometry(xin, transformer_options)
-        _, ca, la, fa = (int(d) for d in x_audio.shape)
-        self._audio_rows = la
-        self._audio_pack = ca * fa
         vemb = c_crossattn.to(dev, dtype=torch.bfloat16).contiguous()
         if int(vemb.shape[0]) != batch:
             raise RuntimeError("qf_native LTX-AV: context batch must match flattened target batch")
-        opening = self._qf.current_session is None or getattr(self, "_qf_needs_begin", False)
+        meta = qfmp._AVPackedMeta(nested, x, x_video, x_audio, targets_per_group)
+        return xin, x_audio, vemb, meta
+
+    def _av_prepare_session(self, xin, x_audio, vemb, transformer_options, kwargs, opening):
+        geom = (tuple(int(d) for d in xin.shape[1:]), tuple(int(d) for d in x_audio.shape[1:]))
+        if opening or geom != getattr(self, "_qf_av_geom", None):
+            self._derive_geometry(xin, transformer_options)
+            if not opening:
+                self._qf_av_geom = geom
+        _, ca, la, fa = (int(d) for d in x_audio.shape)
+        self._audio_rows = la
+        self._audio_pack = ca * fa
+        dev = xin.device
         self._call_fps(kwargs, opening)
         ref_active = self._prepare_audio_reference(
             kwargs.get("ref_audio"), dev,
             (self._reference_activation_dtype(dev) if opening and kwargs.get("ref_audio") is not None else None),
             opening)
+        self._qf_ref_active = ref_active
         if opening:
-            self._qf_needs_begin = False
             qfmp.refuse_all_zero_initial_latent(xin, "LTX-AV")
             self._begin(xin[0:1].contiguous(), vemb[0:1].contiguous())
-        _, c, f_dim, h, w = xin.shape
+            self._qf_av_geom = geom
+            self._qf_needs_begin = False
+
+    def _av_step_tensors(self, xin, x_audio, vemb, meta, sigma, sig_all, transformer_options, kwargs, step_index):
+        dev = xin.device
+        batch = int(xin.shape[0])
+        _, c, f_dim, h, w = (int(d) for d in xin.shape)
+        _, ca, la, fa = (int(d) for d in x_audio.shape)
         n_tok = f_dim * h * w
-        if self._out is None or self._out.shape != (1, n_tok, c):
-            self._out = torch.empty((1, n_tok, c), dtype=xin.dtype, device=dev)
-        if self._out_audio is None or self._out_audio.shape != (1, la, ca * fa):
-            self._out_audio = torch.empty((1, la, ca * fa), dtype=torch.float32, device=dev)
-        sig_all = sigma.reshape(-1) if torch.is_tensor(sigma) else None
-        step_index = self._sigma_step_index(sigma, sig_all, transformer_options)
+        self._out = self._ensure_scratch("_out", (1, n_tok, c), xin.dtype, dev)
+        self._out_audio = self._ensure_scratch("_out_audio", (1, la, ca * fa), torch.float32, dev)
         cuuids = transformer_options.get("uuids") if isinstance(transformer_options, dict) else None
+        ref_active = bool(getattr(self, "_audio_reference_bound", False)
+                          and getattr(self, "_qf_ref_active", False))
+        targets_per_group = meta.targets_per_group
         out5d = torch.empty_like(xin)
         out_audio = torch.empty_like(x_audio)
         for i in range(batch):
-            _interrupt_poll_end_session_on_raise(self._qf)
             xi = xin[i:i + 1].contiguous()
             tokens = xi.reshape(1, c, n_tok).transpose(1, 2).contiguous()
             arows = x_audio[i:i + 1].float().permute(0, 2, 1, 3).reshape(1, la, ca * fa).contiguous()
             vi = vemb[i:i + 1].contiguous()
             sig_i = (float(sig_all[i].item()) if (sig_all is not None and sig_all.numel() >= batch)
                      else (float(sig_all[0].item()) if sig_all is not None else float(sigma)))
-            p = qfe.QFStepParams()
-            ctypes.memset(ctypes.byref(p), 0, ctypes.sizeof(p))
-            p.struct_size = ctypes.sizeof(p)
-            p.latent_in = tokens.data_ptr()
-            p.velocity_out = self._out.data_ptr()
-            p.velocity_out_capacity = self._out.numel() * self._out.element_size()
-            p.dims = (ctypes.c_int32 * 5)(1, n_tok, c, 0, 0)
-            p.dtype = _qf_dtype(tokens.dtype)
-            p.sigma = sig_i
-            p.step_index = step_index
-            p.total_steps = self._num_steps
-            p.context = vi.data_ptr()
-            p.context_dims = (ctypes.c_int32 * 3)(*vi.shape)
-            p.context_dtype = _qf_dtype(vi.dtype)
             group = i // targets_per_group
             cuid = cuuids[group] if (cuuids is not None and group < len(cuuids)) else None
             if targets_per_group > 1 and cuid is not None:
                 cuid = (cuid, i % targets_per_group)
-            p.cfg_context_key = self._ctx_key_assigner.key(cuid)
-            mp = qfe.QFStepAvParams()
-            ctypes.memset(ctypes.byref(mp), 0, ctypes.sizeof(mp))
-            mp.struct_size = ctypes.sizeof(mp)
-            mp.base = p
-            mp.audio_latent_in = arows.data_ptr()
-            mp.audio_velocity_out = self._out_audio.data_ptr()
-            mp.audio_velocity_out_capacity = self._out_audio.numel() * self._out_audio.element_size()
-            mp.audio_dims = (ctypes.c_int32 * 4)(1, la, ca * fa, 0)
-            mp.audio_dtype = _qf_dtype(arows.dtype)
-            mp.audio_scale = 1.0
-            mp.audio_reference_active = 1 if (getattr(self, "_audio_reference_bound", False) and ref_active) else 0
-            self._call_denoise_step_av(mp, f"LTX-AV qf_xfm_step_av[step={step_index},group={i}]")
+            ctx_key = self._ctx_key_assigner.key(cuid)
+            self._execute_av_group_step(
+                vid_in=tokens, vid_dims=(1, n_tok, c), vid_out=self._out,
+                aud_in=arows, aud_dims=(1, la, ca * fa), aud_out=self._out_audio,
+                vi=vi, sig_i=sig_i, step_index=step_index, ctx_key=ctx_key,
+                audio_scale=1.0, ref_active=ref_active, group_i=i,
+            )
             out5d[i:i + 1] = self._out.transpose(1, 2).reshape(1, c, f_dim, h, w).to(xin.dtype)
             out_audio[i:i + 1] = self._out_audio.reshape(1, la, ca, fa).permute(0, 2, 1, 3).to(out_audio.dtype)
-            self._qf.step_count += 1
-            self._sess_denoise += 1
-        self._step_i += 1
-        self._qf.sampler_step_count += 1
-        if nested:
-            den_v = self.model_sampling.calculate_denoised(sigma, out5d.float(), x_video)
-            den_a = self.model_sampling.calculate_denoised(sigma, out_audio.float(), x_audio)
-            return comfy.nested_tensor.NestedTensor((den_v, den_a))
-        vel_flat = torch.cat([out5d.reshape(batch, -1), out_audio.reshape(batch, -1)], dim=1).reshape(x.shape)
-        return self.model_sampling.calculate_denoised(sigma, vel_flat.float(), x)
-
-    def process_latent_out(self, latent):
-        if self._qf.current_session is not None:
-            try:
-                qfe.info(f"[qf_native] LTX-AV SESSION CLOSED after {self._step_i} sampler steps, "
-                         f"{self._sess_denoise} qf_xfm_step_av calls", flush=True)
-            finally:
-                self._qf.end_session_if_open()
-        return super(QFLTXModel, self).process_latent_out(latent)
+        return out5d, out_audio
 
     def _qf_restore_frozen_audio(self, output, noise, latent_image, sampler, sigmas,
                                  denoise_mask=None, callback=None, disable_pbar=False,

@@ -26,36 +26,40 @@ import traceback
 import types
 import urllib.parse
 import urllib.request
-from typing import NamedTuple, Optional
 
-# qf_status_t (include/qf_capi.h)
-QF_OK = 0
-QF_ERR_INVALID_ARG = 1
-QF_ERR_BACKEND = 2
-QF_ERR_OOM = 3
-QF_ERR_IO = 4
-QF_ERR_INTERNAL = 5
-QF_ERR_BUSY = 6
-QF_ERR_AUTH = 7
-QF_ERR_UNSUPPORTED = 8
-
-# qf_dtype_t (include/qf_capi.h)
-QF_DTYPE_FP32 = 0
-QF_DTYPE_FP16 = 1
-QF_DTYPE_BF16 = 2
-QF_DTYPE_INT8 = 3
-QF_DTYPE_INT32 = 4
-QF_DTYPE_FP8_E4M3 = 5
-QF_DTYPE_INT4_PACKED = 6
-QF_DTYPE_E2M1_PACKED = 7
-QF_FP32, QF_FP16, QF_BF16 = QF_DTYPE_FP32, QF_DTYPE_FP16, QF_DTYPE_BF16
-
-# Capability bits & limits (include/qf_capi.h)
-QF_ATTN_CAP_FP16 = 1 << 0
-QF_ATTN_CAP_INT8 = 1 << 1
-QF_ATTN_CAP_INT4 = 1 << 2
-QF_MAX_STEP_REFS = 16
-QF_UINT64_MAX = (1 << 64) - 1
+if __package__:
+    from .qf_capi import (
+        QF_OK, QF_ERR_INVALID_ARG, QF_ERR_BACKEND, QF_ERR_OOM, QF_ERR_IO,
+        QF_ERR_INTERNAL, QF_ERR_BUSY, QF_ERR_AUTH, QF_ERR_UNSUPPORTED,
+        QF_DTYPE_FP32, QF_DTYPE_FP16, QF_DTYPE_BF16, QF_DTYPE_INT8, QF_DTYPE_INT32,
+        QF_DTYPE_FP8_E4M3, QF_DTYPE_INT4_PACKED, QF_DTYPE_E2M1_PACKED,
+        QF_FP32, QF_FP16, QF_BF16,
+        QF_ATTN_CAP_FP16, QF_ATTN_CAP_INT8, QF_ATTN_CAP_INT4,
+        QF_MAX_STEP_REFS, QF_UINT64_MAX,
+        QFAuthConfig, QFDeviceCaps, QFXfmCreateParams, QFVramEstimate,
+        QFSessionBeginParams, QFStepParams, QFStepAvParams, QFStepRefsParams,
+        ColdNeed, _CAPI_SIGNATURES,
+    )
+else:
+    import importlib.util as _ilu
+    _capi_spec = _ilu.spec_from_file_location(
+        "qf_capi", os.path.join(os.path.dirname(os.path.abspath(__file__)), "qf_capi.py"))
+    _capi = _ilu.module_from_spec(_capi_spec)
+    _capi_spec.loader.exec_module(_capi)
+    for _sym in (
+        "QF_OK", "QF_ERR_INVALID_ARG", "QF_ERR_BACKEND", "QF_ERR_OOM", "QF_ERR_IO",
+        "QF_ERR_INTERNAL", "QF_ERR_BUSY", "QF_ERR_AUTH", "QF_ERR_UNSUPPORTED",
+        "QF_DTYPE_FP32", "QF_DTYPE_FP16", "QF_DTYPE_BF16", "QF_DTYPE_INT8", "QF_DTYPE_INT32",
+        "QF_DTYPE_FP8_E4M3", "QF_DTYPE_INT4_PACKED", "QF_DTYPE_E2M1_PACKED",
+        "QF_FP32", "QF_FP16", "QF_BF16",
+        "QF_ATTN_CAP_FP16", "QF_ATTN_CAP_INT8", "QF_ATTN_CAP_INT4",
+        "QF_MAX_STEP_REFS", "QF_UINT64_MAX",
+        "QFAuthConfig", "QFDeviceCaps", "QFXfmCreateParams", "QFVramEstimate",
+        "QFSessionBeginParams", "QFStepParams", "QFStepAvParams", "QFStepRefsParams",
+        "ColdNeed", "_CAPI_SIGNATURES",
+    ):
+        globals()[_sym] = getattr(_capi, _sym)
+    del _ilu, _capi_spec, _capi, _sym
 
 # Pending LTX reference-audio borrows must survive model/handle GC until native cleanup.
 _REFERENCE_AUDIO_PENDING_OWNERS = set()
@@ -80,162 +84,10 @@ _DT_NEEDED = 1
 _CONSUMER_SMS = (75, 86, 89, 120)
 
 
-# ── Frozen 8 C structs (include/qf_capi.h) ───────────────────────────────────
-
-class QFAuthConfig(ctypes.Structure):
-    _fields_ = [
-        ("struct_size", ctypes.c_size_t),
-        ("server_url", ctypes.c_char_p),
-        ("api_key", ctypes.c_char_p),
-        ("cache_dir", ctypes.c_char_p),
-        ("device_id", ctypes.c_int32),
-    ]
-
-
-class QFDeviceCaps(ctypes.Structure):
-    _fields_ = [
-        ("struct_size", ctypes.c_size_t),
-        ("backend_type", ctypes.c_uint32),
-        ("device_id", ctypes.c_int32),
-        ("arch_code", ctypes.c_int32),
-        ("compute_unit_count", ctypes.c_int32),
-        ("total_vram_bytes", ctypes.c_uint64),
-        ("free_vram_bytes", ctypes.c_uint64),
-        ("attn_caps_mask", ctypes.c_uint32),
-        ("reserved", ctypes.c_uint32),
-        ("backend_feature_flags", ctypes.c_uint64),
-        ("device_name", ctypes.c_char * 128),
-        ("uuid_hex", ctypes.c_char * 65),
-        ("plugin_path", ctypes.c_char * 512),
-    ]
-
-
-class QFXfmCreateParams(ctypes.Structure):
-    _fields_ = [
-        ("struct_size", ctypes.c_size_t),
-        ("weights_path", ctypes.c_char_p),
-        ("device_id", ctypes.c_int32),
-        ("config_json", ctypes.c_char_p),
-    ]
-
-
-class QFVramEstimate(ctypes.Structure):
-    _fields_ = [
-        ("struct_size", ctypes.c_size_t),
-        ("resident_weight_bytes", ctypes.c_uint64),
-        ("min_offload_bytes", ctypes.c_uint64),
-        ("working_set_floor_bytes", ctypes.c_uint64),
-        ("recommended_offload_mode", ctypes.c_int32),
-        ("reserved", ctypes.c_int32),
-    ]
-
-
-class QFSessionBeginParams(ctypes.Structure):
-    _fields_ = [
-        ("struct_size", ctypes.c_size_t),
-        ("width", ctypes.c_int32),
-        ("height", ctypes.c_int32),
-        ("num_steps", ctypes.c_int32),
-        ("max_context_dims", ctypes.c_int32 * 3),
-        ("cond_dtype", ctypes.c_int32),
-        ("producer_stream", ctypes.c_size_t),
-        ("options_json", ctypes.c_char_p),
-    ]
-
-
-class QFStepParams(ctypes.Structure):
-    _fields_ = [
-        ("struct_size", ctypes.c_size_t),
-        ("latent_in", ctypes.c_void_p),
-        ("velocity_out", ctypes.c_void_p),
-        ("velocity_out_capacity", ctypes.c_uint64),
-        ("dims", ctypes.c_int32 * 5),
-        ("dtype", ctypes.c_int32),
-        ("sigma", ctypes.c_float),
-        ("step_index", ctypes.c_int32),
-        ("total_steps", ctypes.c_int32),
-        ("context", ctypes.c_void_p),
-        ("context_dims", ctypes.c_int32 * 3),
-        ("context_dtype", ctypes.c_int32),
-        ("cfg_context_key", ctypes.c_uint64),
-        ("producer_stream", ctypes.c_size_t),
-    ]
-
-
-class QFStepAvParams(ctypes.Structure):
-    _fields_ = [
-        ("struct_size", ctypes.c_size_t),
-        ("base", QFStepParams),
-        ("audio_latent_in", ctypes.c_void_p),
-        ("audio_velocity_out", ctypes.c_void_p),
-        ("audio_velocity_out_capacity", ctypes.c_uint64),
-        ("audio_dims", ctypes.c_int32 * 4),
-        ("audio_dtype", ctypes.c_int32),
-        ("audio_scale", ctypes.c_float),
-        ("audio_reference_active", ctypes.c_uint32),
-    ]
-
-
-class QFStepRefsParams(ctypes.Structure):
-    _fields_ = [
-        ("struct_size", ctypes.c_size_t),
-        ("base", QFStepParams),
-        ("num_refs", ctypes.c_int32),
-        ("ref_latents", ctypes.POINTER(ctypes.c_void_p)),
-        ("ref_dims", ctypes.POINTER(ctypes.c_int32)),
-        ("image_slots", ctypes.POINTER(ctypes.c_int32)),
-    ]
-
-
-class ColdNeed(NamedTuple):
-    """Cold create-time VRAM estimate from qf_xfm_estimate_vram."""
-    bytes: Optional[int]
-    note: Optional[str] = None
-    min_offload_bytes: Optional[int] = None
-    working_set_floor_bytes: Optional[int] = None
-
-    @property
-    def resident_weight_bytes(self):
-        return self.bytes
-
-
 def library_identity(lib):
     """Loaded image identity, not its filename (load_lib retains the CDLL)."""
     handle = getattr(lib, "_handle", None)
     return ("dso", int(handle)) if handle is not None else ("library", lib)
-
-
-# ── Frozen 25-symbol qf_* C-API binding ──────────────────────────────────────
-
-_V = ctypes.c_void_p
-_CAPI_SIGNATURES = (
-    ("qf_version", ctypes.c_char_p, []),
-    ("qf_last_error", ctypes.c_char_p, []),
-    ("qf_set_log_level", None, [ctypes.c_int]),
-    ("qf_get_log_level", ctypes.c_int, []),
-    ("qf_set_log_stderr", None, [ctypes.c_int]),
-    ("qf_auth_configure", ctypes.c_int, [ctypes.POINTER(QFAuthConfig)]),
-    ("qf_auth_set_api_key", ctypes.c_int, [_V, ctypes.c_char_p]),
-    ("qf_device_query_caps", ctypes.c_int, [ctypes.c_int32, ctypes.POINTER(QFDeviceCaps)]),
-    ("qf_xfm_estimate_vram", ctypes.c_int, [ctypes.POINTER(QFXfmCreateParams), ctypes.POINTER(QFVramEstimate)]),
-    ("qf_default_xfm_create_params", QFXfmCreateParams, []),
-    ("qf_xfm_create", ctypes.c_int, [ctypes.POINTER(QFXfmCreateParams), ctypes.POINTER(_V)]),
-    ("qf_xfm_destroy", None, [_V]),
-    ("qf_xfm_set_loras", ctypes.c_int, [_V, ctypes.c_char_p]),
-    ("qf_xfm_unload_vram", ctypes.c_int, [_V, ctypes.c_uint64, ctypes.POINTER(ctypes.c_uint64)]),
-    ("qf_xfm_resident_vram_bytes", ctypes.c_int, [_V, ctypes.POINTER(ctypes.c_uint64)]),
-    ("qf_xfm_vram_need_bytes", ctypes.c_int,
-     [_V, ctypes.POINTER(ctypes.c_int64), ctypes.c_int, ctypes.POINTER(ctypes.c_uint64)]),
-    ("qf_default_session_begin_params", QFSessionBeginParams, []),
-    ("qf_default_step_params", QFStepParams, []),
-    ("qf_default_step_av_params", QFStepAvParams, []),
-    ("qf_default_step_refs_params", QFStepRefsParams, []),
-    ("qf_xfm_session_begin", ctypes.c_int, [_V, ctypes.POINTER(QFSessionBeginParams), ctypes.POINTER(_V)]),
-    ("qf_xfm_step", ctypes.c_int, [_V, ctypes.POINTER(QFStepParams)]),
-    ("qf_xfm_step_av", ctypes.c_int, [_V, ctypes.POINTER(QFStepAvParams)]),
-    ("qf_xfm_step_refs", ctypes.c_int, [_V, ctypes.POINTER(QFStepRefsParams)]),
-    ("qf_xfm_session_end", ctypes.c_int, [_V]),
-)
 
 
 def _bind(lib):
@@ -572,6 +424,28 @@ def _engine_http_get(url):
         return resp.read()
 
 
+def _harden_posix_mode(path, mode=0o755):
+    """Harden a non-symlink POSIX file or directory without an islink->chmod TOCTOU window."""
+    if os.name != "posix":
+        return
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return
+    try:
+        os.fchmod(fd, mode)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _refuse_symlink_dir(path, label):
+    if os.path.islink(path):
+        raise RuntimeError(f"qf_native: refusing symlinked {label} directory: {path}")
+
+
 def _engine_fetch_to(url, dest, label):
     import hashlib
     h, done = hashlib.sha256(), 0
@@ -584,6 +458,7 @@ def _engine_fetch_to(url, dest, label):
             _engine_status("downloading", f"{label}: {done >> 20} of {total >> 20 if total else '?'} MB")
         f.flush()
         os.fsync(f.fileno())
+    _harden_posix_mode(dest, 0o755)
     return h.hexdigest()
 
 
@@ -699,8 +574,9 @@ def _markers():
     return [(os.path.join(d, n), m) for n in names for m in (_read_marker(os.path.join(d, n)),) if m]
 
 
-def _installed_pair():
-    major, sm = _torch_cuda_major(), _gpu_sm(_ENGINE_DEVICE)
+def _installed_pair(device_id=None):
+    dev = _ENGINE_DEVICE if device_id is None else int(device_id)
+    major, sm = _torch_cuda_major(), _gpu_sm(dev)
     mine = [(p, m) for p, m in _markers() if m["cuda"] == major and sm in m["sms"]]
     return max(mine, key=lambda pm: _version_key(pm[1]["version"])) if mine else (None, None)
 
@@ -802,10 +678,12 @@ def _install_addons(pair, version, info_entry, gpu_set, major, hashes):
             continue
         try:
             if not os.path.islink(dest) and os.path.isfile(dest) and _sha256_of(dest) == want:
+                _harden_posix_mode(dest, 0o755)
                 continue
             if _engine_fetch_to(f"{_ENGINE_BASE_URL}/{version}/{_BIN_SUBDIR}/{key}", part,
                                 f"engine {version}: {name}") != want:
                 raise RuntimeError(f"{key} does not match its published SHA-256")
+            _harden_posix_mode(part, 0o755)
             os.replace(part, dest)
         except Exception as e:  # noqa: BLE001
             for leftover in (part, dest):
@@ -822,6 +700,7 @@ def _engine_write_file(path, data):
         f.write(data)
         f.flush()
         os.fsync(f.fileno())
+    _harden_posix_mode(tmp, 0o644)
     os.replace(tmp, path)
 
 
@@ -846,7 +725,9 @@ def install_engine(device_idx=None):
             f"QuantFunc engines are published for {'/'.join(plat['arches'])} only, and this "
             f"machine is {platform.machine() or 'unknown'}; no engine was installed")
     bin_dir = _engine_bin_dir()
+    _refuse_symlink_dir(bin_dir, "engine bin")
     os.makedirs(bin_dir, exist_ok=True)
+    _harden_posix_mode(bin_dir, 0o755)
     with _install_lock(os.path.join(bin_dir, _ENGINE_INSTALL_LOCKFILE)):
         return _install_pair(bin_dir, _ENGINE_DEVICE if device_idx is None else int(device_idx))
 
@@ -912,26 +793,39 @@ def _install_pair(bin_dir, device_idx):
     known_bad = None
     if have and have["version"] == version:
         if all(hashes.get(_manifest_key(gpu_set, n, major, hashes)) == h for n, h in have["sha256"].items()):
+            pair_have = os.path.join(bin_dir, _pair_dir(have))
+            _refuse_symlink_dir(pair_have, "engine pair")
+            _harden_posix_mode(pair_have, 0o755)
+            for n in have["sha256"]:
+                _harden_posix_mode(os.path.join(pair_have, n), 0o755)
+            _harden_posix_mode(marker, 0o644)
             _claim(bin_dir, marker, sets[gpu_set])
-            _install_addons(os.path.join(bin_dir, _pair_dir(have)), version, versions[version], gpu_set, major, hashes)
+            _install_addons(pair_have, version, versions[version], gpu_set, major, hashes)
             _engine_status("installed", f"engine {version} ({gpu_set}, CUDA {major})")
             return have
-        os.remove(marker)
         known_bad, have = version, None
     kernel = _resolve_kernel_for_set(version, gpu_set, sm, major, hashes) if plat["kernel"] else None
     pair = os.path.join(bin_dir, f"{version}-{gpu_set}-cu{major}")
+    _refuse_symlink_dir(pair, "engine pair")
     os.makedirs(pair, exist_ok=True)
-    got, parts = {}, []
+    _harden_posix_mode(pair, 0o755)
+    order = ([kernel] if kernel else []) + [host]
+    got, parts, backups, replaced = {}, [], {}, []
+    m = {"version": version, "set": gpu_set, "cuda": major, "sms": sets[gpu_set], "host": host, "kernel": kernel,
+         "sha256": got}
+    rollback_failed = False
     try:
         for name in ((host, kernel) if kernel else (host,)):
             key = _manifest_key(gpu_set, name, major, hashes)
             if not _ENGINE_SHA256_RE.fullmatch(str(hashes.get(key, ""))):
                 raise RuntimeError(f"the {version} manifest has no SHA-256 for {key}")
-            parts.append(os.path.join(pair, f".{name}.part"))
+            part_path = os.path.join(pair, f".{name}.part")
+            parts.append(part_path)
             got[name] = _engine_fetch_to(
-                f"{_ENGINE_BASE_URL}/{version}/{_BIN_SUBDIR}/{key}", parts[-1], f"engine {version}: {name}")
+                f"{_ENGINE_BASE_URL}/{version}/{_BIN_SUBDIR}/{key}", part_path, f"engine {version}: {name}")
             if got[name] != hashes[key]:
                 raise RuntimeError(f"{key} does not match its published SHA-256 (download corrupt or tampered)")
+            _harden_posix_mode(part_path, 0o755)
         if kernel:
             if _BIN_SUBDIR == "windows":
                 host_cuda = _host_forbidden_cuda_pe(parts[0])
@@ -950,24 +844,51 @@ def _install_pair(bin_dir, device_idx):
                     raise RuntimeError(
                         f"the {version} host and kernel libraries are not one build (pair ids {ids[0]} / "
                         f"{ids[1]}); nothing was installed")
-        for n in ([kernel] if kernel else []) + [host]:
-            os.replace(os.path.join(pair, f".{n}.part"), os.path.join(pair, n))
+        for n in order:
+            dst = os.path.join(pair, n)
+            if os.path.exists(dst):
+                bak = os.path.join(pair, f".{n}.bak-{os.getpid()}")
+                shutil.copy2(dst, bak)
+                _harden_posix_mode(bak, 0o755)
+                backups[n] = bak
+        for n in order:
+            part_path = os.path.join(pair, f".{n}.part")
+            _harden_posix_mode(part_path, 0o755)
+            os.replace(part_path, os.path.join(pair, n))
+            replaced.append(n)
+        _install_addons(pair, version, versions[version], gpu_set, major, hashes)
+        _claim(bin_dir, marker, sets[gpu_set], chosen=m)
     except Exception as e:
+        for n in reversed(replaced):
+            dst = os.path.join(pair, n)
+            bak = backups.get(n)
+            try:
+                if bak is not None and os.path.exists(bak):
+                    os.replace(bak, dst)
+                    _harden_posix_mode(dst, 0o755)
+                elif os.path.exists(dst):
+                    os.remove(dst)
+            except OSError:
+                rollback_failed = True
+        if rollback_failed:
+            try:
+                os.remove(marker)
+            except OSError:
+                pass
+            raise RuntimeError(
+                f"the installed engine {version} update failed ({type(e).__name__}: {e}) and "
+                f"rollback failed; stale marker removed so mismatched libraries will not load") from e
         if known_bad:
             raise RuntimeError(
                 f"the installed engine {known_bad} no longer matches its published SHA-256 and the "
-                f"re-download failed ({type(e).__name__}: {e}); it is not loaded") from e
+                f"re-download failed ({type(e).__name__}: {e}); existing installation was preserved") from e
         raise
     finally:
-        for p in parts:
+        for p in parts + list(backups.values()):
             try:
                 os.remove(p)
             except OSError:
                 pass
-    m = {"version": version, "set": gpu_set, "cuda": major, "sms": sets[gpu_set], "host": host, "kernel": kernel,
-         "sha256": got}
-    _install_addons(pair, version, versions[version], gpu_set, major, hashes)
-    _claim(bin_dir, marker, sets[gpu_set], chosen=m)
     keep = {_pair_dir(m), have and _pair_dir(have)}
     for d in os.listdir(bin_dir):
         p = _ENGINE_PAIR_RE.fullmatch(d)
@@ -1030,6 +951,45 @@ def start_engine_install(device_idx=None):
     return t
 
 
+def _local_host_names(plat):
+    names = []
+    if plat is not None:
+        preferred = plat["hosts"].get(_torch_cuda_major())
+        if preferred:
+            names.append(preferred)
+    if _LIB_BASENAME not in names:
+        names.append(_LIB_BASENAME)
+    return names
+
+
+def has_ready_so(device_id=None):
+    """Read-only probe mirroring resolve_so_path() priority without deleting markers or downloading."""
+    if _LIB is not None:
+        return True
+    try:
+        override = os.environ.get(_ENV_SO_OVERRIDE, "").strip()
+        if override:
+            return os.path.isfile(override)
+        bin_dir = _engine_bin_dir()
+        pkg = os.path.dirname(os.path.abspath(__file__))
+        plat = _engine_platform()
+        local = os.path.exists(os.path.join(bin_dir, _ENGINE_LOCAL_BUILD_LOCK))
+        if local or plat is None:
+            names = _local_host_names(plat)
+            return any(os.path.isfile(os.path.join(d, name)) for name in names for d in (bin_dir, pkg))
+        if os.path.islink(bin_dir):
+            return False
+        _, m = _installed_pair(device_id=device_id)
+        if not m:
+            return False
+        pair = os.path.join(bin_dir, _pair_dir(m))
+        if os.path.islink(pair):
+            return False
+        return _pair_intact(m)
+    except OSError:
+        return False
+
+
 def resolve_so_path():
     """Resolve the engine library path without any workflow-serializable input."""
     pkg = os.path.dirname(os.path.abspath(__file__))
@@ -1042,13 +1002,7 @@ def resolve_so_path():
     plat = _engine_platform()
     local = os.path.exists(os.path.join(bin_dir, _ENGINE_LOCAL_BUILD_LOCK))
     if local or plat is None:
-        names = []
-        if plat is not None:
-            preferred = plat["hosts"].get(_torch_cuda_major())
-            if preferred:
-                names.append(preferred)
-        if _LIB_BASENAME not in names:
-            names.append(_LIB_BASENAME)
+        names = _local_host_names(plat)
         for name in names:
             for d in (bin_dir, pkg):
                 c = os.path.join(d, name)
@@ -1060,10 +1014,17 @@ def resolve_so_path():
             + (f"bin/{_BIN_SUBDIR}/{_ENGINE_LOCAL_BUILD_LOCK} marks a local build, but "
                f"{missing} is not there" if local else
                f"put {_LIB_BASENAME} in the package bin/{_BIN_SUBDIR}/, or set {_ENV_SO_OVERRIDE}=<abs path>"))
+    _refuse_symlink_dir(bin_dir, "engine bin")
     mpath, m = _installed_pair()
     if m:
+        pair = os.path.join(bin_dir, _pair_dir(m))
+        _refuse_symlink_dir(pair, "engine pair")
         if _pair_intact(m):
-            return os.path.realpath(os.path.join(bin_dir, _pair_dir(m), m["host"]))
+            _harden_posix_mode(bin_dir, 0o755)
+            _harden_posix_mode(pair, 0o755)
+            for n in m["sha256"]:
+                _harden_posix_mode(os.path.join(pair, n), 0o755)
+            return os.path.realpath(os.path.join(pair, m["host"]))
         try:
             os.remove(mpath)
         except OSError:
@@ -1416,50 +1377,57 @@ def _assert_torch_cuda_family(provided, dirs, linker):
                 f"{', '.join(sorted(dirs))}). One process must use one cuBLAS/cuSOLVER set.")
 
 
-def load_lib():
+def load_lib(device_id=None):
     """Load and bind the 25-symbol PC Engine host library once per process."""
-    global _LIB, _LIB_PATH, _FINGERPRINT_PENDING
+    global _LIB, _LIB_PATH, _FINGERPRINT_PENDING, _ENGINE_DEVICE
     if _LIB is not None:
         return _LIB
     with _LIB_LOCK:
         if _LIB is not None:
             return _LIB
-        so_path = resolve_so_path()
-        assert_toolchain_compatible(so_path)
-        torch_major = _torch_cuda_major() if "torch" in sys.modules else None
-        cuda_dirs, cuda_provided, cuda_preloads = _torch_cuda_plan(
-            _engine_cuda_needs(so_path), _linker_path, torch_major)
-        for p in cuda_preloads:
-            try:
-                ctypes.CDLL(p, mode=ctypes.RTLD_LOCAL)
-            except OSError as e:
-                raise RuntimeError(f"qf_native: could not load torch's own {p}: {e}") from e
-        so_dir = os.path.dirname(so_path)
-        pending = [f for f in _sidecar_preloads(so_path) if f not in cuda_provided]
-        for _ in range(max(1, len(pending))):
-            still = []
-            for f in pending:
-                try:
-                    ctypes.CDLL(os.path.join(so_dir, f), mode=ctypes.RTLD_LOCAL)
-                except OSError:
-                    still.append(f)
-            if not still:
-                break
-            pending = still
-        ident = _file_identity(so_path)
+        prev_dev = _ENGINE_DEVICE
+        if device_id is not None:
+            _ENGINE_DEVICE = int(device_id)
         try:
-            lib = ctypes.CDLL(so_path, mode=ctypes.RTLD_GLOBAL)
-        except OSError as e:
-            raise RuntimeError(f"qf_native: {_engine_load_failed(so_path, e)}") from e
-        _engine_load_ok(so_path)
-        _assert_torch_cuda_family(cuda_provided, cuda_dirs, _linker_path)
-        bound = _bind(lib)
-        _LIB_PATH = so_path
-        _LIB = bound
-        if _LOG_LEVEL is not None:
-            _LIB.qf_set_log_level(_LOG_LEVEL)
-        _FINGERPRINT_PENDING = (_LIB, so_path, ident if _file_identity(so_path) == ident else None)
-        _emit_fingerprint()
+            so_path = resolve_so_path()
+            assert_toolchain_compatible(so_path)
+            torch_major = _torch_cuda_major() if "torch" in sys.modules else None
+            cuda_dirs, cuda_provided, cuda_preloads = _torch_cuda_plan(
+                _engine_cuda_needs(so_path), _linker_path, torch_major)
+            for p in cuda_preloads:
+                try:
+                    ctypes.CDLL(p, mode=ctypes.RTLD_LOCAL)
+                except OSError as e:
+                    raise RuntimeError(f"qf_native: could not load torch's own {p}: {e}") from e
+            so_dir = os.path.dirname(so_path)
+            pending = [f for f in _sidecar_preloads(so_path) if f not in cuda_provided]
+            for _ in range(max(1, len(pending))):
+                still = []
+                for f in pending:
+                    try:
+                        ctypes.CDLL(os.path.join(so_dir, f), mode=ctypes.RTLD_LOCAL)
+                    except OSError:
+                        still.append(f)
+                if not still:
+                    break
+                pending = still
+            ident = _file_identity(so_path)
+            try:
+                lib = ctypes.CDLL(so_path, mode=ctypes.RTLD_GLOBAL)
+            except OSError as e:
+                raise RuntimeError(f"qf_native: {_engine_load_failed(so_path, e)}") from e
+            _engine_load_ok(so_path)
+            _assert_torch_cuda_family(cuda_provided, cuda_dirs, _linker_path)
+            bound = _bind(lib)
+            _LIB_PATH = so_path
+            _LIB = bound
+            if _LOG_LEVEL is not None:
+                _LIB.qf_set_log_level(_LOG_LEVEL)
+            _FINGERPRINT_PENDING = (_LIB, so_path, ident if _file_identity(so_path) == ident else None)
+            _emit_fingerprint()
+        except BaseException:
+            _ENGINE_DEVICE = prev_dev
+            raise
     return _LIB
 
 
@@ -1598,6 +1566,7 @@ def estimate_vram(lib, create_params):
             None,
             int(est.min_offload_bytes),
             int(est.working_set_floor_bytes),
+            int(est.recommended_offload_mode),
         )
     if st == QF_ERR_INVALID_ARG:
         raise RuntimeError(f"QuantFunc cold VRAM estimate refused: {last_err(lib)}")
@@ -1648,6 +1617,7 @@ class QFEngineHandle:
         self.lib = lib
         self.xfm = xfm
         self.capacity_bytes = int(capacity_bytes)
+        self.host_weight_bytes = int(capacity_bytes)
         self.current_session = None
         self.step_count = 0
         self.sampler_step_count = 0

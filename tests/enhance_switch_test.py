@@ -66,14 +66,35 @@ for root, _dirs, files in os.walk(_PLUGIN):
 check(not hits, "arm1: no retired option key or helper reachable from the plugin path (%s)" % (hits or "clean"))
 
 _init_tree = trees["__init__.py"]
+_loader_names = ("QuantFuncLTXLoader", "QuantFuncKrea2Loader", "QuantFuncQwenImage21Loader", "QuantFuncH3Loader")
+_loader_classes = {c.name: c for c in ast.walk(_init_tree) if isinstance(c, ast.ClassDef) and c.name in _loader_names}
+_loader_bases_ok = (len(_loader_classes) == 4 and all(
+    any(isinstance(b, ast.Name) and b.id == "_QuantFuncLoaderBase" for b in c.bases)
+    for c in _loader_classes.values()))
+_load_common_calls = [
+    c for cls_node in _loader_classes.values()
+    for fn_node in cls_node.body if isinstance(fn_node, ast.FunctionDef) and fn_node.name == "load"
+    for c in ast.walk(fn_node)
+    if isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
+    and isinstance(c.func.value, ast.Name) and c.func.value.id == "self" and c.func.attr == "_load_common"
+]
+_base_cls = next((c for c in ast.walk(_init_tree) if isinstance(c, ast.ClassDef) and c.name == "_QuantFuncLoaderBase"), None)
+_base_common_fn = (_base_cls and next(
+    (fn for fn in _base_cls.body if isinstance(fn, ast.FunctionDef) and fn.name == "_load_common"), None))
 _common_calls = [c for c in ast.walk(_init_tree)
                  if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
                  and c.func.id == "_apply_common_loader_dials"]
+_base_dials_calls = (_base_common_fn and [
+    c for c in ast.walk(_base_common_fn)
+    if isinstance(c, ast.Call) and isinstance(c.func, ast.Name) and c.func.id == "_apply_common_loader_dials"
+]) or []
 _sets = [c for c in ast.walk(_init_tree)
          if isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
          and c.func.attr == "set_video_enhance"]
-check(len(_common_calls) == 4 and len(_sets) == 1,
-      f"arm1: all 4 loaders apply common dials (x{len(_common_calls)}) wiring set_video_enhance (x{len(_sets)})")
+check(_loader_bases_ok and len(_load_common_calls) == 4 and len(_common_calls) == 1
+      and len(_base_dials_calls) == 1 and len(_sets) == 1,
+      f"arm1: all 4 loaders inherit _QuantFuncLoaderBase -> _load_common (x{len(_load_common_calls)}) -> "
+      f"_apply_common_loader_dials (x{len(_common_calls)}) wiring set_video_enhance (x{len(_sets)})")
 
 # ---- arm 1b: user-visible text ----
 _CLAIM = ("almost the same", "nearly the same", "closer to best", "picture stays the same")

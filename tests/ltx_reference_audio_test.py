@@ -3,6 +3,7 @@
 import ast
 import ctypes
 import gc
+import itertools
 import json
 import math
 import operator
@@ -11,52 +12,84 @@ import types
 import unittest
 import weakref
 from contextvars import ContextVar
+from typing import NamedTuple
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def production_namespace(source=None, engine_source=None, shared_source=None):
-    ns = dict(torch=torch, ctypes=ctypes, math=math, json=json, operator=operator, ContextVar=ContextVar,
+def production_namespace(source=None, engine_source=None, shared_source=None, capi_source=None):
+    ns = dict(torch=torch, ctypes=ctypes, math=math, json=json, operator=operator, itertools=itertools,
+              ContextVar=ContextVar, weakref=weakref, NamedTuple=NamedTuple,
               time=types.SimpleNamespace(sleep=lambda _: None))
-    for filename, names in [("qf_engine.py", {"QFSessionBeginParams", "QFStepParams", "QFStepAvParams", "QFEngineHandle"}),
-                            ("qf_modelpatcher.py", {"_CtxKeyAssigner", "_qf_dtype"})]:
+    capi_text = capi_source if capi_source is not None else (ROOT / "qf_capi.py").read_text(encoding="utf-8")
+    capi_tree = ast.parse(capi_text)
+    capi_body = [n for n in capi_tree.body if getattr(n, "name", None) in {
+        "QFSessionBeginParams", "QFStepParams", "QFStepAvParams"}]
+    capi_assigns = [n for n in capi_tree.body if isinstance(n, ast.Assign) and any(
+        isinstance(t, ast.Name) and t.id in {
+            "QF_OK", "QF_ERR_BUSY", "QF_DTYPE_FP32", "QF_DTYPE_FP16", "QF_DTYPE_BF16", "QF_UINT64_MAX",
+        } for t in n.targets)]
+    exec(compile(ast.Module(body=capi_assigns + capi_body, type_ignores=[]), "qf_capi.py", "exec"), ns)
+
+    for filename, names in [("qf_engine.py", {"QFEngineHandle"}),
+                            ("qf_modelpatcher.py", {"_CtxKeyAssigner", "_qf_dtype", "_AVPackedMeta",
+                                                    "refuse_all_zero_initial_latent"})]:
         override = engine_source if filename == "qf_engine.py" else shared_source
         text = override if override is not None else (ROOT / filename).read_text(encoding="utf-8")
         tree = ast.parse(text)
         body = [n for n in tree.body if getattr(n, "name", None) in names]
         if filename == "qf_engine.py":
             assigns = [n for n in tree.body if isinstance(n, ast.Assign) and any(
-                isinstance(t, ast.Name) and t.id in {
-                    "_REFERENCE_AUDIO_PENDING_OWNERS", "QF_OK", "QF_UINT64_MAX",
-                } for t in n.targets)]
+                isinstance(t, ast.Name) and t.id == "_REFERENCE_AUDIO_PENDING_OWNERS"
+                for t in n.targets)]
             body = assigns + body
         if filename == "qf_modelpatcher.py":
             body += [n for n in tree.body if isinstance(n, ast.Assign) and any(
                 isinstance(t, ast.Name) and t.id in {
                     "_QF_SAMPLING_GEOMETRY", "_OUTER_SAMPLE_LATENT_SHAPES_ARG",
+                    "_QF_RUN_COUNTER", "_QF_RUN_ID", "_BUSY_BEGIN_RETRY_S",
                 } for t in n.targets)]
             patcher = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "QFModelPatcher")
             patcher.decorator_list = []
             patcher.bases = []
             patcher.body = [n for n in patcher.body if getattr(n, "name", None) == "_sampling_geometry"]
             body.append(patcher)
+
+            class _MockBaseModel:
+                def process_latent_out(self, latent):
+                    return latent
+
+            ns["_MockBaseModel"] = _MockBaseModel
             mixin = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "QFSessionModelMixin")
             mixin.decorator_list = []
-            mixin.body = [n for n in mixin.body if getattr(n, "name", None) == "_call_denoise_step_av"]
+            mixin.bases = [ast.Name(id="_MockBaseModel", ctx=ast.Load())]
+            mixin.body = [n for n in mixin.body if (
+                getattr(n, "name", None) in {
+                    "_reset_run_cond_state", "_begin_extra_conds_guard", "_reject_ignored_conds",
+                    "_ensure_scratch", "_release_scratch_buffers", "_open_native_session",
+                    "_close_session_on_latent_out", "_sigma_step_index", "_call_denoise_step_av",
+                } or (isinstance(n, ast.Assign) and any(
+                    getattr(t, "id", None) in {"_SCRATCH_ATTRS", "_ENGINE_IGNORED_COND_KEYS", "_TAG", "_REFUSED_HINT"}
+                    for t in n.targets)))]
             body.append(mixin)
+            av_cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "QFAVSessionModel")
+            av_cls.decorator_list = []
+            av_cls.bases = [ast.Name(id="QFSessionModelMixin", ctx=ast.Load())]
+            body.append(av_cls)
             lazy = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "QFLazyEngine")
             lazy.decorator_list = []
             lazy.body = [n for n in lazy.body if getattr(n, "name", None) in {
                 "lib", "xfm", "current_session", "retain_reference_audio", "reference_audio_pending",
                 "reference_audio_copy_completed", "end_session_if_open", "unload_vram", "unload_sync"}]
             body.append(lazy)
-        exec(compile(ast.Module(body=body, type_ignores=[]), filename, "exec"), ns)
+        exec(compile(ast.fix_missing_locations(ast.Module(body=body, type_ignores=[])), filename, "exec"), ns)
         if filename == "qf_engine.py":
             ns["qfe"] = types.SimpleNamespace(
                 **{n: ns[n] for n in ["QFSessionBeginParams", "QFStepParams", "QFStepAvParams"]},
-                QF_DTYPE_FP32=0, QF_DTYPE_FP16=1, QF_DTYPE_BF16=2,
-                QF_OK=0, QF_UINT64_MAX=ns["QF_UINT64_MAX"],
+                QF_DTYPE_FP32=ns["QF_DTYPE_FP32"], QF_DTYPE_FP16=ns["QF_DTYPE_FP16"],
+                QF_DTYPE_BF16=ns["QF_DTYPE_BF16"],
+                QF_OK=ns["QF_OK"], QF_ERR_BUSY=ns["QF_ERR_BUSY"], QF_UINT64_MAX=ns["QF_UINT64_MAX"],
                 last_err=lambda lib: lib.error, info=lambda *a, **k: None)
     ns["_KNO_CTX_KEY"] = 0
     ns["last_err"] = lambda lib: lib.error
@@ -67,20 +100,28 @@ def production_namespace(source=None, engine_source=None, shared_source=None):
             self.cond = cond
 
     ns["comfy"] = types.SimpleNamespace(conds=types.SimpleNamespace(CONDConstant=Cond, CONDRegular=Cond))
-    ns["qfmp"] = types.SimpleNamespace(refuse_all_zero_initial_latent=lambda *a: None)
+    ns["qfmp"] = types.SimpleNamespace(
+        refuse_all_zero_initial_latent=ns["refuse_all_zero_initial_latent"],
+        _AVPackedMeta=ns["_AVPackedMeta"],
+        QFAVSessionModel=ns["QFAVSessionModel"],
+    )
     ns["_interrupt_poll_end_session_on_raise"] = lambda _: None
     ltx_text = source if source is not None else (ROOT / "qf_ltx_modelpatcher.py").read_text(encoding="utf-8")
     tree = ast.parse(ltx_text)
     consts = [n for n in tree.body if isinstance(n, ast.Assign) and any(
         isinstance(t, ast.Name) and t.id in {
             "_LTXAV_AUDIO_CH", "_LTXAV_AUDIO_MEL", "_LTXAV_AUDIO_PACK",
-            "_REF_AUDIO_MAX_NUMEL", "_VIDEO_LATENT_NDIM", "_AUDIO_LATENT_NDIM", "_BUSY_BEGIN_RETRY_S",
+            "_REF_AUDIO_MAX_NUMEL", "_VIDEO_LATENT_NDIM", "_AUDIO_LATENT_NDIM",
         } for t in n.targets)]
     classes = []
     for n in tree.body:
         if isinstance(n, ast.ClassDef) and n.name in {"QFLTXModel", "QFLTXAVModel"}:
             n.decorator_list = []
-            n.bases = [ast.Name(id="object" if n.name == "QFLTXModel" else "QFLTXModel", ctx=ast.Load())]
+            if n.name == "QFLTXModel":
+                n.bases = [ast.Name(id="QFSessionModelMixin", ctx=ast.Load())]
+            else:
+                n.bases = [ast.Name(id="QFAVSessionModel", ctx=ast.Load()),
+                           ast.Name(id="QFLTXModel", ctx=ast.Load())]
             n.body = [x for x in n.body if getattr(x, "name", None) != "__init__"]
             classes.append(n)
     exec(compile(ast.fix_missing_locations(ast.Module(body=consts + classes, type_ignores=[])), "actual-ltx", "exec"), ns)
@@ -158,6 +199,13 @@ def model(ns, av=True):
     m.latent_format = types.SimpleNamespace(spacial_downscale_ratio=32)
     m._out = m._out_audio = None
     m._step_i = m._sess_denoise = 0
+    m._pending_frame_t_scale = None
+    m._pending_audio_frame_t_scale = None
+    m._qf_conds_done = False
+    m._qf_conds_run_id = None
+    m._qf_conds_noise_ref = None
+    m._qf_needs_begin = False
+    m._qf_av_geom = None
     m._native_frame_rate = lambda kw: ns["comfy"].conds.CONDConstant(kw.get("frame_rate", 24))
     m._post_connector_seq = lambda n: n
     m.residency_opts = lambda: {}
@@ -789,6 +837,63 @@ class ReferenceAudioTests(unittest.TestCase):
                 bad[0, 0, offset] = value
                 with self.assertRaisesRegex(RuntimeError, "finite"):
                     m._frame_scales_from_mask(bad)
+
+    def test_t16_ltxav_scratch_realloc_derive_geometry_cadence_and_av_guards(self):
+        m = model(self.ns)
+        derive_calls = []
+        m._derive_geometry = lambda x_vid, to: derive_calls.append(tuple(x_vid.shape))
+        m._call_denoise_step_av = lambda mp, *_: None
+
+        def _make_inputs(vshape, ashape):
+            m.latent_shapes = [list(vshape), list(ashape)]
+            n = math.prod(vshape[1:]) + math.prod(ashape[1:])
+            return torch.ones(1, 1, n), torch.ones(1, 3, 6144)
+
+        to = {"cond_or_uncond": [0], "uuids": ["a"]}
+        x0, ctx0 = _make_inputs((1, 128, 3, 2, 2), (1, 8, 4, 16))
+        with self.assertRaisesRegex(RuntimeError, "no c_crossattn"):
+            m._apply_model(x0, torch.ones(1), c_crossattn=None, transformer_options=to)
+        with self.assertRaisesRegex(RuntimeError, "ControlNet"):
+            m._apply_model(x0, torch.ones(1), c_crossattn=ctx0, control=object(), transformer_options=to)
+
+        # 3 consecutive steps with identical geometry -> _derive_geometry called ONCE
+        for _ in range(3):
+            m._apply_model(x0, torch.ones(1), c_crossattn=ctx0, transformer_options=to)
+        self.assertEqual(len(derive_calls), 1)
+
+        # Changing spatial, temporal, audio, or video channel dim shape[1] triggers _derive_geometry
+        for vshape, ashape in (
+            ((1, 128, 3, 2, 4), (1, 8, 4, 16)),
+            ((1, 128, 4, 2, 4), (1, 8, 4, 16)),
+            ((1, 128, 4, 2, 4), (1, 8, 5, 16)),
+            ((1, 64, 4, 2, 4), (1, 8, 5, 16)),
+        ):
+            xi, ctxi = _make_inputs(vshape, ashape)
+            m._apply_model(xi, torch.ones(1), c_crossattn=ctxi, transformer_options=to)
+        self.assertEqual(len(derive_calls), 5)
+
+        # Pre-seeded wrong dtype & wrong device scratch buffers are reallocated and then released
+        x1, ctx1 = _make_inputs((1, 128, 3, 2, 2), (1, 8, 4, 16))
+        v_tokens = 3 * 2 * 2
+        for bad_v, bad_a in (
+            (torch.zeros((1, v_tokens, 128), dtype=torch.float16),
+             torch.zeros((1, 4, 128), dtype=torch.float16)),
+            (torch.empty((1, v_tokens, 128), dtype=torch.bfloat16, device="meta"),
+             torch.empty((1, 4, 128), dtype=torch.float32, device="meta")),
+        ):
+            m._out = bad_v
+            m._out_audio = bad_a
+            m._apply_model(x1, torch.ones(1), c_crossattn=ctx1, transformer_options=to)
+            self.assertEqual(m._out.dtype, torch.bfloat16)
+            self.assertEqual(m._out_audio.dtype, torch.float32)
+            self.assertEqual(m._out.device, x1.device)
+            self.assertEqual(m._out_audio.device, x1.device)
+            self.assertIsNot(m._out, bad_v)
+            self.assertIsNot(m._out_audio, bad_a)
+
+        m.process_latent_out(x1)
+        self.assertIsNone(m._out)
+        self.assertIsNone(m._out_audio)
 
 
 class FrozenAudioTests(unittest.TestCase):

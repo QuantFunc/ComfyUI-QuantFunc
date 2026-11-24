@@ -84,7 +84,7 @@ def make_actual_fixture(testcase):
             return result
 
     qfe = NS(
-        load_lib=lambda: "lib",
+        load_lib=lambda *_a, **_k: "lib",
         loaded_so_path=lambda: "engine.so",
         library_identity=lambda lib: "image-id",
         estimate_vram=lambda lib, params: NS(bytes=64, reason=None),
@@ -111,7 +111,7 @@ def make_actual_fixture(testcase):
 
     cls_node = next(n for n in ast.walk(ast.parse((Q / "qf_modelpatcher.py").read_text(encoding="utf-8")))
                     if isinstance(n, ast.ClassDef) and n.name == "QFLazyEngine")
-    for name in ("__init__", "_adopt_real", "ensure", "_apply_runtime_lora", "lora_set", "_lora_sig"):
+    for name in ("__init__", "_adopt_real", "_drop_dead_real", "ensure", "_apply_runtime_lora", "lora_set", "_lora_sig"):
         method = next(c for c in cls_node.body if isinstance(c, ast.FunctionDef) and c.name == name)
         env = dict(qfe=qfe, _engine_cache_acquisition=acquiring, json=json,
                    _LORA_DRAIN_RETRY_S=0.0, warn_lora_not_loaded=lambda: None)
@@ -179,7 +179,7 @@ class UnifiedLoRATests(unittest.TestCase):
         self.assertEqual(second.model._stack, [self.entry, {"path": str(self.path), "scale": 0.5}])
 
     def test_recipe_cache_key_is_pure_weight_recipe(self):
-        env = dict(os=os, json=json, qfe=NS(load_lib=lambda: "lib", loaded_so_path=lambda: "engine.so"))
+        env = dict(os=os, json=json, qfe=NS(load_lib=lambda *_a, **_k: "lib", loaded_so_path=lambda: "engine.so"))
         install([function(Q / "__init__.py", "_engine_recipe")], env)
         recipe = env["_engine_recipe"]
         for cfg in (None, {}, {"model_arch": "ltx25", "pinned_memory": True}):

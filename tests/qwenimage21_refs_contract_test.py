@@ -38,6 +38,7 @@ sys.modules[pkg.__name__] = pkg
 qfe = importlib.import_module("qf_qi21_contract.qf_engine")
 qfm = importlib.import_module("qf_qi21_contract.qf_modelpatcher")
 qi21 = importlib.import_module("qf_qi21_contract.qf_qwenimage21_modelpatcher")
+krea2 = importlib.import_module("qf_qi21_contract.qf_krea2_modelpatcher")
 
 
 class _FakeLib:
@@ -60,6 +61,7 @@ class _FakeLib:
             "width": int(p.width),
             "height": int(p.height),
             "num_steps": int(p.num_steps),
+            "max_context_dims": tuple(int(v) for v in p.max_context_dims),
             "options": json.loads(p.options_json.decode("utf-8")),
         }))
         return qfe.QF_OK
@@ -259,6 +261,226 @@ class QwenImage21RefsContract(unittest.TestCase):
         self.assertTrue(model._run_single_cond_group)
         self.assertEqual(model._run_cond_groups, 0)
         self.assertEqual(sum(k == "end" for k, _ in lib.events), 1)
+
+    def test_t12_qi21_cfg_siblings_nonweakref_noise_outer_sample_reset_and_presession_abort(self):
+        model, lib, _ = _make_model()
+        c_ch = int(model.latent_format.latent_channels)
+        ref = torch.ones((1, c_ch, 4, 4), dtype=torch.float32)
+        ctx_long = torch.ones((1, 512, 16), dtype=torch.bfloat16)
+        ctx_short = torch.ones((1, 64, 16), dtype=torch.bfloat16)
+        ctx_t2i = torch.ones((1, 32, 16), dtype=torch.bfloat16)
+
+        # (1) Same noise (including non-weakref dict/object): Cond 1 + Cond 2 accumulate without wiping Cond 1
+        with mock.patch.object(qfe, "load_lib", return_value=lib):
+            for noise_obj in ({"stub": 1}, object(), torch.zeros((1, c_ch, 4, 4))):
+                model._qf_conds_done = True
+                model.extra_conds(cross_attn=ctx_long, reference_latents=[ref], noise=noise_obj)
+                model.extra_conds(cross_attn=ctx_short, noise=noise_obj)
+                self.assertTrue(model._run_has_refs)
+                self.assertEqual(model._run_cond_groups, 2)
+                self.assertEqual(model._max_ctx_seq, 512)
+
+            # (2) Same OUTER_SAMPLE run_id accumulates; exception inside executor resets _QF_RUN_ID to None
+            exec_ok = types.SimpleNamespace(
+                class_obj=types.SimpleNamespace(
+                    model_patcher=types.SimpleNamespace(model=model), model_options={}),
+            )
+            def _run_outer():
+                model.extra_conds(cross_attn=ctx_long, reference_latents=[ref])
+                model.extra_conds(cross_attn=ctx_short)
+                return "done"
+            class _Exec:
+                class_obj = exec_ok.class_obj
+                def __call__(self, *a, **kw):
+                    return _run_outer()
+            self.assertIsNone(qfm._QF_RUN_ID.get())
+            self.assertEqual(qfm.QFModelPatcher._sampling_geometry(_Exec()), "done")
+            self.assertTrue(model._run_has_refs)
+            self.assertEqual(model._run_cond_groups, 2)
+            self.assertEqual(model._max_ctx_seq, 512)
+            self.assertIsNone(qfm._QF_RUN_ID.get())
+
+            class _BoomExec:
+                class_obj = exec_ok.class_obj
+                def __call__(self, *a, **kw):
+                    raise RuntimeError("sampler boom")
+            with self.assertRaisesRegex(RuntimeError, "sampler boom"):
+                qfm.QFModelPatcher._sampling_geometry(_BoomExec())
+            self.assertIsNone(qfm._QF_RUN_ID.get())
+
+            # (3) Pre-session _apply_model aborts (control / missing sigmas / missing c_crossattn) reset next naked extra_conds
+            x = torch.ones((1, c_ch, 4, 4), dtype=torch.bfloat16)
+            for abort_kw in (
+                {"c_crossattn": ctx_long, "transformer_options": {"sample_sigmas": torch.tensor([1.0, 0.0])}, "control": object()},
+                {"c_crossattn": ctx_long, "transformer_options": {}},
+                {"c_crossattn": None, "transformer_options": {"sample_sigmas": torch.tensor([1.0, 0.0])}},
+            ):
+                model.extra_conds(cross_attn=ctx_long, reference_latents=[ref])
+                self.assertTrue(model._run_has_refs)
+                with self.assertRaises(RuntimeError):
+                    model._apply_model(x, torch.tensor([1.0]), **abort_kw)
+                model.extra_conds(cross_attn=ctx_t2i)
+                self.assertFalse(model._run_has_refs)
+                self.assertEqual(model._run_cond_groups, 1)
+                self.assertEqual(model._max_ctx_seq, 32)
+
+        opts_t2i = {"sample_sigmas": torch.tensor([1.0, 0.0]), "cond_or_uncond": [0], "uuids": ["t2i"]}
+        begin_n = len(lib.events)
+        model._apply_model(x, torch.tensor([1.0]), c_crossattn=ctx_t2i, transformer_options=opts_t2i)
+        begins = [ev for kind, ev in lib.events[begin_n:] if kind == "begin"]
+        self.assertEqual(_ratio_value(begins[0]["options"]), 0.85)
+        self.assertEqual(begins[0]["max_context_dims"][1], 32)
+        model.process_latent_out(x)
+
+    def test_t12b_extra_conds_reset_on_prev_noise_change_and_gc(self):
+        import gc
+        model, _lib, eng = _make_model()
+        ctx_long = torch.ones((1, 512, 16), dtype=torch.bfloat16)
+        ctx_short = torch.ones((1, 32, 16), dtype=torch.bfloat16)
+        ref = torch.ones((1, 16, 1, 2, 2), dtype=torch.bfloat16)
+        n1 = torch.ones((1, 1, 1, 1))
+        n2 = torch.ones((1, 1, 1, 1))
+        n3 = torch.ones((1, 1, 1, 1))
+
+        # Distinct live noise with _qf_conds_done=False and was_open=False triggers prev is not noise reset
+        self.assertFalse(model._qf_conds_done)
+        self.assertIsNone(eng.current_session)
+        with mock.patch.object(qfe, "load_lib", return_value=_lib):
+            model.extra_conds(cross_attn=ctx_long, reference_latents=[ref], noise=n1)
+            self.assertTrue(model._run_has_refs)
+            self.assertEqual(model._max_ctx_seq, 512)
+            self.assertFalse(model._qf_conds_done)
+
+            model.extra_conds(cross_attn=ctx_short, noise=n2)
+            self.assertFalse(model._run_has_refs)
+            self.assertEqual(model._run_cond_groups, 1)
+            self.assertEqual(model._max_ctx_seq, 32)
+
+            # Garbage-collected prior noise (prev is None while prev_ref is not None) also triggers fresh reset
+            model.extra_conds(cross_attn=ctx_long, reference_latents=[ref], noise=n2)
+            self.assertTrue(model._run_has_refs)
+            del n2
+            gc.collect()
+            model.extra_conds(cross_attn=ctx_short, noise=n3)
+            self.assertFalse(model._run_has_refs)
+            self.assertEqual(model._run_cond_groups, 1)
+            self.assertEqual(model._max_ctx_seq, 32)
+
+    def test_t13_krea2_extra_conds_rollback_and_presession_abort(self):
+        lib = _FakeLib()
+        eng = _FakeEngine(lib)
+        k_cfg = comfy.supported_models.Krea2({"image_model": "krea2", "disable_unet_model_creation": True})
+        qfm.ensure_model_config_attrs(k_cfg)
+        km = krea2.QFKrea2Model(k_cfg, eng, device=torch.device("cpu"))
+        km.set_video_enhance(False)
+        c_ch = int(km.latent_format.latent_channels)
+        ctx_512 = torch.ones((1, 512, 16), dtype=torch.bfloat16)
+        ctx_32 = torch.ones((1, 32, 16), dtype=torch.bfloat16)
+
+        km.extra_conds(cross_attn=ctx_512)
+        self.assertEqual(km._max_ctx_seq, 512)
+        with self.assertRaisesRegex(RuntimeError, "reference_latents"):
+            km.extra_conds(cross_attn=ctx_32, reference_latents=object())
+        self.assertEqual(km._max_ctx_seq, 0)
+
+        km.extra_conds(cross_attn=ctx_512)
+        x = torch.ones((1, c_ch, 1, 4, 4), dtype=torch.bfloat16)
+        with self.assertRaisesRegex(RuntimeError, "sigma schedule"):
+            km._apply_model(x, torch.tensor([1.0]), c_crossattn=ctx_32, transformer_options={})
+        km.extra_conds(cross_attn=ctx_32)
+        self.assertEqual(km._max_ctx_seq, 32)
+
+    def test_t15_and_t16_image_session_busy_schedule_finally_and_scratch_realloc(self):
+        model, lib, eng = _make_model()
+        c_ch = int(model.latent_format.latent_channels)
+        x = torch.ones((1, c_ch, 4, 4), dtype=torch.bfloat16)
+        ctx = torch.ones((1, 8, 16), dtype=torch.bfloat16)
+
+        # Strict _stage_schedule refuses missing/short/non-decreasing before begin
+        for sched in (None, [1.0], [0.4, 0.8], [0.5, 0.5]):
+            to = {} if sched is None else {"sample_sigmas": torch.tensor(sched, dtype=torch.float32)}
+            with self.assertRaises(RuntimeError):
+                model._apply_model(x, torch.tensor([1.0]), c_crossattn=ctx, transformer_options=to)
+        self.assertFalse(any(k == "begin" for k, _ in lib.events))
+
+        # Busy retry 1x succeeds; 2x fails loud
+        orig_begin = lib.qf_xfm_session_begin
+        statuses = [qfe.QF_ERR_BUSY, qfe.QF_OK]
+
+        def flaky_begin(xfm, params_ref, session_ref):
+            st = statuses.pop(0)
+            if st != qfe.QF_OK:
+                lib.qf_last_error = lambda: b"busy draining"
+                return st
+            return orig_begin(xfm, params_ref, session_ref)
+
+        lib.qf_xfm_session_begin = flaky_begin
+        opts = {"sample_sigmas": torch.tensor([1.0, 0.0]), "cond_or_uncond": [0], "uuids": ["c"]}
+        with mock.patch.object(qfm.time, "sleep") as slp:
+            model._apply_model(x, torch.tensor([1.0]), c_crossattn=ctx, transformer_options=opts)
+        slp.assert_called_once_with(qfm._BUSY_BEGIN_RETRY_S)
+        self.assertIsNotNone(eng.current_session)
+
+        # Pre-seeded wrong dtype & wrong device scratch buffers must be reallocated cleanly
+        for bad_buf in (
+            torch.zeros(x.shape, dtype=torch.float16, device="cpu"),
+            torch.empty(x.shape, dtype=torch.bfloat16, device="meta"),
+        ):
+            model._out = bad_buf
+            model._apply_model(x, torch.tensor([1.0]), c_crossattn=ctx, transformer_options=opts)
+            self.assertEqual(model._out.dtype, torch.bfloat16)
+            self.assertEqual(model._out.device, x.device)
+            self.assertIsNot(model._out, bad_buf)
+
+        # process_latent_out closes session & clears _out even when qfe.info raises
+        with mock.patch.object(qfe, "info", side_effect=RuntimeError("console boom")):
+            with self.assertRaisesRegex(RuntimeError, "console boom"):
+                model.process_latent_out(x)
+        self.assertIsNone(eng.current_session)
+        self.assertIsNone(model._out)
+
+        # 2x consecutive QF_ERR_BUSY exhausts retry and leaves current_session None
+        model2, lib2, eng2 = _make_model()
+        lib2.qf_xfm_session_begin = lambda *_a: qfe.QF_ERR_BUSY
+        with mock.patch.object(qfm.time, "sleep") as slp2:
+            with self.assertRaisesRegex(RuntimeError, "qf_xfm_session_begin"):
+                model2._apply_model(x, torch.tensor([1.0]), c_crossattn=ctx, transformer_options=opts)
+        slp2.assert_called_once_with(qfm._BUSY_BEGIN_RETRY_S)
+        self.assertIsNone(eng2.current_session)
+
+        # Krea2 scratch wrong dtype/device realloc + detach(False/True)
+        k_cfg = comfy.supported_models.Krea2({"image_model": "krea2", "disable_unet_model_creation": True})
+        qfm.ensure_model_config_attrs(k_cfg)
+        k_lib = _FakeLib()
+        km = krea2.QFKrea2Model(k_cfg, _FakeEngine(k_lib), device=torch.device("cpu"))
+        km.set_video_enhance(False)
+        kx = torch.ones((1, int(km.latent_format.latent_channels), 1, 4, 4), dtype=torch.bfloat16)
+        kctx = torch.ones((1, 8, 16), dtype=torch.bfloat16)
+        km._out = torch.zeros(kx.shape, dtype=torch.float16, device="cpu")
+        km._apply_model(kx, torch.tensor([1.0]), c_crossattn=kctx, transformer_options=opts)
+        self.assertEqual(km._out.dtype, torch.bfloat16)
+        self.assertEqual(km._out.device, kx.device)
+        km._out = torch.empty(kx.shape, dtype=torch.bfloat16, device="meta")
+        km._apply_model(kx, torch.tensor([1.0]), c_crossattn=kctx, transformer_options=opts)
+        self.assertEqual(km._out.device, kx.device)
+        km.process_latent_out(kx)
+        self.assertIsNone(km._out)
+
+    def test_t12c_check_conds_forwards_cuda_device_id(self):
+        model, lib, _ = _make_model()
+        c_ch = int(model.latent_format.latent_channels)
+        ref = torch.ones((1, c_ch, 4, 4), dtype=torch.bfloat16)
+        ctx = torch.ones((1, 8, 16), dtype=torch.bfloat16)
+
+        model.device = torch.device("cuda", 1)
+        with mock.patch.object(qfe, "load_lib", return_value=lib) as ll_cuda:
+            model.extra_conds(cross_attn=ctx, reference_latents=[ref])
+        ll_cuda.assert_called_once_with(device_id=1)
+
+        model.device = torch.device("cpu")
+        with mock.patch.object(qfe, "load_lib", return_value=lib) as ll_cpu:
+            model.extra_conds(cross_attn=ctx, reference_latents=[ref])
+        ll_cpu.assert_called_once_with(device_id=None)
 
 
 if __name__ == "__main__":

@@ -251,5 +251,69 @@ if _h3 is not None:
     check(r == side_p + 12000 * MB and h._qf.vram_need_bytes.asked == [[2, 24, 31, 48, 50]],
           "arm7: QFH3Model.memory_required == comfy-side + engine need, engine asked with the video stream dims (no double-count)")
 
+# ---- T9: ColdNeed.effective_model_bytes across all VRAM tiers & vram_budget_bytes + estimate_vram rec_mode ----
+GiB = 1 << 30
+cn_off = qfmp.qfe.ColdNeed(23 * GiB, None, 3 * GiB, 1 * GiB, 1)
+check(cn_off.effective_model_bytes(None, 0) == 3 * GiB,
+      "T9a ColdNeed(23G,3G,1G,rec=1) total=None,budget=0 -> 3G")
+check(cn_off.effective_model_bytes(8 * GiB, 0) == (8 * GiB * 17) // 20 - 1 * GiB,
+      "T9b ColdNeed(23G,3G,1G,rec=1) total=8G -> 5.8G")
+check(cn_off.effective_model_bytes(12 * GiB, 0) == (12 * GiB * 17) // 20 - 1 * GiB,
+      "T9c ColdNeed(23G,3G,1G,rec=1) total=12G -> 9.2G")
+check(cn_off.effective_model_bytes(24 * GiB, 0) == (24 * GiB * 17) // 20 - 1 * GiB,
+      "T9d ColdNeed(23G,3G,1G,rec=1) total=24G,budget=0 -> 19.4G")
+check(cn_off.effective_model_bytes(24 * GiB, 8 * GiB) == (8 * GiB * 17) // 20 - 1 * GiB,
+      "T9e ColdNeed(23G,3G,1G,rec=1) total=24G,budget=8G -> 5.8G (budget clips 24G!)")
+check(cn_off.effective_model_bytes(48 * GiB, 8 * GiB) == (8 * GiB * 17) // 20 - 1 * GiB,
+      "T9f ColdNeed(23G,3G,1G,rec=1) total=48G,budget=8G -> 5.8G")
+check(cn_off.effective_model_bytes(48 * GiB, 0) == 3 * GiB,
+      "T9g ColdNeed(23G,3G,1G,rec=1) total=48G,budget=0 -> 3G (fits_phys -> min_offload)")
+cn_fit = qfmp.qfe.ColdNeed(23 * GiB, None, 3 * GiB, 1 * GiB, 0)
+check(cn_fit.effective_model_bytes(48 * GiB, 0) == 23 * GiB and cn_fit.effective_model_bytes(None, 0) == 23 * GiB,
+      "T9h ColdNeed(23G,3G,1G,rec=0) total=48G & total=None -> 23G")
+check(qfmp.qfe.ColdNeed(23 * GiB, None, 0, 1 * GiB, 1).effective_model_bytes(8 * GiB, 0) == 23 * GiB
+      and qfmp.qfe.ColdNeed(None, "err").effective_model_bytes(24 * GiB, 8 * GiB) == 0
+      and qfmp.qfe.ColdNeed(23 * GiB, None).effective_model_bytes(48 * GiB) == 23 * GiB
+      and qfmp.qfe.ColdNeed(23 * GiB, None, 3 * GiB, 1 * GiB).effective_model_bytes(48 * GiB) == 23 * GiB,
+      "T9i min_off==0 or ColdNeed(None) boundary & legacy 2-arg/4-arg ColdNeed compat")
+cn_off = qfmp.qfe.ColdNeed(23 * GiB, None, 3 * GiB, 1 * GiB, 1)
+check(cn_off.effective_model_bytes(None, 8 * GiB) == ((8 * GiB * 17) // 20 - 1 * GiB)
+      and cn_off.effective_model_bytes(4 * GiB, 0) == 3 * GiB,
+      "T9j ColdNeed budget-only (phys=None,budget=8G) & min_off clamp on 4G card")
+
+
+def _fake_est(_p, est_ptr):
+    est_ptr._obj.resident_weight_bytes = 23 * GiB
+    est_ptr._obj.min_offload_bytes = 3 * GiB
+    est_ptr._obj.working_set_floor_bytes = 1 * GiB
+    est_ptr._obj.recommended_offload_mode = 1
+    return qfmp.qfe.QF_OK
+
+
+_est_got = qfmp.qfe.estimate_vram(SimpleNamespace(qf_xfm_estimate_vram=_fake_est), qfmp.qfe.QFXfmCreateParams())
+check(_est_got == qfmp.qfe.ColdNeed(23 * GiB, None, 3 * GiB, 1 * GiB, 1),
+      f"T9j estimate_vram forwards recommended_offload_mode as 5th ColdNeed field ({_est_got})")
+
+# ---- T10: Cold packed AV [B,1,N] unpacks before super().memory_required fallback (and degrades safely) ----
+_TorchBase.asked.clear()
+cold_proxy = SimpleNamespace(
+    vram_need_bytes=lambda s: 0, ensure_if_cached=lambda: None,
+    cold_vram_need_bytes=lambda: qfmp.qfe.ColdNeed(None, None),
+)
+m_cold_av = _Model()
+m_cold_av._qf = cold_proxy
+m_cold_av.latent_shapes = [(1, 24, 31, 48, 50), (1, 32, 2, 207)]
+_quiet(m_cold_av.memory_required, PACKED, cond_shapes=COND)
+check(_TorchBase.asked[-1] == [2, 24, 31, 48, 50],
+      f"T10a cold packed [2,1,N] with matching latent_shapes unpacks to [2,24,31,48,50] ({_TorchBase.asked[-1]})")
+m_cold_av.latent_shapes = [(1, 24, 31, 48, 51), (1, 32, 2, 207)]
+_quiet(m_cold_av.memory_required, PACKED, cond_shapes=COND)
+check(_TorchBase.asked[-1] == PACKED,
+      f"T10b cold packed [2,1,N] with stale latent_shapes falls back to [2,1,N] ({_TorchBase.asked[-1]})")
+del m_cold_av.latent_shapes
+_quiet(m_cold_av.memory_required, PACKED, cond_shapes=COND)
+check(_TorchBase.asked[-1] == PACKED,
+      f"T10c cold packed [2,1,N] without latent_shapes falls back to [2,1,N] ({_TorchBase.asked[-1]})")
+
 print("VRAM_LEDGER: %s (%d failing checks)" % ("PASS" if fails == 0 else "FAIL", fails))
 sys.exit(0 if fails == 0 else 1)

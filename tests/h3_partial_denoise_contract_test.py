@@ -10,17 +10,20 @@
   P10 begin width/height follow the model's latent_format spatial scale
   L1/L2 loader has no allow_partial_denoise; keeps audio_enhance as positional compat switch; builds real QFH3Model
 """
+from contextvars import ContextVar
 import ast
 import copy
 import ctypes
 import importlib.util
 import json
+import math
 import os
 from pathlib import Path
 import sys
 from types import SimpleNamespace
 import unittest
 from unittest import mock
+import weakref
 
 import torch
 
@@ -131,17 +134,83 @@ def _load_real_plugin(test_case):
     return plugin
 
 
+def _module_assign(source, name, namespace):
+    for node in ast.parse(source).body:
+        if isinstance(node, ast.Assign) and any(getattr(t, "id", None) == name for t in node.targets):
+            module = ast.Module(body=[copy.deepcopy(node)], type_ignores=[])
+            ast.fix_missing_locations(module)
+            exec(compile(module, str(PLUGIN_ROOT / "qf_modelpatcher.py"), "exec"), namespace)
+            return namespace[name]
+    raise AssertionError(f"assign {name} not found")
+
+
+def _module_class(source, name, namespace, *, bases=()):
+    node = copy.deepcopy(_class_node(source, name))
+    node.decorator_list = []
+    if bases:
+        node.bases = [ast.Name(id=b, ctx=ast.Load()) for b in bases]
+    module = ast.Module(body=[node], type_ignores=[])
+    ast.fix_missing_locations(module)
+    exec(compile(module, str(PLUGIN_ROOT / "qf_modelpatcher.py"), "exec"), namespace)
+    return namespace[name]
+
+
 class _HarnessBase:
     def process_latent_out(self, latent):
         self._base_process_calls += 1
         return latent
 
 
-_mixin_namespace = {"ctypes": ctypes, "qfe": qfe, "qf_sol": qf_sol, "os": os, "_CAT_KEEP_DEFAULT": 0.80}
+class _CondStub:
+    def __init__(self, cond):
+        self.cond = cond
+
+
+class _NestedStub:
+    is_nested = True
+
+    def __init__(self, values):
+        self.values = values
+
+    def unbind(self):
+        return self.values
+
+
+_comfy_stub = SimpleNamespace(
+    conds=SimpleNamespace(CONDRegular=_CondStub, CONDConstant=_CondStub),
+    nested_tensor=SimpleNamespace(NestedTensor=_NestedStub),
+)
+_mixin_namespace = {
+    "ctypes": ctypes, "json": json, "math": math, "os": os, "torch": torch, "weakref": weakref,
+    "ContextVar": ContextVar, "NamedTuple": __import__("typing").NamedTuple,
+    "time": SimpleNamespace(sleep=lambda _seconds: None),
+    "comfy": _comfy_stub, "qfe": qfe, "qf_sol": qf_sol,
+    "_CAT_KEEP_DEFAULT": 0.80,
+    "_QF_RUN_ID": ContextVar("quantfunc_run_id", default=None),
+    "_QF_SAMPLING_GEOMETRY": ContextVar("quantfunc_sampling_geometry", default=None),
+    "_interrupt_poll_end_session_on_raise": lambda _engine: None,
+}
+_module_assign(MIXIN_SOURCE, "_BUSY_BEGIN_RETRY_S", _mixin_namespace)
+_module_function(MIXIN_SOURCE, "_qf_dtype", _mixin_namespace)
+_module_class(MIXIN_SOURCE, "_AVPackedMeta", _mixin_namespace)
+for _cattr in ("_SCRATCH_ATTRS", "_ENGINE_IGNORED_COND_KEYS", "_TAG", "_REFUSED_HINT"):
+    setattr(_HarnessBase, _cattr, ast.literal_eval(
+        next(n.value for n in _class_node(MIXIN_SOURCE, "QFSessionModelMixin").body
+             if isinstance(n, ast.Assign) and any(getattr(t, "id", None) == _cattr for t in n.targets))))
 for _mname in ("set_attn_backend", "set_video_enhance", "_effective_cat_ratio", "dial_opts", "residency_opts",
-               "_sigma_step_index", "_call_denoise_step_av", "_stage_schedule"):
+               "_sigma_step_index", "_call_denoise_step_av", "_stage_schedule",
+               "_reset_run_cond_state", "_begin_extra_conds_guard", "_reject_ignored_conds",
+               "_ensure_scratch", "_release_scratch_buffers", "_open_native_session",
+               "_close_session_on_latent_out"):
     setattr(_HarnessBase, _mname, _standalone_method(
         MIXIN_SOURCE, "QFSessionModelMixin", _mname, _mixin_namespace))
+
+_mixin_namespace["_HarnessBase"] = _HarnessBase
+_HarnessAVBase = _subset_class(
+    MIXIN_SOURCE, "QFAVSessionModel", "_HarnessAVBase", "_HarnessBase",
+    ("_unpack_av_latent", "_execute_av_group_step", "_av_repack_output", "_apply_model", "process_latent_out"),
+    _mixin_namespace,
+)
 
 
 class _ContextKeys:
@@ -263,21 +332,24 @@ class _Log:
 
 
 _h3_namespace = {
-    "_HarnessBase": _HarnessBase,
+    "_HarnessAVBase": _HarnessAVBase,
     "ctypes": ctypes,
     "json": json,
-    "math": __import__("math"),
+    "math": math,
     "time": SimpleNamespace(sleep=lambda _seconds: None),
     "torch": torch,
+    "comfy": _comfy_stub,
     "qfe": qfe,
-    "qfmp": SimpleNamespace(refuse_all_zero_initial_latent=lambda *_args: None),
+    "qfmp": SimpleNamespace(
+        refuse_all_zero_initial_latent=_module_function(MIXIN_SOURCE, "refuse_all_zero_initial_latent", {"RuntimeError": RuntimeError}),
+        _AVPackedMeta=_mixin_namespace["_AVPackedMeta"],
+    ),
     "_interrupt_poll_end_session_on_raise": lambda _engine: None,
-    "_qf_dtype": lambda _dtype: 0,
+    "_qf_dtype": _mixin_namespace["_qf_dtype"],
     "patchify_video": _patchify_video,
     "unpatchify_video": _unpatchify_video,
     "pack_audio": _pack_audio,
     "unpack_audio": _unpack_audio,
-    "_BUSY_BEGIN_RETRY_S": 2.0,
     "_AUDIO_ENHANCE_DEPRECATION_WARNED": False,
     "_log": _Log(),
 }
@@ -295,8 +367,10 @@ _h3_namespace["_H3_PATCH"] = (1, 2, 2)
 _h3_namespace["_h3_frames_from_latent_t"] = _module_function(H3_SOURCE, "_h3_frames_from_latent_t", _h3_namespace)
 
 H3ContractModel = _subset_class(
-    H3_SOURCE, "QFH3Model", "H3ContractModel", "_HarnessBase",
-    ("set_audio_enhance", "_derive_geometry", "_begin", "_apply_model", "process_latent_out"),
+    H3_SOURCE, "QFH3Model", "H3ContractModel", "_HarnessAVBase",
+    ("_TAG", "_NO_COND_HINT", "_ENGINE_IGNORED_COND_KEYS",
+     "set_audio_enhance", "extra_conds", "_derive_geometry", "_begin",
+     "_av_unpack_and_validate", "_av_prepare_session", "_av_step_tensors"),
     _h3_namespace,
 )
 
@@ -326,11 +400,16 @@ def _new_model(audio_enhance=False):
     model._audio_enhance = False
     model._step_i = 0
     model._sess_denoise = 0
+    model._out = None
     model._out_video = None
     model._out_audio = None
     model._max_ctx_seq = 0
     model._base_process_calls = 0
     model._qf_needs_begin = False
+    model._qf_conds_done = False
+    model._qf_conds_run_id = None
+    model._qf_conds_noise_ref = None
+    model._qf_av_geom = None
     _h3_namespace["_log"].warnings.clear()
     _h3_namespace["_log"].infos.clear()
     _h3_namespace["_AUDIO_ENHANCE_DEPRECATION_WARNED"] = False
@@ -514,6 +593,65 @@ class H3TwoStageContract(unittest.TestCase):
             self.assertEqual(step["audio_dims"], (1, audio_shape[1], audio_shape[2], audio_shape[3]))
             self.assertEqual(step["audio_velocity_out_capacity"], want_audio_cap)
 
+    def test_t13_extra_conds_error_rollback_and_presession_abort(self):
+        model, lib = _new_model()
+        ctx_512 = torch.ones((1, 512, 4), dtype=torch.float32)
+        ctx_32 = torch.ones((1, 32, 4), dtype=torch.float32)
+
+        model.extra_conds(cross_attn=ctx_512)
+        self.assertEqual(model._max_ctx_seq, 512)
+        with self.assertRaisesRegex(RuntimeError, "unknown minimax_refs"):
+            model.extra_conds(cross_attn=ctx_32, minimax_refs=[{"kind": "bad"}])
+        self.assertEqual(model._max_ctx_seq, 0)
+
+        model.extra_conds(cross_attn=ctx_512)
+        self.assertEqual(model._max_ctx_seq, 512)
+        packed_ok, _ = _stage_inputs(model, (1, 24, 2, 2, 2))
+        packed_zero = torch.zeros_like(packed_ok)
+        opts = {"sample_sigmas": torch.tensor(FULL, dtype=torch.float32), "cond_or_uncond": [0], "uuids": ["c"]}
+        with self.assertRaisesRegex(RuntimeError, "ALL ZEROS"):
+            model._apply_model(packed_zero, torch.tensor([1.0]), c_crossattn=ctx_32, transformer_options=opts)
+        self.assertEqual(lib.begin_calls, 0)
+        model.extra_conds(cross_attn=ctx_32)
+        self.assertEqual(model._max_ctx_seq, 32)
+
+    def test_t16_h3_scratch_dtype_device_realloc_release_and_av_guards(self):
+        model, _ = _new_model()
+        packed, ctx = _stage_inputs(model, (1, 24, 2, 2, 2))
+        opts = {"sample_sigmas": torch.tensor(FULL, dtype=torch.float32), "cond_or_uncond": [0], "uuids": ["c"]}
+        v_real = (1, 2, 24 * 1 * 2 * 2)
+        a_real = (1, 2 * 3, 32)
+
+        for bad_v, bad_a in (
+            (torch.zeros(v_real, dtype=torch.float16), torch.zeros(a_real, dtype=torch.float16)),
+            (torch.empty(v_real, dtype=torch.float32, device="meta"),
+             torch.empty(a_real, dtype=torch.float32, device="meta")),
+        ):
+            model._out_video = bad_v
+            model._out_audio = bad_a
+            model._apply_model(packed, torch.tensor([1.0]), c_crossattn=ctx, transformer_options=opts)
+            self.assertEqual(model._out_video.dtype, torch.float32)
+            self.assertEqual(model._out_audio.dtype, torch.float32)
+            self.assertEqual(model._out_video.device, packed.device)
+            self.assertEqual(model._out_audio.device, packed.device)
+            self.assertIsNot(model._out_video, bad_v)
+            self.assertIsNot(model._out_audio, bad_a)
+
+        with self.assertRaisesRegex(RuntimeError, "no c_crossattn"):
+            model._apply_model(packed, torch.tensor([1.0]), c_crossattn=None, transformer_options=opts)
+        with self.assertRaisesRegex(RuntimeError, "ControlNet"):
+            model._apply_model(packed, torch.tensor([1.0]), c_crossattn=ctx, control=object(),
+                               transformer_options=opts)
+        with self.assertRaisesRegex(RuntimeError, "av_conds bind session-wide"):
+            model._apply_model(
+                packed, torch.tensor([1.0]), c_crossattn=ctx, transformer_options=opts,
+                minimax_payload={"keyframes": [{"latent": torch.ones(1, 24, 1, 2, 2)}], "refs": []})
+
+        model.process_latent_out(packed)
+        self.assertIsNone(model._out_video)
+        self.assertIsNone(model._out_audio)
+        self.assertIsNone(model._out)
+
 
 class H3LoaderContract(unittest.TestCase):
     def test_l1_loader_has_no_partial_denoise_switch(self):
@@ -558,6 +696,16 @@ class H3ProductionPathContract(unittest.TestCase):
             self.assertIs(type(patcher), plugin.qfmp.QFModelPatcher)
             self.assertIs(type(patcher.model), h3_module.QFH3Model)
             self.assertIs(patcher.model._audio_enhance, True)
+
+            patcher.model._qf_av_geom = ((24, 1, 2, 2), (32, 1, 3))
+            xv = torch.ones((1, 24, 2, 2, 2), dtype=torch.float32)
+            xa = torch.ones((1, 32, 2, 3), dtype=torch.float32)
+            vemb = torch.ones((1, 3, 4), dtype=torch.float32)
+            to = {"sample_sigmas": torch.tensor([1.0, 0.5, 0.0], dtype=torch.float32),
+                  "cond_or_uncond": [0], "uuids": ["c"]}
+            patcher.model._av_prepare_session(xv, xa, vemb, to, {}, opening=False)
+            self.assertEqual(patcher.model._qf_av_geom, ((24, 2, 2, 2), (32, 2, 3)))
+            self.assertGreater(patcher.model._num_frames, 0)
         self.assertEqual(engine_create_attempts, [])
 
 
