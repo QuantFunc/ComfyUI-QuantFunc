@@ -85,7 +85,7 @@ def build_stage(staged, stage, version, plugin_req, fixer_verify):
             body[rel] = sha256(dst)
     # PC Engine O1 Windows split layout:
     #   - Host DLLs (quantfunc.dll / quantfunc-12.dll) MUST have zero CUDA PE imports.
-    #   - Per-SM kernel plugins (sm*/cu<major>/libquantfunc_kernels_cuda_sm<arch>.dll or sm*/...)
+    #   - Per-SM kernel plugins (sm*/libquantfunc_kernels.dll / sm*/libquantfunc_kernels-12.dll)
     #     MUST carry their expected CUDA major in their PE imports.
     spec = importlib.util.spec_from_file_location("qf_engine_stage", os.path.join(PLUGIN, "qf_engine.py"))
     qfe = importlib.util.module_from_spec(spec)
@@ -104,7 +104,7 @@ def build_stage(staged, stage, version, plugin_req, fixer_verify):
                 wrong_hosts.append(f"{rel} ({', '.join(leaked)})")
             found_hosts.add(hosts_by_name[name])
         elif qfe._ENGINE_KERNEL_WIN_RE.fullmatch(name):
-            want = next((int(seg[2:]) for seg in parts[:-1] if seg.startswith("cu") and seg[2:].isdigit()), None)
+            want = 12 if "-12." in name.lower() else 13
             got = qfe._so_cuda_major(fpath)
             print(f"   kernel {rel}: CUDA {got} from its imports (expected {want or sorted(valid_majors)})")
             if (want is not None and got != want) or (want is None and got not in valid_majors):

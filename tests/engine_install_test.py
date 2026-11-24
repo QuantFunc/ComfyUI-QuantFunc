@@ -4,9 +4,9 @@ end to end against a FAKE release server.
 
 PC Engine layout (O1 + O6):
   - Consumer 4 SMs ONLY: sm75, sm86, sm89, sm120a (server SMs 80/90/100/103 are refused).
-  - Linux & Windows: zero-CUDA host libquantfunc(-12).so / quantfunc(-12).dll + single-arch per-SM
-    kernel plugin libquantfunc_kernels_cuda_sm{75,86,89,120}.{so,dll} (Linux pair shares .qf_pair_id).
-  - No libquantfunc_attention.so; no monolithic libquantfunc_kernels.so.
+  - Linux & Windows: zero-CUDA host libquantfunc(-12).so / quantfunc(-12).dll + per-SM class folder
+    sm{75,86,89,120a}/libquantfunc_kernels(-12).{so,dll} (no cu13/ or cu12/ subdir; Linux pair shares .qf_pair_id).
+  - No libquantfunc_attention.so; no libquantfunc_kernels_cuda_sm*.so.
 """
 import contextlib
 import errno as _errno
@@ -35,8 +35,10 @@ WIN_DLLS = {13: "quantfunc.dll", 12: "quantfunc-12.dll"}
 bad = 0
 
 
-def kernel_for(sm, major=13, win=False):
-    return f"libquantfunc_kernels_cuda_sm{sm}.{'dll' if win else 'so'}"
+def kernel_for(sm=89, major=13, win=False):
+    suffix = "-12" if major == 12 else ""
+    ext = "dll" if win else "so"
+    return f"libquantfunc_kernels{suffix}.{ext}"
 
 
 def check(label, ok, detail=""):
@@ -70,12 +72,11 @@ class Release:
             h = f"HOST-{version}-cu{major}".encode()
             self.files[f"{version}/linux/{HOSTS[major]}"] = h
             body[HOSTS[major]] = sha(h)
-            for gset, sms in (sets or CONSUMER_SETS).items():
-                for sm in sms:
-                    kname = kernel_for(sm, major)
-                    k = f"KERNEL-{version}-{gset}-sm{sm}-cu{major}".encode()
-                    self.files[f"{version}/linux/{gset}/cu{major}/{kname}"] = k
-                    body[f"{gset}/cu{major}/{kname}"] = sha(k)
+            for gset in (sets or CONSUMER_SETS):
+                kname = kernel_for(None, major)
+                k = f"KERNEL-{version}-{gset}-cu{major}".encode()
+                self.files[f"{version}/linux/{gset}/{kname}"] = k
+                body[f"{gset}/{kname}"] = sha(k)
         self.manifest = {"schema": 1, "linux": body}
         if sets is not None:
             self.set_sets(json.dumps({"schema": 2, "sets": sets}).encode())
@@ -122,13 +123,12 @@ class WinRelease(Release):
             hdata = f"WINHOST-{version}-cu{major}".encode()
             self.files[f"{version}/windows/{dll}"] = hdata
             body[dll] = sha(b"tampered" if tamper == dll else hdata)
-            for gset, sms in CONSUMER_SETS.items():
-                for sm in sms:
-                    kname = kernel_for(sm, major, win=True)
-                    kdata = f"WINKERNEL-{version}-{gset}-sm{sm}-cu{major}".encode()
-                    self.files[f"{version}/windows/{gset}/cu{major}/{kname}"] = kdata
-                    body[f"{gset}/cu{major}/{kname}"] = sha(
-                        b"tampered" if tamper == f"{gset}/cu{major}/{kname}" else kdata)
+            for gset in CONSUMER_SETS:
+                kname = kernel_for(None, major, win=True)
+                kdata = f"WINKERNEL-{version}-{gset}-cu{major}".encode()
+                self.files[f"{version}/windows/{gset}/{kname}"] = kdata
+                body[f"{gset}/{kname}"] = sha(
+                    b"tampered" if tamper == f"{gset}/{kname}" else kdata)
         self.files[f"{version}/verify.json"] = json.dumps({"schema": 1, "win32": body}).encode()
         self.entries[version] = {"comfy": plugin_req, "comfy-12": plugin_req, "lib": version, "lib-12": version,
                                  "kernel_so": True}
@@ -288,7 +288,7 @@ def main():
                     qfe.os.replace = real_replace
                 pair = f"0.0.14-{gset}-cu{major}"
                 h = rel.files[f"0.0.14/linux/{HOSTS[major]}"]
-                k = rel.files[f"0.0.14/linux/{gset}/cu{major}/{kname}"]
+                k = rel.files[f"0.0.14/linux/{gset}/{kname}"]
                 want = {"version": "0.0.14", "set": gset, "cuda": major, "sms": [sm], "host": HOSTS[major],
                         "kernel": kname, "sha256": {HOSTS[major]: sha(h), kname: sha(k)}}
                 m = env.marker(gset, major)
@@ -433,7 +433,7 @@ def main():
     # 6) All-or-nothing on missing kernel; offline handling; traversal version; HTTPS only
     rel = Release()
     with Env(rel) as env:
-        del rel.files[f"0.0.14/linux/sm89/cu13/{kernel_for(89, 13)}"]
+        del rel.files[f"0.0.14/linux/sm89/{kernel_for(89, 13)}"]
         try:
             qfe.install_engine()
             check("missing kernel installs nothing", False)
@@ -525,7 +525,9 @@ def main():
         tampered = {
             "host": dict(good, host="../../evil.so"),
             "version": dict(good, version="../../x"),
-            "kernel": dict(good, kernel="libquantfunc_kernels.so"),
+            "kernel_legacy": dict(good, kernel="libquantfunc_kernels_cuda_sm89.so"),
+            "kernel_wrong_cu": dict(good, kernel="libquantfunc_kernels-12.so"),
+            "kernel_traversal": dict(good, kernel="../libquantfunc_kernels.so"),
             "sha256": dict(good, sha256={good["host"]: "zz", good["kernel"]: "zz"}),
             "set": dict(good, set="sm86"),
             "cuda": dict(good, cuda=12),
@@ -537,7 +539,15 @@ def main():
                         qfe._read_marker(mpath) is not None)[1]]
         with open(mpath, "w", encoding="utf-8") as f:
             json.dump(good, f)
-        check("tampered marker (including monolithic kernel name & float cuda) ignored",
+        cu12_mpath = env.path(".engine-sm89-cu12.json")
+        with open(cu12_mpath, "w", encoding="utf-8") as f:
+            json.dump(dict(good, cuda=12, host=HOSTS[12], kernel=kernel_for(89, 13),
+                           sha256={HOSTS[12]: good["sha256"][HOSTS[13]],
+                                   kernel_for(89, 13): good["sha256"][good["kernel"]]}), f)
+        if qfe._read_marker(cu12_mpath) is not None:
+            followed.append("cu12_with_cu13_kernel")
+        os.remove(cu12_mpath)
+        check("tampered marker (including legacy/mismatched kernel name & float cuda) ignored",
               not followed and qfe._installed_pair() == (mpath, good), followed)
 
         host = env.path("0.0.14-sm89-cu13", HOSTS[13])
@@ -553,9 +563,12 @@ def main():
 
     # 8) Sidecar preloads: only non-engine DT_NEEDED sidecar preloaded (never per-SM kernel, other host, stray, backup; no libquantfunc_attention.so)
     d = tempfile.mkdtemp(prefix="qf_preload_")
-    k89 = kernel_for(89, 13)
-    needed = {HOSTS[13]: [k89, "libopencv_core.so.4.6", HOSTS[12]]}
-    for f in (HOSTS[13], HOSTS[12], k89, "libopencv_core.so.4.6", "libfoo.so", "libquantfunc-deadbeef.so", "notes.txt"):
+    k89, k89_12 = kernel_for(89, 13), kernel_for(89, 12)
+    needed = {
+        HOSTS[13]: [k89, "libopencv_core.so.4.6", HOSTS[12]],
+        HOSTS[12]: [k89_12, "libopencv_core.so.4.6", HOSTS[13]],
+    }
+    for f in (HOSTS[13], HOSTS[12], k89, k89_12, "libopencv_core.so.4.6", "libfoo.so", "libquantfunc-deadbeef.so", "notes.txt"):
         open(os.path.join(d, f), "wb").close()
     o_needed = qfe._elf_needed
     qfe._elf_needed = lambda p: needed.get(os.path.basename(p), [])
@@ -563,20 +576,23 @@ def main():
              qfe.ctypes.CDLL, qfe._bind, qfe._engine_load_ok, qfe._log_lib_fingerprint)
     calls = []
     try:
-        got = qfe._sidecar_preloads(os.path.join(d, HOSTS[13]))
-        check("sidecar preloads: only non-engine DT_NEEDED sidecar (never kernel plugin, other host, stray)",
-              got == ["libopencv_core.so.4.6"], got)
-        qfe._LIB = None
-        qfe.resolve_so_path = lambda: os.path.join(d, HOSTS[13])
+        got13 = qfe._sidecar_preloads(os.path.join(d, HOSTS[13]))
+        got12 = qfe._sidecar_preloads(os.path.join(d, HOSTS[12]))
+        check("sidecar preloads (cu13 & cu12): only non-engine DT_NEEDED sidecar (never kernel plugin, other host, stray)",
+              got13 == ["libopencv_core.so.4.6"] and got12 == ["libopencv_core.so.4.6"], (got13, got12))
         qfe.assert_toolchain_compatible = lambda p: None
         qfe._engine_cuda_needs = lambda p: set()
         qfe.ctypes.CDLL = lambda p, mode=0: (calls.append(os.path.basename(p)), object())[1]
         qfe._bind = lambda lib: types.SimpleNamespace(qf_set_log_level=lambda level: None)
         qfe._engine_load_ok = lambda p: None
         qfe._log_lib_fingerprint = lambda lib, p, ident: None
-        qfe.load_lib()
-        check("load_lib preloads only non-engine sidecar before host (no libquantfunc_attention.so)",
-              calls == ["libopencv_core.so.4.6", HOSTS[13]], calls)
+        for host_name in (HOSTS[13], HOSTS[12]):
+            calls.clear()
+            qfe._LIB = None
+            qfe.resolve_so_path = lambda hn=host_name: os.path.join(d, hn)
+            qfe.load_lib()
+            check(f"load_lib ({host_name}) preloads only non-engine sidecar before host (no libquantfunc_attention.so)",
+                  calls == ["libopencv_core.so.4.6", host_name], list(calls))
     finally:
         (qfe.resolve_so_path, qfe.assert_toolchain_compatible, qfe._engine_cuda_needs,
          qfe.ctypes.CDLL, qfe._bind, qfe._engine_load_ok, qfe._log_lib_fingerprint) = saved
@@ -635,11 +651,22 @@ def main():
         check("unlocked bin/linux/libquantfunc.so ignored in favor of installed pair",
               qfe.resolve_so_path() == os.path.realpath(env.path("0.0.14-sm89-cu13", HOSTS[13])))
 
+    with Env(Release(), torch_major=12, driver_major=13, sm=89) as env:
+        open(env.path(qfe._ENGINE_LOCAL_BUILD_LOCK), "w", encoding="utf-8").close()
+        open(env.path(HOSTS[13]), "wb").write(b"LOCAL-CU13")
+        fallback_12 = qfe.resolve_so_path()
+        open(env.path(HOSTS[12]), "wb").write(b"LOCAL-CU12")
+        open(env.path(kernel_for(89, 12)), "wb").write(b"LOCAL-KERN-12")
+        prefer_12 = qfe.resolve_so_path()
+        check("local .dev_lib_lock under CUDA 12 prefers libquantfunc-12.so and falls back to libquantfunc.so when absent",
+              fallback_12 == os.path.realpath(env.path(HOSTS[13]))
+              and prefer_12 == os.path.realpath(env.path(HOSTS[12])), (fallback_12, prefer_12))
+
     rel = Release()
     k89 = kernel_for(89, 13)
-    other = b"KERNEL-0.0.13-sm89-sm89-cu13"
-    rel.files[f"0.0.14/linux/sm89/cu13/{k89}"] = other
-    rel.manifest["linux"][f"sm89/cu13/{k89}"] = sha(other)
+    other = b"KERNEL-0.0.13-sm89-cu13"
+    rel.files[f"0.0.14/linux/sm89/{k89}"] = other
+    rel.manifest["linux"][f"sm89/{k89}"] = sha(other)
     rel.publish()
     with Env(rel) as env:
         try:
@@ -802,7 +829,8 @@ def main():
         return rel
 
     rel = with_addons(Release())
-    evil = ["../escape.so", "sub/x.so", ".hidden.so", HOSTS[13], kernel_for(89, 13), ".engine-sm89-cu13.json"]
+    evil = ["../escape.so", "sub/x.so", ".hidden.so", HOSTS[13], HOSTS[12],
+            kernel_for(89, 13), kernel_for(89, 12), ".engine-sm89-cu13.json"]
     for name in evil:
         rel.files.setdefault(f"0.0.14/linux/sm89/{name}", b"EVIL")
         rel.manifest["linux"].setdefault(qfe._manifest_key("sm89", name), sha(b"EVIL"))
@@ -815,7 +843,154 @@ def main():
                    if f in ("escape.so", "x.so", ".hidden.so")]
         check("add-on: path traversal / hidden / marker refused unfetched; host/kernel untouched",
               m["version"] == "0.0.14" and not planted
-              and env.read("0.0.14-sm89-cu13", HOSTS[13]) == rel.files[f"0.0.14/linux/{HOSTS[13]}"], (planted, rel.fetched))
+              and env.read("0.0.14-sm89-cu13", HOSTS[13]) == rel.files[f"0.0.14/linux/{HOSTS[13]}"]
+              and env.read("0.0.14-sm89-cu13", kernel_for(89, 13)) == rel.files[f"0.0.14/linux/sm89/{kernel_for(89, 13)}"],
+              (planted, rel.fetched))
+
+    # 15) ModelScope 0.0.18 canonical layout (cu13 & cu12): download paths, SHA-256, zero-CUDA host, real .qf_pair_id, regex/legacy rejection
+    good_names = ("libquantfunc_kernels.so", "libquantfunc_kernels-12.so")
+    bad_names = ("libquantfunc_kernels_cuda_sm89.so", "../libquantfunc_kernels.so",
+                 "sm89/libquantfunc_kernels.so", "libquantfunc_kernels-13.so",
+                 "libquantfunc_kernels.dll", "libquantfunc.so", "libquantfunc_attention.so")
+    check("_ENGINE_KERNEL_RE accepts canonical 0.0.17/0.0.18 Linux names and rejects unexpected/traversal",
+          all(qfe._ENGINE_KERNEL_RE.fullmatch(n) for n in good_names)
+          and not any(qfe._ENGINE_KERNEL_RE.fullmatch(n) for n in bad_names))
+
+    rel18 = Release("0.0.18")
+    hashes18 = rel18.manifest["linux"]
+    try:
+        qfe._resolve_kernel_for_set("0.0.18", "sm89", 89, 13, {"sm89/LibQuantFunc_Kernels.so": sha(b"CASE")})
+        linux_mixed_case = "accepted!"
+    except RuntimeError as e:
+        linux_mixed_case = str(e)
+    with windows():
+        win_ci_13 = qfe._resolve_kernel_for_set(
+            "0.0.18", "sm89", 89, 13, {"sm89/LibQuantFunc_Kernels.DLL": sha(b"WIN13")})
+        win_ci_12 = qfe._resolve_kernel_for_set(
+            "0.0.18", "sm89", 89, 12, {"sm89/LibQuantFunc_Kernels-12.DLL": sha(b"WIN12")})
+        try:
+            qfe._resolve_kernel_for_set(
+                "0.0.18", "sm89", 89, 13,
+                {"sm89/libquantfunc_kernels.dll": sha(b"A"), "sm89/LibQuantFunc_Kernels.DLL": sha(b"B")})
+            win_dup_ci = "accepted!"
+        except RuntimeError as e:
+            win_dup_ci = str(e)
+    check("_manifest_key & _resolve_kernel_for_set: Linux strict case, Windows case-insensitive & duplicate collision refused",
+          qfe._manifest_key("sm89", "libquantfunc.so") == "libquantfunc.so"
+          and qfe._manifest_key("sm89", "libquantfunc-12.so") == "libquantfunc-12.so"
+          and qfe._manifest_key("sm89", "libquantfunc_kernels.so", 13, hashes18) == "sm89/libquantfunc_kernels.so"
+          and qfe._manifest_key("sm89", "libquantfunc_kernels-12.so", 12, hashes18) == "sm89/libquantfunc_kernels-12.so"
+          and qfe._resolve_kernel_for_set("0.0.18", "sm89", 89, 13, hashes18) == "libquantfunc_kernels.so"
+          and qfe._resolve_kernel_for_set("0.0.18", "sm89", 89, 12, hashes18) == "libquantfunc_kernels-12.so"
+          and "no per-SM CUDA kernel plugin" in linux_mixed_case
+          and win_ci_13 == "LibQuantFunc_Kernels.DLL"
+          and win_ci_12 == "LibQuantFunc_Kernels-12.DLL"
+          and "no per-SM CUDA kernel plugin" in win_dup_ci,
+          (linux_mixed_case, win_ci_13, win_ci_12, win_dup_ci))
+
+    for major, hname, kname in ((13, "libquantfunc.so", "libquantfunc_kernels.so"),
+                                (12, "libquantfunc-12.so", "libquantfunc_kernels-12.so")):
+        pid = sha(f"0.0.18-cu{major}".encode())[:32]
+        other_pid = sha(f"0.0.18-other-cu{major}".encode())[:32]
+        elf_h = mk_elf({".text": b"\x90" * 8, ".qf_pair_id": pid.encode() + b"\0"})
+        elf_k = mk_elf({".text": b"\xc3" * 8, ".qf_pair_id": pid.encode() + b"\0"})
+        elf_k_mismatch = mk_elf({".text": b"\xc3" * 8, ".qf_pair_id": other_pid.encode() + b"\0"})
+        elf_k_nopid = mk_elf({".text": b"\xc3" * 8})
+
+        rel = Release("0.0.18")
+        rel.files[f"0.0.18/linux/{hname}"] = elf_h
+        rel.files[f"0.0.18/linux/sm89/{kname}"] = elf_k
+        rel.manifest["linux"][hname] = sha(elf_h)
+        rel.manifest["linux"][f"sm89/{kname}"] = sha(elf_k)
+        rel.publish()
+        with Env(rel, torch_major=major, driver_major=13, sm=89) as env:
+            qfe._elf_pair_id = env._saved["_elf_pair_id"]
+            m = qfe.install_engine()
+            want_fetched = ["version.json", "0.0.18/verify.json", "0.0.18/linux/sets.json",
+                            f"0.0.18/linux/{hname}", f"0.0.18/linux/sm89/{kname}"]
+            pair = f"0.0.18-sm89-cu{major}"
+            check(f"0.0.18 cu{major}: exact download, SHA-256, zero-CUDA host, real .qf_pair_id",
+                  rel.fetched == want_fetched and m["host"] == hname and m["kernel"] == kname
+                  and env.read(pair, hname) == elf_h and env.read(pair, kname) == elf_k
+                  and qfe._pair_intact(m) and env.marker("sm89", major) == m, rel.fetched)
+
+        for target_label, rel_path in (("host", f"0.0.18/linux/{hname}"), ("kernel", f"0.0.18/linux/sm89/{kname}")):
+            bad_rel = Release("0.0.18")
+            bad_rel.files[f"0.0.18/linux/{hname}"] = elf_h
+            bad_rel.files[f"0.0.18/linux/sm89/{kname}"] = elf_k
+            bad_rel.manifest["linux"][hname] = sha(elf_h)
+            bad_rel.manifest["linux"][f"sm89/{kname}"] = sha(elf_k)
+            bad_rel.publish()
+            bad_rel.files[rel_path] = b"TAMPERED-" + target_label.encode()
+            with Env(bad_rel, torch_major=major, driver_major=13, sm=89) as env:
+                qfe._elf_pair_id = env._saved["_elf_pair_id"]
+                try:
+                    qfe.install_engine()
+                    msg = "installed!"
+                except RuntimeError as e:
+                    msg = str(e)
+                check(f"0.0.18 cu{major}: tampered {target_label} SHA-256 refused",
+                      "SHA-256" in msg and env.marker("sm89", major) is None and not env.leftovers(), msg[:80])
+
+        leak_rel = Release("0.0.18")
+        leak_rel.files[f"0.0.18/linux/{hname}"] = elf_h
+        leak_rel.files[f"0.0.18/linux/sm89/{kname}"] = elf_k
+        leak_rel.manifest["linux"][hname] = sha(elf_h)
+        leak_rel.manifest["linux"][f"sm89/{kname}"] = sha(elf_k)
+        leak_rel.publish()
+        with Env(leak_rel, torch_major=major, driver_major=13, sm=89) as env:
+            qfe._elf_pair_id = env._saved["_elf_pair_id"]
+            qfe._elf_needed = lambda p, hn=hname, m=major: [f"libcudart.so.{m}"] if f".{hn}." in os.path.basename(p) else []
+            try:
+                qfe.install_engine()
+                msg = "installed!"
+            except RuntimeError as e:
+                msg = str(e)
+            check(f"0.0.18 cu{major}: zero-CUDA host guard refuses {hname} linking libcudart.so.{major}",
+                  "zero CUDA DT_NEEDED" in msg and env.marker("sm89", major) is None and not env.leftovers(), msg[:80])
+
+        for pid_label, bad_k in (("mismatched", elf_k_mismatch), ("missing", elf_k_nopid)):
+            pid_rel = Release("0.0.18")
+            pid_rel.files[f"0.0.18/linux/{hname}"] = elf_h
+            pid_rel.files[f"0.0.18/linux/sm89/{kname}"] = bad_k
+            pid_rel.manifest["linux"][hname] = sha(elf_h)
+            pid_rel.manifest["linux"][f"sm89/{kname}"] = sha(bad_k)
+            pid_rel.publish()
+            with Env(pid_rel, torch_major=major, driver_major=13, sm=89) as env:
+                qfe._elf_pair_id = env._saved["_elf_pair_id"]
+                try:
+                    qfe.install_engine()
+                    msg = "installed!"
+                except RuntimeError as e:
+                    msg = str(e)
+                check(f"0.0.18 cu{major}: real ELF {pid_label} .qf_pair_id refused",
+                      "not one build" in msg and env.marker("sm89", major) is None and not env.leftovers(), msg[:80])
+
+    # Legacy cu13/ subdir or cross-CUDA fallback must be refused
+    legacy_rel = Release("0.0.18")
+    del legacy_rel.manifest["linux"]["sm89/libquantfunc_kernels.so"]
+    legacy_rel.manifest["linux"]["sm89/cu13/libquantfunc_kernels.so"] = sha(b"LEGACY")
+    legacy_rel.publish()
+    with Env(legacy_rel, torch_major=13, sm=89) as env:
+        try:
+            qfe.install_engine()
+            msg = "installed!"
+        except RuntimeError as e:
+            msg = str(e)
+        check("legacy sm89/cu13/ manifest key without sm89/libquantfunc_kernels.so refused",
+              "no per-SM CUDA kernel plugin" in msg and env.marker("sm89", 13) is None and not env.pairs(), msg[:80])
+
+    cu12_missing_rel = Release("0.0.18")
+    del cu12_missing_rel.manifest["linux"]["sm89/libquantfunc_kernels-12.so"]
+    cu12_missing_rel.publish()
+    with Env(cu12_missing_rel, torch_major=12, sm=89) as env:
+        try:
+            qfe.install_engine()
+            msg = "installed!"
+        except RuntimeError as e:
+            msg = str(e)
+        check("cu12 without sm89/libquantfunc_kernels-12.so refused (never falls back to cu13)",
+              "no per-SM CUDA kernel plugin" in msg and env.marker("sm89", 12) is None and not env.pairs(), msg[:80])
 
     print("ENGINE_INSTALL:", "PASS" if bad == 0 else f"FAIL ({bad} wrong)")
     return 1 if bad else 0

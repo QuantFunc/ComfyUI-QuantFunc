@@ -196,27 +196,33 @@ def arm_no_torch_and_unshipped(tmp):
 def arm_closure(tmp):
     """PC Engine O1: zero-CUDA host + selected per-SM kernel plugin (no libquantfunc_attention.so)."""
     d = os.path.join(tmp, "engine")
-    host = _touch(d, "libquantfunc-12.so")
-    _touch(d, "libquantfunc_kernels_cuda_sm89.so")
+    host12 = _touch(d, "libquantfunc-12.so")
+    host13 = _touch(d, "libquantfunc.so")
+    _touch(d, "libquantfunc_kernels-12.so")
+    _touch(d, "libquantfunc_kernels.so")
+    _ENGINE_CU13 = {"libcudart.so.13", "libcublas.so.13", "libcublasLt.so.13", "libcusolver.so.12", "libcudnn.so.9"}
     needed = {
         "libquantfunc-12.so": ["libstdc++.so.6", "libpthread.so.0", "libc.so.6"],
-        "libquantfunc_kernels_cuda_sm89.so": [
-            "libcudart.so.12", "libcublas.so.12", "libcublasLt.so.12",
-            "libcusolver.so.11", "libcudnn.so.9", "libcuda.so.1",
-        ],
+        "libquantfunc.so": ["libstdc++.so.6", "libpthread.so.0", "libc.so.6"],
+        "libquantfunc_kernels-12.so": sorted(_ENGINE_CU12) + ["libcuda.so.1"],
+        "libquantfunc_kernels.so": sorted(_ENGINE_CU13) + ["libcuda.so.1"],
     }
     orig_needed, orig_sm, orig_maj = qfe._elf_needed, qfe._gpu_sm, qfe._torch_cuda_major
     qfe._elf_needed = lambda p: needed.get(os.path.basename(p), [])
     qfe._gpu_sm = lambda _idx: 89
-    qfe._torch_cuda_major = lambda: 12
     try:
-        got = qfe._engine_cuda_needs(host)
-        leaked = qfe._host_forbidden_cuda(host)
+        qfe._torch_cuda_major = lambda: 12
+        got12 = qfe._engine_cuda_needs(host12)
+        leaked12 = qfe._host_forbidden_cuda(host12)
+        qfe._torch_cuda_major = lambda: 13
+        got13 = qfe._engine_cuda_needs(host13)
+        leaked13 = qfe._host_forbidden_cuda(host13)
     finally:
         qfe._elf_needed, qfe._gpu_sm, qfe._torch_cuda_major = orig_needed, orig_sm, orig_maj
-    bad = _check("(E) host libquantfunc has zero CUDA DT_NEEDED imports", leaked == [], f"leaked={leaked}")
-    bad += _check("(E) closure = selected per-SM kernel plugin CUDA sonames, never the driver",
-                  got == _ENGINE_CU12, f"got={sorted(got)}")
+    bad = _check("(E) host libquantfunc(-12).so has zero CUDA DT_NEEDED imports",
+                 leaked12 == [] and leaked13 == [], f"leaked12={leaked12} leaked13={leaked13}")
+    bad += _check("(E) closure = selected kernel plugin CUDA sonames (cu12 & cu13), never the driver",
+                  got12 == _ENGINE_CU12 and got13 == _ENGINE_CU13, f"got12={sorted(got12)} got13={sorted(got13)}")
     return bad
 
 

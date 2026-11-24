@@ -93,7 +93,7 @@ background, it:
    only) and picks the newest engine compatible with this plugin;
 2. picks the engine for your setup, for torch's CUDA version (12 or 13) and your GPU's architecture (the GPU ComfyUI runs
    on), from the release's `sets.json`. An engine holds exactly one consumer architecture (`sm_75`/`sm_86`/`sm_89`/`sm_120`); an architecture the release does not
-   publish is refused with its SM number, never given another's. On both Linux and Windows that is a zero-CUDA host library (`libquantfunc.so` / `quantfunc.dll`) plus the single-architecture CUDA kernel plugin (`libquantfunc_kernels_cuda_sm<arch>.{so,dll}`);
+   publish is refused with its SM number, never given another's. On both Linux and Windows that is a zero-CUDA host library (`libquantfunc.so` / `quantfunc.dll`, or `-12` for CUDA 12) plus the single-architecture CUDA kernel plugin (`libquantfunc_kernels.{so,dll}`, or `-12` for CUDA 12);
 3. downloads it, checks each file's SHA-256 against the release's `verify.json` (on Linux also that host and kernel come
    from one build), and installs it into `bin/<linux|windows>/<version>-<architecture>-cu<major>/` — all or nothing.
    A new version goes into a new folder. A version republished under the same number is downloaded again into

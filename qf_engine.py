@@ -2,7 +2,7 @@
 
 Structs and function signatures mirror include/qf_capi.h verbatim.
 Host libquantfunc.so has zero CUDA DT_NEEDED imports; CUDA lives in the per-SM
-consumer kernel plugin libquantfunc_kernels_cuda_sm{120,89,86,75}.so.
+consumer kernel plugin libquantfunc_kernels.so (or libquantfunc_kernels-12.so for CUDA 12).
 """
 import builtins
 import contextlib
@@ -473,8 +473,8 @@ _ENGINE_PLATFORMS = {
     "windows": {"key": "win32", "arches": ("AMD64",), "kernel": True,
                 "hosts": {13: "quantfunc.dll", 12: "quantfunc-12.dll"}},
 }
-_ENGINE_KERNEL_RE = re.compile(r"libquantfunc_kernels_cuda_sm(?:75|86|89|120)\.so")
-_ENGINE_KERNEL_WIN_RE = re.compile(r"libquantfunc_kernels_cuda_sm(?:75|86|89|120)\.dll", re.IGNORECASE)
+_ENGINE_KERNEL_RE = re.compile(r"libquantfunc_kernels(?:-12)?\.so")
+_ENGINE_KERNEL_WIN_RE = re.compile(r"libquantfunc_kernels(?:-12)?\.dll", re.IGNORECASE)
 _ENGINE_ADDON_RE = re.compile(r"[A-Za-z0-9][-A-Za-z0-9_.]{0,63}\.(?:so|dll|dylib)")
 _ENGINE_VERSION_RE = re.compile(r"\d+\.\d+\.\d+")
 _ENGINE_SET_RE = re.compile(r"[a-z][a-z0-9_]{0,31}")
@@ -661,10 +661,11 @@ def _kernel_regex(is_pe=None):
     return _ENGINE_KERNEL_WIN_RE if use_win else _ENGINE_KERNEL_RE
 
 
-def _kernel_filename(sm, is_pe=None):
+def _kernel_filename(major=13, is_pe=None):
     use_win = (_BIN_SUBDIR == "windows") if is_pe is None else bool(is_pe)
+    suffix = "-12" if major == 12 else ""
     ext = "dll" if use_win else "so"
-    return f"libquantfunc_kernels_cuda_sm{sm}.{ext}"
+    return f"libquantfunc_kernels{suffix}.{ext}"
 
 
 def _read_marker(path):
@@ -678,7 +679,9 @@ def _read_marker(path):
               and m["cuda"] == int(name.group(2))
               and _ENGINE_VERSION_RE.fullmatch(m["version"]) is not None
               and m["host"] == plat["hosts"].get(m["cuda"])
-              and (_kernel_regex().fullmatch(m["kernel"]) is not None if plat["kernel"] else m["kernel"] is None)
+              and (_kernel_regex().fullmatch(m["kernel"]) is not None
+                   and m["kernel"].lower() == _kernel_filename(m["cuda"]).lower()
+                   if plat["kernel"] else m["kernel"] is None)
               and all(type(s) is int and s in _CONSUMER_SMS for s in m["sms"])
               and sorted(m["sha256"]) == sorted(files)
               and all(_ENGINE_SHA256_RE.fullmatch(h) for h in m["sha256"].values()))
@@ -742,25 +745,20 @@ def _manifest_key(gpu_set, name, major=None, hashes=None):
     plat = _engine_platform()
     if plat["kernel"] and name in plat["hosts"].values():
         return name
-    if major is not None and _kernel_regex().fullmatch(name):
-        scoped = f"{gpu_set}/cu{major}/{name}"
-        if hashes is None or scoped in hashes:
-            return scoped
     return f"{gpu_set}/{name}"
 
 
 def _resolve_kernel_for_set(version, gpu_set, sm, major, hashes):
     """Select the exact consumer per-SM kernel plugin from verify.json without reading host imports."""
-    cand = _kernel_filename(sm)
-    if _manifest_key(gpu_set, cand, major, hashes) in hashes:
-        return cand
-    pat = _kernel_regex()
-    for prefix in (f"{gpu_set}/cu{major}/", f"{gpu_set}/"):
+    cand = _kernel_filename(major)
+    if _BIN_SUBDIR == "windows":
+        prefix = f"{gpu_set}/"
         found = [k[len(prefix):] for k in hashes
-                 if k.startswith(prefix) and pat.fullmatch(k[len(prefix):])
-                 and f"_sm{sm}." in k[len(prefix):].lower()]
+                 if k.startswith(prefix) and k[len(prefix):].lower() == cand.lower()]
         if len(found) == 1:
             return found[0]
+    elif _manifest_key(gpu_set, cand) in hashes:
+        return cand
     raise RuntimeError(
         f"the {version} manifest has no per-SM CUDA kernel plugin for {gpu_set} (SM {sm}, CUDA {major})")
 
@@ -920,9 +918,9 @@ def _install_pair(bin_dir, device_idx):
             return have
         os.remove(marker)
         known_bad, have = version, None
+    kernel = _resolve_kernel_for_set(version, gpu_set, sm, major, hashes) if plat["kernel"] else None
     pair = os.path.join(bin_dir, f"{version}-{gpu_set}-cu{major}")
     os.makedirs(pair, exist_ok=True)
-    kernel = _resolve_kernel_for_set(version, gpu_set, sm, major, hashes) if plat["kernel"] else None
     got, parts = {}, []
     try:
         for name in ((host, kernel) if kernel else (host,)):
@@ -1041,15 +1039,26 @@ def resolve_so_path():
         if not os.path.isfile(override):
             raise RuntimeError(f"qf_native: {_ENV_SO_OVERRIDE} names {override!r}, which is not a file")
         return os.path.realpath(override)
+    plat = _engine_platform()
     local = os.path.exists(os.path.join(bin_dir, _ENGINE_LOCAL_BUILD_LOCK))
-    if local or _engine_platform() is None:
-        for c in (os.path.join(bin_dir, _LIB_BASENAME), os.path.join(pkg, _LIB_BASENAME)):
-            if os.path.isfile(c):
-                return os.path.realpath(c)
+    if local or plat is None:
+        names = []
+        if plat is not None:
+            preferred = plat["hosts"].get(_torch_cuda_major())
+            if preferred:
+                names.append(preferred)
+        if _LIB_BASENAME not in names:
+            names.append(_LIB_BASENAME)
+        for name in names:
+            for d in (bin_dir, pkg):
+                c = os.path.join(d, name)
+                if os.path.isfile(c):
+                    return os.path.realpath(c)
+        missing = " or ".join(f"bin/{_BIN_SUBDIR}/{n}" for n in names)
         raise RuntimeError(
             "qf_native: no engine library found: "
             + (f"bin/{_BIN_SUBDIR}/{_ENGINE_LOCAL_BUILD_LOCK} marks a local build, but "
-               f"bin/{_BIN_SUBDIR}/{_LIB_BASENAME} is not there" if local else
+               f"{missing} is not there" if local else
                f"put {_LIB_BASENAME} in the package bin/{_BIN_SUBDIR}/, or set {_ENV_SO_OVERRIDE}=<abs path>"))
     mpath, m = _installed_pair()
     if m:
@@ -1212,39 +1221,42 @@ def _host_forbidden_cuda_pe(dll_path):
     return [n for n in _pe_imports(dll_path) if _HOST_FORBIDDEN_CUDA_PE_RE.fullmatch(n)]
 
 
+def _host_cuda_major(so_path, is_pe=None):
+    use_win = _is_pe(so_path) if is_pe is None else bool(is_pe)
+    stem = os.path.splitext(os.path.basename(so_path))[0]
+    return 12 if (stem.lower() if use_win else stem).endswith("-12") else 13
+
+
+def _find_kernel_in_dir(d, want, pat, is_pe):
+    try:
+        entries = sorted(n for n in os.listdir(d) if pat.fullmatch(n)
+                         and os.path.isfile(os.path.join(d, n)))
+    except OSError:
+        return None
+    for n in entries:
+        if (n.lower() == want.lower()) if is_pe else (n == want):
+            return os.path.join(d, n)
+    return None
+
+
 def _select_kernel_plugin(so_path):
-    """Locate the selected per-SM CUDA kernel plugin beside host library (Linux ELF or Windows PE)."""
+    """Locate the paired CUDA kernel plugin (QF_KERNEL_PLUGIN_DIR -> marker -> beside host)."""
     is_pe = _is_pe(so_path)
+    want = _kernel_filename(_host_cuda_major(so_path, is_pe), is_pe)
     pat = _kernel_regex(is_pe)
-    so_dir = os.path.dirname(os.path.abspath(so_path))
+    so_dir = os.path.dirname(os.path.realpath(so_path))
+    env_dir = os.environ.get(_ENV_KERNEL_PLUGIN_DIR, "").strip()
+    if env_dir:
+        found = _find_kernel_in_dir(env_dir, want, pat, is_pe)
+        if found is not None:
+            return found
     _, marker = _marker_of(so_path)
-    if marker and marker.get("kernel"):
+    if marker and marker.get("kernel") and (
+            marker["kernel"].lower() == want.lower() if is_pe else marker["kernel"] == want):
         p = os.path.join(so_dir, marker["kernel"])
         if os.path.isfile(p):
             return p
-    search_dirs = []
-    env_dir = os.environ.get(_ENV_KERNEL_PLUGIN_DIR, "").strip()
-    if env_dir:
-        search_dirs.append(env_dir)
-    search_dirs.append(so_dir)
-    sm = _gpu_sm(_ENGINE_DEVICE)
-    for d in search_dirs:
-        try:
-            entries = sorted(n for n in os.listdir(d) if pat.fullmatch(n)
-                             and os.path.isfile(os.path.join(d, n)))
-        except OSError:
-            continue
-        if not entries:
-            continue
-        if sm is not None:
-            want = _kernel_filename(sm, is_pe)
-            for n in entries:
-                if (n.lower() == want.lower()) if is_pe else (n == want):
-                    return os.path.join(d, n)
-            continue
-        if len(entries) == 1:
-            return os.path.join(d, entries[0])
-    return None
+    return _find_kernel_in_dir(so_dir, want, pat, is_pe)
 
 
 def _so_cuda_major(bin_path):
@@ -1266,7 +1278,7 @@ def assert_toolchain_compatible(so_path):
 
     On both Linux (ELF) and Windows (PE):
       1. Host library (libquantfunc.so / quantfunc.dll) MUST have zero CUDA runtime/cuBLAS imports.
-      2. The selected per-SM kernel plugin (libquantfunc_kernels_cuda_sm{120,89,86,75}.{so,dll}) MUST
+      2. The selected per-SM kernel plugin (libquantfunc_kernels(?:-12)?.{so,dll}) MUST
          exist beside the host and link the same CUDA major as torch.
     """
     if os.environ.get(_ENV_ALLOW_UNVERIFIED_TOOLCHAIN, "").strip().lower() in ("1", "true", "yes"):
@@ -1289,10 +1301,10 @@ def assert_toolchain_compatible(so_path):
             f"exclusively in the per-SM kernel plugin.")
     target_bin = _select_kernel_plugin(so_path)
     if target_bin is None:
-        ext = "so" if is_elf else "dll"
+        want_name = _kernel_filename(_host_cuda_major(so_path, is_pe), is_pe)
         raise RuntimeError(
             f"qf_native: REFUSING to load - missing consumer CUDA kernel plugin "
-            f"(libquantfunc_kernels_cuda_sm{{120,89,86,75}}.{ext}) beside {so_path}. Place the plugin for your "
+            f"({want_name}) beside {so_path}. Place the plugin for your "
             f"GPU architecture (SM 7.5/8.6/8.9/12.0) and torch CUDA {torch_major or 'none / CPU-only'} in "
             f"that folder, restart ComfyUI to auto-install, or set {_ENV_ALLOW_UNVERIFIED_TOOLCHAIN}=1.")
     so_major = _so_cuda_major(target_bin)
