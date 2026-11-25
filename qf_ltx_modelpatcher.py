@@ -5,9 +5,9 @@ Binds frozen 25-symbol qf_* C-API:
   - step: QFStepAvParams with audio_reference_active (0 or 1) via qf_xfm_step_av
   - OUTER_SAMPLE: _qf_restore_frozen_audio preserves zero-mask frozen audio frames
 """
-import json
 import math
 import os
+import re
 import struct
 
 import torch
@@ -29,18 +29,146 @@ _REF_AUDIO_MAX_NUMEL = (1 << 31) - 1
 _ST_HEADER_MAX_BYTES = 1 << 31
 _CONN_VID_PREFIX = "model.diffusion_model.video_embeddings_connector."
 _CONN_AUD_PREFIX = "model.diffusion_model.audio_embeddings_connector."
+_JSON_STRUCT_RE = re.compile(rb'["{}\[\]]')
+
+
+def _iter_safetensors_top_keys(raw):
+    """Yield depth-1 JSON object keys (excluding __metadata__) from raw safetensors header bytes."""
+    n = len(raw)
+    ws = b" \t\r\n"
+    q = ord('"')
+    bs = ord("\\")
+    lbrace = ord("{")
+    rbrace = ord("}")
+    lbrack = ord("[")
+    rbrack = ord("]")
+    colon = ord(":")
+    comma = ord(",")
+
+    def _skip_ws(pos):
+        while pos < n and raw[pos] in ws:
+            pos += 1
+        return pos
+
+    def _read_string(pos):
+        pos += 1
+        start = pos
+        has_esc = False
+        while pos < n:
+            qi = raw.find(b'"', pos)
+            if qi == -1:
+                return None, n
+            bi = raw.find(b"\\", pos, qi)
+            if bi == -1:
+                raw_s = raw[start:qi]
+                if not has_esc:
+                    return raw_s, qi + 1
+                out = bytearray()
+                j = 0
+                m = len(raw_s)
+                while j < m:
+                    c = raw_s[j]
+                    if c == bs and j + 1 < m:
+                        nxt = raw_s[j + 1]
+                        if nxt in (q, bs, ord("/")):
+                            out.append(nxt)
+                        else:
+                            out.append(c)
+                            out.append(nxt)
+                        j += 2
+                    else:
+                        out.append(c)
+                        j += 1
+                return bytes(out), qi + 1
+            has_esc = True
+            pos = bi + 2
+            if pos > n:
+                return None, n
+        return None, n
+
+    def _skip_value(pos):
+        pos = _skip_ws(pos)
+        if pos >= n:
+            return n
+        b = raw[pos]
+        if b == q:
+            _, end = _read_string(pos)
+            return end
+        if b in (lbrace, lbrack):
+            depth = 0
+            while pos < n:
+                m = _JSON_STRUCT_RE.search(raw, pos)
+                if m is None:
+                    return n
+                c = raw[m.start()]
+                if c == q:
+                    val, pos = _read_string(m.start())
+                    if val is None:
+                        return n
+                    continue
+                pos = m.end()
+                if c in (lbrace, lbrack):
+                    depth += 1
+                else:
+                    depth -= 1
+                    if depth == 0:
+                        return pos
+            return n
+        while pos < n and raw[pos] not in (comma, rbrace, rbrack) and raw[pos] not in ws:
+            pos += 1
+        return pos
+
+    i = _skip_ws(0)
+    if i >= n or raw[i] != lbrace:
+        return
+    i += 1
+    while i < n:
+        i = _skip_ws(i)
+        if i >= n or raw[i] == rbrace:
+            return
+        if raw[i] != q:
+            return
+        key_b, i = _read_string(i)
+        if key_b is None:
+            return
+        i = _skip_ws(i)
+        if i >= n or raw[i] != colon:
+            return
+        i += 1
+        if key_b != b"__metadata__":
+            yield key_b
+        i = _skip_value(i)
+        i = _skip_ws(i)
+        if i < n and raw[i] == comma:
+            i += 1
+            continue
+        return
 
 
 def _file_has_prefix(path, prefix):
     try:
+        hdr_len_size = struct.calcsize("<Q")
         with open(path, "rb") as fh:
-            n = struct.unpack("<Q", fh.read(8))[0]
-            if n > _ST_HEADER_MAX_BYTES:
+            len_buf = fh.read(hdr_len_size)
+            if len(len_buf) != hdr_len_size:
                 return False
-            hdr = json.loads(fh.read(n))
-        return any(k.startswith(prefix) for k in hdr)
+            n = struct.unpack("<Q", len_buf)[0]
+            if n == 0 or n > _ST_HEADER_MAX_BYTES:
+                return False
+            raw = fh.read(n)
+            if len(raw) != n:
+                return False
     except Exception:  # noqa: BLE001
         return False
+    prefix_b = prefix.encode("utf-8") if isinstance(prefix, str) else bytes(prefix)
+    if not prefix_b:
+        return False
+    wrap_b = b"model.diffusion_model."
+    targets = (prefix_b,) if prefix_b.startswith(wrap_b) else (prefix_b, wrap_b + prefix_b)
+    for key_b in _iter_safetensors_top_keys(raw):
+        if any(key_b.startswith(t) for t in targets):
+            return True
+    return False
 
 
 def matches(pipeline_class, transformer_class=""):

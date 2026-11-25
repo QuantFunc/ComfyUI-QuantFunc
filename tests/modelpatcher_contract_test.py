@@ -641,7 +641,7 @@ class ModelPatcherContract(unittest.TestCase):
         self.assertTrue(img._qf_needs_begin)
         self.assertEqual(self.lib.calls, [("qf_xfm_session_end", 0x4444)])
 
-    def test_non_default_cuda_stream_sync_device_bound_across_begin_and_step(self):
+    def test_producer_stream_passthrough_without_host_sync_across_begin_and_step(self):
         events = []
 
         class _FakeStream:
@@ -653,16 +653,16 @@ class ModelPatcherContract(unittest.TestCase):
 
         class _StreamLib:
             def qf_xfm_session_begin(self, xfm, bpx_p, sess_p):
-                events.append(("qf_xfm_session_begin",))
+                events.append(("qf_xfm_session_begin", int(bpx_p._obj.producer_stream)))
                 sess_p._obj.value = 0x5555
                 return qfe.QF_OK
 
             def qf_xfm_step(self, sess, p_p):
-                events.append(("qf_xfm_step",))
+                events.append(("qf_xfm_step", int(p_p._obj.producer_stream)))
                 return qfe.QF_OK
 
             def qf_xfm_step_av(self, sess, mp_p):
-                events.append(("qf_xfm_step_av",))
+                events.append(("qf_xfm_step_av", int(mp_p._obj.base.producer_stream)))
                 return qfe.QF_OK
 
         class _FakeEngine:
@@ -671,69 +671,138 @@ class ModelPatcherContract(unittest.TestCase):
                 self.xfm = ctypes.c_void_p(XFM_PTR)
                 self.current_session = ctypes.c_void_p(0x5555)
                 self.device_id = device_id
+                self.step_count = 0
+                self.sampler_step_count = 0
 
             def end_session_if_open(self):
                 return (False, True)
 
-        class _DummyMixin(qfm.QFSessionModelMixin):
+        class _DummyImg(qfm.QFImageSessionModel):
+            _TAG = "IMGTEST"
+            _NO_COND_HINT = "missing"
+            _REFUSED_HINT = "refused"
+
+            def __init__(self, device, device_id):
+                self.device = device
+                self._qf = _FakeEngine(device_id)
+                self._qf_needs_begin = False
+                self._ctx_key_assigner = qfm._CtxKeyAssigner()
+                self._num_steps = 4
+                self._step_i = 0
+                self._sess_denoise = 0
+                self._out = None
+                self.model_sampling = types.SimpleNamespace(calculate_denoised=lambda s, o, x: o)
+
+        class _DummyAV(qfm.QFAVSessionModel):
+            _TAG = "AVTEST"
+
             def __init__(self, device, device_id):
                 self.device = device
                 self._qf = _FakeEngine(device_id)
                 self._ctx_key_assigner = qfm._CtxKeyAssigner()
                 self._num_steps = 4
+                self._step_i = 0
+                self._sess_denoise = 0
 
         orig_avail = torch.cuda.is_available
         orig_cur = torch.cuda.current_stream
+        x_img = torch.zeros(1, 4, 2, 2, dtype=torch.bfloat16)
+        ctx_img = torch.zeros(1, 2, 4, dtype=torch.bfloat16)
+        vid_in = torch.zeros(1, 2, 4, dtype=torch.bfloat16)
+        vid_out = torch.zeros(1, 2, 4, dtype=torch.bfloat16)
+        aud_in = torch.zeros(1, 2, 4, dtype=torch.float32)
+        aud_out = torch.zeros(1, 2, 4, dtype=torch.float32)
         try:
-            # (a) Non-default stream on self.device=cuda:1 -> queries cuda:1 and syncs BEFORE begin/step/step_av
+            # (a) Non-default stream on self.device=cuda:1 -> passes 0xABCD to begin/step/step_av with 0 syncs
             queried_devs = []
             torch.cuda.is_available = lambda: True
             torch.cuda.current_stream = lambda dev=None: (queried_devs.append(dev), _FakeStream(0xABCD))[1]
 
-            m1 = _DummyMixin(torch.device("cuda:1"), device_id=0)
+            m1 = _DummyImg(torch.device("cuda:1"), device_id=0)
+            av1 = _DummyAV(torch.device("cuda:1"), device_id=0)
             m1._open_native_session("T", (1, 4, 8), 0, 512, 512, {}, skip_end_if_open=True)
-            m1._call_denoise_step(qfe.QFStepParams(), "T")
-            m1._call_denoise_step_av(qfe.QFStepAvParams(), "T")
+            m1._apply_model(x_img, torch.tensor([1.0]), c_crossattn=ctx_img)
+            av1._execute_av_group_step(
+                vid_in=vid_in, vid_dims=(1, 2, 4), vid_out=vid_out,
+                aud_in=aud_in, aud_dims=(1, 2, 4), aud_out=aud_out,
+                vi=ctx_img, sig_i=1.0, step_index=0, ctx_key=1,
+                audio_scale=1.0, ref_active=False, group_i=0,
+            )
             self.assertEqual(queried_devs, [torch.device("cuda:1")] * 3)
             self.assertEqual(
                 events,
                 [
-                    ("sync", 0xABCD), ("qf_xfm_session_begin",),
-                    ("sync", 0xABCD), ("qf_xfm_step",),
-                    ("sync", 0xABCD), ("qf_xfm_step_av",),
+                    ("qf_xfm_session_begin", 0xABCD),
+                    ("qf_xfm_step", 0xABCD),
+                    ("qf_xfm_step_av", 0xABCD),
                 ],
             )
+            self.assertEqual(sum(1 for e in events if e[0] == "sync"), 0)
 
             # (b) CPU self.device falls back to self._qf.device_id=2
             events.clear()
             queried_devs.clear()
-            m2 = _DummyMixin(torch.device("cpu"), device_id=2)
+            m2 = _DummyImg(torch.device("cpu"), device_id=2)
+            av2 = _DummyAV(torch.device("cpu"), device_id=2)
             m2._open_native_session("T", (1, 4, 8), 0, 512, 512, {}, skip_end_if_open=True)
-            m2._call_denoise_step(qfe.QFStepParams(), "T")
-            m2._call_denoise_step_av(qfe.QFStepAvParams(), "T")
+            m2._apply_model(x_img, torch.tensor([1.0]), c_crossattn=ctx_img)
+            av2._execute_av_group_step(
+                vid_in=vid_in, vid_dims=(1, 2, 4), vid_out=vid_out,
+                aud_in=aud_in, aud_dims=(1, 2, 4), aud_out=aud_out,
+                vi=ctx_img, sig_i=1.0, step_index=0, ctx_key=1,
+                audio_scale=1.0, ref_active=False, group_i=0,
+            )
             self.assertEqual(queried_devs, [2, 2, 2])
-            self.assertEqual(len(events), 6)
+            self.assertEqual(
+                events,
+                [
+                    ("qf_xfm_session_begin", 0xABCD),
+                    ("qf_xfm_step", 0xABCD),
+                    ("qf_xfm_step_av", 0xABCD),
+                ],
+            )
 
-            # (c) Default stream (cuda_stream == 0) -> 0 synchronize() calls
+            # (c) Default stream (cuda_stream == 0) -> legacy sentinel 1 and 0 synchronize() calls
             events.clear()
             torch.cuda.current_stream = lambda dev=None: _FakeStream(0)
             m1._open_native_session("T", (1, 4, 8), 0, 512, 512, {}, skip_end_if_open=True)
-            m1._call_denoise_step(qfe.QFStepParams(), "T")
-            m1._call_denoise_step_av(qfe.QFStepAvParams(), "T")
+            m1._apply_model(x_img, torch.tensor([1.0]), c_crossattn=ctx_img)
+            av1._execute_av_group_step(
+                vid_in=vid_in, vid_dims=(1, 2, 4), vid_out=vid_out,
+                aud_in=aud_in, aud_dims=(1, 2, 4), aud_out=aud_out,
+                vi=ctx_img, sig_i=1.0, step_index=0, ctx_key=1,
+                audio_scale=1.0, ref_active=False, group_i=0,
+            )
             self.assertEqual(
                 events,
-                [("qf_xfm_session_begin",), ("qf_xfm_step",), ("qf_xfm_step_av",)],
+                [
+                    ("qf_xfm_session_begin", 1),
+                    ("qf_xfm_step", 1),
+                    ("qf_xfm_step_av", 1),
+                ],
             )
 
-            # (d) CUDA unavailable -> current_stream() never queried
+            # (d) CUDA unavailable -> current_stream() never queried, producer_stream == 0
             events.clear()
             queried_devs.clear()
             torch.cuda.is_available = lambda: False
             torch.cuda.current_stream = lambda dev=None: (_ for _ in ()).throw(AssertionError("must not query stream"))
             m1._open_native_session("T", (1, 4, 8), 0, 512, 512, {}, skip_end_if_open=True)
-            m1._call_denoise_step(qfe.QFStepParams(), "T")
-            m1._call_denoise_step_av(qfe.QFStepAvParams(), "T")
-            self.assertEqual(len(events), 3)
+            m1._apply_model(x_img, torch.tensor([1.0]), c_crossattn=ctx_img)
+            av1._execute_av_group_step(
+                vid_in=vid_in, vid_dims=(1, 2, 4), vid_out=vid_out,
+                aud_in=aud_in, aud_dims=(1, 2, 4), aud_out=aud_out,
+                vi=ctx_img, sig_i=1.0, step_index=0, ctx_key=1,
+                audio_scale=1.0, ref_active=False, group_i=0,
+            )
+            self.assertEqual(
+                events,
+                [
+                    ("qf_xfm_session_begin", 0),
+                    ("qf_xfm_step", 0),
+                    ("qf_xfm_step_av", 0),
+                ],
+            )
         finally:
             torch.cuda.is_available = orig_avail
             torch.cuda.current_stream = orig_cur

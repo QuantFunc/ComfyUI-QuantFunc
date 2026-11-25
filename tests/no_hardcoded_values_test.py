@@ -38,6 +38,11 @@ PLUGIN = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _ABI = "C API value, mirrored from include/qf_capi.h (the engine's ABI, not a model fact)"
 ALLOWED = {
     ("__init__.py", "_MAX_LORA_HEADER_BYTES"): "upper bound on safetensors JSON header read (input validation)",
+    ("__init__.py", "_ESTIMATE_CACHE_MAX_ENTRIES"): "bounded cache capacity for cold VRAM estimates (host policy, not a model fact)",
+    ("__init__.py", "_OS_PREFETCH_MIN_BYTES"): "minimum file size to trigger host OS page-cache prefetch (host I/O policy)",
+    ("__init__.py", "_OS_PREFETCH_RAM_RESERVE_BYTES"): "host RAM headroom guard before OS page-cache prefetch (host memory policy)",
+    ("__init__.py", "_OS_PREFETCH_CHUNK_BYTES"): "per-read chunk size for host OS page-cache prefetch (host I/O policy)",
+    ("__init__.py", "_OS_PREFETCH_THREADS"): "worker thread count for host OS page-cache prefetch (host I/O policy)",
     ("qf_api_key.py", "_REF_HEX"): "length of the reference token this process issues (its own format)",
     ("qf_api_key.py", "_MAX_FIELD"): "upper bound on the POSTed field (input validation at a trust boundary)",
     **{("qf_capi.py", n): _ABI for n in (

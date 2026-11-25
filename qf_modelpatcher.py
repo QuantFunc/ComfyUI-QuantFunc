@@ -113,6 +113,25 @@ def _qf_dtype(torch_dtype):
             torch.bfloat16: qfe.QF_DTYPE_BF16}[torch_dtype]
 
 
+def _resolve_producer_stream_ptr(dev_or_none=None):
+    """Return active CUDA stream handle (0x1 legacy sentinel for default stream), or 0 without CUDA."""
+    _torch = globals().get("torch")
+    if _torch is None or not _torch.cuda.is_available():
+        return 0
+    _dev = dev_or_none
+    if _dev is not None:
+        if isinstance(_dev, bool):
+            _dev = None
+        elif isinstance(_dev, int):
+            if _dev < 0:
+                _dev = None
+        elif getattr(_dev, "type", None) != "cuda":
+            _dev = None
+    _cs = _torch.cuda.current_stream(_dev) if _dev is not None else _torch.cuda.current_stream()
+    raw = int(getattr(_cs, "cuda_stream", 0) or 0)
+    return raw if raw != 0 else 1
+
+
 def _interrupt_poll_end_session_on_raise(qf):
     """Poll ComfyUI interrupt; close open session on ANY BaseException before re-raising."""
     try:
@@ -295,15 +314,12 @@ class QFSessionModelMixin:
         self._begin_keep = bpx
         if before_begin is not None:
             before_begin()
-        _torch = globals().get("torch")
-        if _torch is not None and _torch.cuda.is_available():
-            _dev = getattr(self, "device", None)
-            if _dev is None or getattr(_dev, "type", None) != "cuda":
-                _did = getattr(getattr(self, "_qf", None), "device_id", None)
-                _dev = _did if isinstance(_did, int) and not isinstance(_did, bool) and _did >= 0 else None
-            _cs = _torch.cuda.current_stream(_dev) if _dev is not None else _torch.cuda.current_stream()
-            if getattr(_cs, "cuda_stream", 0) != 0:
-                _cs.synchronize()
+        _dev = getattr(self, "device", None)
+        if _dev is None or getattr(_dev, "type", None) != "cuda":
+            _did = getattr(getattr(self, "_qf", None), "device_id", None)
+            _dev = _did if isinstance(_did, int) and not isinstance(_did, bool) and _did >= 0 else None
+        _ps_fn = globals().get("_resolve_producer_stream_ptr")
+        bpx.producer_stream = _ps_fn(_dev) if _ps_fn is not None else 0
         st = lib.qf_xfm_session_begin(self._qf.xfm, ctypes.byref(bpx), ctypes.byref(session))
         if allow_busy_retry and st != qfe.QF_OK and (
                 st == qfe.QF_ERR_BUSY or "busy" in (qfe.last_err(lib) or "").lower()):
@@ -517,15 +533,6 @@ class QFSessionModelMixin:
         return step_index
 
     def _call_denoise_step(self, p, fail_prefix, fn_name="qf_xfm_step"):
-        _torch = globals().get("torch")
-        if _torch is not None and _torch.cuda.is_available():
-            _dev = getattr(self, "device", None)
-            if _dev is None or getattr(_dev, "type", None) != "cuda":
-                _did = getattr(getattr(self, "_qf", None), "device_id", None)
-                _dev = _did if isinstance(_did, int) and not isinstance(_did, bool) and _did >= 0 else None
-            _cs = _torch.cuda.current_stream(_dev) if _dev is not None else _torch.cuda.current_stream()
-            if getattr(_cs, "cuda_stream", 0) != 0:
-                _cs.synchronize()
         try:
             st = getattr(self._qf.lib, fn_name)(self._qf.current_session, ctypes.byref(p))
         except Exception:
@@ -537,15 +544,6 @@ class QFSessionModelMixin:
             raise RuntimeError(f"{fail_prefix} failed: {err}")
 
     def _call_denoise_step_av(self, mp, fail_prefix):
-        _torch = globals().get("torch")
-        if _torch is not None and _torch.cuda.is_available():
-            _dev = getattr(self, "device", None)
-            if _dev is None or getattr(_dev, "type", None) != "cuda":
-                _did = getattr(getattr(self, "_qf", None), "device_id", None)
-                _dev = _did if isinstance(_did, int) and not isinstance(_did, bool) and _did >= 0 else None
-            _cs = _torch.cuda.current_stream(_dev) if _dev is not None else _torch.cuda.current_stream()
-            if getattr(_cs, "cuda_stream", 0) != 0:
-                _cs.synchronize()
         lib = self._qf.lib
         try:
             st = lib.qf_xfm_step_av(self._qf.current_session, ctypes.byref(mp))
@@ -664,6 +662,12 @@ class QFImageSessionModel(QFSessionModelMixin):
                 p.context_dims = (ctypes.c_int32 * 3)(*ci.shape)
                 p.context_dtype = _qf_dtype(ci.dtype)
                 p.cfg_context_key = ctx_key
+                _dev = dev if getattr(dev, "type", None) == "cuda" else getattr(self, "device", None)
+                if _dev is None or getattr(_dev, "type", None) != "cuda":
+                    _did = getattr(getattr(self, "_qf", None), "device_id", None)
+                    _dev = _did if isinstance(_did, int) and not isinstance(_did, bool) and _did >= 0 else None
+                _ps_fn = globals().get("_resolve_producer_stream_ptr")
+                p.producer_stream = _ps_fn(_dev) if _ps_fn is not None else 0
                 self._denoise_group(p, i, xi, ci, kwargs, step_index, ctx_key)
                 self._qf.step_count += 1
                 self._sess_denoise += 1
@@ -721,6 +725,14 @@ class QFAVSessionModel(QFSessionModelMixin):
         p.context_dims = (ctypes.c_int32 * 3)(*vi.shape)
         p.context_dtype = _qf_dtype(vi.dtype)
         p.cfg_context_key = ctx_key
+        _dev = getattr(vid_in, "device", None)
+        if _dev is None or getattr(_dev, "type", None) != "cuda":
+            _dev = getattr(self, "device", None)
+        if _dev is None or getattr(_dev, "type", None) != "cuda":
+            _did = getattr(getattr(self, "_qf", None), "device_id", None)
+            _dev = _did if isinstance(_did, int) and not isinstance(_did, bool) and _did >= 0 else None
+        _ps_fn = globals().get("_resolve_producer_stream_ptr")
+        p.producer_stream = _ps_fn(_dev) if _ps_fn is not None else 0
         mp = qfe.QFStepAvParams()
         ctypes.memset(ctypes.byref(mp), 0, ctypes.sizeof(mp))
         mp.struct_size = ctypes.sizeof(mp)

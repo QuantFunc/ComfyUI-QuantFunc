@@ -2,6 +2,7 @@
 import inspect
 import json
 import os
+import stat
 import struct
 import sys
 import threading
@@ -444,6 +445,268 @@ def _should_autoload_for_estimate():
         return False
 
 
+_ESTIMATE_CACHE = {}
+_ESTIMATE_CACHE_LOCK = threading.Lock()
+_ESTIMATE_CACHE_MAX_ENTRIES = 64
+
+_OS_PREFETCH_MIN_BYTES = 16 * 1024 * 1024
+_OS_PREFETCH_RAM_RESERVE_BYTES = 8 * 1024 * 1024 * 1024
+_OS_PREFETCH_CHUNK_BYTES = 8 * 1024 * 1024
+_OS_PREFETCH_THREADS = 4
+_OS_PREFETCH_LOCK = threading.Lock()
+_OS_PREFETCH_ACTIVE = {}
+
+
+def _estimate_cache_key(weights_path, params, device_id):
+    """Build a credential-blinded cache key for cold VRAM estimates, or None to bypass cache."""
+    if not weights_path or not isinstance(weights_path, (str, bytes, os.PathLike)):
+        return None
+    try:
+        st = os.stat(weights_path)
+    except OSError:
+        return None
+    raw_json = getattr(params, "config_json", None)
+    try:
+        if isinstance(raw_json, bytes):
+            raw_cfg = json.loads(raw_json.decode("utf-8"))
+        elif isinstance(raw_json, str):
+            raw_cfg = json.loads(raw_json)
+        elif raw_json is None:
+            raw_cfg = {}
+        else:
+            return None
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(raw_cfg, dict):
+        return None
+    conn_path = raw_cfg.get("connectors_path")
+    if conn_path:
+        try:
+            cst = os.stat(conn_path)
+        except OSError:
+            return None
+        conn_stat = (str(conn_path), int(cst.st_size), int(cst.st_mtime_ns))
+    else:
+        conn_stat = ()
+    resolved_api_key = str(raw_cfg.get("api_key") or "")
+    resolved_server_url = str(raw_cfg.get("server_url") or "")
+    import hashlib
+    cred_sha256 = hashlib.sha256(f"{resolved_api_key}\0{resolved_server_url}".encode("utf-8")).hexdigest()
+    nonsecret_cfg = {k: v for k, v in raw_cfg.items() if k not in ("api_key", "server_url")}
+    canonical_nonsecret_cfg = json.dumps(nonsecret_cfg, sort_keys=True)
+    return (
+        os.fspath(weights_path),
+        int(st.st_size),
+        int(st.st_mtime_ns),
+        conn_stat,
+        int(device_id),
+        os.environ.get("QF_BACKEND", ""),
+        canonical_nonsecret_cfg,
+        cred_sha256,
+    )
+
+
+def _estimate_vram_cached(lib, params, weights_path, device_id):
+    """Memoize successful qf_xfm_estimate_vram results without storing plaintext credentials."""
+    if getattr(qfe, "_LIB", None) is None:
+        return qfe.estimate_vram(lib, params)
+    key = _estimate_cache_key(weights_path, params, device_id)
+    if key is None:
+        return qfe.estimate_vram(lib, params)
+    with _ESTIMATE_CACHE_LOCK:
+        hit = _ESTIMATE_CACHE.get(key)
+    if hit is not None:
+        return hit
+    cold = qfe.estimate_vram(lib, params)
+    if getattr(cold, "bytes", None) is not None:
+        with _ESTIMATE_CACHE_LOCK:
+            if len(_ESTIMATE_CACHE) >= _ESTIMATE_CACHE_MAX_ENTRIES:
+                _ESTIMATE_CACHE.pop(next(iter(_ESTIMATE_CACHE)), None)
+            _ESTIMATE_CACHE[key] = cold
+    return cold
+
+
+def _linux_mem_available_bytes():
+    """Return Linux MemAvailable in bytes from /proc/meminfo, or None if unavailable."""
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        with open("/proc/meminfo", "r", encoding="ascii", errors="replace") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        return int(parts[1]) * 1024
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+def _start_os_pagecache_prefetch(path, *, min_bytes=None, ram_reserve_bytes=None, chunk_bytes=None, num_threads=None):
+    """Warm a regular weight file into the Linux OS page cache with zero GPU/VRAM usage."""
+    if not sys.platform.startswith("linux") or not path:
+        return False
+    try:
+        st = os.stat(path)
+    except OSError:
+        return False
+    if not stat.S_ISREG(st.st_mode):
+        return False
+    file_size = int(st.st_size)
+    min_sz = _OS_PREFETCH_MIN_BYTES if min_bytes is None else int(min_bytes)
+    if file_size <= 0 or file_size < min_sz:
+        return False
+    mem_avail = _linux_mem_available_bytes()
+    reserve = _OS_PREFETCH_RAM_RESERVE_BYTES if ram_reserve_bytes is None else int(ram_reserve_bytes)
+    if mem_avail is None or mem_avail < 2 * file_size + reserve:
+        return False
+    key = (int(st.st_dev), int(st.st_ino))
+    csize = max(4096, _OS_PREFETCH_CHUNK_BYTES if chunk_bytes is None else int(chunk_bytes))
+    n_chunks = (file_size + csize - 1) // csize
+    n_workers = max(1, min(_OS_PREFETCH_THREADS if num_threads is None else int(num_threads), n_chunks))
+    with _OS_PREFETCH_LOCK:
+        existing = _OS_PREFETCH_ACTIVE.get(key)
+        if existing is not None and not existing["done"].is_set() and not existing["stop"].is_set():
+            return False
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        try:
+            fd = os.open(path, flags)
+        except OSError:
+            return False
+        try:
+            fst = os.fstat(fd)
+            if not stat.S_ISREG(fst.st_mode) or (int(fst.st_dev), int(fst.st_ino)) != key:
+                os.close(fd)
+                return False
+            fadv = getattr(os, "posix_fadvise", None)
+            fadv_seq = getattr(os, "POSIX_FADV_SEQUENTIAL", None)
+            if callable(fadv) and fadv_seq is not None:
+                try:
+                    fadv(fd, 0, file_size, fadv_seq)
+                except OSError:
+                    pass
+        except Exception:  # noqa: BLE001
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            return False
+        stop_evt = threading.Event()
+        done_evt = threading.Event()
+        fd_lock = threading.Lock()
+        remaining = [n_workers]
+        entry = {
+            "stop": stop_evt,
+            "done": done_evt,
+            "threads": [],
+            "path": os.fspath(path),
+            "bytes_read": 0,
+        }
+        _OS_PREFETCH_ACTIVE[key] = entry
+
+        def _close_fd():
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            done_evt.set()
+
+        def _finish_one(n_read):
+            close_now = False
+            with fd_lock:
+                entry["bytes_read"] += n_read
+                remaining[0] -= 1
+                if remaining[0] == 0:
+                    close_now = True
+            if close_now:
+                _close_fd()
+                with _OS_PREFETCH_LOCK:
+                    if _OS_PREFETCH_ACTIVE.get(key) is entry:
+                        _OS_PREFETCH_ACTIVE.pop(key, None)
+
+        def _worker(start_chunk, end_chunk):
+            read_total = 0
+            try:
+                for ci in range(start_chunk, end_chunk):
+                    if stop_evt.is_set():
+                        break
+                    off = ci * csize
+                    length = min(csize, file_size - off)
+                    if length <= 0:
+                        break
+                    try:
+                        buf = os.pread(fd, length, off)
+                    except OSError:
+                        break
+                    if not buf:
+                        break
+                    read_total += len(buf)
+            finally:
+                _finish_one(read_total)
+
+        base_chunks, extra = divmod(n_chunks, n_workers)
+        cur = 0
+        started = 0
+        try:
+            for wi in range(n_workers):
+                cnt = base_chunks + (1 if wi < extra else 0)
+                t = threading.Thread(target=_worker, args=(cur, cur + cnt), name=f"qf-os-prefetch-{wi}", daemon=True)
+                cur += cnt
+                t.start()
+                entry["threads"].append(t)
+                started += 1
+        except BaseException as exc:  # noqa: BLE001
+            stop_evt.set()
+            close_now = False
+            with fd_lock:
+                remaining[0] -= (n_workers - started)
+                if remaining[0] == 0:
+                    close_now = True
+            if close_now:
+                _close_fd()
+            if close_now or started == 0:
+                if _OS_PREFETCH_ACTIVE.get(key) is entry:
+                    _OS_PREFETCH_ACTIVE.pop(key, None)
+            if not isinstance(exc, Exception):
+                raise
+            return started > 0
+        return True
+
+
+def _cancel_os_pagecache_prefetch(path, *, wait=True, timeout=5.0):
+    """Cancel and join any active OS page-cache prefetch for path."""
+    if not path:
+        return False
+    key = None
+    try:
+        st = os.stat(path)
+        key = (int(st.st_dev), int(st.st_ino))
+    except OSError:
+        key = None
+    path_s = os.fspath(path)
+    entry = None
+    threads = ()
+    with _OS_PREFETCH_LOCK:
+        if key is not None:
+            entry = _OS_PREFETCH_ACTIVE.pop(key, None)
+        if entry is None:
+            for k, v in list(_OS_PREFETCH_ACTIVE.items()):
+                if v.get("path") == path_s:
+                    entry = _OS_PREFETCH_ACTIVE.pop(k, None)
+                    break
+        if entry is not None:
+            entry["stop"].set()
+            threads = list(entry["threads"])
+    if entry is None:
+        return False
+    if wait:
+        me = threading.current_thread()
+        for t in threads:
+            if t is not me:
+                t.join(timeout=timeout)
+    return True
+
+
 def _estimate_engine(weights_path, create_cfg=None, device_id=0, api_key=None):
     """Non-creating header-only VRAM estimate via qf_xfm_estimate_vram."""
     lib = qfe._LIB
@@ -456,7 +719,8 @@ def _estimate_engine(weights_path, create_cfg=None, device_id=0, api_key=None):
         else:
             return qfe.ColdNeed(None, None)
     params = _prepare_params(weights_path, create_cfg, device_id, api_key)
-    return qfe.estimate_vram(lib, params)
+    est_fn = globals().get("_estimate_vram_cached")
+    return est_fn(lib, params, weights_path, device_id) if est_fn is not None else qfe.estimate_vram(lib, params)
 
 
 def _get_engine(weights_path, create_cfg=None, device_id=0, api_key=None):
@@ -468,6 +732,9 @@ def _get_engine(weights_path, create_cfg=None, device_id=0, api_key=None):
             if qfe.library_identity(eng.lib) != qfe.library_identity(lib):
                 raise RuntimeError("QuantFunc cache entry belongs to a different loaded native image")
             _pin_pipeline_consumer_locked(ckey)
+            cancel_fn = globals().get("_cancel_os_pagecache_prefetch")
+            if cancel_fn is not None:
+                cancel_fn(weights_path)
             return eng, ckey
     with _create_lock_for(ckey):
         with _ENGINE_IDENTITY_LOCK:
@@ -476,14 +743,23 @@ def _get_engine(weights_path, create_cfg=None, device_id=0, api_key=None):
                 if qfe.library_identity(eng.lib) != qfe.library_identity(lib):
                     raise RuntimeError("QuantFunc cache entry belongs to a different loaded native image")
                 _pin_pipeline_consumer_locked(ckey)
+                cancel_fn = globals().get("_cancel_os_pagecache_prefetch")
+                if cancel_fn is not None:
+                    cancel_fn(weights_path)
                 return eng, ckey
         _sweep_dead_pipelines(ckey)
         params = _prepare_params(weights_path, create_cfg, device_id, api_key)
-        cold = qfe.estimate_vram(lib, params)
+        est_fn = globals().get("_estimate_vram_cached")
+        cold = est_fn(lib, params, weights_path, device_id) if est_fn is not None else qfe.estimate_vram(lib, params)
         cold_bytes = int(cold.bytes or 0)
         min_off = int(getattr(cold, "min_offload_bytes", None) or 0)
         rec_mode = getattr(cold, "recommended_offload_mode", None)
-        eng = qfe.QFEngineHandle.create(lib, create_params=params, capacity_bytes=cold_bytes)
+        try:
+            eng = qfe.QFEngineHandle.create(lib, create_params=params, capacity_bytes=cold_bytes)
+        finally:
+            cancel_fn = globals().get("_cancel_os_pagecache_prefetch")
+            if cancel_fn is not None:
+                cancel_fn(weights_path)
         eng.applied_api_key = api_key
         eng.host_weight_bytes = cold_bytes
         actual_res = 0
@@ -559,9 +835,16 @@ if _IMPORT_OK:
                 f"transformer1 weight (expected a name matching {pats}).")
         token = qfmp.LOADER_SIG.set(sig)
         try:
-            return builder(transformer1_path=xfm1, bundle_dir=bundle_dir, pinned_memory=bool(pinned_memory))
+            res = builder(transformer1_path=xfm1, bundle_dir=bundle_dir, pinned_memory=bool(pinned_memory))
         finally:
             qfmp.LOADER_SIG.reset(token)
+        pf_fn = globals().get("_start_os_pagecache_prefetch")
+        if pf_fn is not None:
+            try:
+                pf_fn(xfm1)
+            except Exception:  # noqa: BLE001
+                pass
+        return res
 
     _STEP_CACHE_INPUT = ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.005,
                          "tooltip": "Speed-up that reuses earlier work while the result is barely changing. "
