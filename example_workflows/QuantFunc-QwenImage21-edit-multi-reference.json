@@ -1,6 +1,6 @@
 {
- "last_node_id": 10,
- "last_link_id": 11,
+ "last_node_id": 11,
+ "last_link_id": 12,
  "nodes": [
   {
    "id": 1,
@@ -20,7 +20,7 @@
    "outputs": [],
    "properties": {},
    "widgets_values": [
-    "## QuantFunc Qwen-Image-2.1\n\n- **QuantFunc Qwen-Image-2.1 Loader** replaces the official `Load Diffusion Model` (UNETLoader): the QuantFunc engine runs the 32-block transformer; the text encoder (`CLIPLoader`, type `qwen_image`), `TextEncodeQwenImage21`, the VAE, the sampler and CFG stay stock ComfyUI.\n- `transformer`: the QuantFunc int4 export under `models/diffusion_models`.\n- `quality_enhance`: OFF (default) is faster; the subject and scene stay the same, but details such as poses, faces or small objects can differ. ON gives the highest quality.\n- Output is **RGBA**: `VAE Decode` + `Save Image` keep the alpha channel, so a transparent result saves as a transparent PNG.\n- Official settings: 25 steps, CFG 1, euler / simple (40 steps = the diffusers default, a little sharper).\n\n**Image edit (two references)** — the official example: `<image1>` = the person (sets the output size), `<image2>` = the shirt. Up to 16 references (`image_1` .. `image_16`)."
+    "## QuantFunc Qwen-Image-2.1\n\n- **QuantFunc Qwen-Image-2.1 Loader** replaces the official `Load Diffusion Model` (UNETLoader): the QuantFunc engine runs the 32-block transformer; the text encoder (`CLIPLoader`, type `qwen_image`), `TextEncodeQwenImage21`, the VAE, the sampler and CFG stay stock ComfyUI.\n- `transformer`: the QuantFunc int4 export under `models/diffusion_models`.\n- `quality_enhance`: OFF (default) is faster; the subject and scene stay the same, but details such as poses, faces or small objects can differ. ON gives the highest quality.\n- Output is **RGBA**: `VAE Decode` + `Save Image` keep the alpha channel, so a transparent result saves as a transparent PNG.\n- Default settings: 6 steps, CFG 1, res_multistep / simple with QuantFunc Native LoRA (`qwen_image_21_lightning_v2_rl_4steps_lora_rank64.safetensors`, strength 1.0).\n\n**Image edit (two references)** — the official example: `<image1>` = the person (sets the output size), `<image2>` = the shirt. Up to 16 references (`image_1` .. `image_16`)."
    ]
   },
   {
@@ -32,12 +32,64 @@
    ],
    "size": [
     400,
-    150
+    322
    ],
    "flags": {},
    "order": 1,
    "mode": 0,
    "inputs": [],
+   "outputs": [
+    {
+     "name": "MODEL",
+     "type": "MODEL",
+     "links": [
+      12
+     ],
+     "slot_index": 0
+    }
+   ],
+   "properties": {
+    "qf_layout": 3,
+    "qf_sol_version": 2,
+    "Node name for S&R": "QuantFuncQwenImage21Loader"
+   },
+   "widgets_values": [
+    "qwen_image_21_base_quantfunc_int4_r128.safetensors",
+    "qwen-image-2.1-int4",
+    "auto",
+    1.3,
+    0.2,
+    0.9,
+    0,
+    "exact_kv_and_rows",
+    2,
+    false,
+    true,
+    true,
+    true
+   ]
+  },
+  {
+   "id": 11,
+   "type": "QuantFuncNativeLoRA",
+   "pos": [
+    460,
+    -150
+   ],
+   "size": [
+    420,
+    90
+   ],
+   "flags": {},
+   "order": 2,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "model",
+     "type": "MODEL",
+     "link": 12
+    }
+   ],
    "outputs": [
     {
      "name": "MODEL",
@@ -49,14 +101,11 @@
     }
    ],
    "properties": {
-    "Node name for S&R": "QuantFuncQwenImage21Loader"
+    "Node name for S&R": "QuantFuncNativeLoRA"
    },
    "widgets_values": [
-    "qwen_image_21_base_quantfunc_int4_r128.safetensors",
-    "qwen-image-2.1-int4",
-    "auto",
-    false,
-    true
+    "qwen_image_21_lightning_v2_rl_4steps_lora_rank64.safetensors",
+    1.0
    ]
   },
   {
@@ -64,14 +113,14 @@
    "type": "CLIPLoader",
    "pos": [
     0,
-    200
+    380
    ],
    "size": [
     400,
     110
    ],
    "flags": {},
-   "order": 2,
+   "order": 3,
    "mode": 0,
    "inputs": [],
    "outputs": [
@@ -98,14 +147,14 @@
    "type": "VAELoader",
    "pos": [
     0,
-    360
+    540
    ],
    "size": [
     400,
     60
    ],
    "flags": {},
-   "order": 3,
+   "order": 4,
    "mode": 0,
    "inputs": [],
    "outputs": [
@@ -131,14 +180,14 @@
    "type": "LoadImage",
    "pos": [
     0,
-    480
+    660
    ],
    "size": [
     300,
     330
    ],
    "flags": {},
-   "order": 4,
+   "order": 5,
    "mode": 0,
    "inputs": [],
    "outputs": [
@@ -170,14 +219,14 @@
    "type": "LoadImage",
    "pos": [
     0,
-    860
+    1040
    ],
    "size": [
     300,
     330
    ],
    "flags": {},
-   "order": 5,
+   "order": 6,
    "mode": 0,
    "inputs": [],
    "outputs": [
@@ -216,7 +265,7 @@
     330
    ],
    "flags": {},
-   "order": 6,
+   "order": 7,
    "mode": 0,
    "inputs": [
     {
@@ -300,7 +349,7 @@
     270
    ],
    "flags": {},
-   "order": 7,
+   "order": 8,
    "mode": 0,
    "inputs": [
     {
@@ -340,9 +389,9 @@
    "widgets_values": [
     0,
     "fixed",
-    25,
+    6,
     1.0,
-    "euler",
+    "res_multistep",
     "simple",
     1.0
    ]
@@ -359,7 +408,7 @@
     50
    ],
    "flags": {},
-   "order": 8,
+   "order": 9,
    "mode": 0,
    "inputs": [
     {
@@ -402,7 +451,7 @@
     540
    ],
    "flags": {},
-   "order": 9,
+   "order": 10,
    "mode": 0,
    "inputs": [
     {
@@ -455,7 +504,7 @@
   ],
   [
    5,
-   2,
+   11,
    0,
    8,
    0,
@@ -508,6 +557,14 @@
    10,
    0,
    "IMAGE"
+  ],
+  [
+   12,
+   2,
+   0,
+   11,
+   0,
+   "MODEL"
   ]
  ],
  "groups": [],

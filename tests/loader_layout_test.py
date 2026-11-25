@@ -351,6 +351,37 @@ class LoaderLayout(unittest.TestCase):
                         if wf_name in shifted_files:
                             self.assertAlmostEqual(vals["block_cache"], 0.03, places=6)
 
+    def test_l7_all_12_shipped_example_workflows_use_res_multistep(self):
+        wf_files = sorted((PLUGIN / "example_workflows").glob("*.json"))
+        self.assertEqual(len(wf_files), 12)
+        for wf_path in wf_files:
+            data = json.loads(wf_path.read_text(encoding="utf-8"))
+            sampler_hits = 0
+            for node in data.get("nodes", []):
+                ntype = node.get("type", "")
+                wv = node.get("widgets_values")
+                wvn = node.get("widgets_values_named")
+                if ntype == "KSampler":
+                    sampler_hits += 1
+                    self.assertEqual(node.get("mode", 0), 0, f"{wf_path.name} node {node.get('id')} bypassed")
+                    self.assertIsInstance(wv, list, f"{wf_path.name} node {node.get('id')}")
+                    self.assertGreaterEqual(len(wv), 5, f"{wf_path.name} node {node.get('id')} truncated widgets_values")
+                    self.assertEqual(wv[4], "res_multistep", f"{wf_path.name} node {node.get('id')}")
+                    if isinstance(wvn, dict) and "sampler_name" in wvn:
+                        self.assertEqual(wvn["sampler_name"], "res_multistep", f"{wf_path.name} node {node.get('id')}")
+                elif ntype == "KSamplerSelect":
+                    sampler_hits += 1
+                    self.assertEqual(node.get("mode", 0), 0, f"{wf_path.name} node {node.get('id')} bypassed")
+                    self.assertIsInstance(wv, list, f"{wf_path.name} node {node.get('id')}")
+                    self.assertGreaterEqual(len(wv), 1, f"{wf_path.name} node {node.get('id')} truncated widgets_values")
+                    self.assertEqual(wv[0], "res_multistep", f"{wf_path.name} node {node.get('id')}")
+                    if isinstance(wvn, dict) and "sampler_name" in wvn:
+                        self.assertEqual(wvn["sampler_name"], "res_multistep", f"{wf_path.name} node {node.get('id')}")
+                elif ntype == "MarkdownNote":
+                    note_text = json.dumps(wv) + json.dumps(wvn)
+                    self.assertNotIn("euler", note_text.lower(), f"{wf_path.name} MarkdownNote still mentions euler")
+            self.assertGreaterEqual(sampler_hits, 1, f"{wf_path.name} missing sampler node")
+
 
 if __name__ == "__main__":
     result = unittest.main(argv=[__file__], exit=False, verbosity=2).result

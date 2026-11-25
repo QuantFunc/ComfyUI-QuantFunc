@@ -40,8 +40,9 @@ MIB = 1 << 20
 
 
 def pc_engine_library():
-    """Minimal 25-symbol PC Engine stub covering VRAM residency & unload verbs."""
-    lib = types.SimpleNamespace(held=1536, need=4096, unload_status=qfe.QF_OK, calls=[])
+    """Minimal 25-symbol PC Engine stub covering VRAM residency, session close & unload verbs."""
+    lib = types.SimpleNamespace(held=1536, need=4096, unload_status=qfe.QF_OK,
+                                session_open=False, calls=[])
 
     def resident(xfm, out_ptr):
         out_ptr._obj.value = lib.held
@@ -51,8 +52,15 @@ def pc_engine_library():
         out_ptr._obj.value = lib.need
         return qfe.QF_OK
 
+    def session_end(sess):
+        lib.calls.append(("qf_xfm_session_end", sess.value))
+        lib.session_open = False
+        return qfe.QF_OK
+
     def unload_vram(xfm, target_bytes, out_freed_ptr):
         lib.calls.append(("qf_xfm_unload_vram", xfm.value, target_bytes))
+        if lib.session_open:
+            return qfe.QF_ERR_BUSY
         if lib.unload_status != qfe.QF_OK:
             return lib.unload_status
         if target_bytes == qfe.QF_UINT64_MAX:
@@ -69,9 +77,10 @@ def pc_engine_library():
 
     lib.qf_xfm_resident_vram_bytes = resident
     lib.qf_xfm_vram_need_bytes = need
+    lib.qf_xfm_session_end = session_end
     lib.qf_xfm_unload_vram = unload_vram
     lib.qf_xfm_destroy = destroy
-    lib.qf_last_error = lambda: b"session busy"
+    lib.qf_last_error = lambda: b"QF:CA_UL_BUSY" if lib.session_open else b"session busy"
     return lib
 
 
@@ -482,6 +491,312 @@ class ModelPatcherContract(unittest.TestCase):
         m_none = _ColdTorchModel(lazy_none, with_weight=True)
         p_none = qfm.QFModelPatcher(m_none, torch.device("cpu"), torch.device("cpu"))
         self.assertEqual(p_none.model_size(), 16)
+
+    def test_detach_closes_open_session_before_unload_preventing_ca_ul_busy(self):
+        self.lib.session_open = True
+        self.handle.current_session = ctypes.c_void_p(0xCAFE)
+        self.model._qf_needs_begin = False
+        self.patcher.detach(True)
+        self.assertEqual(
+            self.lib.calls,
+            [
+                ("qf_xfm_session_end", 0xCAFE),
+                ("qf_xfm_unload_vram", XFM_PTR, qfe.QF_UINT64_MAX),
+            ],
+        )
+        self.assertIsNone(self.handle.current_session)
+        self.assertTrue(self.model._qf_needs_begin)
+        self.assertEqual(self.patcher.loaded_size(), 0)
+
+    def test_lazy_end_session_if_open_reaches_cached_handle_and_detach_unloads(self):
+        self.lib.session_open = True
+        self.handle.current_session = ctypes.c_void_p(0xBEEF)
+        lazy = qfm.QFLazyEngine(
+            lambda: (_ for _ in ()).throw(AssertionError("must not materialize")),
+            peek_cached=lambda: (self.handle, ("k",)),
+        )
+        m = _ColdTorchModel(lazy)
+        m._qf_needs_begin = False
+        p = qfm.QFModelPatcher(m, torch.device("cpu"), torch.device("cpu"))
+        p.detach(True)
+        self.assertEqual(
+            self.lib.calls,
+            [
+                ("qf_xfm_session_end", 0xBEEF),
+                ("qf_xfm_unload_vram", XFM_PTR, qfe.QF_UINT64_MAX),
+            ],
+        )
+        self.assertIsNone(self.handle.current_session)
+        self.assertTrue(m._qf_needs_begin)
+        self.assertEqual(p.loaded_size(), 0)
+
+    def test_sampling_geometry_and_apply_model_close_open_session_on_oom(self):
+        # 1) _sampling_geometry closes open session on mid-loop exception (e.g. OOM in sampler).
+        self.lib.session_open = True
+        self.handle.current_session = ctypes.c_void_p(0x1111)
+        self.model._qf_needs_begin = False
+
+        class _BoomExec:
+            def __init__(self, patcher):
+                self.class_obj = types.SimpleNamespace(model_patcher=patcher, model_options={})
+
+            def __call__(self, *a, **k):
+                raise RuntimeError("simulated CUDA OOM mid-sampler")
+
+        with self.assertRaisesRegex(RuntimeError, "simulated CUDA OOM"):
+            qfm.QFModelPatcher._sampling_geometry(_BoomExec(self.patcher), latent_shapes=None)
+        self.assertIsNone(self.handle.current_session)
+        self.assertFalse(self.lib.session_open)
+        self.assertTrue(self.model._qf_needs_begin)
+        self.assertEqual(self.lib.calls, [("qf_xfm_session_end", 0x1111)])
+
+        # 2) QFAVSessionModel._apply_model closes open session if _av_step_tensors / _av_repack_output OOMs.
+        self.lib.calls.clear()
+        self.lib.session_open = True
+        self.handle.current_session = ctypes.c_void_p(0x2222)
+
+        class _DummyAV(qfm.QFAVSessionModel):
+            _TAG = "AVTEST"
+            _NO_COND_HINT = "missing"
+
+            def __init__(self, eng):
+                self._qf = eng
+                self._qf_needs_begin = False
+                self._step_i = 0
+
+            def _av_unpack_and_validate(self, x, c_crossattn, transformer_options):
+                return x, x, c_crossattn, types.SimpleNamespace(nested=False)
+
+            def _av_prepare_session(self, x_vid, x_audio, vemb, transformer_options, kwargs, opening):
+                return None
+
+            def _av_step_tensors(self, *a, **k):
+                raise RuntimeError("simulated OOM in patchify_video")
+
+        av = _DummyAV(self.handle)
+        with self.assertRaisesRegex(RuntimeError, "patchify_video"):
+            av._apply_model(torch.zeros(1, 2), torch.tensor([1.0]), c_crossattn=torch.zeros(1, 2))
+        self.assertIsNone(self.handle.current_session)
+        self.assertFalse(self.lib.session_open)
+        self.assertTrue(av._qf_needs_begin)
+        self.assertEqual(self.lib.calls, [("qf_xfm_session_end", 0x2222)])
+
+    def test_image_session_model_apply_model_closes_open_session_on_to_and_step_oom(self):
+        # 1) OOM inside x.to(torch.bfloat16) while session is ALREADY open (step >= 1) must close session.
+        self.lib.calls.clear()
+        self.lib.session_open = True
+        self.handle.current_session = ctypes.c_void_p(0x3333)
+
+        class _DummyImg(qfm.QFImageSessionModel):
+            _TAG = "IMGTEST"
+            _NO_COND_HINT = "missing"
+            _REFUSED_HINT = "refused"
+
+            def __init__(self, eng):
+                self._qf = eng
+                self._qf_needs_begin = False
+                self._step_i = 0
+                self._sess_denoise = 0
+                self._num_steps = 4
+                self._ctx_key_assigner = qfm._CtxKeyAssigner()
+                self._out = None
+                self.model_sampling = types.SimpleNamespace(
+                    calculate_denoised=lambda s, o, x: o
+                )
+
+            def _begin(self, x0, c0):
+                self._qf.current_session = ctypes.c_void_p(0x4444)
+
+            def _denoise_group(self, *a, **k):
+                raise RuntimeError("simulated OOM inside _denoise_group")
+
+        class _OomToTensor:
+            device = torch.device("cpu")
+            dtype = torch.float32
+
+            def to(self, *a, **k):
+                raise RuntimeError("simulated OOM in x.to(bfloat16)")
+
+        img = _DummyImg(self.handle)
+        with self.assertRaisesRegex(RuntimeError, r"x\.to\(bfloat16\)"):
+            img._apply_model(_OomToTensor(), torch.tensor([1.0]), c_crossattn=torch.zeros(1, 2, 4, dtype=torch.bfloat16))
+        self.assertIsNone(self.handle.current_session)
+        self.assertFalse(self.lib.session_open)
+        self.assertTrue(img._qf_needs_begin)
+        self.assertEqual(self.lib.calls, [("qf_xfm_session_end", 0x3333)])
+
+        # 2) OOM inside _denoise_group after opening session closes the newly opened session.
+        self.lib.calls.clear()
+        self.lib.session_open = True
+        self.handle.current_session = ctypes.c_void_p(0x4444)
+        img._qf_needs_begin = False
+        with self.assertRaisesRegex(RuntimeError, "_denoise_group"):
+            img._apply_model(
+                torch.zeros(1, 4, 2, 2, dtype=torch.bfloat16),
+                torch.tensor([1.0]),
+                c_crossattn=torch.zeros(1, 2, 4, dtype=torch.bfloat16),
+            )
+        self.assertIsNone(self.handle.current_session)
+        self.assertFalse(self.lib.session_open)
+        self.assertTrue(img._qf_needs_begin)
+        self.assertEqual(self.lib.calls, [("qf_xfm_session_end", 0x4444)])
+
+    def test_non_default_cuda_stream_sync_device_bound_across_begin_and_step(self):
+        events = []
+
+        class _FakeStream:
+            def __init__(self, stream_ptr):
+                self.cuda_stream = stream_ptr
+
+            def synchronize(self):
+                events.append(("sync", self.cuda_stream))
+
+        class _StreamLib:
+            def qf_xfm_session_begin(self, xfm, bpx_p, sess_p):
+                events.append(("qf_xfm_session_begin",))
+                sess_p._obj.value = 0x5555
+                return qfe.QF_OK
+
+            def qf_xfm_step(self, sess, p_p):
+                events.append(("qf_xfm_step",))
+                return qfe.QF_OK
+
+            def qf_xfm_step_av(self, sess, mp_p):
+                events.append(("qf_xfm_step_av",))
+                return qfe.QF_OK
+
+        class _FakeEngine:
+            def __init__(self, device_id):
+                self.lib = _StreamLib()
+                self.xfm = ctypes.c_void_p(XFM_PTR)
+                self.current_session = ctypes.c_void_p(0x5555)
+                self.device_id = device_id
+
+            def end_session_if_open(self):
+                return (False, True)
+
+        class _DummyMixin(qfm.QFSessionModelMixin):
+            def __init__(self, device, device_id):
+                self.device = device
+                self._qf = _FakeEngine(device_id)
+                self._ctx_key_assigner = qfm._CtxKeyAssigner()
+                self._num_steps = 4
+
+        orig_avail = torch.cuda.is_available
+        orig_cur = torch.cuda.current_stream
+        try:
+            # (a) Non-default stream on self.device=cuda:1 -> queries cuda:1 and syncs BEFORE begin/step/step_av
+            queried_devs = []
+            torch.cuda.is_available = lambda: True
+            torch.cuda.current_stream = lambda dev=None: (queried_devs.append(dev), _FakeStream(0xABCD))[1]
+
+            m1 = _DummyMixin(torch.device("cuda:1"), device_id=0)
+            m1._open_native_session("T", (1, 4, 8), 0, 512, 512, {}, skip_end_if_open=True)
+            m1._call_denoise_step(qfe.QFStepParams(), "T")
+            m1._call_denoise_step_av(qfe.QFStepAvParams(), "T")
+            self.assertEqual(queried_devs, [torch.device("cuda:1")] * 3)
+            self.assertEqual(
+                events,
+                [
+                    ("sync", 0xABCD), ("qf_xfm_session_begin",),
+                    ("sync", 0xABCD), ("qf_xfm_step",),
+                    ("sync", 0xABCD), ("qf_xfm_step_av",),
+                ],
+            )
+
+            # (b) CPU self.device falls back to self._qf.device_id=2
+            events.clear()
+            queried_devs.clear()
+            m2 = _DummyMixin(torch.device("cpu"), device_id=2)
+            m2._open_native_session("T", (1, 4, 8), 0, 512, 512, {}, skip_end_if_open=True)
+            m2._call_denoise_step(qfe.QFStepParams(), "T")
+            m2._call_denoise_step_av(qfe.QFStepAvParams(), "T")
+            self.assertEqual(queried_devs, [2, 2, 2])
+            self.assertEqual(len(events), 6)
+
+            # (c) Default stream (cuda_stream == 0) -> 0 synchronize() calls
+            events.clear()
+            torch.cuda.current_stream = lambda dev=None: _FakeStream(0)
+            m1._open_native_session("T", (1, 4, 8), 0, 512, 512, {}, skip_end_if_open=True)
+            m1._call_denoise_step(qfe.QFStepParams(), "T")
+            m1._call_denoise_step_av(qfe.QFStepAvParams(), "T")
+            self.assertEqual(
+                events,
+                [("qf_xfm_session_begin",), ("qf_xfm_step",), ("qf_xfm_step_av",)],
+            )
+
+            # (d) CUDA unavailable -> current_stream() never queried
+            events.clear()
+            queried_devs.clear()
+            torch.cuda.is_available = lambda: False
+            torch.cuda.current_stream = lambda dev=None: (_ for _ in ()).throw(AssertionError("must not query stream"))
+            m1._open_native_session("T", (1, 4, 8), 0, 512, 512, {}, skip_end_if_open=True)
+            m1._call_denoise_step(qfe.QFStepParams(), "T")
+            m1._call_denoise_step_av(qfe.QFStepAvParams(), "T")
+            self.assertEqual(len(events), 3)
+        finally:
+            torch.cuda.is_available = orig_avail
+            torch.cuda.current_stream = orig_cur
+
+    def test_detach_sampling_geometry_and_lazy_edge_branches(self):
+        # 1) detach(True) when was_open=False preserves _qf_needs_begin=False
+        self.lib.calls.clear()
+        self.lib.session_open = False
+        self.handle.current_session = None
+        self.model._qf_needs_begin = False
+        self.patcher.detach(True)
+        self.assertFalse(self.model._qf_needs_begin)
+        self.assertEqual(self.lib.calls, [("qf_xfm_unload_vram", XFM_PTR, qfe.QF_UINT64_MAX)])
+
+        # 2) detach(True) when end_session_if_open raises still calls unload_vram and _release_scratch_buffers
+        unloaded = []
+        released = []
+
+        class _ErrEndEng:
+            def end_session_if_open(self):
+                raise RuntimeError("simulated end_session_if_open failure")
+
+            def unload_vram(self, n):
+                unloaded.append(n)
+                return 0
+
+        m_err = _ColdTorchModel(_ErrEndEng())
+        m_err._release_scratch_buffers = lambda: released.append(True)
+        p_err = qfm.QFModelPatcher(m_err, torch.device("cpu"), torch.device("cpu"))
+        p_err.detach(True)
+        self.assertEqual(unloaded, [qfe.QF_UINT64_MAX])
+        self.assertEqual(released, [True])
+
+        # 3) _sampling_geometry when end_session_if_open raises still resets ContextVars and re-raises original error
+        prev_geom = qfm._QF_SAMPLING_GEOMETRY.get()
+        prev_run = qfm._QF_RUN_ID.get()
+
+        class _BoomExec2:
+            def __init__(self, patcher):
+                self.class_obj = types.SimpleNamespace(model_patcher=patcher, model_options={})
+
+            def __call__(self, *a, **k):
+                raise RuntimeError("original sampling failure")
+
+        with self.assertRaisesRegex(RuntimeError, "original sampling failure"):
+            qfm.QFModelPatcher._sampling_geometry(_BoomExec2(p_err), latent_shapes=None)
+        self.assertEqual(qfm._QF_SAMPLING_GEOMETRY.get(), prev_geom)
+        self.assertEqual(qfm._QF_RUN_ID.get(), prev_run)
+
+        # 4) QFLazyEngine.end_session_if_open on cache miss and on dead handle (xfm is None) -> (False, True), 0 factory calls
+        lazy_miss = qfm.QFLazyEngine(
+            lambda: (_ for _ in ()).throw(AssertionError("must not materialize on miss")),
+            peek_cached=lambda: None,
+        )
+        self.assertEqual(lazy_miss.end_session_if_open(), (False, True))
+
+        dead_real = types.SimpleNamespace(xfm=None)
+        lazy_dead = qfm.QFLazyEngine(
+            lambda: (_ for _ in ()).throw(AssertionError("must not materialize on dead handle")),
+            peek_cached=lambda: None,
+        )
+        lazy_dead._real = dead_real
+        self.assertEqual(lazy_dead.end_session_if_open(), (False, True))
 
 
 if __name__ == "__main__":

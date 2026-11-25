@@ -295,6 +295,15 @@ class QFSessionModelMixin:
         self._begin_keep = bpx
         if before_begin is not None:
             before_begin()
+        _torch = globals().get("torch")
+        if _torch is not None and _torch.cuda.is_available():
+            _dev = getattr(self, "device", None)
+            if _dev is None or getattr(_dev, "type", None) != "cuda":
+                _did = getattr(getattr(self, "_qf", None), "device_id", None)
+                _dev = _did if isinstance(_did, int) and not isinstance(_did, bool) and _did >= 0 else None
+            _cs = _torch.cuda.current_stream(_dev) if _dev is not None else _torch.cuda.current_stream()
+            if getattr(_cs, "cuda_stream", 0) != 0:
+                _cs.synchronize()
         st = lib.qf_xfm_session_begin(self._qf.xfm, ctypes.byref(bpx), ctypes.byref(session))
         if allow_busy_retry and st != qfe.QF_OK and (
                 st == qfe.QF_ERR_BUSY or "busy" in (qfe.last_err(lib) or "").lower()):
@@ -508,6 +517,15 @@ class QFSessionModelMixin:
         return step_index
 
     def _call_denoise_step(self, p, fail_prefix, fn_name="qf_xfm_step"):
+        _torch = globals().get("torch")
+        if _torch is not None and _torch.cuda.is_available():
+            _dev = getattr(self, "device", None)
+            if _dev is None or getattr(_dev, "type", None) != "cuda":
+                _did = getattr(getattr(self, "_qf", None), "device_id", None)
+                _dev = _did if isinstance(_did, int) and not isinstance(_did, bool) and _did >= 0 else None
+            _cs = _torch.cuda.current_stream(_dev) if _dev is not None else _torch.cuda.current_stream()
+            if getattr(_cs, "cuda_stream", 0) != 0:
+                _cs.synchronize()
         try:
             st = getattr(self._qf.lib, fn_name)(self._qf.current_session, ctypes.byref(p))
         except Exception:
@@ -519,6 +537,15 @@ class QFSessionModelMixin:
             raise RuntimeError(f"{fail_prefix} failed: {err}")
 
     def _call_denoise_step_av(self, mp, fail_prefix):
+        _torch = globals().get("torch")
+        if _torch is not None and _torch.cuda.is_available():
+            _dev = getattr(self, "device", None)
+            if _dev is None or getattr(_dev, "type", None) != "cuda":
+                _did = getattr(getattr(self, "_qf", None), "device_id", None)
+                _dev = _did if isinstance(_did, int) and not isinstance(_did, bool) and _did >= 0 else None
+            _cs = _torch.cuda.current_stream(_dev) if _dev is not None else _torch.cuda.current_stream()
+            if getattr(_cs, "cuda_stream", 0) != 0:
+                _cs.synchronize()
         lib = self._qf.lib
         try:
             st = lib.qf_xfm_step_av(self._qf.current_session, ctypes.byref(mp))
@@ -594,54 +621,59 @@ class QFImageSessionModel(QFSessionModelMixin):
             raise RuntimeError(
                 f"qf_native {self._TAG}: c_concat conditioning is not part of the {self._TAG} seam - remove "
                 "the node feeding it.")
-        dev = x.device
-        x_bf = x if x.dtype == torch.bfloat16 else x.to(torch.bfloat16)
-        if ctx.dtype != torch.bfloat16 or ctx.device != dev:
-            ctx = ctx.to(device=dev, dtype=torch.bfloat16)
-        sig_all = sigma.reshape(-1) if torch.is_tensor(sigma) else None
-        xin = x_bf
-        batch = int(xin.shape[0])
-        if getattr(self, "_qf_needs_begin", True) or self._qf.current_session is None:
-            self._stage_schedule(transformer_options, self._TAG)
-            self._prepare_begin_context(xin, ctx, transformer_options, kwargs)
-            self._begin(xin[0:1], ctx[0:1])
-            self._qf_needs_begin = False
-        self._out = self._ensure_scratch("_out", xin.shape, xin.dtype, xin.device)
-        cuuids = transformer_options.get("uuids") if isinstance(transformer_options, dict) else None
-        step_index = self._sigma_step_index(sigma, sig_all, transformer_options)
-        for i in range(batch):
-            _interrupt_poll_end_session_on_raise(self._qf)
-            xi = xin[i:i + 1].contiguous()
-            oi = self._out[i:i + 1]
-            if xi.dim() == 5 and xi.shape[2] == 1:
-                xi = xi.squeeze(2).contiguous()
-                oi = oi.squeeze(2)
-            ci = ctx[i:i + 1].contiguous()
-            cuid = cuuids[i] if (cuuids is not None and i < len(cuuids)) else None
-            ctx_key = self._ctx_key_assigner.key(cuid)
-            sig_i = (float(sig_all[i].item()) if (sig_all is not None and sig_all.numel() >= batch)
-                     else (float(sig_all[0].item()) if sig_all is not None else float(sigma)))
-            p = qfe.QFStepParams()
-            ctypes.memset(ctypes.byref(p), 0, ctypes.sizeof(p))
-            p.struct_size = ctypes.sizeof(p)
-            p.latent_in = xi.data_ptr()
-            p.velocity_out = oi.data_ptr()
-            p.velocity_out_capacity = oi.numel() * oi.element_size()
-            p.dims[:xi.dim()] = list(xi.shape)
-            p.dtype = _qf_dtype(xi.dtype)
-            p.sigma = sig_i
-            p.step_index = step_index
-            p.total_steps = self._num_steps
-            p.context = ci.data_ptr()
-            p.context_dims = (ctypes.c_int32 * 3)(*ci.shape)
-            p.context_dtype = _qf_dtype(ci.dtype)
-            p.cfg_context_key = ctx_key
-            self._denoise_group(p, i, xi, ci, kwargs, step_index, ctx_key)
-            self._qf.step_count += 1
-            self._sess_denoise += 1
-        self._step_i += 1
-        self._qf.sampler_step_count += 1
-        return self.model_sampling.calculate_denoised(sigma, self._out.float(), x)
+        try:
+            dev = x.device
+            x_bf = x if x.dtype == torch.bfloat16 else x.to(torch.bfloat16)
+            if ctx.dtype != torch.bfloat16 or ctx.device != dev:
+                ctx = ctx.to(device=dev, dtype=torch.bfloat16)
+            sig_all = sigma.reshape(-1) if torch.is_tensor(sigma) else None
+            xin = x_bf
+            batch = int(xin.shape[0])
+            if getattr(self, "_qf_needs_begin", True) or self._qf.current_session is None:
+                self._stage_schedule(transformer_options, self._TAG)
+                self._prepare_begin_context(xin, ctx, transformer_options, kwargs)
+                self._begin(xin[0:1], ctx[0:1])
+                self._qf_needs_begin = False
+            self._out = self._ensure_scratch("_out", xin.shape, xin.dtype, xin.device)
+            cuuids = transformer_options.get("uuids") if isinstance(transformer_options, dict) else None
+            step_index = self._sigma_step_index(sigma, sig_all, transformer_options)
+            for i in range(batch):
+                _interrupt_poll_end_session_on_raise(self._qf)
+                xi = xin[i:i + 1].contiguous()
+                oi = self._out[i:i + 1]
+                if xi.dim() == 5 and xi.shape[2] == 1:
+                    xi = xi.squeeze(2).contiguous()
+                    oi = oi.squeeze(2)
+                ci = ctx[i:i + 1].contiguous()
+                cuid = cuuids[i] if (cuuids is not None and i < len(cuuids)) else None
+                ctx_key = self._ctx_key_assigner.key(cuid)
+                sig_i = (float(sig_all[i].item()) if (sig_all is not None and sig_all.numel() >= batch)
+                         else (float(sig_all[0].item()) if sig_all is not None else float(sigma)))
+                p = qfe.QFStepParams()
+                ctypes.memset(ctypes.byref(p), 0, ctypes.sizeof(p))
+                p.struct_size = ctypes.sizeof(p)
+                p.latent_in = xi.data_ptr()
+                p.velocity_out = oi.data_ptr()
+                p.velocity_out_capacity = oi.numel() * oi.element_size()
+                p.dims[:xi.dim()] = list(xi.shape)
+                p.dtype = _qf_dtype(xi.dtype)
+                p.sigma = sig_i
+                p.step_index = step_index
+                p.total_steps = self._num_steps
+                p.context = ci.data_ptr()
+                p.context_dims = (ctypes.c_int32 * 3)(*ci.shape)
+                p.context_dtype = _qf_dtype(ci.dtype)
+                p.cfg_context_key = ctx_key
+                self._denoise_group(p, i, xi, ci, kwargs, step_index, ctx_key)
+                self._qf.step_count += 1
+                self._sess_denoise += 1
+            self._step_i += 1
+            self._qf.sampler_step_count += 1
+            return self.model_sampling.calculate_denoised(sigma, self._out.float(), x)
+        except BaseException:
+            self._qf.end_session_if_open()
+            self._qf_needs_begin = True
+            raise
 
     def _denoise_group(self, p, i, xi, ci, kwargs, step_index, ctx_key):
         self._call_denoise_step(p, f"{self._TAG} qf_xfm_step[step={step_index},group={i},key={ctx_key}]")
@@ -732,16 +764,21 @@ class QFAVSessionModel(QFSessionModelMixin):
         if control is not None:
             raise RuntimeError(
                 f"qf_native {self._TAG}: a ControlNet is wired, but this seam does not consume control hints.")
-        x_vid, x_audio, vemb, meta = self._av_unpack_and_validate(x, c_crossattn, transformer_options)
-        opening = self._qf.current_session is None or getattr(self, "_qf_needs_begin", False)
-        self._av_prepare_session(x_vid, x_audio, vemb, transformer_options, kwargs, opening)
-        sig_all = sigma.reshape(-1) if torch.is_tensor(sigma) else None
-        step_index = self._sigma_step_index(sigma, sig_all, transformer_options)
-        out_vid, out_audio = self._av_step_tensors(
-            x_vid, x_audio, vemb, meta, sigma, sig_all, transformer_options, kwargs, step_index)
-        self._step_i += 1
-        self._qf.sampler_step_count += 1
-        return self._av_repack_output(out_vid, out_audio, meta, sigma)
+        try:
+            x_vid, x_audio, vemb, meta = self._av_unpack_and_validate(x, c_crossattn, transformer_options)
+            opening = self._qf.current_session is None or getattr(self, "_qf_needs_begin", False)
+            self._av_prepare_session(x_vid, x_audio, vemb, transformer_options, kwargs, opening)
+            sig_all = sigma.reshape(-1) if torch.is_tensor(sigma) else None
+            step_index = self._sigma_step_index(sigma, sig_all, transformer_options)
+            out_vid, out_audio = self._av_step_tensors(
+                x_vid, x_audio, vemb, meta, sigma, sig_all, transformer_options, kwargs, step_index)
+            self._step_i += 1
+            self._qf.sampler_step_count += 1
+            return self._av_repack_output(out_vid, out_audio, meta, sigma)
+        except BaseException:
+            self._qf.end_session_if_open()
+            self._qf_needs_begin = True
+            raise
 
     def process_latent_out(self, latent):
         self._close_session_on_latent_out(self._TAG, "qf_xfm_step_av")
@@ -901,7 +938,11 @@ class QFLazyEngine:
         self._real.reference_audio_copy_completed()
 
     def end_session_if_open(self):
-        return (False, True) if self._real is None else self._real.end_session_if_open()
+        entry = self._real
+        if entry is None or getattr(entry, "xfm", None) is None:
+            fn = getattr(self, "ensure_if_cached", None)
+            entry = fn() if callable(fn) else None
+        return (False, True) if entry is None else entry.end_session_if_open()
 
     def resident_vram_bytes(self):
         entry = self._real if self.materialized else self.ensure_if_cached()
@@ -1033,6 +1074,16 @@ class QFModelPatcher(comfy.model_patcher.ModelPatcher):
             if restore is not None and "denoise_mask_function" not in executor.class_obj.model_options:
                 return restore(output, *args, **kwargs)
             return output
+        except BaseException:
+            eng = getattr(model, "_qf", None)
+            if eng is not None and callable(getattr(eng, "end_session_if_open", None)):
+                try:
+                    was_open, _ = eng.end_session_if_open()
+                    if was_open and hasattr(model, "_qf_needs_begin"):
+                        model._qf_needs_begin = True
+                except Exception as exc:  # noqa: BLE001
+                    _log.warning("[qf_native] session close after sampling abort returned error: %s", exc)
+            raise
         finally:
             _QF_RUN_ID.reset(run_token)
             _QF_SAMPLING_GEOMETRY.reset(token)
@@ -1131,6 +1182,13 @@ class QFModelPatcher(comfy.model_patcher.ModelPatcher):
     def detach(self, unpatch_all=True):
         if unpatch_all:
             eng = self._engine()
+            if eng is not None and callable(getattr(eng, "end_session_if_open", None)):
+                try:
+                    was_open, _ = eng.end_session_if_open()
+                    if was_open and hasattr(self.model, "_qf_needs_begin"):
+                        self.model._qf_needs_begin = True
+                except Exception as exc:  # noqa: BLE001
+                    _log.warning("[qf_native] session close during detach returned error: %s", exc)
             if eng is not None and callable(getattr(eng, "unload_vram", None)):
                 try:
                     eng.unload_vram(qfe.QF_UINT64_MAX)

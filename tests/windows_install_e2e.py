@@ -42,7 +42,7 @@ import uuid
 
 PLUGIN = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LIVE = "https://www.modelscope.cn/models/QuantFunc/Plugin/resolve/master/version.json"
-# The QI-2.1 t2i template's API prompt, as ComfyUI's frontend builds it from example_workflows/QuantFunc-QwenImage21-t2i.json
+# Minimal standalone Windows installer QI-2.1 smoke prompt (without optional Lightning LoRA dependency).
 PROMPT = {
     "2": {"inputs": {"transformer": "qwen-image-2.1-quantfunc-int4-r128-i8sidecar.qfc.safetensors",
                      "model_config": "qwen-image-2.1-int4", "attention_backend": "auto", "quality_enhance": False},
