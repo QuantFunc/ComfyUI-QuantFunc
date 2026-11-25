@@ -394,6 +394,16 @@ def _validate_loader_node(name, node, loader_schemas):
     return by_name
 
 
+QI21_BASE_ALPHA_WORKFLOWS = frozenset({
+    "QuantFunc-QwenImage21-t2i-transparent.json",
+})
+QI21_FORBIDDEN_ALPHA_LORA_TYPES = frozenset({
+    "QuantFuncNativeLoRA",
+    "LoraLoader",
+    "LoraLoaderModelOnly",
+})
+
+
 def _validate_qi21(name, doc, loaders):
     qi_loaders = [(n, vals) for n, vals in loaders if n.get("type") == "QuantFuncQwenImage21Loader"]
     if not qi_loaders:
@@ -408,7 +418,45 @@ def _validate_qi21(name, doc, loaders):
         if vals.get("pinned_memory") is not True:
             raise ValueError(f"{name}: QI-2.1 loader pinned_memory={vals.get('pinned_memory')!r} is not True")
 
+    samplers = [n for n in doc["nodes"] if n.get("type") == "KSampler" and n.get("mode", 0) == 0]
+    if not samplers:
+        raise ValueError(f"{name}: QI-2.1 workflow missing active KSampler")
+    loader_ids = {n["id"] for n, _ in qi_loaders if n.get("mode", 0) == 0}
+    sampler_ids = {n["id"] for n in samplers}
+    model_edges = {(l[1], l[3]) for l in doc["links"] if l[5] == "MODEL"}
     loras = [n for n in doc["nodes"] if n.get("type") == "QuantFuncNativeLoRA"]
+
+    if name in QI21_BASE_ALPHA_WORKFLOWS:
+        # Pure T2I transparent PNG requires base model (the 4-step RL Lightning LoRA suppresses RGBA alpha).
+        forbidden_loras = [n for n in doc["nodes"] if n.get("type") in QI21_FORBIDDEN_ALPHA_LORA_TYPES]
+        if forbidden_loras:
+            bad_types = sorted({n.get("type") for n in forbidden_loras})
+            raise ValueError(
+                f"{name}: base RGBA transparent workflow must not attach LoRA nodes {bad_types!r} "
+                f"(the 4-step Lightning LoRA breaks text-to-image alpha transparency)"
+            )
+        for ks in samplers:
+            kwv = ks.get("widgets_values")
+            if not isinstance(kwv, list) or len(kwv) < 7:
+                raise ValueError(f"{name}: malformed KSampler widgets_values {kwv!r}")
+            if not _is_strict_int(kwv[2]) or kwv[2] < 20:
+                raise ValueError(f"{name}: QI-2.1 base transparent KSampler steps={kwv[2]!r} < 20")
+            wvn = ks.get("widgets_values_named")
+            if isinstance(wvn, dict) and "steps" in wvn:
+                wvn_steps = wvn["steps"]
+                if not _is_strict_int(wvn_steps) or wvn_steps < 20 or wvn_steps != kwv[2]:
+                    raise ValueError(
+                        f"{name}: QI-2.1 base transparent KSampler widgets_values_named['steps']="
+                        f"{wvn_steps!r} invalid or disagrees with widgets_values[2]={kwv[2]!r}"
+                    )
+            sid = ks["id"]
+            incoming_models = [src for src, dst in model_edges if dst == sid]
+            if not incoming_models or not all(src in loader_ids for src in incoming_models):
+                raise ValueError(
+                    f"{name}: QI-2.1 base transparent workflow KSampler id={sid} must wire Loader -> KSampler directly"
+                )
+        return
+
     if not loras:
         raise ValueError(f"{name}: QI-2.1 workflow missing QuantFuncNativeLoRA node")
     active_loras = [n for n in loras if n.get("mode", 0) == 0]
@@ -423,9 +471,6 @@ def _validate_qi21(name, doc, loaders):
         if not _is_finite_number(lwv[1]) or lwv[1] != 1.0:
             raise ValueError(f"{name}: QI-2.1 LoRA strength {lwv[1]!r} != 1.0")
 
-    samplers = [n for n in doc["nodes"] if n.get("type") == "KSampler" and n.get("mode", 0) == 0]
-    if not samplers:
-        raise ValueError(f"{name}: QI-2.1 workflow missing active KSampler")
     for ks in samplers:
         kwv = ks.get("widgets_values")
         if not isinstance(kwv, list) or len(kwv) < 7:
@@ -435,10 +480,7 @@ def _validate_qi21(name, doc, loaders):
         if kwv[4] != "res_multistep":
             raise ValueError(f"{name}: QI-2.1 KSampler sampler_name={kwv[4]!r} != 'res_multistep'")
 
-    loader_ids = {n["id"] for n, _ in qi_loaders if n.get("mode", 0) == 0}
     lora_ids = {n["id"] for n in active_loras}
-    sampler_ids = {n["id"] for n in samplers}
-    model_edges = {(l[1], l[3]) for l in doc["links"] if l[5] == "MODEL"}
     if not any((lid, loid) in model_edges and (loid, sid) in model_edges
                for lid in loader_ids for loid in lora_ids for sid in sampler_ids):
         raise ValueError(f"{name}: QI-2.1 must wire QuantFuncQwenImage21Loader -> QuantFuncNativeLoRA -> KSampler")
@@ -687,6 +729,132 @@ class ExampleWorkflowsContractTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "sampler_name"):
             validate_workflow(qi_wf, self._mutate_doc(qi_wf, bad_sampler), self.schemas)
+
+    def test_mutation_qi21_transparent_rejects_lightning_lora_and_low_steps(self):
+        wf = "QuantFunc-QwenImage21-t2i-transparent.json"
+
+        # (a) Reject QuantFuncNativeLoRA and stock ComfyUI LoraLoader / LoraLoaderModelOnly
+        for lora_type in ("QuantFuncNativeLoRA", "LoraLoader", "LoraLoaderModelOnly"):
+            with self.subTest(case="forbidden_lora_type", lora_type=lora_type):
+                def add_lora(doc, lt=lora_type):
+                    loader = next(n for n in doc["nodes"] if n["type"] == "QuantFuncQwenImage21Loader")
+                    loader["outputs"][0]["links"] = [9]
+                    for link in doc["links"]:
+                        if link[0] == 2:
+                            link[1] = 10
+                    doc["links"].append([9, loader["id"], 0, 10, 0, "MODEL"])
+                    doc["nodes"].append({
+                        "id": 10,
+                        "type": lt,
+                        "mode": 0,
+                        "inputs": [{"name": "model", "type": "MODEL", "link": 9}],
+                        "outputs": [{"name": "MODEL", "type": "MODEL", "links": [2]}],
+                        "widgets_values": [QI21_LORA_FILE, 1.0],
+                    })
+                    doc["last_node_id"] = 10
+                    doc["last_link_id"] = 9
+
+                with self.assertRaisesRegex(ValueError, "must not attach LoRA"):
+                    validate_workflow(wf, self._mutate_doc(wf, add_lora), self.schemas)
+
+        # (b) Exact boundary steps=20 passes; steps=19, 6, float 25.0, bool True all rejected
+        def exact_20_steps(doc):
+            next(n for n in doc["nodes"] if n["type"] == "KSampler")["widgets_values"][2] = 20
+
+        self.assertIsInstance(
+            validate_workflow(wf, self._mutate_doc(wf, exact_20_steps), self.schemas),
+            dict,
+        )
+
+        for bad_steps in (6, 19, 25.0, True):
+            with self.subTest(case="bad_steps", bad_steps=bad_steps):
+                def mut_steps(doc, s=bad_steps):
+                    next(n for n in doc["nodes"] if n["type"] == "KSampler")["widgets_values"][2] = s
+
+                with self.assertRaisesRegex(ValueError, "steps"):
+                    validate_workflow(wf, self._mutate_doc(wf, mut_steps), self.schemas)
+
+        # (c) Truncated KSampler widgets_values len in (5, 6) rejected cleanly with ValueError
+        for trunc_len in (5, 6):
+            with self.subTest(case="truncated_kwv", trunc_len=trunc_len):
+                def trunc_kwv(doc, n=trunc_len):
+                    ks = next(x for x in doc["nodes"] if x["type"] == "KSampler")
+                    ks["widgets_values"] = ks["widgets_values"][:n]
+
+                with self.assertRaisesRegex(ValueError, "malformed KSampler widgets_values"):
+                    validate_workflow(wf, self._mutate_doc(wf, trunc_kwv), self.schemas)
+
+        # (d) Dual-write drift: widgets_values_named['steps'] disagrees or < 20 -> rejected
+        for wvn_steps in (6, 19, 24, 25.0, True):
+            with self.subTest(case="wvn_steps_drift", wvn_steps=wvn_steps):
+                def mut_wvn_steps(doc, s=wvn_steps):
+                    ks = next(x for x in doc["nodes"] if x["type"] == "KSampler")
+                    ks["widgets_values_named"] = {"steps": s, "sampler_name": "res_multistep"}
+
+                with self.assertRaisesRegex(ValueError, "widgets_values_named"):
+                    validate_workflow(wf, self._mutate_doc(wf, mut_wvn_steps), self.schemas)
+
+        def valid_wvn_steps(doc):
+            ks = next(x for x in doc["nodes"] if x["type"] == "KSampler")
+            ks["widgets_values_named"] = {"steps": 25, "sampler_name": "res_multistep"}
+
+        self.assertIsInstance(
+            validate_workflow(wf, self._mutate_doc(wf, valid_wvn_steps), self.schemas),
+            dict,
+        )
+
+        # (e) Indirect Loader -> intermediate node -> KSampler bypass rejected
+        def indirect_model_node(doc):
+            loader = next(n for n in doc["nodes"] if n["type"] == "QuantFuncQwenImage21Loader")
+            loader["outputs"][0]["links"] = [9]
+            for link in doc["links"]:
+                if link[0] == 2:
+                    link[1] = 10
+            doc["links"].append([9, loader["id"], 0, 10, 0, "MODEL"])
+            doc["nodes"].append({
+                "id": 10,
+                "type": "ModelSamplingAuraFlow",
+                "mode": 0,
+                "inputs": [{"name": "model", "type": "MODEL", "link": 9}],
+                "outputs": [{"name": "MODEL", "type": "MODEL", "links": [2]}],
+                "widgets_values": [3.0],
+            })
+            doc["last_node_id"] = 10
+            doc["last_link_id"] = 9
+
+        with self.assertRaisesRegex(ValueError, "wire Loader -> KSampler directly"):
+            validate_workflow(wf, self._mutate_doc(wf, indirect_model_node), self.schemas)
+
+        # (f) Two-sampler graph where sampler 1 is direct but sampler 2 goes through intermediate node -> rejected
+        def second_sampler_indirect(doc):
+            loader = next(n for n in doc["nodes"] if n["type"] == "QuantFuncQwenImage21Loader")
+            ks1 = next(n for n in doc["nodes"] if n["type"] == "KSampler")
+            loader["outputs"][0]["links"].append(9)
+            doc["links"].append([9, loader["id"], 0, 10, 0, "MODEL"])
+            doc["links"].append([10, 10, 0, 11, 0, "MODEL"])
+            doc["nodes"].append({
+                "id": 10,
+                "type": "ModelSamplingAuraFlow",
+                "mode": 0,
+                "inputs": [{"name": "model", "type": "MODEL", "link": 9}],
+                "outputs": [{"name": "MODEL", "type": "MODEL", "links": [10]}],
+                "widgets_values": [3.0],
+            })
+            ks2 = copy.deepcopy(ks1)
+            ks2["id"] = 11
+            ks2["inputs"] = [
+                {"name": "model", "type": "MODEL", "link": 10},
+                {"name": "positive", "type": "CONDITIONING", "link": None},
+                {"name": "negative", "type": "CONDITIONING", "link": None},
+                {"name": "latent_image", "type": "LATENT", "link": None},
+            ]
+            ks2["outputs"] = [{"name": "LATENT", "type": "LATENT", "links": []}]
+            doc["nodes"].append(ks2)
+            doc["last_node_id"] = 11
+            doc["last_link_id"] = 10
+
+        with self.assertRaisesRegex(ValueError, "KSampler id=11.*wire Loader -> KSampler directly"):
+            validate_workflow(wf, self._mutate_doc(wf, second_sampler_indirect), self.schemas)
 
     def test_mutation_all_families_res_multistep_and_sampler_boundaries_rejected(self):
         # (a) KSamplerSelect mutated back to "euler" on LTX25 and MiniMaxH3 (single & double).

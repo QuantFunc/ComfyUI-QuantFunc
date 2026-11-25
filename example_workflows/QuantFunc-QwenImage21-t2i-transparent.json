@@ -1,6 +1,6 @@
 {
- "last_node_id": 10,
- "last_link_id": 9,
+ "last_node_id": 9,
+ "last_link_id": 8,
  "nodes": [
   {
    "id": 1,
@@ -20,7 +20,7 @@
    "outputs": [],
    "properties": {},
    "widgets_values": [
-    "## QuantFunc Qwen-Image-2.1\n\n- **QuantFunc Qwen-Image-2.1 Loader** replaces the official `Load Diffusion Model` (UNETLoader): the QuantFunc engine runs the 32-block transformer; the text encoder (`CLIPLoader`, type `qwen_image`), `TextEncodeQwenImage21`, the VAE, the sampler and CFG stay stock ComfyUI.\n- `transformer`: the QuantFunc int4 export under `models/diffusion_models`.\n- `quality_enhance`: OFF (default) is faster; the subject and scene stay the same, but details such as poses, faces or small objects can differ. ON gives the highest quality.\n- Output is **RGBA**: `VAE Decode` + `Save Image` keep the alpha channel, so a transparent result saves as a transparent PNG.\n- Default settings: 6 steps, CFG 1, res_multistep / simple with QuantFunc Native LoRA (`qwen_image_21_lightning_v2_rl_4steps_lora_rank64.safetensors`, strength 1.0).\n\n**Transparent PNG.** Ask for a transparent background in the prompt; the RGBA VAE puts it in the alpha channel and `Save Image` writes a transparent PNG (the ComfyUI preview shows it over a checkerboard/white)."
+    "## QuantFunc Qwen-Image-2.1\n\n- **QuantFunc Qwen-Image-2.1 Loader** replaces the official `Load Diffusion Model` (UNETLoader): the QuantFunc engine runs the 32-block transformer; the text encoder (`CLIPLoader`, type `qwen_image`), `TextEncodeQwenImage21`, the VAE, the sampler and CFG stay stock ComfyUI.\n- `transformer`: the QuantFunc int4 export under `models/diffusion_models`.\n- `quality_enhance`: OFF (default) is faster; the subject and scene stay the same, but details such as poses, faces or small objects can differ. ON gives the highest quality.\n- Output is **RGBA**: `VAE Decode` + `Save Image` keep the alpha channel, so a transparent result saves as a transparent PNG.\n- Base transparent-PNG settings: 25 steps, CFG 1, res_multistep / simple (intentionally without the 4-step RL Lightning LoRA, which degrades text-to-image RGBA alpha transparency).\n\n**Transparent PNG.** Ask for a transparent background in the prompt; the RGBA VAE puts it in the alpha channel and `Save Image` writes a transparent PNG (the ComfyUI preview shows it over a checkerboard/white)."
    ]
   },
   {
@@ -43,7 +43,7 @@
      "name": "MODEL",
      "type": "MODEL",
      "links": [
-      9
+      2
      ],
      "slot_index": 0
     }
@@ -70,45 +70,6 @@
    ]
   },
   {
-   "id": 10,
-   "type": "QuantFuncNativeLoRA",
-   "pos": [
-    460,
-    -150
-   ],
-   "size": [
-    420,
-    90
-   ],
-   "flags": {},
-   "order": 2,
-   "mode": 0,
-   "inputs": [
-    {
-     "name": "model",
-     "type": "MODEL",
-     "link": 9
-    }
-   ],
-   "outputs": [
-    {
-     "name": "MODEL",
-     "type": "MODEL",
-     "links": [
-      2
-     ],
-     "slot_index": 0
-    }
-   ],
-   "properties": {
-    "Node name for S&R": "QuantFuncNativeLoRA"
-   },
-   "widgets_values": [
-    "qwen_image_21_lightning_v2_rl_4steps_lora_rank64.safetensors",
-    1.0
-   ]
-  },
-  {
    "id": 3,
    "type": "CLIPLoader",
    "pos": [
@@ -120,7 +81,7 @@
     110
    ],
    "flags": {},
-   "order": 3,
+   "order": 2,
    "mode": 0,
    "inputs": [],
    "outputs": [
@@ -154,7 +115,7 @@
     60
    ],
    "flags": {},
-   "order": 4,
+   "order": 3,
    "mode": 0,
    "inputs": [],
    "outputs": [
@@ -186,7 +147,7 @@
     330
    ],
    "flags": {},
-   "order": 5,
+   "order": 4,
    "mode": 0,
    "inputs": [
     {
@@ -254,7 +215,7 @@
     110
    ],
    "flags": {},
-   "order": 6,
+   "order": 5,
    "mode": 0,
    "inputs": [],
    "outputs": [
@@ -288,7 +249,7 @@
     270
    ],
    "flags": {},
-   "order": 7,
+   "order": 6,
    "mode": 0,
    "inputs": [
     {
@@ -328,7 +289,7 @@
    "widgets_values": [
     0,
     "fixed",
-    6,
+    25,
     1.0,
     "res_multistep",
     "simple",
@@ -347,7 +308,7 @@
     50
    ],
    "flags": {},
-   "order": 8,
+   "order": 7,
    "mode": 0,
    "inputs": [
     {
@@ -390,7 +351,7 @@
     540
    ],
    "flags": {},
-   "order": 9,
+   "order": 8,
    "mode": 0,
    "inputs": [
     {
@@ -419,7 +380,7 @@
   ],
   [
    2,
-   10,
+   2,
    0,
    7,
    0,
@@ -472,14 +433,6 @@
    9,
    0,
    "IMAGE"
-  ],
-  [
-   9,
-   2,
-   0,
-   10,
-   0,
-   "MODEL"
   ]
  ],
  "groups": [],
