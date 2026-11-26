@@ -388,7 +388,7 @@
    },
    "widgets_values": [
     0,
-    "fixed",
+    "randomize",
     6,
     1.0,
     "res_multistep",

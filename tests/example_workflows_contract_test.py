@@ -488,7 +488,22 @@ def _validate_qi21(name, doc, loaders):
         raise ValueError(f"{name}: QI-2.1 must not bypass QuantFuncNativeLoRA with direct Loader -> KSampler link")
 
 
-def _validate_minimax_h3(name, raw_text, doc):
+def _validate_ltx25(name, loaders):
+    ltx_loaders = [(n, vals) for n, vals in loaders if n.get("type") == "QuantFuncLTXLoader"]
+    if not ltx_loaders:
+        raise ValueError(f"{name}: missing QuantFuncLTXLoader")
+    for n, vals in ltx_loaders:
+        if vals.get("sol_min_tokens") != 0 or isinstance(vals.get("sol_min_tokens"), bool):
+            raise ValueError(f"{name}: LTX-2.5 loader sol_min_tokens={vals.get('sol_min_tokens')!r} != 0")
+
+
+def _validate_minimax_h3(name, raw_text, doc, loaders):
+    h3_loaders = [(n, vals) for n, vals in loaders if n.get("type") == "QuantFuncH3Loader"]
+    if not h3_loaders:
+        raise ValueError(f"{name}: missing QuantFuncH3Loader")
+    for n, vals in h3_loaders:
+        if vals.get("sol_min_tokens") != 0 or isinstance(vals.get("sol_min_tokens"), bool):
+            raise ValueError(f"{name}: MiniMax-H3 loader sol_min_tokens={vals.get('sol_min_tokens')!r} != 0")
     if "sol_vae" in raw_text.lower():
         raise ValueError(f"{name}: forbidden 'sol_vae' reference in MiniMax-H3 workflow")
     vaes = [n for n in doc["nodes"] if n.get("type") == "VAELoader"]
@@ -520,6 +535,23 @@ def _validate_minimax_h3(name, raw_text, doc):
         raise ValueError(f"{name}: MarkdownNote id=1 must state 'attention auto.'")
     if re.search(r"\battention\s+(?:sage|int8)\b", text, re.I):
         raise ValueError(f"{name}: MarkdownNote id=1 contains stale attention backend")
+    if re.search(r"Saved seed:.*\(fixed\)", text, re.I):
+        raise ValueError(f"{name}: MarkdownNote id=1 contains stale '(fixed)' seed description")
+    if "Saved seed:" in text and "(randomize)" not in text:
+        raise ValueError(f"{name}: MarkdownNote id=1 Saved seed line must document '(randomize)'")
+
+    for node in doc["nodes"]:
+        if node.get("type") == "PrimitiveInt":
+            pwv = node.get("widgets_values")
+            if not isinstance(pwv, list) or len(pwv) < 2 or pwv[1] != "fixed":
+                raise ValueError(
+                    f"{name}: PrimitiveInt node {node.get('id')} control_after_generate must stay 'fixed' (got {pwv!r})"
+                )
+            pwvn = node.get("widgets_values_named")
+            if isinstance(pwvn, dict) and "fixed" in pwvn and pwvn["fixed"] != "fixed":
+                raise ValueError(
+                    f"{name}: PrimitiveInt node {node.get('id')} widgets_values_named['fixed'] must stay 'fixed'"
+                )
 
 
 def _validate_all_samplers_res_multistep(name, doc):
@@ -563,6 +595,30 @@ def _validate_all_samplers_res_multistep(name, doc):
         raise ValueError(f"{name}: workflow contains zero KSampler/KSamplerSelect nodes")
 
 
+def _validate_all_seeds_randomize(name, doc):
+    seed_hits = 0
+    for node in doc["nodes"]:
+        ntype = node.get("type") or ""
+        nid = node.get("id")
+        wv = node.get("widgets_values")
+        wvn = node.get("widgets_values_named")
+        if ntype in ("KSampler", "RandomNoise"):
+            seed_hits += 1
+            if not isinstance(wv, list) or len(wv) < 2:
+                raise ValueError(f"{name}: {ntype} node {nid} malformed widgets_values {wv!r}")
+            if wv[1] != "randomize":
+                raise ValueError(
+                    f"{name}: {ntype} node {nid} control_after_generate={wv[1]!r} != 'randomize'"
+                )
+            if isinstance(wvn, dict) and "control_after_generate" in wvn and wvn["control_after_generate"] != "randomize":
+                raise ValueError(
+                    f"{name}: {ntype} node {nid} widgets_values_named['control_after_generate']="
+                    f"{wvn['control_after_generate']!r} != 'randomize'"
+                )
+    if seed_hits < 1:
+        raise ValueError(f"{name}: workflow contains zero KSampler/RandomNoise seed nodes")
+
+
 def validate_workflow(name, raw_text, loader_schemas):
     """Validate one shipped example workflow JSON against all plugin contracts."""
     if not isinstance(raw_text, str):
@@ -574,6 +630,7 @@ def validate_workflow(name, raw_text, loader_schemas):
     _check_topology(name, doc)
     _check_hygiene(name, raw_text, doc)
     _validate_all_samplers_res_multistep(name, doc)
+    _validate_all_seeds_randomize(name, doc)
 
     loaders = []
     for node in doc["nodes"]:
@@ -585,8 +642,10 @@ def validate_workflow(name, raw_text, loader_schemas):
 
     if name.startswith("QuantFunc-QwenImage21-"):
         _validate_qi21(name, doc, loaders)
+    elif name.startswith("QuantFunc-LTX25-"):
+        _validate_ltx25(name, loaders)
     elif name.startswith("QuantFunc-MiniMaxH3-"):
-        _validate_minimax_h3(name, raw_text, doc)
+        _validate_minimax_h3(name, raw_text, doc, loaders)
     return doc
 
 
@@ -1078,6 +1137,109 @@ class ExampleWorkflowsContractTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "absolute path"):
             validate_workflow(wf, self._mutate_doc(wf, abs_path), self.schemas)
+
+    def test_mutation_ltx_and_h3_sol_min_tokens_nonzero_rejected(self):
+        for wf, cls_name in (
+            ("QuantFunc-LTX25-t2v.json", "QuantFuncLTXLoader"),
+            ("QuantFunc-MiniMaxH3-fl2va.json", "QuantFuncH3Loader"),
+            ("QuantFunc-MiniMaxH3-fl2va-double-sampling.json", "QuantFuncH3Loader"),
+            ("QuantFunc-MiniMaxH3-ref2va.json", "QuantFuncH3Loader"),
+            ("QuantFunc-MiniMaxH3-ref2va-double-sampling.json", "QuantFuncH3Loader"),
+        ):
+            idx = self._widget_index(cls_name, "sol_min_tokens")
+            with self.subTest(wf=wf):
+                def m(doc, c=cls_name, i=idx):
+                    loader = next(n for n in doc["nodes"] if n["type"] == c)
+                    loader["widgets_values"][i] = 12288
+
+                with self.assertRaisesRegex(ValueError, "sol_min_tokens"):
+                    validate_workflow(wf, self._mutate_doc(wf, m), self.schemas)
+
+        # Missing target loader branch coverage (_validate_ltx25 & _validate_minimax_h3)
+        with self.assertRaisesRegex(ValueError, "missing QuantFuncLTXLoader"):
+            _validate_ltx25("QuantFunc-LTX25-t2v.json", [])
+        h3_doc = json.loads(self.raw_workflows["QuantFunc-MiniMaxH3-fl2va.json"])
+        with self.assertRaisesRegex(ValueError, "missing QuantFuncH3Loader"):
+            _validate_minimax_h3("QuantFunc-MiniMaxH3-fl2va.json", self.raw_workflows["QuantFunc-MiniMaxH3-fl2va.json"], h3_doc, [])
+
+        # H3 MarkdownNote stale '(fixed)' seed description & PrimitiveInt frame-count preservation
+        for wf in (
+            "QuantFunc-MiniMaxH3-fl2va.json",
+            "QuantFunc-MiniMaxH3-ref2va.json",
+            "QuantFunc-MiniMaxH3-ref2va-double-sampling.json",
+        ):
+            with self.subTest(note_wf=wf):
+                def m_note(doc):
+                    note = next(n for n in doc["nodes"] if n["id"] == 1 and n["type"] == "MarkdownNote")
+                    note["widgets_values"][0] = note["widgets_values"][0].replace("(randomize).", "(fixed).")
+                    if isinstance(note.get("widgets_values_named"), dict) and "text" in note["widgets_values_named"]:
+                        note["widgets_values_named"]["text"] = note["widgets_values"][0]
+
+                with self.assertRaisesRegex(ValueError, "stale '\\(fixed\\)'"):
+                    validate_workflow(wf, self._mutate_doc(wf, m_note), self.schemas)
+
+                def m_note_missing(doc):
+                    note = next(n for n in doc["nodes"] if n["id"] == 1 and n["type"] == "MarkdownNote")
+                    note["widgets_values"][0] = note["widgets_values"][0].replace("(randomize).", "(increment).")
+                    if isinstance(note.get("widgets_values_named"), dict) and "text" in note["widgets_values_named"]:
+                        note["widgets_values_named"]["text"] = note["widgets_values"][0]
+
+                with self.assertRaisesRegex(ValueError, "must document '\\(randomize\\)'"):
+                    validate_workflow(wf, self._mutate_doc(wf, m_note_missing), self.schemas)
+
+        for wf in (
+            "QuantFunc-MiniMaxH3-fl2va-double-sampling.json",
+            "QuantFunc-MiniMaxH3-ref2va-double-sampling.json",
+        ):
+            with self.subTest(prim_wf=wf):
+                def m_prim(doc):
+                    prim = next(n for n in doc["nodes"] if n["type"] == "PrimitiveInt")
+                    prim["widgets_values"][1] = "randomize"
+
+                with self.assertRaisesRegex(ValueError, "PrimitiveInt.*must stay 'fixed'"):
+                    validate_workflow(wf, self._mutate_doc(wf, m_prim), self.schemas)
+
+                def m_prim_named(doc):
+                    prim = next(n for n in doc["nodes"] if n["type"] == "PrimitiveInt")
+                    prim["widgets_values_named"] = {"value": 124, "fixed": "randomize"}
+
+                with self.assertRaisesRegex(ValueError, "widgets_values_named\\['fixed'\\] must stay 'fixed'"):
+                    validate_workflow(wf, self._mutate_doc(wf, m_prim_named), self.schemas)
+
+    def test_mutation_fixed_seed_rejected(self):
+        # Every seed node across all 12 workflows (including Stage 2 KSampler[11] in Krea2 double-sampling)
+        for wf in sorted(EXPECTED_WORKFLOWS):
+            doc0 = json.loads(self.raw_workflows[wf])
+            seed_ids = [n["id"] for n in doc0["nodes"] if n.get("type") in ("KSampler", "RandomNoise")]
+            self.assertGreaterEqual(len(seed_ids), 1, f"{wf} missing seed nodes")
+            for nid in seed_ids:
+                for bad_ctrl in ("fixed", "increment", "decrement"):
+                    with self.subTest(wf=wf, nid=nid, bad_ctrl=bad_ctrl):
+                        def m(doc, target_id=nid, val=bad_ctrl):
+                            node = next(n for n in doc["nodes"] if n["id"] == target_id)
+                            node["widgets_values"][1] = val
+
+                        with self.assertRaisesRegex(ValueError, "randomize"):
+                            validate_workflow(wf, self._mutate_doc(wf, m), self.schemas)
+
+        # widgets_values_named drift, truncated widgets_values, and zero seed nodes
+        wf_krea = "QuantFunc-Krea2-t2i.json"
+        def m_wvn_drift(doc):
+            ks = next(n for n in doc["nodes"] if n["type"] == "KSampler")
+            ks["widgets_values_named"] = {"control_after_generate": "fixed"}
+
+        with self.assertRaisesRegex(ValueError, "widgets_values_named\\['control_after_generate'\\]"):
+            validate_workflow(wf_krea, self._mutate_doc(wf_krea, m_wvn_drift), self.schemas)
+
+        def m_trunc(doc):
+            rn = next(n for n in doc["nodes"] if n["type"] == "RandomNoise")
+            rn["widgets_values"] = [42]
+
+        with self.assertRaisesRegex(ValueError, "malformed widgets_values"):
+            validate_workflow("QuantFunc-LTX25-t2v.json", self._mutate_doc("QuantFunc-LTX25-t2v.json", m_trunc), self.schemas)
+
+        with self.assertRaisesRegex(ValueError, "zero KSampler/RandomNoise seed nodes"):
+            _validate_all_seeds_randomize("empty.json", {"nodes": []})
 
 
 if __name__ == "__main__":

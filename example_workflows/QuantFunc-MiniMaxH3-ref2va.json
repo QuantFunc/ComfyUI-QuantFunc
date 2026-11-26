@@ -22,10 +22,10 @@
       "outputs": [],
       "properties": {},
       "widgets_values": [
-        "## QuantFunc MiniMax-H3\n\nQuantFunc runs the H3 transformer and joint video/audio sampling. CLIPLoader (type minimax), the VAEs, conditioning, scheduler and sampler are stock ComfyUI.\n\n- Transformer: `minimax_h3_ref2va_8steps_quantfunc_int4_r128.safetensors`, from [QuantFunc on ModelScope](https://modelscope.cn/models/QuantFunc/Minimax-H3-Quantfunc-4bit), in models/diffusion_models.\n- Text encoder: `qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors`. Video VAE: `minimax_h3_video_vae_int8_convrot.safetensors`. Audio VAE: `minimax_h3_audio_vae_fp32.safetensors`, from [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3).\n- Saved canvas: 1024x1024, 124 frames.\n- Saved sampling: 8 total steps, res_multistep / simple, denoise 1, attention auto.\n- Saved seed: 42 (fixed).\n- References: `ComfyUI_temp_tupev_00031_.png` is active; `mecha_dragon_lightning.png` is bypassed.\n- Reference sizing: match. The active image is `<Picture 1>` in the prompt; connect more references in order as needed.\n\nSingle-stage sampling at the saved canvas size. Change the prompt, canvas and frame count in the H3 conditioning node.\n"
+        "## QuantFunc MiniMax-H3\n\nQuantFunc runs the H3 transformer and joint video/audio sampling. CLIPLoader (type minimax), the VAEs, conditioning, scheduler and sampler are stock ComfyUI.\n\n- Transformer: `minimax_h3_ref2va_8steps_quantfunc_int4_r128.safetensors`, from [QuantFunc on ModelScope](https://modelscope.cn/models/QuantFunc/Minimax-H3-Quantfunc-4bit), in models/diffusion_models.\n- Text encoder: `qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors`. Video VAE: `minimax_h3_video_vae_int8_convrot.safetensors`. Audio VAE: `minimax_h3_audio_vae_fp32.safetensors`, from [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3).\n- Saved canvas: 1024x1024, 124 frames.\n- Saved sampling: 8 total steps, res_multistep / simple, denoise 1, attention auto.\n- Saved seed: 42 (randomize).\n- References: `ComfyUI_temp_tupev_00031_.png` is active; `mecha_dragon_lightning.png` is bypassed.\n- Reference sizing: match. The active image is `<Picture 1>` in the prompt; connect more references in order as needed.\n\nSingle-stage sampling at the saved canvas size. Change the prompt, canvas and frame count in the H3 conditioning node.\n"
       ],
       "widgets_values_named": {
-        "text": "## QuantFunc MiniMax-H3\n\nQuantFunc runs the H3 transformer and joint video/audio sampling. CLIPLoader (type minimax), the VAEs, conditioning, scheduler and sampler are stock ComfyUI.\n\n- Transformer: `minimax_h3_ref2va_8steps_quantfunc_int4_r128.safetensors`, from [QuantFunc on ModelScope](https://modelscope.cn/models/QuantFunc/Minimax-H3-Quantfunc-4bit), in models/diffusion_models.\n- Text encoder: `qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors`. Video VAE: `minimax_h3_video_vae_int8_convrot.safetensors`. Audio VAE: `minimax_h3_audio_vae_fp32.safetensors`, from [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3).\n- Saved canvas: 1024x1024, 124 frames.\n- Saved sampling: 8 total steps, res_multistep / simple, denoise 1, attention auto.\n- Saved seed: 42 (fixed).\n- References: `ComfyUI_temp_tupev_00031_.png` is active; `mecha_dragon_lightning.png` is bypassed.\n- Reference sizing: match. The active image is `<Picture 1>` in the prompt; connect more references in order as needed.\n\nSingle-stage sampling at the saved canvas size. Change the prompt, canvas and frame count in the H3 conditioning node.\n"
+        "text": "## QuantFunc MiniMax-H3\n\nQuantFunc runs the H3 transformer and joint video/audio sampling. CLIPLoader (type minimax), the VAEs, conditioning, scheduler and sampler are stock ComfyUI.\n\n- Transformer: `minimax_h3_ref2va_8steps_quantfunc_int4_r128.safetensors`, from [QuantFunc on ModelScope](https://modelscope.cn/models/QuantFunc/Minimax-H3-Quantfunc-4bit), in models/diffusion_models.\n- Text encoder: `qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors`. Video VAE: `minimax_h3_video_vae_int8_convrot.safetensors`. Audio VAE: `minimax_h3_audio_vae_fp32.safetensors`, from [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3).\n- Saved canvas: 1024x1024, 124 frames.\n- Saved sampling: 8 total steps, res_multistep / simple, denoise 1, attention auto.\n- Saved seed: 42 (randomize).\n- References: `ComfyUI_temp_tupev_00031_.png` is active; `mecha_dragon_lightning.png` is bypassed.\n- Reference sizing: match. The active image is `<Picture 1>` in the prompt; connect more references in order as needed.\n\nSingle-stage sampling at the saved canvas size. Change the prompt, canvas and frame count in the H3 conditioning node.\n"
       },
       "color": "#432",
       "bgcolor": "#653"
@@ -158,7 +158,7 @@
         1.3,
         0.0,
         0.9,
-        12288,
+        0,
         "exact_kv_and_rows",
         2,
         0.0,
@@ -657,11 +657,11 @@
       },
       "widgets_values": [
         42,
-        "fixed"
+        "randomize"
       ],
       "widgets_values_named": {
         "noise_seed": 42,
-        "control_after_generate": "fixed"
+        "control_after_generate": "randomize"
       }
     },
     {

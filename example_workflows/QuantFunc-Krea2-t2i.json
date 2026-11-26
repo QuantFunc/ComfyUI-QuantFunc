@@ -503,7 +503,7 @@
       },
       "widgets_values": [
         42,
-        "fixed",
+        "randomize",
         8,
         1,
         "res_multistep",
@@ -512,7 +512,7 @@
       ],
       "widgets_values_named": {
         "seed": 42,
-        "control_after_generate": "fixed",
+        "control_after_generate": "randomize",
         "steps": 8,
         "cfg": 1,
         "sampler_name": "res_multistep",
