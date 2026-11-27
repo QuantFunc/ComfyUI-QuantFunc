@@ -52,7 +52,7 @@ ComfyUI/
 | **cuDNN** | 9.x |
 | **OS** | Linux (glibc 2.31+) or Windows 10/11 |
 | **Python** | 3.9+ (ComfyUI's embedded Python) |
-| **Engine build** (0.0.13, Linux) | CUDA 13.0 + cuDNN 9.13 (CUDA 13 engine), CUDA 12.9.2 + cuDNN 9.3 (CUDA 12 engine); gcc 11.4; OpenCV / OpenSSL / curl linked statically |
+| **Engine build** (0.0.18, Linux & Windows) | CUDA 13.0 (CUDA 13 engine) and CUDA 12.9 (CUDA 12 engine); OpenSSL / curl linked statically |
 
 ### 2.4 Runtime Dependencies
 

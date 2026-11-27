@@ -61,6 +61,13 @@ Reference images included with the example workflows.
 
 ## Recent Updates
 
+### Engine 0.0.18 · Plugin 0.0.08
+
+- **PC Engine architecture:** refactored to a standalone single-Transformer engine with a zero-CUDA host library (`libquantfunc.so` / `quantfunc.dll`) paired with single-architecture CUDA 12/13 kernel plugins (`sm75`, `sm86`, `sm89`, `sm120a`) across Linux and Windows, with SHA-256 verification and strict `-12` pairing.
+- **Blackwell (SM120) quality & 8 GB VRAM stability:** fixed diagonal blur artifacts on RTX 50-series GPUs (MiniMax-H3) while preserving full throughput and 8 GB VRAM headroom across MiniMax-H3, LTX-2.5, Krea-2 and Qwen-Image-2.1.
+- **Built-in attention tiers & faster startup/loading:** exposed `auto`, `int8`, `i4xi8`, `int4`, `fp16` across all four loaders, with faster model scanning, cached VRAM estimates, prefetching, and zero-sync stream handoff.
+- **Bug fixes & workflow updates:** fixed `QF:PL_PERM` / clone 2x VRAM inflation / cold autoload / MiniMax-H3 3D audio packing / Qwen-Image-2.1 `CFG=1.0` & RGBA transparent alpha issues; unified all 12 example workflows to `res_multistep` with `sol_min_tokens=0` on LTX-2.5 and MiniMax-H3.
+
 ### Engine 0.0.17 · Plugin 0.0.07
 
 - **Built-in attention backends:** architecture-matched attention backends (`auto`, `int8`, `i4xi8`, `int4`, `fp16`) for Linux and Windows.

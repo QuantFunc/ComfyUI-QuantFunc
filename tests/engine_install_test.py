@@ -1438,6 +1438,279 @@ def main():
         sys.modules.pop(f"{pkg_tmp.__name__}.qf_engine", None)
         sys.modules.pop(f"{pkg_tmp.__name__}.qf_capi", None)
 
+    # 22) T20: Same-version marker matches remote verify.json, but file on disk is corrupted OR missing -> install_engine self-heals;
+    #     AND symlinked pair_have dir is refused BEFORE _sha256_of is ever called.
+    rel_heal = Release("0.0.14")
+    with Env(rel_heal, sm=89) as env:
+        qfe.install_engine()
+        pair = "0.0.14-sm89-cu13"
+        orig_k = env.read(pair, kernel_for(89, 13))
+        # (a) Corrupt kernel on disk while marker JSON still matches remote verify.json
+        with open(env.path(pair, kernel_for(89, 13)), "wb") as f:
+            f.write(b"CORRUPTED-ON-DISK")
+        rel_heal.fetched.clear()
+        qfe.install_engine()
+        healed_corrupt = (
+            env.read(pair, kernel_for(89, 13)) == orig_k
+            and qfe._pair_intact(env.marker("sm89", 13))
+            and f"0.0.14/linux/sm89/{kernel_for(89, 13)}" in rel_heal.fetched
+        )
+        # (b) Delete kernel on disk while marker JSON still matches remote verify.json
+        os.remove(env.path(pair, kernel_for(89, 13)))
+        rel_heal.fetched.clear()
+        qfe.install_engine()
+        healed_missing = (
+            env.read(pair, kernel_for(89, 13)) == orig_k
+            and qfe._pair_intact(env.marker("sm89", 13))
+            and f"0.0.14/linux/sm89/{kernel_for(89, 13)}" in rel_heal.fetched
+        )
+        # (c) Symlinked pair_have dir MUST be refused BEFORE _sha256_of reads any file
+        real_pair = env.path(pair)
+        moved_pair = os.path.join(env.dir, "elsewhere-pair")
+        shutil.move(real_pair, moved_pair)
+        os.symlink(moved_pair, real_pair)
+        sha_calls = []
+        orig_sha = qfe._sha256_of
+        def _spy_sha(p):
+            sha_calls.append(p)
+            return orig_sha(p)
+        qfe._sha256_of = _spy_sha
+        sym_refused = False
+        try:
+            qfe.install_engine()
+        except RuntimeError as e:
+            sym_refused = "symlink" in str(e).lower()
+        finally:
+            qfe._sha256_of = orig_sha
+        check("T20 install_engine self-heals corrupted/missing disk files and refuses symlink pair before hashing",
+              healed_corrupt and healed_missing and sym_refused and len(sha_calls) == 0,
+              (healed_corrupt, healed_missing, sym_refused, sha_calls))
+
+    # 23) T21: Windows locked-DLL rename-aside, stale cleanup, non-Windows/fresh-install guards, and fail-closed rollback
+    def _win_rel_bytes(hdata, kdata, addons=None):
+        wr = WinRelease("0.0.18")
+        wr.files["0.0.18/windows/quantfunc.dll"] = hdata
+        wr.files["0.0.18/windows/sm120a/libquantfunc_kernels.dll"] = kdata
+        vdoc = json.loads(wr.files["0.0.18/verify.json"])
+        vdoc["win32"]["quantfunc.dll"] = sha(hdata)
+        vdoc["win32"]["sm120a/libquantfunc_kernels.dll"] = sha(kdata)
+        if addons:
+            verdoc = json.loads(wr.files["version.json"])
+            verdoc["win32"]["0.0.18"]["addons"] = list(addons.keys())
+            wr.files["version.json"] = json.dumps(verdoc).encode()
+            for aname, adata in addons.items():
+                wr.files[f"0.0.18/windows/sm120a/{aname}"] = adata
+                vdoc["win32"][f"sm120a/{aname}"] = sha(adata)
+        wr.files["0.0.18/verify.json"] = json.dumps(vdoc).encode()
+        return wr
+
+    # (a) Non-Windows PermissionError on os.replace MUST NOT rename aside
+    rel_lin_perm = Release("0.0.14")
+    with Env(rel_lin_perm, sm=89) as env:
+        qfe.install_engine()
+        pair = "0.0.14-sm89-cu13"
+        os.remove(env.path(pair, kernel_for(89, 13)))
+        real_replace = os.replace
+        def lin_perm(src, dst):
+            if os.path.basename(dst) == HOSTS[13]:
+                raise PermissionError(13, "POSIX EACCES", dst)
+            return real_replace(src, dst)
+        qfe.os.replace = lin_perm
+        lin_perm_refused = False
+        try:
+            qfe.install_engine()
+        except (PermissionError, RuntimeError) as e:
+            lin_perm_refused = "PermissionError" in str(e) or isinstance(e, PermissionError)
+        finally:
+            qfe.os.replace = real_replace
+        no_stale_linux = not any(".stale-" in fn for fn in os.listdir(env.path(pair)))
+        check("T21a Linux PermissionError does not trigger Windows rename-aside",
+              lin_perm_refused and no_stale_linux, (lin_perm_refused, no_stale_linux))
+
+    with windows():
+        # (b) Windows fresh install (dst does not exist) PermissionError MUST NOT rename aside
+        wrel_fresh = _win_rel_bytes(b"MZ-HOST-F", b"MZ-KERN-F")
+        with Env(wrel_fresh, sm=120, torch_major=13, driver_major=13, machine="AMD64") as env:
+            real_replace = os.replace
+            def fresh_perm(src, dst):
+                if os.path.basename(dst) == "libquantfunc_kernels.dll":
+                    raise PermissionError(13, "WinError 5 fresh", dst)
+                return real_replace(src, dst)
+            qfe.os.replace = fresh_perm
+            fresh_perm_raised = False
+            try:
+                qfe.install_engine()
+            except PermissionError:
+                fresh_perm_raised = True
+            finally:
+                qfe.os.replace = real_replace
+            check("T21b Windows fresh-install PermissionError (no existing dst) propagates without rename-aside",
+                  fresh_perm_raised, fresh_perm_raised)
+
+        # (c) Positive rename-aside with locked stale survivor, legitimate add-on containing '.stale-',
+        #     stale symlink/dir immunity, skip-branch & update-branch cleanup, and locked-stale OSError tolerance
+        wrel1 = _win_rel_bytes(b"MZ-HOST-V1", b"MZ-KERN-V1", addons={"helper.stale-1.dll": b"ADDON-OK"})
+        with Env(wrel1, sm=120, torch_major=13, driver_major=13, machine="AMD64") as env:
+            qfe.install_engine()
+            pair = "0.0.18-sm120a-cu13"
+            pair_dir = env.path(pair)
+            marker_path = os.path.join(env.dir, ".engine-sm120a-cu13.json")
+
+            wrel2 = _win_rel_bytes(b"MZ-HOST-V2", b"MZ-KERN-V2", addons={"helper.stale-1.dll": b"ADDON-OK"})
+            qfe._engine_http_open = wrel2.open
+            real_replace = os.replace
+            real_remove = os.remove
+            seen_perm = {"count": 0}
+            locked_stales = set()
+
+            def win_locked_replace(src, dst):
+                if os.path.exists(dst) and os.path.basename(dst) in ("quantfunc.dll", "libquantfunc_kernels.dll"):
+                    seen_perm["count"] += 1
+                    raise PermissionError(13, "WinError 5 locked DLL", dst)
+                return real_replace(src, dst)
+
+            def block_stale_remove(p):
+                if ".stale-" in os.path.basename(p):
+                    locked_stales.add(os.path.basename(p))
+                    raise PermissionError(13, "WinError 5 still mapped", p)
+                return real_remove(p)
+
+            qfe.os.replace = win_locked_replace
+            qfe.os.remove = block_stale_remove
+            try:
+                qfe.install_engine()
+            finally:
+                qfe.os.replace = real_replace
+                qfe.os.remove = real_remove
+            # Create an unrelated symlink & dir matching stale regex to confirm _cleanup_stale ignores both
+            victim_file = os.path.join(env.dir, "outside-victim.bin")
+            with open(victim_file, "wb") as vf:
+                vf.write(b"KEEP")
+            stale_sym = os.path.join(pair_dir, ".quantfunc.dll.stale-999-abcdef01")
+            os.symlink(victim_file, stale_sym)
+            stale_sub = os.path.join(pair_dir, ".quantfunc.dll.stale-998-abcdef02")
+            os.makedirs(stale_sub, exist_ok=True)
+
+            win_rename_ok = (
+                seen_perm["count"] == 2
+                and len(locked_stales) == 2
+                and env.read(pair, "quantfunc.dll") == b"MZ-HOST-V2"
+                and env.read(pair, "libquantfunc_kernels.dll") == b"MZ-KERN-V2"
+                and env.read(pair, "helper.stale-1.dll") == b"ADDON-OK"
+                and qfe._pair_intact(env.marker("sm120a", 13))
+            )
+
+            # Skip branch while stale files still locked -> tolerates OSError; then unlocked -> cleans only real stale files
+            qfe.os.remove = block_stale_remove
+            try:
+                qfe.install_engine()
+            finally:
+                qfe.os.remove = real_remove
+            still_has_locked = all(os.path.exists(os.path.join(pair_dir, s)) for s in locked_stales)
+            qfe.install_engine()
+            skip_cleaned_ok = (
+                still_has_locked
+                and not any(os.path.exists(os.path.join(pair_dir, s)) for s in locked_stales)
+                and os.path.exists(os.path.join(pair_dir, "helper.stale-1.dll"))
+                and os.path.exists(victim_file)
+                and os.path.islink(stale_sym)
+                and os.path.isdir(stale_sub)
+            )
+            os.unlink(stale_sym)
+            os.rmdir(stale_sub)
+
+            # Update branch cleans pre-existing unlocked stale file
+            pre_stale = os.path.join(pair_dir, ".quantfunc.dll.stale-777-deadbeef")
+            with open(pre_stale, "wb") as sf:
+                sf.write(b"OLD-STALE")
+            wrel2b = _win_rel_bytes(b"MZ-HOST-V2B", b"MZ-KERN-V2B", addons={"helper.stale-1.dll": b"ADDON-OK"})
+            qfe._engine_http_open = wrel2b.open
+            qfe.install_engine()
+            update_cleaned_ok = (
+                not os.path.exists(pre_stale)
+                and env.read(pair, "quantfunc.dll") == b"MZ-HOST-V2B"
+                and env.read(pair, "helper.stale-1.dll") == b"ADDON-OK"
+            )
+
+            # (d) Negative rollback 1: kernel renamed aside, then host fails -> restores kernel V2B
+            wrel3 = _win_rel_bytes(b"MZ-HOST-V3", b"MZ-KERN-V3")
+            qfe._engine_http_open = wrel3.open
+            def win_fail_host_after_kernel_stale(src, dst):
+                if os.path.basename(dst) == "libquantfunc_kernels.dll" and os.path.exists(dst):
+                    raise PermissionError(13, "WinError 5 locked kernel", dst)
+                if os.path.basename(dst) == "quantfunc.dll":
+                    raise OSError("disk full on host")
+                return real_replace(src, dst)
+            qfe.os.replace = win_fail_host_after_kernel_stale
+            rb1_ok = False
+            try:
+                qfe.install_engine()
+            except RuntimeError as e:
+                rb1_ok = "existing installation was preserved" in str(e)
+            finally:
+                qfe.os.replace = real_replace
+            rb1_ok = rb1_ok and env.read(pair, "quantfunc.dll") == b"MZ-HOST-V2B" and env.read(pair, "libquantfunc_kernels.dll") == b"MZ-KERN-V2B"
+
+            # (e) Negative rollback 2: BOTH kernel & host renamed aside, then _claim fails -> restores BOTH
+            orig_claim = qfe._claim
+            def fail_claim(*args, **kwargs):
+                raise OSError("simulated claim failure")
+            qfe.os.replace = win_locked_replace
+            qfe._claim = fail_claim
+            rb2_ok = False
+            try:
+                qfe.install_engine()
+            except RuntimeError as e:
+                rb2_ok = "existing installation was preserved" in str(e)
+            finally:
+                qfe.os.replace = real_replace
+                qfe._claim = orig_claim
+            rb2_ok = rb2_ok and env.read(pair, "quantfunc.dll") == b"MZ-HOST-V2B" and env.read(pair, "libquantfunc_kernels.dll") == b"MZ-KERN-V2B"
+
+            # (f) Negative rollback 3: rename dst->stale succeeds, retry replace fails, outer rollback restores dst
+            retry_calls = {"k": 0}
+            def fail_retry_replace(src, dst):
+                if os.path.basename(dst) == "libquantfunc_kernels.dll":
+                    retry_calls["k"] += 1
+                    if retry_calls["k"] == 1:
+                        raise PermissionError(13, "WinError 5 locked", dst)
+                    raise OSError("AV locked .part on retry")
+                return real_replace(src, dst)
+            qfe.os.replace = fail_retry_replace
+            rb3_ok = False
+            try:
+                qfe.install_engine()
+            except RuntimeError as e:
+                rb3_ok = "existing installation was preserved" in str(e)
+            finally:
+                qfe.os.replace = real_replace
+            rb3_ok = rb3_ok and env.read(pair, "libquantfunc_kernels.dll") == b"MZ-KERN-V2B" and os.path.exists(marker_path)
+
+            # (g) Negative rollback 4 (fail-closed): rename dst->stale succeeds, retry replace fails, AND rename(stale,dst) fails
+            #     MUST set rollback_failed=True, remove marker, and NEVER claim "existing installation was preserved"!
+            retry_calls["k"] = 0
+            real_rename = os.rename
+            def fail_restore_rename(src, dst):
+                if ".stale-" in os.path.basename(src):
+                    raise OSError("simulated restore rename failure")
+                return real_rename(src, dst)
+            qfe.os.replace = fail_retry_replace
+            qfe.os.rename = fail_restore_rename
+            rb4_ok = False
+            try:
+                qfe.install_engine()
+            except RuntimeError as e:
+                msg = str(e)
+                rb4_ok = ("rollback failed" in msg) and ("existing installation was preserved" not in msg)
+            finally:
+                qfe.os.replace = real_replace
+                qfe.os.rename = real_rename
+            rb4_ok = rb4_ok and (not os.path.exists(marker_path))
+
+            check("T21c-g Windows rename-aside, stale cleanup, add-on preservation & fail-closed rollback all pass",
+                  win_rename_ok and skip_cleaned_ok and update_cleaned_ok and rb1_ok and rb2_ok and rb3_ok and rb4_ok,
+                  (win_rename_ok, skip_cleaned_ok, update_cleaned_ok, rb1_ok, rb2_ok, rb3_ok, rb4_ok))
+
     print("ENGINE_INSTALL:", "PASS" if bad == 0 else f"FAIL ({bad} wrong)")
     return 1 if bad else 0
 
