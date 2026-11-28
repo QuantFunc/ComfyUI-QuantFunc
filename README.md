@@ -61,6 +61,11 @@ Reference images included with the example workflows.
 
 ## Recent Updates
 
+### Engine 0.0.19 · Plugin 0.0.09
+
+- **Clean shutdown & pinned host-memory safety:** added `atexit` and GC cleanup for cached and pending native handles so CUDA resources and pinned host memory release cleanly on exit, and bounded large Linux pinned host allocations into chunks to eliminate multi-GiB host memory retention across repeated LTX-2.5 and MiniMax-H3 runs.
+- **Backward compatibility:** fully compatible with existing Plugin `0.0.08` installs (which automatically receive Engine `0.0.19`).
+
 ### Engine 0.0.18 · Plugin 0.0.08
 
 - **Compact engine download:** shrunk per-GPU runtime libraries from 95–174 MiB (`0.0.17`) down to 4.0–5.5 MiB on Linux and 14.0–28.3 MiB on Windows (`14.0–17.6 MiB` on RTX 40/50 series).
@@ -75,12 +80,6 @@ Reference images included with the example workflows.
 - **SM75 performance:** faster inference on Turing GPUs.
 - **VRAM management:** more efficient memory use and model movement for faster inference.
 - **MiniMax-H3 workflows:** updated single- and double-sampling examples for better image quality and speed.
-
-### Engine 0.0.13 · Plugin 0.0.07
-
-- Added quality-enhancement and pinned-memory controls.
-- Reuse loaded models when changing settings or LoRAs.
-- Architecture-specific engines, simpler LoRA handling and quieter logging.
 
 ## Community
 

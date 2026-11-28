@@ -1711,6 +1711,82 @@ def main():
                   win_rename_ok and skip_cleaned_ok and update_cleaned_ok and rb1_ok and rb2_ok and rb3_ok and rb4_ok,
                   (win_rename_ok, skip_cleaned_ok, update_cleaned_ok, rb1_ok, rb2_ok, rb3_ok, rb4_ok))
 
+    # 24) C09: Plugin 0.0.09 version.json & Engine 0.0.19 release matrix (0.0.08/0.0.09 pick 0.0.19; 0.0.07 rejects)
+    shipped_ver = {}
+    for plat_dir in ("linux", "windows"):
+        vpath = os.path.join(_PLUGIN, "bin", plat_dir, "version.json")
+        with open(vpath, encoding="utf-8") as vf:
+            shipped_ver[plat_dir] = json.load(vf)
+    check("C09 shipped bin/{linux,windows}/version.json equal {'comfy': '0.0.09'}",
+          shipped_ver == {"linux": {"comfy": "0.0.09"}, "windows": {"comfy": "0.0.09"}}, shipped_ver)
+
+    stanza17 = {"comfy": "0.0.07", "comfy-12": "0.0.07", "sdk": "0.0.07", "sdk-12": "0.0.07",
+                "lib": "0.0.17", "lib-12": "0.0.17", "kernel_so": True}
+    stanza18 = {"comfy": "0.0.08", "comfy-12": "0.0.08", "sdk": "0.0.08", "sdk-12": "0.0.08",
+                "lib": "0.0.18", "lib-12": "0.0.18", "kernel_so": True}
+    stanza19 = {"comfy": "0.0.08", "comfy-12": "0.0.08", "sdk": "0.0.08", "sdk-12": "0.0.08",
+                "lib": "0.0.19", "lib-12": "0.0.19", "kernel_so": True}
+    matrix_versions = {"0.0.17": stanza17, "0.0.18": stanza18, "0.0.19": stanza19}
+    matrix_no17 = {"0.0.18": stanza18, "0.0.19": stanza19}
+    pick_ok = True
+    pick_details = {}
+    for pver, want_with_17, want_no_17 in (("0.0.09", "0.0.19", "0.0.19"),
+                                           ("0.0.08", "0.0.19", "0.0.19"),
+                                           ("0.0.07", "0.0.17", None)):
+        for major in (13, 12):
+            got17 = qfe._engine_pick_version(matrix_versions, pver, major)
+            got_no17 = qfe._engine_pick_version(matrix_no17, pver, major)
+            pick_details[(pver, major)] = (got17, got_no17)
+            if got17 != want_with_17 or got_no17 != want_no_17:
+                pick_ok = False
+    check("C09 _engine_pick_version matrix: 0.0.08/0.0.09 pick 0.0.19, 0.0.07 rejects 0.0.19/0.0.18 (cu12/cu13)",
+          pick_ok, pick_details)
+
+    # Linux & Windows end-to-end 0.0.19 install/upgrade/refusal across 0.0.09 / 0.0.08 / 0.0.07
+    rel18_19 = Release("0.0.18", plugin_req="0.0.08")
+    rel19 = Release("0.0.19", plugin_req="0.0.08")
+    rel18_19.files.update({k: v for k, v in rel19.files.items() if k != "version.json"})
+    rel18_19.entries = {"0.0.18": dict(stanza18), "0.0.19": dict(stanza19)}
+    rel18_19.files["version.json"] = json.dumps({"linux": rel18_19.entries}).encode()
+    e2e_lin = {}
+    for major in (13, 12):
+        for pver in ("0.0.09", "0.0.08"):
+            with Env(rel18_19, torch_major=major, driver_major=major, sm=89, plugin_version=pver) as env:
+                qfe.install_engine()
+                e2e_lin[(pver, major)] = env.marker("sm89", major)["version"]
+        with Env(rel18_19, torch_major=major, driver_major=major, sm=89, plugin_version="0.0.07") as env:
+            try:
+                qfe.install_engine()
+                e2e_lin[("0.0.07", major)] = "installed!"
+            except RuntimeError as exc:
+                e2e_lin[("0.0.07", major)] = type(exc).__name__
+    check("C09 Linux install_engine: 0.0.09 & 0.0.08 install 0.0.19, 0.0.07 refuses (cu12/cu13)",
+          all(e2e_lin[(p, m)] == "0.0.19" for p in ("0.0.09", "0.0.08") for m in (13, 12))
+          and all(e2e_lin[("0.0.07", m)] == "EngineNotInstallable" for m in (13, 12)), e2e_lin)
+
+    with windows():
+        wr18_19 = WinRelease("0.0.18", plugin_req="0.0.08")
+        wr18_19.add("0.0.19", plugin_req="0.0.08")
+        wr18_19.entries = {"0.0.18": dict(stanza18), "0.0.19": dict(stanza19)}
+        wr18_19.files["version.json"] = json.dumps({"linux": {}, "win32": wr18_19.entries}).encode()
+        e2e_win = {}
+        for major in (13, 12):
+            for pver in ("0.0.09", "0.0.08"):
+                with Env(wr18_19, torch_major=major, driver_major=major, sm=120,
+                         plugin_version=pver, machine="AMD64") as env:
+                    qfe.install_engine()
+                    e2e_win[(pver, major)] = env.marker("sm120a", major)["version"]
+            with Env(wr18_19, torch_major=major, driver_major=major, sm=120,
+                     plugin_version="0.0.07", machine="AMD64") as env:
+                try:
+                    qfe.install_engine()
+                    e2e_win[("0.0.07", major)] = "installed!"
+                except RuntimeError as exc:
+                    e2e_win[("0.0.07", major)] = type(exc).__name__
+        check("C09 Windows install_engine: 0.0.09 & 0.0.08 install 0.0.19, 0.0.07 refuses (cu12/cu13)",
+              all(e2e_win[(p, m)] == "0.0.19" for p in ("0.0.09", "0.0.08") for m in (13, 12))
+              and all(e2e_win[("0.0.07", m)] == "EngineNotInstallable" for m in (13, 12)), e2e_win)
+
     print("ENGINE_INSTALL:", "PASS" if bad == 0 else f"FAIL ({bad} wrong)")
     return 1 if bad else 0
 

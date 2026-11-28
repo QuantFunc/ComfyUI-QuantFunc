@@ -1,4 +1,5 @@
 """qf_native -- ComfyUI plugin for QuantFunc PC Engine (LTX-2.5, MiniMax-H3, Krea-2, Qwen-Image-2.1)."""
+import atexit
 import inspect
 import json
 import os
@@ -272,24 +273,35 @@ def _live_pipeline_models(ckey):
         return [r() for r in refs]
 
 
-def _retire_handle(ckey, eng, requester=None, *, keep_binding=False, reason=""):
+def _retire_handle(ckey, eng, requester=None, *, keep_binding=False, reason="", force_shutdown=False):
     """Single authorized .destroy() chokepoint: refuses while any live foreign consumer is bound."""
+    if eng is None:
+        return False
     with _ENGINE_IDENTITY_LOCK:
-        if _PIPELINE_CACHE.get(ckey) is not eng:
-            return False
-        req_qf = getattr(requester, "_qf", requester)
-        foreign = [c for c in _live_pipeline_models(ckey)
-                   if requester is None or getattr(c, "_qf", c) is not req_qf]
-        if foreign:
-            qfe.info(f"[qf_native] retire refused ({reason or 'unspecified'}): {len(foreign)} live "
-                     "foreign consumer(s) still bound to this cache entry", flush=True)
-            return False
-        _PIPELINE_CACHE.pop(ckey, None)
-        if not keep_binding:
-            _PIPELINE_MODELS.pop(ckey, None)
-            _PIPELINE_SIGS.pop(ckey, None)
+        if ckey is None:
+            if not force_shutdown:
+                return False
+        else:
+            if _PIPELINE_CACHE.get(ckey) is not eng:
+                return False
+            if not force_shutdown:
+                req_qf = getattr(requester, "_qf", requester)
+                foreign = [c for c in _live_pipeline_models(ckey)
+                           if requester is None or getattr(c, "_qf", c) is not req_qf]
+                if foreign:
+                    qfe.info(f"[qf_native] retire refused ({reason or 'unspecified'}): {len(foreign)} live "
+                             "foreign consumer(s) still bound to this cache entry", flush=True)
+                    return False
+            _PIPELINE_CACHE.pop(ckey, None)
+            if not keep_binding:
+                _PIPELINE_MODELS.pop(ckey, None)
+                _PIPELINE_SIGS.pop(ckey, None)
     try:
-        eng.destroy()
+        shutdown_fn = getattr(eng, "_destroy_for_shutdown", None) if force_shutdown else None
+        if callable(shutdown_fn):
+            shutdown_fn()
+        else:
+            eng.destroy()
     except Exception:  # noqa: BLE001
         pass
     return True
@@ -303,6 +315,51 @@ def _sweep_dead_pipelines(keep_key):
             eng = _PIPELINE_CACHE.get(k)
         if eng is not None and _retire_handle(k, eng, None, reason="host-RAM sweep"):
             qfe.info("[qf_native] host-RAM sweep: destroyed cached transformer whose model was GC'd", flush=True)
+
+
+def _shutdown_all_pipelines():
+    """Drain cached and pending native handles at interpreter exit before CUDA/C++ teardown."""
+    for _ in range(8):
+        with _ENGINE_IDENTITY_LOCK:
+            entries = list(_PIPELINE_CACHE.items())
+            if not entries:
+                _PIPELINE_MODELS.clear()
+                _PIPELINE_SIGS.clear()
+                break
+        snapshot_ids = [(k, id(v)) for k, v in entries]
+        retired_any = False
+        for ckey, eng in entries:
+            try:
+                if _retire_handle(ckey, eng, None, reason="process exit", force_shutdown=True):
+                    retired_any = True
+            except Exception:  # noqa: BLE001
+                pass
+        if not retired_any:
+            with _ENGINE_IDENTITY_LOCK:
+                if [(k, id(v)) for k, v in _PIPELINE_CACHE.items()] == snapshot_ids:
+                    _PIPELINE_CACHE.clear()
+                    _PIPELINE_MODELS.clear()
+                    _PIPELINE_SIGS.clear()
+                    break
+    else:
+        with _ENGINE_IDENTITY_LOCK:
+            _PIPELINE_CACHE.clear()
+            _PIPELINE_MODELS.clear()
+            _PIPELINE_SIGS.clear()
+    if qfe is not None:
+        snap_fn = qfe._snapshot_pending_reference_audio_owners
+        try:
+            pending = snap_fn()
+        except Exception:  # noqa: BLE001
+            pending = ()
+        for eng in pending:
+            try:
+                _retire_handle(None, eng, None, reason="process exit pending audio", force_shutdown=True)
+            except Exception:  # noqa: BLE001
+                pass
+
+
+atexit.register(_shutdown_all_pipelines)
 
 
 def _coerce_bool_switch(value, default, name, *, allow_none=False, warn=True):

@@ -63,7 +63,69 @@ else:
     del _ilu, _capi_spec, _capi, _sym
 
 # Pending LTX reference-audio borrows must survive model/handle GC until native cleanup.
+# Zero lock nesting: _destroy_lock and _PENDING_OWNERS_LOCK are never held simultaneously;
+# both use RLock so same-thread cyclic GC reentrancy cannot self-deadlock, and discards
+# triggered while any _destroy_lock is held on the current thread are deferred until release.
 _REFERENCE_AUDIO_PENDING_OWNERS = set()
+_PENDING_OWNERS_LOCK = threading.RLock()
+_PENDING_SNAPSHOT_STACK = []
+_DEFERRED_PENDING_DISCARDS = []
+_THREAD_DESTROY_STATE = threading.local()
+
+
+def _enter_destroy_scope():
+    _THREAD_DESTROY_STATE.depth = getattr(_THREAD_DESTROY_STATE, "depth", 0) + 1
+
+
+def _exit_destroy_scope():
+    depth = getattr(_THREAD_DESTROY_STATE, "depth", 0)
+    new_depth = depth - 1 if depth > 1 else 0
+    _THREAD_DESTROY_STATE.depth = new_depth
+    if new_depth > 0:
+        return []
+    pending = getattr(_THREAD_DESTROY_STATE, "pending_discards", None)
+    if not pending:
+        return []
+    _THREAD_DESTROY_STATE.pending_discards = None
+    return pending
+
+
+def _flush_pending_discards(items):
+    if not items:
+        return
+    with _PENDING_OWNERS_LOCK:
+        if _PENDING_SNAPSHOT_STACK:
+            _DEFERRED_PENDING_DISCARDS.extend(items)
+            return
+        for handle in items:
+            if not getattr(handle, "_reference_audio_pending", False):
+                _REFERENCE_AUDIO_PENDING_OWNERS.discard(handle)
+
+
+def _discard_or_defer_pending_owner(handle):
+    if getattr(_THREAD_DESTROY_STATE, "depth", 0) > 0:
+        pending = getattr(_THREAD_DESTROY_STATE, "pending_discards", None)
+        if pending is None:
+            pending = []
+            _THREAD_DESTROY_STATE.pending_discards = pending
+        pending.append(handle)
+        return
+    _flush_pending_discards([handle])
+
+
+def _snapshot_pending_reference_audio_owners():
+    """Return a thread-safe snapshot of handles with pending LTX reference-audio borrows."""
+    with _PENDING_OWNERS_LOCK:
+        _PENDING_SNAPSHOT_STACK.append(None)
+        try:
+            return list(_REFERENCE_AUDIO_PENDING_OWNERS)
+        finally:
+            _PENDING_SNAPSHOT_STACK.pop()
+            if not _PENDING_SNAPSHOT_STACK and _DEFERRED_PENDING_DISCARDS:
+                for handle in _DEFERRED_PENDING_DISCARDS:
+                    if not getattr(handle, "_reference_audio_pending", False):
+                        _REFERENCE_AUDIO_PENDING_OWNERS.discard(handle)
+                _DEFERRED_PENDING_DISCARDS.clear()
 
 _IS_WINDOWS = platform.system() == "Windows"
 _IS_DARWIN = platform.system() == "Darwin"
@@ -1656,6 +1718,9 @@ class QFEngineHandle:
         self.sampler_step_count = 0
         self.applied_lora_sig = "[]"
         self.applied_api_key = None
+        self._destroy_lock = threading.RLock()
+        self._destroying = False
+        self._sys = sys
 
     def set_api_key(self, api_key):
         """Hot-switch API key in place via qf_auth_set_api_key (no rebuild)."""
@@ -1688,19 +1753,30 @@ class QFEngineHandle:
         return int(freed.value)
 
     def retain_reference_audio(self, owner):
-        if getattr(self, "_reference_audio_pending", False):
-            raise RuntimeError("qf_native LTX-AV: prior reference begin has no proven copy completion")
-        self._reference_audio_owner = owner
-        self._reference_audio_pending = owner is not None
-        if owner is not None:
-            _REFERENCE_AUDIO_PENDING_OWNERS.add(self)
+        lock = globals().get("_PENDING_OWNERS_LOCK")
+        if lock is not None:
+            lock.acquire()
+        try:
+            if getattr(self, "_reference_audio_pending", False):
+                raise RuntimeError("qf_native LTX-AV: prior reference begin has no proven copy completion")
+            self._reference_audio_owner = owner
+            self._reference_audio_pending = owner is not None
+            if owner is not None:
+                _REFERENCE_AUDIO_PENDING_OWNERS.add(self)
+        finally:
+            if lock is not None:
+                lock.release()
 
     def reference_audio_pending(self):
-        return getattr(self, "_reference_audio_pending", False)
+        return bool(getattr(self, "_reference_audio_pending", False))
 
     def reference_audio_copy_completed(self):
         self._reference_audio_pending = False
-        _REFERENCE_AUDIO_PENDING_OWNERS.discard(self)
+        defer_fn = globals().get("_discard_or_defer_pending_owner")
+        if callable(defer_fn):
+            defer_fn(self)
+        else:
+            _REFERENCE_AUDIO_PENDING_OWNERS.discard(self)
 
     def unload_sync(self):
         """Explicit between-call synchronization fence via qf_xfm_unload_vram(0)."""
@@ -1713,18 +1789,24 @@ class QFEngineHandle:
 
     def end_session_if_open(self):
         """Close the open session if any. Retains current_session on refused/raising end."""
-        if self.current_session is None:
+        sess = getattr(self, "current_session", None)
+        if sess is None:
             return (False, True)
         ok = True
         try:
-            st = self.lib.qf_xfm_session_end(self.current_session)
-            if st != QF_OK:
+            lib = getattr(self, "lib", None)
+            end_fn = getattr(lib, "qf_xfm_session_end", None)
+            if not callable(end_fn):
                 ok = False
-                try:
-                    say(f"[qf_native] WARNING qf_xfm_session_end returned status={st}: "
-                        f"{last_err(self.lib)}", flush=True)
-                except Exception:  # noqa: BLE001
-                    pass
+            else:
+                st = end_fn(sess)
+                if st != QF_OK:
+                    ok = False
+                    try:
+                        say(f"[qf_native] WARNING qf_xfm_session_end returned status={st}: "
+                            f"{last_err(lib)}", flush=True)
+                    except Exception:  # noqa: BLE001
+                        pass
         except Exception as exc:  # noqa: BLE001
             ok = False
             try:
@@ -1761,13 +1843,159 @@ class QFEngineHandle:
             raise RuntimeError(f"QuantFunc demand query failed: {last_err(self.lib)}")
         return int(out.value)
 
+    def _destroy_native_unlocked(self):
+        """Best-effort session close and native handle teardown (caller holds _destroy_lock if present)."""
+        try:
+            self.end_session_if_open()
+        except Exception:  # noqa: BLE001
+            pass
+        xfm = getattr(self, "xfm", None)
+        self.xfm = None
+        if xfm is not None:
+            destroy_fn = getattr(getattr(self, "lib", None), "qf_xfm_destroy", None)
+            if callable(destroy_fn):
+                try:
+                    destroy_fn(xfm)
+                except Exception:  # noqa: BLE001
+                    pass
+
     def destroy(self):
-        if self.reference_audio_pending():
-            raise RuntimeError("qf_native LTX-AV: reference copy pending; explicit successful native cleanup required")
-        self.end_session_if_open()
-        if self.xfm is not None:
+        enter_fn = globals().get("_enter_destroy_scope")
+        exit_fn = globals().get("_exit_destroy_scope")
+        flush_fn = globals().get("_flush_pending_discards")
+        if callable(enter_fn):
+            enter_fn()
+        try:
+            lock = getattr(self, "_destroy_lock", None)
+            if lock is not None:
+                lock.acquire()
             try:
-                self.lib.qf_xfm_destroy(self.xfm)
+                if getattr(self, "_destroying", False):
+                    return
+                if self.reference_audio_pending():
+                    raise RuntimeError(
+                        "qf_native LTX-AV: reference copy pending; explicit successful native cleanup required")
+                self._destroying = True
+                try:
+                    self.end_session_if_open()
+                    xfm = getattr(self, "xfm", None)
+                    self.xfm = None
+                    if xfm is not None:
+                        destroy_fn = getattr(getattr(self, "lib", None), "qf_xfm_destroy", None)
+                        if callable(destroy_fn):
+                            try:
+                                destroy_fn(xfm)
+                            except Exception:  # noqa: BLE001
+                                pass
+                finally:
+                    self._destroying = False
+            finally:
+                if lock is not None:
+                    lock.release()
+        finally:
+            if callable(exit_fn):
+                pending = exit_fn()
+                if pending and callable(flush_fn):
+                    flush_fn(pending)
+
+    def _destroy_for_shutdown(self):
+        """Force-retire native state at process exit while pinning pending reference-audio owner across sync."""
+        enter_fn = globals().get("_enter_destroy_scope")
+        exit_fn = globals().get("_exit_destroy_scope")
+        flush_fn = globals().get("_flush_pending_discards")
+        if callable(enter_fn):
+            enter_fn()
+        try:
+            lock = getattr(self, "_destroy_lock", None)
+            if lock is not None:
+                lock.acquire()
+            owner_keep = None
+            try:
+                if getattr(self, "_destroying", False):
+                    return
+                self._destroying = True
+                try:
+                    if self.reference_audio_pending():
+                        owner_keep = getattr(self, "_reference_audio_owner", None)
+                        try:
+                            self.unload_sync()
+                        except Exception:  # noqa: BLE001
+                            pass
+                        if self.reference_audio_pending():
+                            try:
+                                self.end_session_if_open()
+                            except Exception:  # noqa: BLE001
+                                pass
+                        if self.reference_audio_pending():
+                            self.reference_audio_copy_completed()
+                            self._reference_audio_owner = None
+                    self._destroy_native_unlocked()
+                finally:
+                    self._destroying = False
+            finally:
+                owner_keep = None
+                if lock is not None:
+                    lock.release()
+        finally:
+            if callable(exit_fn):
+                pending = exit_fn()
+                if pending and callable(flush_fn):
+                    flush_fn(pending)
+
+    def __del__(self):
+        inst_dict = getattr(self, "__dict__", None)
+        has_inst_sys = isinstance(inst_dict, dict) and "_sys" in inst_dict
+        g = globals()
+        has_mod_sys = "sys" in g
+        if not has_inst_sys and not has_mod_sys:
+            return
+        for sys_mod in ((inst_dict["_sys"],) if has_inst_sys else ()) + ((g["sys"],) if has_mod_sys else ()):
+            if sys_mod is None:
+                return
+            try:
+                is_fin = getattr(sys_mod, "is_finalizing", None)
+                if callable(is_fin) and is_fin():
+                    return
+            except Exception:  # noqa: BLE001
+                return
+        if getattr(self, "_destroying", False):
+            return
+        if getattr(self, "_reference_audio_pending", False):
+            return
+        if getattr(self, "xfm", None) is None:
+            return
+        enter_fn = g.get("_enter_destroy_scope")
+        exit_fn = g.get("_exit_destroy_scope")
+        flush_fn = g.get("_flush_pending_discards")
+        if callable(enter_fn):
+            enter_fn()
+        try:
+            lock = getattr(self, "_destroy_lock", None)
+            acquired = False
+            if lock is not None:
+                acquired = lock.acquire(blocking=False)
+                if not acquired:
+                    return
+            try:
+                if (getattr(self, "_destroying", False)
+                        or getattr(self, "_reference_audio_pending", False)
+                        or getattr(self, "xfm", None) is None):
+                    return
+                self._destroying = True
+                try:
+                    self._destroy_native_unlocked()
+                finally:
+                    self._destroying = False
             except Exception:  # noqa: BLE001
                 pass
-            self.xfm = None
+            finally:
+                if acquired and lock is not None:
+                    lock.release()
+        finally:
+            if callable(exit_fn):
+                try:
+                    pending = exit_fn()
+                    if pending and callable(flush_fn):
+                        flush_fn(pending)
+                except Exception:  # noqa: BLE001
+                    pass
